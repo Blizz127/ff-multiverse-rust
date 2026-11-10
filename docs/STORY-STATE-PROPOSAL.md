@@ -22,7 +22,7 @@ value and ordered arithmetic, not bitwise OR. The read-side guard remains until 
 and effect it consumes is known and carried.
 
 The sampled route requires at least `Var[3][66]` bit 0, `Var[3][111]` bit 0, relevant bits of
-`Var[3][209]`, `Var[3][211]` and `Var[3][212]`, and potentially `Var[1][4]` affection. This
+`Var[3][208]`, `Var[3][209]`, `Var[3][211]` and `Var[3][212]`, and potentially `Var[1][4]` affection. This
 list is evidence from sampled paths, not a complete schema: map all read and write dependencies,
 including clears and conditions, before declaring the route supported. Party membership and
 health/menu effects require their own authoritative model; a moment-derived party is not enough.

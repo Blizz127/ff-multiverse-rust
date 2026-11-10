@@ -10,7 +10,12 @@
 //!     -- --ignored --exact scene::shots::offscreen_real_ff7_the_proof_scene --test-threads=1 --nocapture
 //! FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> cargo test --offline -p fmv-client --bin fmv-client \
 //!     -- --ignored --exact scene::shots::offscreen_real_ff7_the_witness_spots_and_a_recommendation --test-threads=1 --nocapture
+//! FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> FMV_EXPLORATORY_MASK=3 cargo test --offline -p fmv-client --bin fmv-client \
+//!     -- --ignored --exact scene::shots::offscreen_survey_flower_witness --test-threads=1 --nocapture
 //! ```
+//! The unregistered early-bar and flower surveys accept `FMV_EXPLORATORY_SPOT` (one spot) and
+//! `FMV_EXPLORATORY_MASK` (choice ordinals). They save sample pictures and check walkmesh
+//! distance, but do not validate all-frame screen occlusion, live progression or audio.
 //!
 //! The measurements read whatever witness spots and arrival `fmv_ff7::script::scene::proof_scene()` has, so they judge the
 //! game's data as it is. Two environment variables try data that is not in `fmv_ff7` yet, without editing it:
@@ -258,8 +263,8 @@ const SPOT_NAMES: [&str; 3] = ["witness0", "witness1", "witness2"];
 /// The rig for `def`: the game's proof scene (made by [`Ff7Scenes`]) or, when `moved`, one made from `def` itself (the witness
 /// spots changed). The local player is the owner; two party members stand in the area too, to watch.
 fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
-    let key = PROOF_FIELD;
-    let story = StoryState::at(72);
+    let key = def.field.as_str();
+    let story = StoryState::at(*def.trigger.moments.start());
     let area = real.adapter.load_field(key).expect("the proof field loads");
     let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
     let scale = view.stage.as_ref().expect("the field has a stage").model_scale;
@@ -281,15 +286,16 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
             facing: n.facing,
         })
         .collect();
-    let trigger = trigger_npc(area.field_file(), &def, &story).expect("the trigger stands in the field");
-    npcs.push(NpcSnapshot {
+    let trigger = trigger_npc(area.field_file(), &def, &story);
+    if def.id == fmv_ff7::script::scene::PROOF_SCENE_ID { assert!(trigger.is_some(), "the proof trigger stands in the field"); }
+    if let Some(trigger) = trigger { npcs.push(NpcSnapshot {
         id: SCENE_NPC_ID_BASE,
         name: clip(&trigger.name, NPC_NAME_CHARS),
         model: clip(&trigger.model, NPC_REF_CHARS),
         idle_animation: trigger.idle.as_deref().map(|a| clip(a, NPC_REF_CHARS)),
         pos: Pos::new(f32::from(trigger.x), f32::from(trigger.y), trigger.z),
         facing: trigger.heading,
-    });
+    }); }
     // The local player stands where a preview puts it: at the scene's arrival spot, facing Tifa across the counter, in the
     // default placeholder body and a colour of its own. Two party members stand near it.
     let arrival = def.arrival;
@@ -310,11 +316,12 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
         avatar: AvatarAppearance::new(name, tint, Some(look.to_string())),
     };
     let beside = |dx: f32, dy: f32| area.place_arrival(Pos::new(own_real.x + dx, own_real.y + dy, own_real.z), None);
-    let entities = vec![
+    let mut entities = vec![
         person(1, "Wedge", own_tint, looks[0], own_real),
         person(2, "PlayerB", [240, 120, 40], looks[1], beside(60.0, 0.0)),
         person(3, "PlayerC", [70, 200, 90], looks[2], beside(0.0, 60.0)),
     ];
+    if def.id == fmv_ff7::script::scene::EARLY_BAR_SCENE_ID || def.id == fmv_ff7::script::scene::FLOWER_STATION_SCENE_ID { entities.truncate(1); }
     assert!(state.apply(0.0, ServerMsg::AreaSnapshot { area: area_id, tick: 1, entities, npcs }).is_none());
     if moved {
         state.scene.set_builder(Box::new(Moved { adapter: Arc::clone(&real.adapter), def: def.clone(), reach: Ff7Scenes::new(Some(Arc::clone(&real.adapter))) }));
@@ -323,6 +330,66 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
     }
     let avatars = Avatars::new(AvatarLibrary::new(Box::new(LgpLoader::new(&real.char_lgp))));
     Rig { view, state, avatars, npc_epoch: 0, own_tint, own_real, looks, def, story, play, scale, report: Report { min_separation: f32::MAX, ..Report::default() } }
+}
+
+/// A survey, not visual acceptance: sample one witness's walkmesh distance to visible cast
+/// while saving a few frames. Background occlusion, other bodies and intermediate frames must
+/// still be inspected; neither survey definition is in the live scene registry.
+fn survey_witness(mut def: SceneDef, default: Spot, prefix: &str) {
+    let Some(real) = open() else { return };
+    let mut gpu = Offscreen::new().expect("software or physical GPU");
+    def.witness = vec![std::env::var("FMV_EXPLORATORY_SPOT").ok().and_then(|s| parse_spot(&s)).unwrap_or(default)];
+    let mut rig = make_rig(&real, def, true);
+    let msg = ServerMsg::SceneStart {
+        run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), owner: EntityId(1),
+        participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }], you: SceneRole::Owner,
+    };
+    assert!(rig.state.apply(0.0, msg).is_none());
+    assert!(rig.state.scene.is_active());
+    let mask = std::env::var("FMV_EXPLORATORY_MASK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let (mut samples, mut actor_samples, mut nearest, mut choice_epoch, mut choice_index) = (0usize, 0usize, f32::MAX, None, 0usize);
+    for step in 0..400 {
+        if !rig.state.scene.is_active() { break; }
+        if let Some(scene) = rig.state.scene.player() {
+            if let Some(w) = scene.witnesses().first() {
+                for actor in scene.cast_draws() { nearest = nearest.min(w.pos.dist_xy(actor.pos)); actor_samples += 1; }
+                samples += 1;
+            }
+        }
+        if step % 20 == 0 && step < 100 { rig.picture(&mut gpu, &format!("{prefix}-{}", step / 20), SIZE, false); }
+        if rig.state.scene.player().is_some_and(|p| p.has_window()) {
+            let selection = rig.state.scene.player().and_then(|p| p.panel().filter(|panel| panel.window().message.choice.is_some() && panel.on_choices(SIZE)).map(|_| p.epoch()));
+            if let Some(epoch) = selection.filter(|e| Some(*e) != choice_epoch) {
+                if mask.checked_shr(u32::try_from(choice_index).unwrap_or(u32::MAX)).unwrap_or(0) & 1 != 0 { rig.state.scene.key(KeyCode::ArrowDown, true, false); }
+                choice_epoch = Some(epoch);
+                choice_index += 1;
+            }
+            rig.state.scene.key(KeyCode::Enter, true, false);
+        } else { rig.state.scene.advance(0.25); }
+    }
+    let commands = rig.state.scene.take_commands();
+    let threshold = 2.0 * RING_RADIUS_UNITS * rig.scale;
+    eprintln!("{prefix}: samples={samples} actor_samples={actor_samples} nearest={nearest:.1} threshold={threshold:.1} commands={commands:?}");
+    assert!(commands.iter().any(|c| matches!(c, super::SceneCmd::End { skipped: false, .. })), "scene must finish without skipping");
+    assert!(samples > 0 && actor_samples > 0 && nearest >= threshold, "sampled cast must stay clear of the witness");
+    assert!(choice_index > 0, "the survey must exercise a choice");
+    let answers: Vec<usize> = commands.iter().filter_map(|c| match c { super::SceneCmd::Step { answer: Some(n), .. } => Some(usize::from(*n)), _ => None }).collect();
+    let expected = if prefix == "early-bar" { vec![1 + (mask & 1)] }
+        else if mask & 1 == 0 { vec![2] }
+        else { vec![3, 2 + ((mask >> 1) & 1), (mask >> 2) & 1] };
+    assert_eq!(answers, expected, "the survey must take the requested path");
+}
+
+#[test]
+#[ignore = "requires owned FF7 data and an offscreen GPU; exploratory early-bar staging"]
+fn offscreen_survey_early_bar_witness() {
+    survey_witness(fmv_ff7::script::scene::early_bar_scene(), Spot { x: 218, y: 292, triangle: 37, direction: 192 }, "early-bar");
+}
+
+#[test]
+#[ignore = "requires owned FF7 data and an offscreen GPU; exploratory flower-scene staging"]
+fn offscreen_survey_flower_witness() {
+    survey_witness(fmv_ff7::script::scene::flower_station_scene(), Spot { x: -3785, y: 20901, triangle: 31, direction: 192 }, "flower");
 }
 
 impl Rig {

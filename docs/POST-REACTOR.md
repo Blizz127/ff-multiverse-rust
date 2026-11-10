@@ -134,6 +134,10 @@ In `mds7`, the early director checks and sets `Var[3][209]` bit 0; the script-dr
 entrance to the bar requests Cloud's slot 11, which sets bit 1 before jumping to `mds7pb_1`.
 Neither bit is carried by the current story model. These are static findings, not evidence that
 either sequence can be skipped or that a moment alone reconstructs the player's flags.
+The intermediate `mds7plr1` producer also tests `Var[3][208]` bits 0, 1 and 3 and can turn
+bits 0 and 3 on; a stage script can turn bit 1 off. These field-entry paths must be evaluated
+against actual player state, and the current monotonic union cannot represent the clear. Static
+references do not establish which branch an existing player took.
 The unregistered `sector7_intro_scene()` surveys the field producer at moment 63 using zero for
 unavailable flags. That sampled run has no dialogue windows, stages ten actors and turns on bits
 0, 2, 3, 5 and 7 of `Var[3][209]`; it also reads uncarried bytes 209, 210 and 213. The outcome
