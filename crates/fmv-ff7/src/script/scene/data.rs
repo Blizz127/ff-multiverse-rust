@@ -133,17 +133,18 @@ pub struct SceneDef {
 }
 
 impl SceneDef {
-    /// Rebind every entity reference to a replacement section by its original entity name.
+    /// Rebind every entity reference to a replacement section by its original entity name,
+    /// ignoring ASCII case as field scripts can capitalize the same actor differently.
     /// Refuse missing or ambiguous names: guessing would drive the wrong actor or script.
     /// This only maps identities; it does not establish that the replacement has equivalent
     /// script slots, dialogue choices, timing, or multiplayer synchronization.
     pub fn rebind_entities(&self, original: &FieldScript<'_>, replacement: &FieldScript<'_>) -> Option<Self> {
         let map = |entity: u8| -> Option<u8> {
             let name = original.entity_name(usize::from(entity))?;
-            if original.entities().iter().filter(|entry| entry.name == name).count() != 1 {
+            if original.entities().iter().filter(|entry| entry.name.eq_ignore_ascii_case(name)).count() != 1 {
                 return None;
             }
-            let mut matches = replacement.entities().iter().enumerate().filter(|(_, entry)| entry.name == name);
+            let mut matches = replacement.entities().iter().enumerate().filter(|(_, entry)| entry.name.eq_ignore_ascii_case(name));
             let index = matches.next()?.0;
             if matches.next().is_some() { return None; }
             u8::try_from(index).ok()

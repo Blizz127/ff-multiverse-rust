@@ -32,6 +32,8 @@ pub enum SceneError {
     Walkmesh(String),
     #[error("the scene's trigger names an entity the field does not have")]
     NoSuchEntity,
+    #[error("the replacement script does not have unique matching scene entities")]
+    UnmatchedEntities,
 }
 
 /// What a scene's script wrote that the story can carry.
@@ -173,13 +175,27 @@ impl ScenePlay {
 
     pub fn with_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits) -> Result<Self, SceneError> {
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        Self::with_script(field, def, story, seed, limits, &script)
+    }
+
+    /// Build a scene from a replacement script section and the original field's walkmesh.
+    /// The caller must establish compatible choices, pacing, and multiplayer synchronization
+    /// before using this for a live scene; mapping entity names does not establish those properties.
+    pub fn with_script_section(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8]) -> Result<Self, SceneError> {
+        let original = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        let replacement = FieldScript::parse(section).map_err(|e| SceneError::Script(e.to_string()))?;
+        let rebound = def.rebind_entities(&original, &replacement).ok_or(SceneError::UnmatchedEntities)?;
+        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement)
+    }
+
+    fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>) -> Result<Self, SceneError> {
         if usize::from(def.trigger.entity) >= script.entity_count() {
             return Err(SceneError::NoSuchEntity);
         }
         let mesh = field.walkmesh().map_err(|e| SceneError::Walkmesh(e.to_string()))?;
         let section = script.bytes().to_vec();
         let mut vm = Vm::new(SceneVars::new(story.clone(), &def.given), seed, limits);
-        vm.setup(&script, &def.setup);
+        vm.setup(script, &def.setup);
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
         for m in &def.cast {
@@ -188,7 +204,6 @@ impl ScenePlay {
             }
         }
         vm.begin(def.root.clone());
-        drop(script);
         let ground = Ground::new(mesh);
         let cast: BTreeSet<u8> = def.cast.iter().map(|m| m.entity).collect();
         let initial = Self::initial_stage(&vm, &ground, &def.cast);

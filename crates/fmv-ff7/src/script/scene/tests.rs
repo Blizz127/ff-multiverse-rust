@@ -127,7 +127,7 @@ fn field_of(section: Vec<u8>) -> FieldFile {
 #[test]
 fn replacement_scene_entities_are_rebound_by_unique_name() {
     let original = script(vec![("dic", vec![]), ("cloud", vec![]), ("barret", vec![]), ("biggs", vec![]), ("jessie", vec![]), ("wedge", vec![])], vec![]);
-    let replacement = script(vec![("wedge", vec![]), ("jessie", vec![]), ("biggs", vec![]), ("barret", vec![]), ("cloud", vec![]), ("dic", vec![])], vec![]);
+    let replacement = script(vec![("Wedge", vec![]), ("Jessie", vec![]), ("Biggs", vec![]), ("Barret", vec![]), ("Cloud", vec![]), ("Dic", vec![])], vec![]);
     let original = FieldScript::parse(&original).unwrap();
     let replacement = FieldScript::parse(&replacement).unwrap();
     let mut def = station_scene();
@@ -141,7 +141,7 @@ fn replacement_scene_entities_are_rebound_by_unique_name() {
     assert_eq!(rebound.speakers.iter().map(|(_, e)| *e).collect::<Vec<_>>(), vec![4, 3, 2, 1, 0]);
     let missing = script(vec![("dic", vec![])], vec![]);
     assert!(def.rebind_entities(&original, &FieldScript::parse(&missing).unwrap()).is_none());
-    let ambiguous = script(vec![("dic", vec![]), ("dic", vec![])], vec![]);
+    let ambiguous = script(vec![("dic", vec![]), ("DIC", vec![])], vec![]);
     assert!(def.rebind_entities(&original, &FieldScript::parse(&ambiguous).unwrap()).is_none());
     assert!(def.rebind_entities(&FieldScript::parse(&ambiguous).unwrap(), &replacement).is_none());
 }
@@ -521,6 +521,23 @@ fn demo_def(cast: Vec<CastMember>, root: Vec<Step>) -> SceneDef {
         witness: vec![Spot { x: 50, y: 10, triangle: 0, direction: 64 }],
         arrival: Spot { x: 50, y: 10, triangle: 0, direction: 64 },
     }
+}
+
+#[test]
+fn replacement_section_plays_its_own_windows_on_rebound_entities() {
+    let original = script(vec![("a", vec![(1, vec![message(0, 0)])]), ("b", vec![])], vec![dialog("Aya")]);
+    let line = [dialog("Aya").split_last().unwrap().1.to_vec(), vec![0xE7], dialog("Hello.")].concat();
+    let replacement = script(vec![("b", vec![]), ("a", vec![(1, vec![message(0, 1)])])], vec![dialog("unused"), line]);
+    let field = field_of(original);
+    let def = demo_def(vec![member(0, "aya"), member(1, "bo")], vec![Step::Start(ScriptRef::new(0, 1))]);
+    let mut play = ScenePlay::with_script_section(&field, &def, &StoryState::at(4), 1, &replacement).unwrap();
+    assert_eq!(play.def().trigger.entity, 1);
+    let beat = play.next(None);
+    let Then::Window(w) = beat.then else { panic!("expected replacement window") };
+    assert_eq!((w.opener, w.speaker), (1, Some(1)));
+    assert!(matches!(w.message.origin, crate::script::dialogue::MessageOrigin::Canon { entity: 1, dialog: 1 }));
+    let missing = script(vec![("b", vec![])], vec![]);
+    assert!(matches!(ScenePlay::with_script_section(&field, &def, &StoryState::at(4), 1, &missing), Err(SceneError::UnmatchedEntities)));
 }
 
 fn member(entity: u8, name: &str) -> CastMember {

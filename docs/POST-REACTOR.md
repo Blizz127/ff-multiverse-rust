@@ -34,6 +34,17 @@ watcher synchronization must be reconciled before claiming that scene dialogue a
 missing or ambiguous names; it is not wired into playback, and entity identity alone does not prove
 the replacement's slots, choices, windows or timing are compatible.
 
+The verified Echo-S 1.24 archive was compared locally against the owned English field data with
+`fmv-mods`' `echo_scene_compare` example. At the same story moments, `md8_4` produces four windows
+in both layers, while `md8_1` produces four original windows and five Echo-S windows. At the bar,
+the original's two answer paths produce six and eleven windows; Echo-S produces seven and twelve.
+The original bar question uses absolute lines 1–2, while Echo-S uses 0–1. Comparing answer ordinal
+(first with first, second with second) gives the same tracked story bits on the sampled paths; this
+does not establish semantic equivalence of every choice or a safe watcher protocol. The bar script
+also capitalizes actor names differently, so identity matching must be case-insensitive and reject
+case-insensitive duplicates. Echo-S's added windows have voice files in these samples. These
+measurements do not enable the layer or claim that sound, animation or all story effects are done.
+
 The owned-data exit graph also gives the unreviewed continuation `cargoin` → `tin_1` →
 `mds7st3` → `mds7plr1` → `mds7` → `mds7pb_1`. `tin_1` → `mds7st3` is a
 script-driven line with a moment guard, and `mds7` → `mds7pb_1` is a script-driven
