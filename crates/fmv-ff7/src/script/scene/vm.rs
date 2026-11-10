@@ -210,6 +210,16 @@ pub struct Stats {
     pub unresolved: u32,
 }
 
+/// The destination of the MAPJUMP that ended a scene, as authored in the field script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneJump {
+    pub field: u16,
+    pub x: i16,
+    pub y: i16,
+    pub triangle: i16,
+    pub direction: u8,
+}
+
 impl Stats {
     fn note(&mut self, class: Class, mnemonic: &'static str) {
         let table = match class {
@@ -458,6 +468,7 @@ fn clamp_u8(v: i32) -> u8 {
 /// The VM (see the module docs).
 #[derive(Debug, Clone)]
 pub struct Vm {
+    jump: Option<SceneJump>,
     limits: Limits,
     vars: SceneVars,
     writes: BTreeMap<(u8, u8), u8>,
@@ -492,6 +503,7 @@ pub struct Vm {
 impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
         Self {
+            jump: None,
             limits,
             vars,
             writes: BTreeMap::new(),
@@ -526,6 +538,8 @@ impl Vm {
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
+
+    pub fn destination(&self) -> Option<SceneJump> { self.jump }
 
     /// The counters so far, which start again from nothing (the setup's are kept apart from the scene's).
     pub fn take_stats(&mut self) -> Stats {
@@ -1118,7 +1132,17 @@ impl Vm {
                 self.gift_not_given = true;
                 Flow::Next
             }
-            0x60 => Flow::Scene(End::MapJump { field: ins.literal("field").and_then(|f| u16::try_from(f).ok()).unwrap_or(0) }),
+            0x60 => {
+                let jump = (|| Some(SceneJump {
+                    field: u16::try_from(ins.literal("field")?).ok()?,
+                    x: i16::try_from(ins.literal("x")?).ok()?,
+                    y: i16::try_from(ins.literal("y")?).ok()?,
+                    triangle: i16::try_from(ins.literal("triangle")?).ok()?,
+                    direction: u8::try_from(ins.literal("direction")?).ok()?,
+                }))();
+                self.jump = jump;
+                Flow::Scene(End::MapJump { field: jump.map_or(0, |j| j.field) })
+            },
             0x70 => Flow::Scene(End::Battle),
             0xFF => Flow::Scene(End::GameOver),
             0x74 => {
@@ -1347,6 +1371,7 @@ impl Vm {
 
     /// Start the scene: the root thread, which takes the steps the field's own trigger takes.
     pub fn begin(&mut self, root: Vec<Step>) {
+        self.jump = None;
         self.quiet = false;
         self.threads.clear();
         self.slots.clear();

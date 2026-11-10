@@ -37,4 +37,4 @@ mod tests;
 
 pub use data::*;
 pub use play::{run_to_end, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes};
-pub use vm::{AnimHow, Beat, CameraOp, Limits, MoveHow, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};
+pub use vm::{AnimHow, Beat, CameraOp, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};

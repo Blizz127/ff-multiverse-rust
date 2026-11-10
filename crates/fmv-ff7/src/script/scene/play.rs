@@ -78,6 +78,7 @@ pub struct Outcome {
     pub end: End,
     pub windows: usize,
     pub writes: Writes,
+    pub jump: Option<super::vm::SceneJump>,
     pub stats: Stats,
 }
 
@@ -347,7 +348,7 @@ pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u
             }
         }
     };
-    Ok(Outcome { end, windows, writes: play.writes(), stats: play.stats().clone() })
+    Ok(Outcome { end, windows, writes: play.writes(), jump: play.vm.destination(), stats: play.stats().clone() })
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).

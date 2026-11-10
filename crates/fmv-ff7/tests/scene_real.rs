@@ -111,6 +111,7 @@ fn post_escape_director_reaches_its_scripted_destination() {
     let outcome = run_to_end(&f, &def, &StoryState::at(33), 1, &[]).unwrap();
     eprintln!("post-escape outcome: {:?}, windows={}, stats={:?}", outcome.end, outcome.windows, outcome.stats);
     assert_eq!(outcome.end, End::MapJump { field: 133 });
+    assert_eq!(outcome.jump, Some(fmv_ff7::script::scene::SceneJump { field: 133, x: 1629, y: -5357, triangle: 15, direction: 192 }));
     assert!(outcome.windows >= 3);
     assert!(outcome.stats.unknown.is_empty());
     assert_eq!(outcome.stats.dropped_requests, 0);
