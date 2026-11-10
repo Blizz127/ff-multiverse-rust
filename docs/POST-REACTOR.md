@@ -17,6 +17,9 @@ moment 72 in `mds7pb_1`; it is not reachable from the escape in this branch yet.
 The `md8_2` director has branching questions and one branch removes one gil (`GOLDd`) before
 writing moment 39. A presentation-only replay must not alter currency; a server-owned, once-only
 transaction and its persistence need to be implemented before serving that branch.
+The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
+story party table otherwise continues to offer Cloud and Barret at later moments. Those
+operations and the correct later party must be modeled before this scene advances real progress.
 
 The branch has an arrival-scene trigger and a scene jump through the ordinary area handshake.
 Scene jumps only resolve to reviewed fields, so `md8_1` remains closed until its transition and
