@@ -133,6 +133,11 @@ lookup found clips for six of the seven windows; the choice window had no match 
 The original skipped `MENU` and `MMBud`, while Echo-S skipped `SPECIAL` and `MMBud`; both read
 uncarried persistent bytes. This comparison does not establish equivalent effects, multiplayer
 synchronization, speaker anchors, or audible playback, and it does not enable Echo-S here.
+A separate temporary `ScenePlay` experiment bound the sampled Echo-S section directly to its
+own surveyed director and cast indices. Both choices again finished with seven windows, no
+unresolved position reads and no off-cast events. This is preliminary staging evidence only:
+the binding is not in the client, the actor identity mappings and presentation have not been
+validated end to end, and party/state effects still prevent real progression.
 
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
