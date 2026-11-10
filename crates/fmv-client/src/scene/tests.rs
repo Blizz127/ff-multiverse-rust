@@ -1116,7 +1116,8 @@ fn single_frame_holds_stay_fixed_until_replaced_for_owner_and_watcher() {
     let hold = |frame| Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(frame), last: Some(frame), speed: 16, divisor: 1 };
     let replace = [
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: Some(1), last: Some(0), speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
+        // Wedge now uses the verified same-default [0, 0] Once; another same-slot range remains unsupported.
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(1), last: Some(1), speed: 16, divisor: 1 },
         Stage::AnimSpeed { entity: 20, speed: 48 },
         Stage::Anim { entity: 20, animation: 99, how: AnimHow::Hold, first: Some(0), last: Some(0), speed: 16, divisor: 1 },
     ];
@@ -1476,7 +1477,7 @@ fn bounded_once_restores_only_known_defaults_for_owner_and_watcher() {
         actor.scene_clip.map(|(stem, frame)| (stem.to_string(), frame))
     };
     let unsupported = [
-        once(0, 0, 2), // Same slot as the known default is deliberately unsupported.
+        once(0, 0, 2), // Same-slot ranges other than [0, 0] remain unsupported.
         once(99, 0, 2),
         once(3, 2, 0),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: Some(2), speed: 32, divisor: 1 },
@@ -1664,7 +1665,7 @@ fn full_once_keeps_scene_time_and_a_verified_return_for_owner_and_watcher() {
         Some((clip.to_string(), ClipFrame::OnceFull { elapsed })), Some(default.to_string()),
     );
     let unsupported = [
-        once(0), // The incoming slot must differ from the verified default.
+        Stage::Anim { entity: 20, animation: 0, how: AnimHow::Once, first: None, last: None, speed: 32, divisor: 1 }, // Same-slot doubled returns remain unsupported.
         once(99),
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: None, last: Some(2), speed: 16, divisor: 1 },
@@ -2288,7 +2289,7 @@ fn scene_sound_late_tick_drops_stale_cues_but_keeps_stops_for_both_roles() {
     use super::SoundAction;
     let beats = vec![
         Beat {
-            stage: vec![timed(10, Stage::Sound { id: 61, pan: 63 }), timed(40, Stage::Sound { id: 0, pan: 63 })],
+            stage: vec![timed(10, Stage::Sound { channel: 1, id: 61, pan: 63 }), timed(40, Stage::Sound { channel: 1, id: 0, pan: 63 })],
             then: say(60, 18, 18, 1).then,
         },
         end(0),
@@ -2299,7 +2300,7 @@ fn scene_sound_late_tick_drops_stale_cues_but_keeps_stops_for_both_roles() {
         let actions = |client: &mut SceneClient| client.take_sounds().into_iter().map(|c| c.action).collect::<Vec<_>>();
         assert_eq!(actions(&mut rig.client), vec![SoundAction::Begin, SoundAction::Prepare(61)]);
         rig.client.advance(2.0);
-        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 0, pan: 63 }], "event substeps must not replay a cue that is 50 frames late");
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { channel: 1, id: 0, pan: 63 }], "event substeps must not replay a cue that is 50 frames late");
         assert!(rig.client.player().unwrap().has_window());
         rig.client.advance(10.0);
         assert!(actions(&mut rig.client).is_empty(), "the window pauses the remaining scene");
@@ -2307,11 +2308,38 @@ fn scene_sound_late_tick_drops_stale_cues_but_keeps_stops_for_both_roles() {
 }
 
 #[test]
+fn scene_sound_channels_reach_both_roles_without_collapsing_their_stops() {
+    use super::SoundAction;
+    let beats = vec![
+        Beat { stage: vec![timed(15, Stage::Sound { channel: 1, id: 61, pan: 0 }),
+            timed(15, Stage::Sound { channel: 2, id: 233, pan: 64 })], then: say(30, 18, 18, 1).then },
+        Beat { stage: vec![timed(15, Stage::Sound { channel: 2, id: 0, pan: 64 })], then: end(60).then },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut rig = rig_with(beats.clone(), false);
+        begin(&mut rig, role);
+        let actions = |client: &mut SceneClient| client.take_sounds().into_iter().map(|c| c.action).collect::<Vec<_>>();
+        assert_eq!(actions(&mut rig.client), [SoundAction::Begin, SoundAction::Prepare(61), SoundAction::Prepare(233)]);
+        rig.client.advance(0.5);
+        assert_eq!(actions(&mut rig.client), [SoundAction::Play { channel: 1, id: 61, pan: 0 },
+            SoundAction::Play { channel: 2, id: 233, pan: 64 }]);
+        rig.client.advance(0.5);
+        if role == SceneRole::Owner { rig.client.autoplay(None); }
+        else { rig.client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 0, answer: None }); }
+        assert!(actions(&mut rig.client).is_empty());
+        rig.client.advance(0.5);
+        assert_eq!(actions(&mut rig.client), [SoundAction::Play { channel: 2, id: 0, pan: 64 }]);
+        rig.client.end_local();
+        assert_eq!(actions(&mut rig.client), [SoundAction::End]);
+    }
+}
+
+#[test]
 fn scene_sound_clock_prefetch_pause_stop_and_cancel_follow_both_roles() {
     use super::SoundAction;
     let beats = vec![
-        Beat { stage: vec![timed(15, Stage::Sound { id: 61, pan: 63 })], then: say(30, 18, 18, 1).then },
-        Beat { stage: vec![timed(15, Stage::Sound { id: 0, pan: 63 }), timed(30, Stage::Sound { id: 59, pan: 127 })], then: end(60).then },
+        Beat { stage: vec![timed(15, Stage::Sound { channel: 1, id: 61, pan: 63 })], then: say(30, 18, 18, 1).then },
+        Beat { stage: vec![timed(15, Stage::Sound { channel: 1, id: 0, pan: 63 }), timed(30, Stage::Sound { channel: 1, id: 59, pan: 127 })], then: end(60).then },
     ];
     for role in [SceneRole::Owner, SceneRole::Watcher] {
         let mut rig = rig_with(beats.clone(), false);
@@ -2321,7 +2349,7 @@ fn scene_sound_clock_prefetch_pause_stop_and_cancel_follow_both_roles() {
         rig.client.advance(0.25);
         assert!(actions(&mut rig.client).is_empty());
         rig.client.advance(0.25);
-        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 61, pan: 63 }]);
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { channel: 1, id: 61, pan: 63 }]);
         rig.client.advance(0.5);
         rig.client.advance(10.0); // the open window pauses the clock, including the sound stop
         assert!(actions(&mut rig.client).is_empty());
@@ -2329,7 +2357,7 @@ fn scene_sound_clock_prefetch_pause_stop_and_cancel_follow_both_roles() {
         else { rig.client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 0, answer: None }); }
         assert_eq!(actions(&mut rig.client), vec![SoundAction::Prepare(59)]);
         rig.client.advance(0.5);
-        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 0, pan: 63 }]);
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { channel: 1, id: 0, pan: 63 }]);
         rig.client.end_local(); // area change/disconnect cancels the unplayed tail
         assert_eq!(actions(&mut rig.client), vec![SoundAction::End]);
         rig.client.advance(60.0);
@@ -2391,4 +2419,37 @@ fn every_scene_participant_builds_the_branch_from_the_owners_authoritative_gil_s
         }
         assert_eq!(captured.borrow().len(), 3);
     }
+}
+
+#[test]
+fn visible_screen_effects_spend_the_rest_of_a_tick_at_dialogue_without_moving_the_cast() {
+    use fmv_ff7::script::scene::{FadeBlend, FadeColor, FadeOp};
+    let mut rig = rig_with(vec![
+        Beat { stage: vec![
+            timed(0, Stage::Fade(FadeOp::Nfade { kind: 11, rgb: [120, 60, 30], frames: 60 })),
+            timed(0, Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 4, y_steps: 2 }),
+            timed(0, Stage::Move { entity: 18, from: None, x: 70, y: 10, z: None, triangle: None, frames: 30, how: MoveHow::Walk, animation: None }),
+        ], then: Then::Window(window(15, 18, Some(18), message(1, 18, "held"))) },
+        end(0),
+    ], false);
+    begin(&mut rig, SceneRole::Owner);
+    rig.client.advance_visible(1.0, true);
+    let scene = rig.client.player().unwrap();
+    let at = scene.cast_draws().into_iter().find(|c| c.entity == 18).unwrap().pos;
+    let clock = scene.camera_clock();
+    assert_eq!(at.x, 40.0, "the walk stopped at the window's fifteenth frame");
+    assert_eq!(clock.frames, 15.0);
+    assert_eq!(scene.fade(), Some(FadeColor { blend: FadeBlend::Add, rgb: [60, 30, 15] }), "all thirty visible frames reached the fade");
+    let shake = scene.shake();
+    rig.client.advance_visible(2.0, false);
+    let scene = rig.client.player().unwrap();
+    assert_eq!(scene.fade().unwrap().rgb, [60, 30, 15]);
+    assert_eq!(scene.shake(), shake, "the field freezes behind battle/result presentation");
+    rig.client.advance_visible(1.0, true);
+    let scene = rig.client.player().unwrap();
+    assert_eq!(scene.fade().unwrap().rgb, [120, 60, 30]);
+    assert_eq!(scene.camera_clock(), clock);
+    assert_eq!(scene.cast_draws().into_iter().find(|c| c.entity == 18).unwrap().pos, at);
+    confirm(&mut rig);
+    assert!(rig.client.player().is_none(), "normal teardown releases the completed screen effects");
 }

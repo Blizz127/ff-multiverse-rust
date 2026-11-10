@@ -65,7 +65,7 @@ pub enum SceneError {
 }
 
 /// Replay semantics version. Change this when the interpreter's durable replay contract changes.
-pub const REPLAY_VERSION: u32 = 1;
+pub const REPLAY_VERSION: u32 = 2;
 
 /// The exact authored instruction at which this run stopped for combat. Ordinals distinguish
 /// repeated executions of the same instruction, including repeated formations.
@@ -352,6 +352,13 @@ impl Ground {
         &self.mesh
     }
 
+    /// JUMP lands on the authored triangle's plane, even outside that triangle's edges.
+    /// Original integer plane evaluation truncates toward zero; an invalid/vertical triangle
+    /// has no supported landing height, rather than silently selecting another surface.
+    pub fn jump_height(&self, x: i16, y: i16, triangle: u16) -> Option<i16> {
+        super::jump::landing_height(self.mesh.triangles.get(usize::from(triangle))?, x, y)
+    }
+
     /// The height of the surface at `(x, y)`: the triangle `hint` names when it holds the point, else the surface
     /// nearest `z_hint` where several overlap, else `None` (off the mesh).
     pub fn height(&self, x: i16, y: i16, hint: Option<u16>, z_hint: Option<i16>) -> Option<f32> {
@@ -515,6 +522,7 @@ impl ScenePlay {
     /// The cast's starting presentation, including default loops left by quiet setup.
     fn initial_stage(vm: &Vm, ground: &Ground, cast: &[CastMember]) -> Vec<Stage> {
         let mut out = Vec::new();
+        out.extend(vm.initial_background_ops().iter().copied().map(Stage::Background));
         for member in cast {
             let place = vm.place_of(member.entity).or_else(|| member.start.as_ref().map(spot_where));
             if let Some(w) = place {
@@ -687,9 +695,14 @@ impl ScenePlay {
                     // The authored landing triangle selects a jump's floor. Walking has no
                     // triangle: prefer its preceding surface where several floors overlap.
                     if z.is_none() {
-                        let hint = matches!(*how, MoveHow::Walk | MoveHow::WalkKeepAnimation)
-                            .then(|| self.heights.get(entity).copied()).flatten();
-                        *z = self.ground.height(*x, *y, *triangle, hint).map(|h| h.round() as i16);
+                        if *how == MoveHow::Jump {
+                            *z = triangle.and_then(|triangle| self.ground.jump_height(*x, *y, triangle));
+                            if z.is_none() { self.vm.note_unresolved_motion(); }
+                        } else {
+                            let hint = matches!(*how, MoveHow::Walk | MoveHow::WalkKeepAnimation)
+                                .then(|| self.heights.get(entity).copied()).flatten();
+                            *z = self.ground.height(*x, *y, *triangle, hint).map(|h| h.round() as i16);
+                        }
                     }
                     if let Some(z) = *z { self.heights.insert(*entity, z); }
                 }
@@ -752,13 +765,14 @@ impl ScenePlay {
     }
 }
 
-/// Bind the bridge's initially unplaced Cloud to the accepted crossing position. Both the
+/// Bind a line scene's initially unplaced actor to the accepted crossing position. Both the
 /// host and client call this before constructing the VM and its source fingerprint. This does
 /// not verify that a crossing occurred: the authoritative world owns that movement test.
 /// An explicit triangle hint must be valid; without one the nearest containing floor is used.
 /// Other scenes do not accept a trigger-origin override.
 pub fn with_trigger_position(field: &FieldFile, def: &SceneDef, pos: fmv_core::Pos, facing: f32, triangle: Option<u32>) -> Result<SceneDef, SceneError> {
-    if def.id != super::data::BRIDGE_SCENE_ID || !pos.is_finite() || !facing.is_finite() { return Err(SceneError::SceneOrigin); }
+    let actor = def.origin_actor().ok_or(SceneError::SceneOrigin)?;
+    if !pos.is_finite() || !facing.is_finite() { return Err(SceneError::SceneOrigin); }
     let [x, y] = [pos.x.round(), pos.y.round()];
     if [x, y].into_iter().any(|n| n < f32::from(i16::MIN) || n > f32::from(i16::MAX)) { return Err(SceneError::SceneOrigin); }
     let (x, y) = (x as i16, y as i16);
@@ -776,7 +790,7 @@ pub fn with_trigger_position(field: &FieldFile, def: &SceneDef, pos: fmv_core::P
         }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(index, _)| index).ok_or(SceneError::SceneOrigin)?,
     };
     let mut bound = def.clone();
-    let cloud = bound.cast.iter_mut().find(|member| member.entity == 1).ok_or(SceneError::SceneOrigin)?;
+    let cloud = bound.cast.iter_mut().find(|member| member.entity == actor).ok_or(SceneError::SceneOrigin)?;
     // Bound the angle before the older converter's float-to-integer step, including huge but
     // finite protocol headings. Server and client use the same quantized turn.
     let facing = facing.rem_euclid(std::f32::consts::TAU);
@@ -814,7 +828,7 @@ pub fn replay_scene_to(field: &FieldFile, def: &SceneDef, story: &StoryState, re
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
         Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
-        Stage::Sound { .. } | Stage::Camera(_) => None,
+        Stage::Sound { .. } | Stage::Camera(_) | Stage::Background(_) | Stage::Shake { .. } | Stage::Fade(_) => None,
     }
 }
 

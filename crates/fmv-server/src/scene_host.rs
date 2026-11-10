@@ -206,9 +206,11 @@ impl SceneHost for Ff7SceneHost {
     }
 
     fn continuation(&self, scene: &str) -> bool {
-        self.extended_save && self.def(scene).is_some_and(|def| {
-            def.id == fmv_ff7::script::scene::BRIDGE_SCENE_ID || def.id == fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID
-        })
+        self.extended_save && self.def(scene).is_some_and(SceneDef::requires_continuation)
+    }
+
+    fn requires_landing(&self, scene: &str) -> bool {
+        self.def(scene).is_some_and(SceneDef::requires_landing)
     }
 
     fn evaluate_continuation(&self, scene: &str, original_progress: &[u8], seed: u32, original_gil: u32,

@@ -55,7 +55,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use fmv_ff7::background::depth::{pack_atlas, DepthTile, TileAtlas, ENGINE_FAR_PLANE, ENGINE_NEAR_PLANE};
-use fmv_ff7::background::{decode_background_tiles_with_depth, BlendMode, ScreenRect};
+use fmv_ff7::background::{decode_background_tiles_with_depth_options, BackgroundOptions, BlendMode, ScreenRect};
 use fmv_ff7::field::FieldFile;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -235,7 +235,7 @@ fn premultiplied_with_black_row(atlas: &TileAtlas) -> Option<Vec<u8>> {
 }
 
 impl Scenery {
-    /// Prepare `tiles` (from [`decode_background_tiles_with_depth`], in its back-to-front order) for
+    /// Prepare `tiles` (from [`decode_background_tiles_with_depth_options`], in its back-to-front order) for
     /// drawing on a picture covering `canvas` (field-screen units). `None`, with the reason for the
     /// log, when there is nothing in front of the characters (no tile of layer 2 or 4: the flat
     /// picture is then exactly right and cheaper), the canvas is empty, or the tiles do not fit an
@@ -305,11 +305,11 @@ impl Scenery {
         (Some(scenery), note)
     }
 
-    /// [`Scenery::choose`] for the tiles of `field` (its static animation groups, blending on: the
-    /// same picture as [`fmv_ff7::background::decode_background`]) over `canvas`, the rectangle of that
-    /// picture. A background that does not decode gives `None` and the reason.
-    pub fn from_field(field: &FieldFile, canvas: ScreenRect) -> (Option<Self>, String) {
-        match decode_background_tiles_with_depth(field) {
+    /// Select authored frames before atlas packing and hidden-texel baking. Hidden variants
+    /// never contribute either colour or depth to this scenery. A background that does not
+    /// decode gives `None` and the reason.
+    pub fn from_field_with_options(field: &FieldFile, canvas: ScreenRect, options: &BackgroundOptions) -> (Option<Self>, String) {
+        match decode_background_tiles_with_depth_options(field, options) {
             Ok(tiles) => Self::choose(&tiles, canvas),
             Err(e) => (None, format!("background tiles not decoded ({e}); characters over the whole picture")),
         }

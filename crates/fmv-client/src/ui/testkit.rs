@@ -142,6 +142,19 @@ impl Offscreen {
         })
     }
 
+    /// The field path with its authored fade after scene filters and before dialogue/HUD.
+    #[allow(clippy::too_many_arguments)] // Mirrors the window's scene, clipping and fade inputs.
+    pub fn render_field_effects(
+        &mut self, w: u32, h: u32, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: &DrawList, range: Option<fmv_adapter_api::Bounds>, fade: Option<fmv_ff7::script::scene::FadeColor>,
+    ) -> Vec<u8> {
+        if fade.is_none() { return self.render_field_clipped(w, h, scene, avatars, overlay, range); }
+        self.render_with(w, h, |gpu, target, srgb| {
+            gpu.draw_field_effects(target, (w, h), scene, avatars, srgb, range, fade);
+            gpu.draw_overlay(target, &overlay.vertices(w, h, srgb));
+        })
+    }
+
     /// Draw with `draw` (given the GPU, a `w` x `h` target and whether it is sRGB) and read the
     /// target back: tightly packed RGBA8, top row first.
     pub fn render_with(&mut self, w: u32, h: u32, draw: impl FnOnce(&mut Gpu, &wgpu::TextureView, bool)) -> Vec<u8> {

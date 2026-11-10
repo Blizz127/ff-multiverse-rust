@@ -1,4 +1,4 @@
-//! Durable scenes whose original script pauses for a battle and continues afterwards.
+//! Durable scenes, including battles and required arrival scenes linked by saved landings.
 //!
 //! The host interprets game data. The world validates reported windows, retains participants,
 //! and waits for the ordered saver before starting combat or resuming the script.
@@ -36,7 +36,10 @@ use crate::saver::{SceneBatchJob, SceneBatchMember, SceneSaveError};
 use super::{SceneRun, World, SCENE_STEP_POINT};
 use super::super::battle::{SceneBattleContext, SceneBattleFinished, SceneBattlePlan, SceneCombatCarry};
 
-const REPLAY_VERSION: u32 = 1;
+// Persisted execution contract, independent of the JSON envelope. Version 2 adds authored
+// ambient tasks and field effects/motion; an older checkpoint must not be silently rerun
+// under changed execution semantics. The adapter also binds its interpreter in source_hash.
+const REPLAY_VERSION: u32 = 2;
 
 /// Only validated scalar metadata is persisted. In particular, a final landing drops the battle
 /// roster and contains no nested account ids, so the account can later be restored under a new id.
@@ -114,6 +117,28 @@ fn fresh_instance() -> Option<[u8; 32]> {
     Some(bytes)
 }
 
+/// A saved execution prefix must also fit the bounded reconnect message. The storage envelope
+/// has independent limits and includes combat setup, so accepting it alone is insufficient.
+/// Reserve the largest supported cohort and numeric ids, rather than relying on today's small
+/// entity numbers or a disconnected roster, to keep later announcements representable too.
+fn checkpoint_can_be_announced(checkpoint: &SceneCheckpoint) -> bool {
+    if checkpoint.replay.len() > fmv_persist::MAX_SCENE_REPLAY_BYTES { return false; }
+    let Ok(payload) = serde_json::from_slice::<Payload>(&checkpoint.replay) else { return false; };
+    replay_can_be_announced(&checkpoint.scene_key, &checkpoint.original_story, checkpoint.seed,
+        checkpoint.original_gil, &payload.replay)
+}
+
+fn replay_can_be_announced(scene: &str, progress: &[u8], seed: u32, gil: u32, replay: &SceneReplay) -> bool {
+    if replay.validate().is_err() { return false; }
+    let participants = (0..fmv_persist::MAX_SCENE_BATCH_ACCOUNTS).map(|slot| SceneParticipant {
+        entity: EntityId(u64::MAX - slot as u64), spot: slot as u8,
+    }).collect();
+    fmv_protocol::encode(&ServerMsg::SceneStart {
+        run: SceneRunId(u64::MAX), scene: scene.to_owned(), seed, progress: progress.to_vec(), gil,
+        replay: Some(replay.clone()), owner: EntityId(u64::MAX), participants, you: SceneRole::Watcher,
+    }).is_ok()
+}
+
 impl Continuation {
     pub(super) fn destinations(&self) -> Vec<String> {
         let mut fields = vec![self.payload.field.clone()];
@@ -154,6 +179,7 @@ impl World {
         let Some(instance) = fresh_instance() else { return false; };
         let payload = Payload { replay: SceneReplay { source: boundary.source, origin, events: vec![] }, field: player.area.clone(),
             position: player.snapshot.pos, facing: player.snapshot.facing, plan: None, carry: None, landing: None, game_over: false };
+        if !replay_can_be_announced(&record.scene, &record.progress, record.seed, record.gil, &payload.replay) { return false; }
         self.scenes.continuations.insert(run, Continuation { owner: player.account, instance, accounts: vec![player.account],
             payload, boundary, checkpoint: None, states: vec![], frozen: vec![], phase: Phase::Playing });
         true
@@ -196,6 +222,9 @@ impl World {
             }
             _ => false,
         };
+        // A reconnect to this still-running process receives the accepted in-memory prefix,
+        // even before its next durable boundary. Keep that prefix within the same wire bound.
+        let valid = valid && replay_can_be_announced(&record.scene, &record.progress, record.seed, record.gil, &c.payload.replay);
         let boundary = valid.then(|| self.scenes.host.as_ref()?.evaluate_continuation(&record.scene, &record.progress,
             record.seed, record.gil, Some(&c.payload.replay))).flatten();
         let Some(boundary) = boundary else {
@@ -362,6 +391,11 @@ impl World {
                         && c.accounts.iter().filter_map(|a| self.by_account.get(a))
                             .all(|e| self.players.get(e).is_some_and(|p| p.transit.is_none())));
                     if ready { self.launch_continuation_battle(run, now); }
+                    // A follower's handshake or disconnect can be the last thing holding up
+                    // a linked arrival. Only the owner's saved landing supplies durable input.
+                    let landing_owner = self.scenes.continuations.get(&run).filter(|c| matches!(c.phase, Phase::Landing))
+                        .and_then(|c| self.by_account.get(&c.owner)).copied();
+                    if let Some(owner) = landing_owner { self.continuation_entered(owner, now); }
                 }
             }
         }
@@ -491,13 +525,20 @@ impl World {
                 let landing = c.payload.landing.as_ref()?;
                 let host = self.scenes.host.as_ref()?;
                 let entry = Landing::from_exit(&host.entry(&result.progress)?);
-                if entry != *landing || host.offered(&record.scene, &result.progress) || !self.valid_continuation_destination(&entry) { return None; }
+                // The arrival script may walk the lead away from its MAPJUMP landing before
+                // returning control. The final story must resolve to a valid control position
+                // in this same field; another field requires an explicit saved travel instead.
+                if entry.field != landing.field || entry.field != c.payload.field
+                    || host.offered(&record.scene, &result.progress) || !self.valid_continuation_destination(&entry) { return None; }
                 members[owner_index].checkpoint = None;
                 members[owner_index].reservation = None;
                 members[owner_index].next_story = Some(result.progress.clone());
                 members[owner_index].next_gil = Some(c.boundary.gil);
                 operation.kind = SceneOperationKind::Complete;
             }
+        }
+        if members.iter().filter_map(|member| member.checkpoint.as_ref()).any(|checkpoint| !checkpoint_can_be_announced(checkpoint)) {
+            return None;
         }
         Some(SceneBatchJob { operation, members })
     }
@@ -553,16 +594,20 @@ impl World {
                     battle_id: finished.id, progress, gil });
             }
             Action::Finish(result) => {
-                let record = self.scenes.runs.get(&run).cloned().expect("present");
+                let mut record = self.scenes.runs.get(&run).cloned().expect("present");
+                record.watchers.retain(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run)));
+                self.scenes.runs.get_mut(&run).expect("present").watchers = record.watchers.clone();
                 let c = self.scenes.continuations.get_mut(&run).expect("present");
                 c.accounts = vec![c.owner];
                 c.states.retain(|s| s.pair.story.account_id == c.owner);
                 c.phase = Phase::Landing;
                 let mut failed = vec![];
-                // Guests retain their own story. Only connected followers take this authored travel.
-                for entity in record.watchers.iter().copied() { self.release(entity, run, SceneOutcome::Finished, &mut failed); }
-                self.refresh_continuation_release(&record.watchers, &mut failed);
-                self.send_to(record.owner, ServerMsg::SceneEnded { run, outcome: SceneOutcome::Finished }, &mut failed);
+                // Guests' durable reservations end here, but connected followers remain held
+                // through the linked arrival. Their own story must not start an independent
+                // automatic scene between the old SceneEnded and the owner's next SceneStart.
+                for entity in std::iter::once(record.owner).chain(record.watchers.iter().copied()) {
+                    self.send_to(entity, ServerMsg::SceneEnded { run, outcome: SceneOutcome::Finished }, &mut failed);
+                }
                 self.drop_failed(failed);
                 if let Some(exit) = result.travel {
                     for entity in std::iter::once(record.owner).chain(record.watchers) {
@@ -572,7 +617,10 @@ impl World {
                     }
                 }
             }
-            Action::Continue { record, instance, boundary, payload } => {
+            Action::Continue { mut record, instance, boundary, payload } => {
+                // A disconnect while ContinueLanding was queued cannot put an expired entity
+                // back into the arrival's presentation cohort when its acknowledgment arrives.
+                record.watchers.retain(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run)));
                 let c = self.scenes.continuations.get_mut(&run).expect("present");
                 c.instance = instance;
                 c.boundary = boundary;
@@ -581,15 +629,49 @@ impl World {
                 self.scenes.runs.insert(run, record);
                 self.announce_continuation(run, None);
             }
-            Action::Complete(_) => {
+            Action::Complete(result) => {
+                let Some(entry) = self.scenes.host.as_ref().and_then(|host| host.entry(&result.progress)) else {
+                    self.continuation_failure(run,"the completed arrival has no control position"); return;
+                };
+                let Some(record) = self.scenes.runs.get(&run) else { return; };
+                let everyone = std::iter::once(record.owner).chain(record.watchers.iter().copied())
+                    .filter(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run))).collect::<Vec<_>>();
+                for &entity in &everyone {
+                    if !self.place_continuation_control(entity, &entry, now) {
+                        self.continuation_failure(run,"the completed arrival control position could not be placed"); return;
+                    }
+                }
                 self.scenes.continuations.remove(&run);
-                let Some(record) = self.scenes.runs.remove(&run) else { return; };
+                self.scenes.runs.remove(&run);
                 let mut failed = vec![];
-                self.release(record.owner,run,SceneOutcome::Finished,&mut failed);
-                self.refresh_continuation_release(&[record.owner], &mut failed);
+                // Replace the held view with the final phase and authoritative pose before
+                // SceneEnded reveals the player's own character and permits local movement.
+                let accounts = everyone.iter().filter_map(|entity| self.players.get(entity).map(|p| p.account)).collect();
+                self.refresh_story_placements(&accounts, &mut failed);
+                for entity in everyone { self.release(entity,run,SceneOutcome::Finished,&mut failed); }
                 self.drop_failed(failed);
             }
         }
+    }
+
+    /// Apply a durably completed arrival's own control position without running entry scripts
+    /// again. A disconnected owner recovers the same position from the committed story on login.
+    fn place_continuation_control(&mut self, entity: EntityId, entry: &Exit, now: Instant) -> bool {
+        let Some(player) = self.players.get(&entity) else { return true; };
+        if player.area != entry.target || player.transit.is_some() { return false; }
+        let Some(area) = self.areas.get(&entry.target) else { return false; };
+        let position = area.runtime().place_arrival(entry.arrival, entry.arrival_hint);
+        if !position.is_finite() || entry.arrival_facing.is_some_and(|facing| !facing.is_finite()) { return false; }
+        let budget = super::super::MoveBudget::full(now, area.rules());
+        let player = self.players.get_mut(&entity).expect("checked player");
+        player.snapshot.pos = position;
+        if let Some(facing) = entry.arrival_facing { player.snapshot.facing = super::normalize_facing(facing); }
+        player.snapshot.anim = fmv_core::AnimState::Idle;
+        player.budget = budget;
+        player.walked = 0.0;
+        player.dirty = true;
+        self.place_links(entity);
+        true
     }
 
     fn refresh_continuation_release(&mut self, entities: &[EntityId], failed: &mut Vec<(EntityId, bool)>) {
@@ -665,6 +747,8 @@ impl World {
     fn announce_continuation(&mut self, run:SceneRunId, only:Option<EntityId>) {
         let (Some(c),Some(record))=(self.scenes.continuations.get(&run),self.scenes.runs.get(&run)) else{return;};
         let participants=std::iter::once(record.owner).chain(record.watchers.iter().copied()).enumerate()
+            .filter(|(_, entity)| self.players.get(entity).is_some_and(|p| p.scene == Some(run)
+                && p.transit.is_none() && p.area.eq_ignore_ascii_case(&c.payload.field)))
             .map(|(spot,entity)|SceneParticipant{entity,spot:spot as u8}).collect::<Vec<_>>();
         let mut failed=vec![];
         for p in &participants {
@@ -699,7 +783,8 @@ impl World {
         }
         if !group.iter().any(|s|s.pair.story.account_id==player.account) { return Err(JoinError::StorageUnavailable); }
         let host = self.scenes.host.as_ref().ok_or(JoinError::StorageUnavailable)?;
-        if checkpoint.replay_version != REPLAY_VERSION || !host.continuation(&checkpoint.scene_key) {
+        if checkpoint.replay_version != REPLAY_VERSION || !host.continuation(&checkpoint.scene_key)
+            || !checkpoint_can_be_announced(&checkpoint) {
             return Err(JoinError::StorageUnavailable);
         }
         let payload: Payload = serde_json::from_slice(&checkpoint.replay).map_err(|_|JoinError::StorageUnavailable)?;
@@ -818,10 +903,10 @@ impl World {
     }
 
     /// Called after the area's snapshot and placement, before ordinary entry scripts. It can
-    /// redirect through the normal area handshake, replay a held source, or atomically begin cargo.
+    /// redirect through the normal area handshake, replay a held source, or atomically begin its required arrival.
     pub(in crate::world) fn continuation_entered(&mut self,entity:EntityId,now:Instant)->bool {
-        let Some((run,account,area,pos,facing,transit))=self.players.get(&entity).and_then(|p|p.scene.map(|run|
-            (run,p.account,p.area.clone(),p.snapshot.pos,p.snapshot.facing,p.transit.is_some()))) else {return false;};
+        let Some((run,area,pos,facing,transit))=self.players.get(&entity).and_then(|p|p.scene.map(|run|
+            (run,p.area.clone(),p.snapshot.pos,p.snapshot.facing,p.transit.is_some()))) else {return false;};
         let Some(c)=self.scenes.continuations.get(&run) else {return false;};
         if transit || matches!(c.phase, Phase::Snapshot { .. } | Phase::Commit { .. }) { return true; }
         let landing=matches!(c.phase,Phase::Landing);
@@ -836,7 +921,17 @@ impl World {
             return true;
         }
         if landing {
-            if account!=c.owner {return true;}
+            let Some(previous) = self.scenes.runs.get(&run) else { return true; };
+            let Some(owner) = self.players.get(&previous.owner).filter(|p| p.account == c.owner
+                && p.scene == Some(run) && p.transit.is_none() && p.area.eq_ignore_ascii_case(&destination.field)) else { return true; };
+            let watchers = previous.watchers.iter().copied().filter(|entity|
+                self.players.get(entity).is_some_and(|p| p.scene == Some(run))).collect::<Vec<_>>();
+            // A linked arrival is a single presentation for the online cohort. Wait for every
+            // retained follower's destination handshake; disconnected followers no longer block it.
+            if watchers.iter().any(|entity| self.players.get(entity).is_some_and(|p|
+                p.transit.is_some() || !p.area.eq_ignore_ascii_case(&destination.field))) { return true; }
+            let owner_entity = previous.owner;
+            let (area, pos, facing) = (owner.area.clone(), owner.snapshot.pos, owner.snapshot.facing);
             let Some(owner_state)=c.states.iter().find(|s|s.pair.story.account_id==c.owner) else{return true;};
             let Some(host)=self.scenes.host.as_ref() else{return true;};
             let Some(info)=self.scenes.list.iter().find(|info|info.field.eq_ignore_ascii_case(&area)
@@ -852,7 +947,7 @@ impl World {
             let Some(instance)=fresh_instance() else {self.continuation_failure(run,"continuation instance could not be allocated");return true;};
             let payload=Payload{replay:SceneReplay{source:boundary.source,origin:None,events:vec![]},field:area,position:pos,facing,
                 plan:None,carry:None,landing:Some(destination),game_over:false};
-            let record=SceneRun{scene:info.id,owner:entity,watchers:vec![],seed,progress,gil,answers:vec![],steps:0,
+            let record=SceneRun{scene:info.id,owner:owner_entity,watchers,seed,progress,gil,answers:vec![],steps:0,
                 started:now,last_activity:now,writes_story:true,preview:false,then:None};
             self.queue_continuation_action(run,Action::Continue{record,instance,boundary,payload:Box::new(payload)});
             return true;
@@ -864,7 +959,12 @@ impl World {
             Phase::Playing=>(None,false,false,None),
             _=>return true,
         };
-        self.announce_continuation(run,Some(entity));
+        // A reconnected owner has a new entity id. Retained arrival watchers must receive the
+        // same corrected participant list, otherwise they show that new body beside the cast.
+        // Only a noncombat linked arrival is rebuilt here; active battle mirrors stay bound.
+        let refresh_arrival = matches!(c.phase, Phase::Playing) && c.payload.landing.is_some()
+            && self.scenes.runs.get(&run).is_some_and(|record| record.owner == entity);
+        self.announce_continuation(run,if refresh_arrival { None } else { Some(entity) });
         if fighting.is_some() && !game_over {
             if context.is_none_or(|context|self.reattach_scene_battle(entity,context).is_err()) {
                 self.continuation_failure(run,"reserved player could not reattach to the active fight");

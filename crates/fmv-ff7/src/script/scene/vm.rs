@@ -24,8 +24,8 @@
 //!
 //! * It never touches the world: the variables it writes are its own ([`Vm::writes`]), the caller decides what to
 //!   keep ([`super::Writes`]).
-//! * It never guesses. An opcode it does not know (or one that changes nothing a scene shows: palettes, music,
-//!   background layers) is skipped and COUNTED by mnemonic ([`Stats::unknown`], [`Stats::ignored`]); an operand it
+//! * It never guesses. Unsupported opcodes and effects such as palette changes and music are
+//!   skipped and COUNTED by mnemonic ([`Stats::unknown`], [`Stats::ignored`]); an operand it
 //!   cannot read is not made up.
 //! * It never runs away: [`Limits`] bound instructions, windows, threads and virtual time, a script that cannot be
 //!   decoded ends the scene ([`End::Broken`]), and a loop that waits for something no thread can change is
@@ -52,7 +52,9 @@
 
 use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary};
 use super::data::{Given, ScriptRef, Step};
+use super::fade::{FadeOp, FadeState};
 use crate::field_direction_to_facing;
+use crate::background::{BackgroundOp, BackgroundState};
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
 use crate::script::{decode_at, FieldScript, Instruction};
 use crate::story::{tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
@@ -102,8 +104,8 @@ const DEFAULT_CLIP_FRAMES: u32 = 15;
 const DEFAULT_ANIM_SPEED: u32 = 16;
 /// How long a turn takes, in frames.
 const TURN_FRAMES: u32 = 8;
-/// How long a ladder or a jump takes, in frames.
-const JUMP_FRAMES: u32 = 30;
+/// Shortest estimated ladder traversal. JUMP instead uses its authored step count.
+const MIN_LADDER_FRAMES: u32 = 15;
 /// Most threads a run ever starts, ended ones included (the table is bounded, whatever a script does).
 const MAX_THREADS_EVER: usize = 4096;
 
@@ -142,7 +144,7 @@ pub enum MoveHow {
     Walk,
     /// `FMOVE`: walks while retaining the current animation instead of selecting a movement clip.
     WalkKeepAnimation,
-    /// `JUMP`.
+    /// `JUMP`: `Stage::Move::frames` is the authored movement-step count plus two completion phases.
     Jump,
     /// `LADER`: up or down a ladder.
     Ladder,
@@ -177,6 +179,9 @@ pub enum Stage {
     Place { entity: u8, x: i16, y: i16, z: Option<i16>, triangle: Option<u16> },
     /// Walk to a place over `frames`, from where the entity stood (`from`, when the scene knows it). `z` is the
     /// script's height (a ladder's), else the ground's at the place ([`super::ScenePlay`] fills it in).
+    /// For JUMP, `frames` is N+2: N authored motion steps, the completion update and the script's
+    /// next pass. Its `z` uses the authored triangle's infinite plane, including destinations
+    /// outside that triangle; [`super::JumpMotion`] supplies the original Q12 trajectory.
     /// `triangle` preserves the authored landing floor of a jump or ladder when one is supplied.
     /// `animation` is ordinary MOVE's authored walk/run loader slot; other move opcodes leave it unknown.
     Move { entity: u8, from: Option<(i16, i16)>, x: i16, y: i16, z: Option<i16>, triangle: Option<u16>, frames: u32, how: MoveHow, animation: Option<u8> },
@@ -191,9 +196,18 @@ pub enum Stage {
     AnimSpeed { entity: u8, speed: u16 },
     /// Show or hide (`VISI`).
     Show { entity: u8, visible: bool },
-    /// Play a literal `SOUND` on effect channel 1; id 0 stops that channel. Pan is the script's byte.
-    Sound { id: u16, pan: u8 },
+    /// Play a literal `SOUND` (channel 1), or `AKAO`/`AKAO2` operation 40 or 41
+    /// (channels 1 and 2); id 0 stops that channel. Pan is the script's byte.
+    /// Higher scene channels remain unsupported; field ambience owns its existing loops.
+    Sound { channel: u8, id: u16, pan: u8 },
     Camera(CameraOp),
+    /// The field's one authored additive/subtractive fade, before dialogue and HUD.
+    Fade(FadeOp),
+    /// Change authored background group visibility; frames are bit ordinals, not tile-state bytes.
+    Background(BackgroundOp),
+    /// Nonblocking field-camera shake. Only enabled axes read their banked operands;
+    /// disabled axes retain their previous parameters and settle back to zero.
+    Shake { mask: u8, x_amplitude: u8, x_steps: u8, y_amplitude: u8, y_steps: u8 },
 }
 
 /// A window the scene opens.
@@ -238,7 +252,7 @@ pub struct Stats {
     pub threads: usize,
     /// Opcodes the VM carries out.
     pub handled: BTreeMap<&'static str, u32>,
-    /// Opcodes not presented (music, other sound commands, palettes, background layers, field logic): skipped.
+    /// Opcodes not presented (music, other sound commands, palettes, field logic): skipped.
     pub ignored: BTreeMap<&'static str, u32>,
     /// Opcodes it does not know: skipped, never guessed.
     pub unknown: BTreeMap<&'static str, u32>,
@@ -383,6 +397,8 @@ enum Code {
 
 #[derive(Debug, Clone)]
 struct Thread {
+    /// Authored background work and its descendants run during finite scene work only.
+    ambient: bool,
     entity: usize,
     prio: u8,
     code: Code,
@@ -593,6 +609,13 @@ pub struct Vm {
     standing_defaults: BTreeMap<u8, Option<Stage>>,
     anim_ends: BTreeMap<u8, u32>,
     camera_end: u32,
+    fade: FadeState,
+    fade_at: u32,
+    /// Background changes retained from quiet setup (ordinary playback emits timed events).
+    initial_background: Vec<BackgroundOp>,
+    /// Change detection for idle-loop parking; presentation still receives redundant commands
+    /// because the field may have inherited state from a previous scene.
+    background_state: BackgroundState,
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
     /// What the scripts did to the party, in the order they did it (setup included): see [`Vm::party_ops`].
     party_ops: Vec<PartyOp>,
@@ -641,6 +664,10 @@ impl Vm {
             standing_defaults: BTreeMap::new(),
             anim_ends: BTreeMap::new(),
             camera_end: 0,
+            fade: FadeState::default(),
+            fade_at: 0,
+            initial_background: Vec::new(),
+            background_state: BackgroundState::default(),
             geometry: BTreeMap::new(),
             party_ops: Vec::new(),
             resources: ResourceOutcome::default(),
@@ -671,11 +698,18 @@ impl Vm {
         &self.party_ops
     }
 
+    pub(crate) fn note_unresolved_motion(&mut self) {
+        self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+    }
+
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
 
     pub fn destination(&self) -> Option<SceneJump> { self.jump }
+
+    /// Authored group changes from quiet setup, replayed once in the initial presentation.
+    pub fn initial_background_ops(&self) -> &[BackgroundOp] { &self.initial_background }
 
     /// The counters so far, which start again from nothing (the setup's are kept apart from the scene's).
     pub fn take_stats(&mut self) -> Stats {
@@ -1033,6 +1067,7 @@ impl Vm {
         };
         let seq = self.next_seq();
         self.threads.push(Thread {
+            ambient: false,
             entity,
             prio,
             code: Code::Script { pc: span.start },
@@ -1101,8 +1136,8 @@ impl Vm {
     }
 
     /// A narrow, verified animation tail: CANIM2, WAIT, ANIME1, WAIT, JMPB to the first
-    /// instruction. Only finish when every other thread has ended or is parked at an
-    /// unconditional self-jump. In particular, a waiter or runnable thread can never be
+    /// instruction. Only finish when every other foreground thread has ended or reached
+    /// a due unconditional self-jump. A waiter or any other runnable instruction cannot be
     /// skipped. This tail cannot change variables, request work or open a window.
     fn quiescent_animation_tail(&self, script: &FieldScript<'_>, idx: usize) -> bool {
         let Some(t) = self.threads.get(idx) else { return false };
@@ -1114,11 +1149,53 @@ impl Vm {
             if ins.opcode != expected || (expected == 0x12 && ins.jump_target != Some(start)) { return false; }
             pc = ins.end();
         }
+        let at = t.time;
         self.threads.iter().enumerate().all(|(i, t)| {
-            if i == idx || t.state == State::Done { return true; }
-            let State::Parked(_) = t.state else { return false };
-            let Code::Script { pc } = t.code else { return false };
-            decode_at(code, pc, 0).is_ok_and(|ins| ins.opcode == 0x12 && ins.jump_target == Some(pc))
+            i == idx || t.ambient || t.state == State::Done || Self::quiet_self_jump(script, t, at)
+                || Self::quiet_parked_presentation_loop(script, t, at)
+        })
+    }
+
+    /// An ambient write may wake an idle self-jump on every epoch. Its exact instruction
+    /// is still provably inert even before the scheduler parks it again. Respect the due
+    /// time so reaching such a jump after a finite WAIT cannot erase that wait.
+    fn quiet_self_jump(script: &FieldScript<'_>, thread: &Thread, at: u32) -> bool {
+        if thread.time > at || !matches!(thread.state, State::Run | State::Parked(_)) { return false; }
+        let Code::Script { pc } = thread.code else { return false };
+        decode_at(script.bytes(), pc, 0).is_ok_and(|ins| ins.opcode == 0x12 && ins.jump_target == Some(pc))
+    }
+
+    /// Preserve the existing idle behavior of constant ASPED/background metadata loops.
+    /// Parking proves the last lap produced no epoch-changing work. Additionally require
+    /// a linear cycle containing only these presentation commands and WAIT: no condition, request,
+    /// actor movement, persistent write, resource operation or window may be hidden here.
+    fn quiet_parked_presentation_loop(script: &FieldScript<'_>, thread: &Thread, at: u32) -> bool {
+        if thread.time > at || !matches!(thread.state, State::Parked(_)) { return false; }
+        let Code::Script { pc: start } = thread.code else { return false };
+        let mut pc = start;
+        let mut visited = BTreeSet::new();
+        for _ in 0..128 {
+            if !visited.insert(pc) { return pc == start; }
+            let Ok(ins) = decode_at(script.bytes(), pc, 0) else { return false };
+            match ins.opcode {
+                0x12 => match ins.jump_target.filter(|target| *target <= pc) {
+                    Some(target) => pc = target,
+                    None => return false,
+                },
+                0x24 | 0xBD | 0xE0..=0xE4 => pc = ins.end(),
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Background field mains do not extend a finite scene. A conditional foreground poll
+    /// is not quiet: an ambient write may still wake it. Slot/end waiters and asynchronously
+    /// requested actor tails likewise keep ownership of completion until they actually end.
+    fn foreground_finished(&self, script: &FieldScript<'_>) -> bool {
+        self.threads.iter().filter(|t| !t.ambient).all(|t| {
+            t.state == State::Done || Self::quiet_self_jump(script, t, self.clock)
+                || Self::quiet_parked_presentation_loop(script, t, self.clock)
         })
     }
 
@@ -1355,7 +1432,9 @@ impl Vm {
             self.stats.dropped_requests = self.stats.dropped_requests.saturating_add(1);
             return Flow::Next;
         };
+        let ambient = self.threads.get(idx).is_some_and(|thread| thread.ambient);
         let Some(child) = self.spawn(script, entity, slot, prio, time) else { return Flow::Next };
+        if let Some(thread) = self.threads.get_mut(child) { thread.ambient = ambient; }
         match ins.opcode {
             // REQEW: the requester waits for the end of the script it asked for.
             0x03 => {
@@ -1597,7 +1676,12 @@ impl Vm {
             0xC0 => {
                 let (x, y) = (clamp_i16(self.num(ins, "x", Width::S16)), clamp_i16(self.num(ins, "y", Width::S16)));
                 let triangle = u16::try_from(self.num(ins, "triangle", Width::U16)).ok();
-                self.do_move(idx, me, Goal { x, y, z: None, triangle, how: MoveHow::Jump, animation: None, frames: Some(JUMP_FRAMES) });
+                let steps = clamp_i16(self.num(ins, "steps", Width::S16));
+                let Some(frames) = super::jump::jump_frames(steps) else {
+                    self.note_unresolved_motion();
+                    return Flow::Scene(End::Budget);
+                };
+                self.do_move(idx, me, Goal { x, y, z: None, triangle, how: MoveHow::Jump, animation: None, frames: Some(frames) });
                 Flow::Yield
             }
             0xC2 => {
@@ -1605,7 +1689,7 @@ impl Vm {
                 let z = clamp_i16(self.num(ins, "z", Width::S16));
                 let triangle = u16::try_from(self.num(ins, "triangle", Width::U16)).ok();
                 let from_z = self.places.get(&me).and_then(|w| w.z).unwrap_or(z);
-                let frames = (u32::from(from_z.abs_diff(z)) / 4).clamp(JUMP_FRAMES / 2, MAX_MOVE_FRAMES);
+                let frames = (u32::from(from_z.abs_diff(z)) / 4).clamp(MIN_LADDER_FRAMES, MAX_MOVE_FRAMES);
                 // LADER sets its literal facing directly, independently of the climb's path.
                 if let Some(direction) = ins.literal("direction").map(clamp_u8) {
                     self.do_face(idx, me, field_direction_to_facing(direction), 0);
@@ -1729,7 +1813,76 @@ impl Vm {
                 }
                 Flow::Yield
             }
+            // ---- authored fades ---------------------------------------------------------------------------
+            0x25 | 0x6B => {
+                let time = self.thread_time(idx);
+                self.fade.advance(time.saturating_sub(self.fade_at) as f32);
+                self.fade_at = time;
+                let kind = clamp_u8(ins.literal("type").unwrap_or(0));
+                let rgb = ["r", "g", "b"].map(|name| clamp_u8(self.num(ins, name, Width::U8)));
+                let fade = if op == 0x25 {
+                    FadeOp::Nfade { kind, rgb, frames: self.num(ins, "speed", Width::S16) as i16 }
+                } else {
+                    FadeOp::Fade { kind, rgb, speed: clamp_u8(ins.literal("speed").unwrap_or(0)), adjust: clamp_u8(ins.literal("adjust").unwrap_or(0)) }
+                };
+                if self.fade.apply(fade) { self.emit(time, Stage::Fade(fade)); }
+                else { *class = Class::Ignored; self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+                Flow::Next
+            }
+            0x6C => {
+                let time = self.thread_time(idx);
+                self.fade.advance(time.saturating_sub(self.fade_at) as f32);
+                self.fade_at = time;
+                if self.fade.complete() { Flow::Next } else {
+                    // Recheck each field tick: another script can replace the global fade.
+                    // A zero-speed hold remains bounded by the VM's ordinary time/step limits.
+                    self.set_pc(idx, ins.offset);
+                    self.add_time(idx, 1);
+                    if let Some(thread) = self.threads.get_mut(idx) { thread.seen.clear(); }
+                    Flow::Yield
+                }
+            }
+            // ---- background visibility ----------------------------------------------------------------------
+            0xE0..=0xE4 => {
+                let group = clamp_u8(self.num(ins, "group", Width::U8));
+                let frame = if op <= 0xE1 { clamp_u8(self.num(ins, "frame", Width::U8)) } else { 0 };
+                if group >= 64 || frame >= 8 {
+                    *class = Class::Ignored;
+                } else {
+                    let change = match op {
+                        0xE0 => BackgroundOp::On { group, frame },
+                        0xE1 => BackgroundOp::Off { group, frame },
+                        0xE2 => BackgroundOp::ShiftLeft { group },
+                        0xE3 => BackgroundOp::ShiftRight { group },
+                        _ => BackgroundOp::Clear { group },
+                    };
+                    if self.quiet { self.initial_background.push(change); }
+                    if self.background_state.apply(change) { self.epoch = self.epoch.wrapping_add(1); }
+                    self.out.push(Timed { at: self.thread_time(idx).saturating_sub(self.origin), what: Stage::Background(change) });
+                }
+                Flow::Next
+            }
             // ---- the camera ----------------------------------------------------------------------------------
+            0x5E => {
+                // Original field_opcodes.c opcode_SHAKE: low mask bits enable axes;
+                // disabled axes do not read their operands or replace saved parameters.
+                let Some(mask) = ins.literal("type").and_then(|v| u8::try_from(v).ok()) else {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return Flow::Next;
+                };
+                let (x_amplitude, x_steps) = if mask & 1 != 0 {
+                    (clamp_u8(self.num(ins, "x_amplitude", Width::U8)), clamp_u8(self.num(ins, "x_frames", Width::U8)))
+                } else { (0, 0) };
+                let (y_amplitude, y_steps) = if mask & 2 != 0 {
+                    (clamp_u8(self.num(ins, "y_amplitude", Width::U8)), clamp_u8(self.num(ins, "y_frames", Width::U8)))
+                } else { (0, 0) };
+                if (mask & 1 != 0 && x_steps == 0) || (mask & 2 != 0 && y_steps == 0) {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return Flow::Next;
+                }
+                self.emit(self.thread_time(idx), Stage::Shake { mask: mask & 3, x_amplitude, x_steps, y_amplitude, y_steps });
+                Flow::Next
+            }
             0x64 | 0x66 | 0x68 => {
                 let time = self.thread_time(idx);
                 let (x, y) = (clamp_i16(self.num(ins, "x", Width::S16)), clamp_i16(self.num(ins, "y", Width::S16)));
@@ -1753,12 +1906,14 @@ impl Vm {
                 self.wait_until(idx, self.camera_end);
                 Flow::Yield
             }
-            0xF1 => {
+            0xF1 | 0xF2 | 0xDA => {
                 match crate::field_sound::Call::of(ins) {
-                    Ok(Some(call)) => self.emit(self.thread_time(idx), Stage::Sound { id: call.id, pan: call.pan }),
+                    Ok(Some(call)) if call.channel <= 2 => self.emit(self.thread_time(idx),
+                        Stage::Sound { channel: call.channel, id: call.id, pan: call.pan }),
                     _ => {
-                        // This presentation slice supports literal SOUND operands only. Do not turn an
-                        // unreviewed variable read into a guessed sound or a stop of the current channel.
+                        // Only reviewed literal effects on channels 1 and 2 are presented. Higher
+                        // channels may already belong to field ambience (tin_1's train loop is ch3).
+                        // Banked operands and music/volume operations remain skipped, never guessed.
                         *class = Class::Ignored;
                     }
                 }
@@ -1808,11 +1963,14 @@ impl Vm {
             }
             match step {
                 Step::SetBit { bank, address, bit } => self.flip_bit(bank, address, i32::from(bit), 0x82),
-                Step::StartMain(entity) => {
+                Step::StartMain(entity) | Step::StartAmbientMain(entity) => {
                     let main = script.entity_inits(None).into_iter().find(|init| init.entity == usize::from(entity)).and_then(|init| init.main_start);
                     if let Some(main) = main {
                         if let Some(child) = self.spawn(script, usize::from(entity), 0, 7, time) {
-                            if let Some(thread) = self.threads.get_mut(child) { thread.code = Code::Script { pc: main }; }
+                            if let Some(thread) = self.threads.get_mut(child) {
+                                thread.code = Code::Script { pc: main };
+                                thread.ambient = matches!(step, Step::StartAmbientMain(_));
+                            }
                         }
                     } else {
                         self.stats.dropped_requests = self.stats.dropped_requests.saturating_add(1);
@@ -1845,6 +2003,7 @@ impl Vm {
         self.slots.clear();
         let seq = self.next_seq();
         self.threads.push(Thread {
+            ambient: false,
             entity: usize::MAX,
             prio: 7,
             code: Code::Root { steps: root, next: 0 },
@@ -1857,6 +2016,7 @@ impl Vm {
         });
         self.origin = 0;
         self.clock = 0;
+        self.fade_at = 0;
         self.out.clear();
         self.done = None;
     }
@@ -1865,7 +2025,13 @@ impl Vm {
     /// or pass a different formation. Existing budgets cover both the prelude and the tail.
     pub(super) fn seek_after_battle(&mut self, script: &FieldScript<'_>, formation: u16) -> bool {
         loop {
-            match self.resume(script, None).then {
+            let beat = self.resume(script, None);
+            // A legacy victory presentation starts after this prefix, but the field still has
+            // every group change the prefix made. Hand them to the initial stage once.
+            self.initial_background.extend(beat.stage.iter().filter_map(|event| match event.what {
+                Stage::Background(op) => Some(op), _ => None,
+            }));
+            match beat.then {
                 Then::Window(w) if w.message.choice.is_none() => {},
                 Then::End { how: End::Battle, .. } if self.battle == Some(formation) => {
                     self.done = None;
@@ -1984,8 +2150,23 @@ impl Vm {
             }
         }
         loop {
-            let Some(idx) = self.pick() else { return self.finish(End::Finished) };
-            if self.quiescent_animation_tail(script, idx) {
+            let Some(idx) = self.pick() else {
+                // A parked condition or slot owner cannot manufacture a RET. No runnable
+                // work is not completion unless all foreground work is demonstrably quiet.
+                return self.finish(if self.foreground_finished(script) { End::Finished } else { End::Budget });
+            };
+            if self.foreground_finished(script) { return self.finish(End::Finished); }
+            // A background event may be next in time while the only foreground work left
+            // is a proven standing-animation tail. Run background events up to that tail's
+            // time, then finish there; no later actor work or waiter may be cut short.
+            if let Some(time) = self.threads.iter().enumerate()
+                .filter(|(_, t)| !t.ambient && t.state == State::Run && t.time <= self.thread_time(idx))
+                .filter(|(i, _)| self.quiescent_animation_tail(script, *i))
+                .map(|(_, t)| t.time).min() {
+                if time > self.limits.frames || self.steps >= self.limits.steps {
+                    return self.finish(End::Budget);
+                }
+                self.clock = self.clock.max(time);
                 self.stats.quiescent_tails = self.stats.quiescent_tails.saturating_add(1);
                 return self.finish(End::Finished);
             }
@@ -2023,7 +2204,7 @@ impl Vm {
 }
 
 /// Opcodes a scene can skip without changing a line, a place, a turn, an animation, a visibility or the camera: the
-/// other sound commands and music, the picture's own effects (palettes, fades, background layers, shakes), and the field's logic
+/// other sound commands and music, unsupported picture effects, and the field's logic
 /// that is about the player (controls, menus, party, talk and solid radii, triggers).
 fn is_ignored(op: u8) -> bool {
     matches!(
@@ -2033,10 +2214,10 @@ fn is_ignored(op: u8) -> bool {
         | 0x7E | 0xBF | 0xC3 | 0xC4 | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
         // windows other than the one that is shown
         | 0x2E | 0x2F | 0x36 | 0x37 | 0x41..=0x43 | 0x51..=0x55 | 0x56 | 0x57 | 0x45 | 0x47 | 0x4D | 0x4F
-        // the picture: fades, shakes, background layers, palettes, scrolls of a layer
-        | 0x25 | 0x2C | 0x2D | 0x5E | 0x69 | 0x6A | 0x6B | 0x6C | 0x61 | 0x62 | 0x6F | 0xDF | 0xE0..=0xEF
-        // sound commands other than SOUND, and music
-        | 0xDA | 0xF0 | 0xF2..=0xF7 | 0xF8..=0xFE
+        // unsupported picture effects (palette changes and layer scrolls among them)
+        | 0x2C | 0x2D | 0x69 | 0x6A | 0x61 | 0x62 | 0x6F | 0xDF | 0xE5..=0xEF
+        // sound commands other than the supported literal channel plays, and music
+        | 0xF0 | 0xF3..=0xF7 | 0xF8..=0xFE
         // items and materia: not given here
         | 0x59 | 0x5A | 0x5C | 0x5D | 0x3A | 0x3C..=0x3F
         // SPECIAL and KAWAI families

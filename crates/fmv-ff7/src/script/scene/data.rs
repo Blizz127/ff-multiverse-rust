@@ -53,6 +53,10 @@ pub enum Step {
     Start(ScriptRef),
     /// Start the main part of an entity's script 0 (after its initial RET).
     StartMain(u8),
+    /// Run an authored field main and its requests alongside finite scene work. Ambient
+    /// descendants use the same clock, limits and state audit, but do not keep a completed
+    /// scene alive. A foreground request is always a separate completion-owning thread.
+    StartAmbientMain(u8),
 }
 
 /// A field variable (one byte) the scene assumes when it is offered.
@@ -160,7 +164,31 @@ impl SceneDef {
     /// Keep this capability attached to the stable scene identity: another scene in the same field
     /// does not inherit permission to promote a save or publish economic effects.
     pub fn requires_exact_transaction(&self) -> bool {
-        self.id == FLOWER_STATION_SCENE_ID || self.id == BRIDGE_SCENE_ID || self.id == CARGO_TRAIN_SCENE_ID
+        self.id == FLOWER_STATION_SCENE_ID || self.requires_continuation()
+    }
+
+    /// Reviewed scenes whose acknowledged windows, transfers or battles use durable continuation.
+    /// Economic scenes such as the flower encounter do not inherit this capability.
+    pub fn requires_continuation(&self) -> bool {
+        [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID].contains(&self.id.as_str())
+    }
+
+    /// Reviewed scenes that show the authored cast while participant bodies remain hidden.
+    /// This affects presentation only, never script execution or its replay identity.
+    pub fn hides_participants(&self) -> bool {
+        [CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID].contains(&self.id.as_str())
+    }
+
+    /// Reviewed arrival scenes that require a preceding durable transfer in production.
+    /// Offline previews may still construct them directly from their explicit snapshot.
+    pub fn requires_landing(&self) -> bool {
+        [CARGO_TRAIN_SCENE_ID, TRAIN_SCENE_ID].contains(&self.id.as_str())
+    }
+
+    /// The actor initially placed from the accepted crossing, before the script moves it.
+    /// A production caller must bind that origin with `with_trigger_position` before playback.
+    pub fn origin_actor(&self) -> Option<u8> {
+        match self.id.as_str() { BRIDGE_SCENE_ID => Some(1), CARGO_DOOR_SCENE_ID => Some(11), _ => None }
     }
 
     /// The snapshot used to interpret this scene. Promotion is local and preserves unknown bits;
@@ -192,7 +220,7 @@ impl SceneDef {
         for step in &mut def.root {
             match step {
                 Step::Await(script) | Step::Start(script) => script.entity = map(script.entity)?,
-                Step::StartMain(entity) => *entity = map(*entity)?,
+                Step::StartMain(entity) | Step::StartAmbientMain(entity) => *entity = map(*entity)?,
                 Step::SetBit { .. } => {},
             }
         }
@@ -210,9 +238,11 @@ impl SceneDef {
     /// confrontation. The host preserves its actual crossing position, choices and battle
     /// boundaries in the durable continuation transcript.
     pub fn line_trigger(&self) -> Option<SceneLineTrigger> {
-        (self.id == BRIDGE_SCENE_ID).then_some(SceneLineTrigger {
-            a: [-614, 835, 518], b: [-238, 835, 518],
-        })
+        match self.id.as_str() {
+            BRIDGE_SCENE_ID => Some(SceneLineTrigger { a: [-614, 835, 518], b: [-238, 835, 518] }),
+            CARGO_DOOR_SCENE_ID => Some(SceneLineTrigger { a: [-15, -104, 0], b: [53, -104, 0] }),
+            _ => None,
+        }
     }
 
     /// Whether the scene starts by itself when a player whose story it is offered to comes to stand in its field (an
@@ -321,6 +351,8 @@ pub const REACTOR_OPENING_SCENE_ID: &str = "ff7/md1stin/opening-survey";
 
 /// The cargo train arrival director. The established id is retained for saved continuation identity.
 pub const CARGO_TRAIN_SCENE_ID: &str = "ff7/cargoin/train-survey";
+/// The authored cargo door sequence preceding the passenger-car arrival.
+pub const CARGO_DOOR_SCENE_ID: &str = "ff7/cargoin/passenger-door";
 
 /// **After the escape: the team at the tunnel mouth** (field `md8_4`, story moment 33). An arrival scene
 /// ([`SceneDef::starts_on_arrival`]): the field's director (`dic`, entity 0) does it by itself when the field loads at
@@ -382,10 +414,11 @@ pub fn station_scene() -> SceneDef {
     def
 }
 
-/// The train's arrival director at moment 48. Not registered for live play: presentation,
-/// preceding travel, and persistence effects elsewhere on the route still need review.
+/// The train's authored arrival at moment 48: the director, its finite actors, and the
+/// background producer/camera mains. The incoming placement differs from the final control
+/// position at moment 51; participant bodies are hidden while the authored cast enters.
 pub fn train_scene() -> SceneDef {
-    let cast = [
+    let cast: Vec<CastMember> = [
         (30, "cloud", "aaaa", "acfe"), (31, "barret", "acgd", "adcb"),
         (33, "biggs", "bwfd", "acfe"), (34, "jessie", "axdc", "acfe"),
         (35, "wedge", "bxbe", "acfe"), (36, "guard", "azhe", "acfe"),
@@ -397,9 +430,18 @@ pub fn train_scene() -> SceneDef {
     SceneDef {
         id: TRAIN_SCENE_ID.into(), game: "ff7".into(), field: "tin_1".into(),
         trigger: Trigger { entity: 17, name: "direct".into(), slot: 0, talk_radius: 0, moments: 48..=48 },
-        setup: vec![ScriptRef::new(40, 0)], given: vec![], root: vec![Step::StartMain(17)], cast,
+        // Reviewed environment inits establish scratch bytes and the background's initial
+        // frames; none reads unknown persistent state at 48. The cast inits include the
+        // woman's authored placement. The employee's placement is in his main instead.
+        setup: (0..=24).chain(cast.iter().map(|member| member.entity)).map(|entity| ScriptRef::new(entity, 0)).collect(),
+        // Producer16 requests3/1, setting scratch5[1]=1: only background mains9..12 run
+        // at 48. The other backdrop modes remain inactive. Main20 supplies the camera and
+        // requests its own random/shake helper; unrelated timer/lesson mains are omitted.
+        given: vec![], root: vec![Step::StartAmbientMain(9), Step::StartAmbientMain(10),
+            Step::StartAmbientMain(11), Step::StartAmbientMain(12), Step::StartAmbientMain(16),
+            Step::StartAmbientMain(20), Step::StartMain(37), Step::StartMain(17)], cast,
         speakers: vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)],
-        // Deliberately absent until a visible walkmesh location has been checked.
+        // The arriving cast crosses the narrow floor; participant bodies stay hidden.
         witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
@@ -816,11 +858,31 @@ pub fn cargo_train_scene() -> SceneDef {
     SceneDef {
         id: CARGO_TRAIN_SCENE_ID.into(), game: "ff7".into(), field: "cargoin".into(),
         trigger: Trigger { entity: 6, name: "direct".into(), slot: 0, talk_radius: 0, moments: 39..=39 },
-        setup: (11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
+        setup: [0, 1, 4].into_iter().chain(11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
         root: vec![Step::StartMain(6)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
         // Cloud's XYZI at 0x0750, with the final TURNGEN at 0x0863 after the introduction.
         witness: vec![], arrival: Spot { x: -24, y: 16, triangle: 20, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
+    }
+}
+
+/// Cargo's border1 slot2: lock controls, await Cloud's authored door animation and jump,
+/// then MAPJUMP to the passenger car. The original slot has no story comparison; offering it
+/// only at moment 48 is the reviewed route boundary after the cargo introduction. The exact
+/// original directional LINE-slot firing behavior remains unverified. The host owns crossing
+/// detection and must bind the actual accepted origin before constructing the scene.
+pub fn cargo_door_scene() -> SceneDef {
+    SceneDef {
+        id: CARGO_DOOR_SCENE_ID.into(), game: "ff7".into(), field: "cargoin".into(),
+        trigger: Trigger { entity: 10, name: "border1".into(), slot: 2, talk_radius: 0, moments: 48..=48 },
+        setup: [3, 10, 11].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: vec![Step::Await(ScriptRef::new(10, 2))],
+        cast: vec![CastMember { entity: 11, name: "cloud".into(), look: Look::Model { hrc: "aaaa".into(), idle: "acfe".into() }, start: None }],
+        speakers: vec![], witness: vec![],
+        // The preceding introduction's authored control position; never substitute it for
+        // the actual crossing origin of the jump.
+        arrival: Spot { x: -24, y: 16, triangle: 20, direction: 0 },
+        presents: None, presents_bit: None, resume_after_battle: None,
     }
 }
 
@@ -916,9 +978,10 @@ pub fn proof_scene() -> SceneDef {
 
 /// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
-/// reactor's own story points, followed by the flower encounter, bridge confrontation and cargo arrival.
+/// reactor's own story points, followed by the flower encounter, bridge confrontation, cargo arrival,
+/// cargo door and passenger-train arrival.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene(), bridge_scene(), cargo_train_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene(), bridge_scene(), cargo_train_scene(), cargo_door_scene(), train_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a
@@ -952,6 +1015,8 @@ pub struct StoryEntry {
 /// * **From moment 48** the cargo introduction has finished. Return at Cloud's authored placement and final heading
 ///   in `cargoin`. Before that durable completion, a bridge landing must retain its separate pending destination:
 ///   the unchanged moment 39 alone does not authorize bypassing the introduction.
+/// * **From moment 51** the passenger-train arrival has finished. Return at Cloud's authored
+///   XYZI/DIR control position, not the earlier incoming MAPJUMP placement at (-2,608).
 ///
 /// A row names a place the game's own data puts the player at (never an invented one). Rows ascend by moment.
 /// `tests/scene_real.rs` holds every row to
@@ -962,6 +1027,7 @@ pub const STORY_ENTRIES: &[StoryEntry] = &[
     StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1629, y: -5357, triangle: 15, direction: 192 } },
     StoryEntry { from_moment: 39, field: "md8_2", spot: Spot { x: -3989, y: 21138, triangle: 19, direction: 150 } },
     StoryEntry { from_moment: 48, field: "cargoin", spot: Spot { x: -24, y: 16, triangle: 20, direction: 0 } },
+    StoryEntry { from_moment: 51, field: "tin_1", spot: Spot { x: 2, y: 537, triangle: 28, direction: 0 } },
 ];
 
 /// The entry of a story at `moment` ([`STORY_ENTRIES`]): the row with the greatest `from_moment` that is not past it.

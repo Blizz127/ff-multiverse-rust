@@ -495,6 +495,8 @@ pub struct Gpu {
     /// Allocated only while optional edge smoothing is selected.
     fxaa: Option<crate::graphics::fxaa::Fxaa>,
     supersample: Option<crate::graphics::supersample::Supersample>,
+    /// Created on the first authored fade, after scene filtering and before UI.
+    fade: Option<crate::scene::fade::FadeGpu>,
     /// Say a requested 2x fallback once per window size, rather than every frame.
     last_scale_fallback: Option<(u32, u32)>,
 }
@@ -607,6 +609,7 @@ impl Gpu {
             avatars,
             fxaa: None,
             supersample: None,
+            fade: None,
             last_scale_fallback: None,
         }
     }
@@ -697,12 +700,31 @@ impl Gpu {
         &mut self, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene<'_>,
         avatars: Option<&crate::avatar::AvatarFrame>, srgb: bool, range: Option<Bounds>,
     ) {
-        let raster = self.scene_target(target, size);
+        self.draw_field_effects(target, size, scene, avatars, srgb, range, None);
+    }
+
+    /// Apply an authored display-RGB fade to the completed field, before native dialogue/HUD.
+    /// A frame without a fade follows the unchanged render path and needs no fade target.
+    #[allow(clippy::too_many_arguments)] // Keep the existing field-render inputs plus its optional authored fade.
+    pub fn draw_field_effects(
+        &mut self, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>, srgb: bool, range: Option<Bounds>,
+        fade: Option<fmv_ff7::script::scene::FadeColor>,
+    ) {
+        let before_fade = fade.map(|_| {
+            let compositor = self.fade.get_or_insert_with(|| crate::scene::fade::FadeGpu::new(&self.device, self.format));
+            compositor.target(&self.device, size)
+        });
+        let scene_target = before_fade.as_ref().unwrap_or(target);
+        let raster = self.scene_target(scene_target, size);
         let margins = field_margin_vertices(&scene.bounds, range, size, srgb);
         self.draw_field_raw(&raster, size, scene, avatars, srgb);
         self.draw_shapes(&raster.draw, &margins);
-        self.resolve_scene(&raster, target);
-        if raster.downsample_to.is_some() || self.fxaa.is_some() { self.draw_shapes(target, &margins); }
+        self.resolve_scene(&raster, scene_target);
+        if raster.downsample_to.is_some() || self.fxaa.is_some() { self.draw_shapes(scene_target, &margins); }
+        if let Some(colour) = fade {
+            self.fade.as_ref().expect("fade target was created").resolve(&self.device, &self.queue, target, colour);
+        }
     }
 
     fn draw_field_raw(
@@ -1180,7 +1202,15 @@ impl Renderer {
         &mut self, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
         overlay: Option<&crate::ui::draw::DrawList>, range: Option<Bounds>,
     ) -> FrameResult {
-        self.render_field_layers(scene, avatars, overlay, None, range)
+        self.render_layers_effects(scene, avatars, overlay, range, None)
+    }
+
+    /// Draw an authored field fade after scene filtering, with native UI over the result.
+    pub fn render_layers_effects(
+        &mut self, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: Option<&crate::ui::draw::DrawList>, range: Option<Bounds>, fade: Option<fmv_ff7::script::scene::FadeColor>,
+    ) -> FrameResult {
+        self.render_field_layers(scene, avatars, overlay, None, range, fade)
     }
 
     /// Render a character preview after the menu overlay, using pixel-space projection.
@@ -1191,12 +1221,13 @@ impl Renderer {
         overlay: Option<&crate::ui::draw::DrawList>,
         preview: Option<&crate::avatar::AvatarFrame>,
     ) -> FrameResult {
-        self.render_field_layers(scene, avatars, overlay, preview, None)
+        self.render_field_layers(scene, avatars, overlay, preview, None, None)
     }
 
     fn render_field_layers(
         &mut self, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
         overlay: Option<&crate::ui::draw::DrawList>, preview: Option<&crate::avatar::AvatarFrame>, range: Option<Bounds>,
+        fade: Option<fmv_ff7::script::scene::FadeColor>,
     ) -> FrameResult {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
@@ -1231,9 +1262,10 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return FrameResult::Skipped,
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        match range {
-            Some(range) => self.gpu.draw_field_clipped(&view, (w, h), scene, avatars, self.srgb, Some(range)),
-            None => self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb),
+        match (range, fade) {
+            (_, Some(fade)) => self.gpu.draw_field_effects(&view, (w, h), scene, avatars, self.srgb, range, Some(fade)),
+            (Some(range), None) => self.gpu.draw_field_clipped(&view, (w, h), scene, avatars, self.srgb, Some(range)),
+            (None, None) => self.gpu.draw_field(&view, (w, h), scene, avatars, self.srgb),
         }
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));

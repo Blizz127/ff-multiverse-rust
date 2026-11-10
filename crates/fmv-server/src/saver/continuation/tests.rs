@@ -381,7 +381,7 @@ fn a_zero_effect_settlement_preserves_the_entire_character_record_without_normal
 }
 
 #[test]
-fn the_hosted_game_and_encoded_checkpoint_limit_are_checked_before_any_write() {
+fn the_hosted_game_and_raw_checkpoint_limit_are_checked_before_any_write() {
     let (dir, store, accounts) = fixture(2);
     let before = states(&store, &accounts);
     let job = prepare_job(&before);
@@ -389,9 +389,9 @@ fn the_hosted_game_and_encoded_checkpoint_limit_are_checked_before_any_write() {
     assert!(matches!(persist_scene_batch(&store, GameId::Ff7, None, &job, NOW + 1), Err(SceneSaveError::InvalidRequest)));
     let mut oversized = job.clone();
     let checkpoint = oversized.members[0].checkpoint.as_mut().unwrap();
-    checkpoint.replay = vec![255; MAX_SCENE_REPLAY_BYTES];
-    assert!(checkpoint.replay.len() <= MAX_SCENE_REPLAY_BYTES);
-    assert!(serde_json::to_vec(checkpoint).unwrap().len() > MAX_SCENE_CHECKPOINT_BYTES, "JSON expands each replay byte");
+    checkpoint.replay = vec![255; MAX_SCENE_REPLAY_BYTES + 1];
+    assert!(serde_json::to_vec(checkpoint).unwrap().len() < MAX_SCENE_CHECKPOINT_BYTES,
+        "the containing JSON allowance does not waive the raw transcript bound");
     let (handle, mut queue) = crate::saver::SaverHandle::channel();
     assert!(matches!(handle.save_scene_batch(oversized.clone()), Err(SceneSaveError::InvalidRequest)));
     assert!(matches!(queue.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)), "invalid data never enters the save queue");

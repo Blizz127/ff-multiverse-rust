@@ -1420,8 +1420,8 @@ Cloud (18) three times (33, 36 and 38); answering line 1, or nothing, gives six,
 
 ### After the escape: the scenes that start by themselves
 
-The story of the first reactor ends at moment 33. Its next fields carry it through the street, bridge and cargo-car
-arrival; the flower, bridge and cargo continuations require `--story-extended-save`.
+The story of the first reactor ends at moment 33. Its next fields carry it through the street, bridge, cargo car and
+passenger-train arrival at moment 51; the flower and these continuations require `--story-extended-save`.
 
 * **`ff7/md8_4/post-escape`** (the tunnel mouth, moment 33): the field's director has the team talk (four windows) and then
   jumps to the street. It changes nothing that is saved; the scene ends in the field's own `MAPJUMP`, which the server
@@ -1443,27 +1443,38 @@ arrival; the flower, bridge and cargo continuations require `--story-extended-sa
   the 26-window arrival, which saves **moment 48**. The bridge's placeholder destination is resolved to the arrival
   script's authored position `(-24,16)`, triangle 20. Participant bodies and name labels stay hidden through this narrow
   cutscene until the server acknowledges completion; the original cast performs it.
+* **`ff7/cargoin/passenger-door`** (moment 48): crossing the original door line starts Cloud's authored animation,
+  wait and jump from the accepted crossing position. The sequence has no dialogue and keeps moment 48; its `MAPJUMP`
+  lands in `tin_1` at `(-2,608)`, triangle 29, direction 252. That landing is saved before travel is released.
+* **`ff7/tin_1/sector-seven-train`**: the saved landing starts the original two-window arrival and its cast scripts.
+  Completion saves **moment 51**, then places the player at Cloud's control position `(2,537)`, triangle 28,
+  direction 0, before revealing participant bodies. This position differs from the entry landing. The train arrival
+  requires its linked landing; merely joining the field at moment 48 does not start an independent copy.
 
-**Saving between fights.** Bridge and cargo use durable continuations. The server records a source-bound replay,
+**Saving between fights and fields.** Bridge, cargo, door and train use durable continuations. The server records a source-bound replay,
 the frozen participant roster, the exact battle setup and seed, and each pending landing. Battle costs and rewards are
 committed for the whole roster before the next scene segment is released. Retrying a save cannot award them twice.
-Restarting before a fight, after a victory or between bridge and cargo restores that checkpoint. A defeat rolls back
+Restarting before a fight, after a victory, between bridge and cargo or between the cargo door and train restores that checkpoint. A defeat rolls back
 that attempt's staged costs and offers **Confirm** to retry the saved fight; **Back** disconnects while preserving the
-checkpoint. Party changes involving a held participant are refused until release. Guest story progression remains their own.
+checkpoint. Party changes involving a held participant are refused until release. Connected guests remain held through
+the linked arrival and receive the final position before release; their story progression remains their own.
 
 The first continuation transaction raises the account-store format fence to version 3, so an older server refuses to
 open that store. Use matching protocol-20 client and server builds. The extended-save switch is off by default; these
 implementation checks use temporary stores and do not change the live preview store.
+Continuation replay contract 2 includes the revised scheduler and authored jump/effect execution. Older contract-1
+checkpoints are refused without changing the save; they are not reinterpreted under the new execution rules.
 
 The flower encounter prepares a known-bit v3 story in memory when reading a supported legacy save. Unknown bits remain
 unknown; the original stored bytes remain the transaction's expected predecessor. Only successful completion stores the
-new format. Bridge and cargo also prepare a known-bit snapshot against their original saved predecessor; unrelated
+new format. The bridge-to-train continuations also prepare a known-bit snapshot against their original saved predecessor; unrelated
 scene definitions do not automatically promote saves. The route and rendering checks use temporary saves and read the owned game files without
 changing them; these changes do not deploy or convert the live preview store.
 
 **They start by themselves.** A scene whose trigger nobody can talk to (`SceneDef::starts_on_arrival`: a talk radius of 0)
 is started by the server for a player whose story it is offered to as soon as that player comes to stand in its field, for
-that player alone (no watchers; a party member plays its own). The server announces no trigger character for it.
+that player alone (no watchers; a party member plays its own). Linked cargo/train arrivals instead require their saved
+landing and retain the preceding scene's connected guests. The server announces no trigger character for an automatic scene.
 
 **What such a scene may save.** The server applies a scene's story only if the headless run was complete and
 (`scene_host::safe_outcome`, `Ff7SceneHost::finish_scene`):
@@ -1491,16 +1502,27 @@ watcher, the original is shown.
 **Coming back.** Everyone joins in `md1stin`. A story that a scene took somewhere no walk leads back from stands there
 again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::entry`, `World::enter_at_story`): from moment
 33 outside the reactor in `md8_4`, from 36 on the street of `md8_1`, and from 39 at Cloud's authored final flower-scene
-position in `md8_2`, and from 48 in `cargoin` at `(-24,16)`, triangle 20, direction 0. A durable continuation takes
+position in `md8_2`, from 48 in `cargoin` at `(-24,16)`, triangle 20, direction 0, and from 51 in `tin_1` at
+`(2,537)`, triangle 28, direction 0. A durable continuation takes
 precedence over these moment-based entries, including the bridge's pending cargo landing while the moment is still 39. The
 player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
 reach the story again (`md8_1` has no way back and only the scene jumps there).
 
-**Not done here:** the street and bridge movies, bridge fades and some cargo background/audio effects are skipped.
-The cargo door sequence into the passenger train, later train, Sector 7 and bar scenes remain outside the verified
-playable route; see `docs/POST-REACTOR.md`. HP/MP carry currently covers consecutive continuation battles, not ordinary
+**Scene presentation.** Reviewed cargo/train initializers establish the background masks; scripted changes update both
+flat and depth rendering, including the train door opening and closing. Authored fades composite after scene filtering
+and before dialogue/HUD, and a terminal black fade survives the old-field travel gap. Train camera shake uses the
+original fixed-point tables, while the cargo jump uses the original step count, integer trajectory and target triangle.
+Fades and shake continue while a dialogue window pauses the cast. These comparisons use original scripts and static
+engine evidence; they are not a complete trace comparison against the owner's running PC game.
+
+**Not done here:** the street and bridge movies, some scene audio, dynamic train walkmesh locks, later train interactions,
+Sector 7 and bar scenes remain outside the verified playable route; see `docs/POST-REACTOR.md`. The train currently holds
+player input through its remaining cast actions and durable acknowledgment, later than the original `UC 0` instruction.
+Full field-effect history outside registered scenes and all original clock interactions are not reproduced. HP/MP carry currently covers consecutive continuation battles, not ordinary
 field health. Keeping current HP/MP through a level-up and keeping companion levels fixed during the chain are port
 policies, not established original-game parity. This is not a claim of complete Disc 1 accuracy.
+The cargo jump passes close to and through the camera, producing very large foreground geometry; original PC
+near clipping and the existing model-scale hypothesis still need comparison against the original renderer.
 
 ```
 scripts/story-smoke.sh --debug --build                    # one real headless player: both scenes, 33 -> 36 saved once, restart, re-login on the street
@@ -1591,13 +1613,16 @@ How it works (`World::start_point_scene`, `SceneHost::point_scene`):
   joins); a name entry or a display setting one edition has and the other has not does not count (Echo-S's `md1_1` names one
   character where the original names two).
 
-**Scene sound effects.** Literal `SOUND` commands in a scene now follow its stage clock, including waits and pauses
-at dialogue windows. Each participant reads and decodes the sounds from their own local library. A new sound replaces
-channel 1; sound 0 stops it. Clips with authored loop regions repeat until stopped; other clips finish naturally.
-Finishing, skipping, leaving or replacing a scene cancels its channel and any pending decode. Other ambient channels,
-menu effects and voices keep their own handles. Missing or late clips are skipped without delaying dialogue.
+**Scene sound effects.** Literal `SOUND` and `AKAO`/`AKAO2` operations 40 and 41 follow the stage clock, including waits
+and pauses at dialogue windows. `SOUND` uses channel 1; operations 40 and 41 use channels 1 and 2 respectively. Each
+participant reads and decodes the sounds from their own local library. A new sound replaces only its channel; sound 0
+stops that channel. This includes cargo's door sound 233 and the train's announcement 59, door 167 and impact 427.
+Clips with authored loop regions repeat until stopped; other clips finish naturally. Finishing, skipping, leaving or
+replacing a scene cancels its touched channels and pending decodes. Other ambient channels, menu effects and voices
+keep their own handles. Missing or late clips are skipped without delaying dialogue.
 `FMV_FIELD_SOUNDS=off` disables this path too. Setup sounds and a victory continuation's discarded prelude are not replayed.
-Banked `SOUND` operands remain unresolved, and scene `AKAO` commands remain unsupported. Timing follows the scene
+Banked sound operands and other scene `AKAO` operations remain unsupported. The field sound path still owns ambient
+channels 3 and 4, including the train's loop 154; the scene does not duplicate them. Timing follows the scene
 interpreter's existing movement estimates; the change has not been checked with audible device output or rendered frames.
 Headless checks can use `--scene-realtime` to preserve that clock while automatically advancing dialogue windows.
 
@@ -1809,6 +1834,9 @@ Protocol 20 adds bounded scene replay and battle continuation messages: `SceneBa
 uses `null`, while a continuation carries its source fingerprint, accepted origin and acknowledged window/battle history.
 Encounter messages also require the escape policy and nullable initial party resources, so server and clients reconstruct
 the same carried battle state. Missing fields, oversized transcripts and mismatched boundary identities are refused.
+Stored continuation replay is bounded at 256 KiB, a checkpoint at 2 MiB and a character record at 4 MiB, allowing all
+known persistent script bytes to survive the three-fight bridge. Wire messages retain their separate 256 KiB frame
+limit: scene starts and accepted prefixes must fit before a checkpoint is admitted or saved. Storage encoding is unchanged.
 
 ### Checking it
 
@@ -1817,6 +1845,7 @@ FMV_FF7_DATA=<.../data> cargo test --offline -p fmv-ff7 --test scene_real -- --i
 FMV_FF7_FLEVEL=<.../flevel.lgp> cargo test --offline -p fmv-server --test scene_real -- --ignored   # a real server and socket
 cargo test --offline -p fmv-server --test scene_preview   # a real store and sockets: preview never saves, a real write is saved once, restart
 FMV_FF7_LIBRARY=<state dir> cargo test --offline -p fmv-server --test bridge_real -- --ignored --nocapture # bridge battles, checkpoint restarts, cargo to 48
+FMV_FF7_LIBRARY=<state dir> cargo test --offline -p fmv-server --test train_real -- --ignored --nocapture # cargo door, restart at train landing, final placement at 51
 scripts/scene-smoke.sh --debug --build                 # two real headless players, the scene, a server restart (real data)
 FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> cargo test --offline -p fmv-client --bin fmv-client -- --ignored \
     --exact scene::shots::offscreen_real_ff7_the_proof_scene --test-threads=1 --nocapture   # the pictures and what the camera shows
@@ -1832,7 +1861,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
 
 ### Known gaps of the proof
 
-* **The proof scene is had once per story, and only a debug preview can reach it today.** The playable route ends at the cargo arrival, so
+* **The proof scene is had once per story, and only a debug preview can reach it today.** The playable route ends at the passenger-train arrival, so
   no real account is ever at moment 72 in the bar: the save-and-reload path is proved with a stand-in scene on a real account and
   store (`crates/fmv-server/tests/scene_preview.rs`: the scene's write is saved once, the server restarts on the same store, the
   account is told its saved story and no scene is on offer, an OK starts nothing, nothing holds the player) and, on the real

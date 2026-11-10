@@ -9,13 +9,16 @@
 //! * `Move` walks it there over the number of frames the event says (a straight line from where it stood, heading
 //!   toward the target the whole way). A second move of the same actor first finishes the first. A resolved ordinary-MOVE
 //!   clip follows only that move's elapsed time, and yields to the standing default when it arrives.
-//!   FMOVE can instead keep an already resolved normal full loop advancing through movement and arrival.
+//!   FMOVE and JUMP can instead keep an already resolved normal full loop advancing through movement and arrival.
+//!   JUMP samples the original Q12 trajectory over its authored steps and two completion frames.
 //! * `Face` turns it (the short way round), at once or over the frames it says.
 //! * `Show` hides or shows it.
 //! * The player resolves supported `Anim` loops, full Holds and explicit forward Holds against the actor's exact field model.
 //!   Loops and Holds support ASPED 16 and 32 (normal and double speed), including standing rate changes without
 //!   restarting their phase. Loops and Holds follow scene time; a Hold stops at its last frame until replaced. A Once can
 //!   restart a separately remembered, different default slot after its range or actual loaded clip length.
+//!   A normal full Once or a normal `[0, 0]` Once can also return to the exact same default clip at frame zero;
+//!   other same-slot ranges and doubled same-slot returns remain unsupported.
 //!   A full doubled Once can return to normal speed at an authored ASPED, retaining its pose and completion time.
 //!   Other animations clear that loop and are counted ([`Counts::anims_skipped`]), never guessed at.
 //! * `Sound` is routed separately by the scene player to its cancellable audio channel.
@@ -23,9 +26,11 @@
 //!   (`crate::camera`) shows it.
 //!
 //! Time is in field frames (30 a second), the interpreter's clock. A walk or a turn only moves while the scene runs: a
-//! window pauses the whole stage, as it pauses the interpreter.
+//! window pauses actors and script time. Screen fades and shake follow the visible field clock, even during dialogue.
 
-use fmv_ff7::script::scene::{AnimHow, CameraOp, MoveHow, Stage};
+use fmv_ff7::script::scene::{AnimHow, CameraOp, FadeColor, FadeState, JumpMotion, MoveHow, Stage};
+use super::shake::ShakeState;
+use fmv_ff7::background::BackgroundOp;
 use crate::avatar::anim::ClipFrame;
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
@@ -47,6 +52,8 @@ pub enum CameraState {
 pub struct Counts {
     /// Unsupported or unresolved `Anim` events of cast members.
     pub anims_skipped: u32,
+    /// Jumps without a valid authored duration, position or landing height.
+    pub moves_skipped: u32,
     /// Camera events (the window's field camera shows them; counted here as the scene's camera clock).
     pub camera_ops: u32,
     /// Events about an entity that is not in the cast.
@@ -61,6 +68,8 @@ struct Walk {
     elapsed: f32,
     how: MoveHow,
     keep_animation: bool,
+    jump: Option<JumpMotion>,
+    landing_triangle: Option<u16>,
 }
 
 fn is_walk(how: MoveHow) -> bool {
@@ -254,8 +263,15 @@ impl Actor {
             }
             walk.elapsed += frames;
             let t = progress(walk.elapsed, walk.frames);
-            let at = [0, 1, 2].map(|i| walk.from[i] + (walk.to[i] - walk.from[i]) * t);
+            let at = walk.jump.map_or_else(
+                || [0, 1, 2].map(|i| walk.from[i] + (walk.to[i] - walk.from[i]) * t),
+                |jump| jump.at(walk.elapsed));
             self.pos = Some(at);
+            // Original JUMP changes the triangle on the completion update, one frame after
+            // its last motion step and one before the script consumes completion.
+            if walk.jump.is_some() && walk.elapsed >= walk.frames - 1.0 {
+                self.triangle = walk.landing_triangle;
+            }
             if t >= 1.0 {
                 self.walk = None;
                 self.movement_animation = None;
@@ -300,6 +316,10 @@ pub struct Cast {
     camera: CameraState,
     /// Frames of scene time since the last camera event ([`CameraClock::frames`]).
     camera_frames: f32,
+    /// Authored field mutations survive cast teardown until the client captures their suffix.
+    background_ops: Vec<BackgroundOp>,
+    fade: FadeState,
+    shake: ShakeState,
     counts: Counts,
 }
 
@@ -309,12 +329,28 @@ pub type Height<'a> = &'a dyn Fn(i16, i16, Option<u16>) -> Option<f32>;
 impl Cast {
     /// A stage for the cast playing these script entities (every one starts unplaced).
     pub fn new(entities: impl IntoIterator<Item = u8>) -> Self {
-        Self { actors: entities.into_iter().map(|e| (e, Actor::new(e))).collect(), camera: CameraState::Default, camera_frames: 0.0, counts: Counts::default() }
+        Self { actors: entities.into_iter().map(|e| (e, Actor::new(e))).collect(), camera: CameraState::Default, camera_frames: 0.0, background_ops: Vec::new(), fade: FadeState::default(), shake: ShakeState::default(), counts: Counts::default() }
     }
 
     /// What the scene told the camera and the stage's clock of it ([`CameraClock`]).
     pub fn camera_clock(&self) -> CameraClock {
         CameraClock { state: self.camera, events: self.counts.camera_ops, frames: self.camera_frames }
+    }
+
+    pub fn background_ops(&self) -> &[BackgroundOp] { &self.background_ops }
+
+    pub fn fade(&self) -> Option<FadeColor> { self.fade.color() }
+
+    pub fn shake(&self) -> [f32; 2] { self.shake.offset() }
+
+    pub fn shake_rng_indices(&self) -> [u8; 2] { self.shake.rng_indices() }
+
+    pub fn seed_shake_rng(&mut self, indices: [u8; 2]) { self.shake = ShakeState::with_rng_indices(indices); }
+
+    /// The original field updater keeps screen effects moving while dialogue holds script time.
+    pub fn advance_effects(&mut self, frames: f32) {
+        self.fade.advance(frames);
+        self.shake.advance(frames);
     }
 
     #[cfg(test)]
@@ -348,6 +384,8 @@ impl Cast {
         self.actors.clear();
         self.camera = CameraState::Default;
         self.camera_frames = 0.0;
+        self.fade = FadeState::default();
+        self.shake = ShakeState::with_rng_indices(self.shake.rng_indices());
     }
 
     /// Move every walk and turn on by `frames` of scene time (no time, or time that is not a number, moves nothing).
@@ -355,6 +393,7 @@ impl Cast {
         if frames.partial_cmp(&0.0).is_none_or(|o| o.is_le()) {
             return;
         }
+        self.advance_effects(frames);
         self.camera_frames += frames;
         for actor in self.actors.values_mut() {
             actor.advance(frames);
@@ -434,11 +473,14 @@ impl Cast {
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldFull { elapsed }, rate, once: false });
     }
 
-    /// A bounded Once can return to a verified, different default slot. Same-slot phase
-    /// retention and gestures started during another movement remain unsupported.
+    /// A bounded Once can return to a verified, different default slot. The same slot is
+    /// supported only for `[0, 0]` on the exact default clip: its return begins at frame zero.
+    /// Other same-slot phase retention and gestures started during movement remain unsupported.
     pub fn apply_once(&mut self, entity: u8, slot: u8, clip: &str, first: u8, last: u8, overshoot: f32) -> bool {
         let Some(actor) = self.actors.get_mut(&entity) else { return false };
-        if first > last || actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
+        let known_return = actor.default_animation.as_ref().is_some_and(|default|
+            default.slot != slot || (default.clip == clip && first == 0 && last == 0));
+        if first > last || actor.walk.is_some() || !known_return { return false; }
         let elapsed = if overshoot.is_nan() { 0.0 } else { overshoot.max(0.0) };
         actor.movement_animation = None;
         actor.animation = Some(SceneAnimation { clip: clip.to_string(), frame: ClipFrame::HoldRange { first, last, elapsed }, rate: 1.0, once: true });
@@ -446,8 +488,9 @@ impl Cast {
         true
     }
 
-    /// A full Once carries its elapsed time and known different default to the avatar cache.
-    /// Only that cache knows the actual loaded clip length; no guessed deadline ends this pose.
+    /// A full Once carries its elapsed time and verified default to the avatar cache. At the
+    /// normal rate the same exact clip can return to itself: reaching its end restarts frame zero.
+    /// Only the cache knows the actual loaded clip length; no guessed deadline ends this pose.
     pub fn apply_once_full(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32) -> bool {
         self.once_full_at_rate(entity, slot, clip, overshoot, false)
     }
@@ -460,7 +503,9 @@ impl Cast {
 
     fn once_full_at_rate(&mut self, entity: u8, slot: u8, clip: &str, overshoot: f32, doubled: bool) -> bool {
         let Some(actor) = self.actors.get_mut(&entity) else { return false };
-        if actor.walk.is_some() || !actor.default_animation.as_ref().is_some_and(|default| default.slot != slot) { return false; }
+        let known_return = actor.default_animation.as_ref().is_some_and(|default|
+            default.slot != slot || (!doubled && default.clip == clip));
+        if actor.walk.is_some() || !known_return { return false; }
         let rate = if doubled { 2.0 } else { 1.0 };
         let elapsed = if overshoot.is_finite() { overshoot.max(0.0) * rate } else { 0.0 };
         let frame = if doubled { ClipFrame::OnceFullDoubled { elapsed } } else { ClipFrame::OnceFull { elapsed } };
@@ -476,6 +521,15 @@ impl Cast {
         let overshoot = if overshoot.is_nan() { 0.0 } else { overshoot.max(0.0) };
         match event {
             Stage::Sound { .. } => {},
+            Stage::Background(op) => self.background_ops.push(*op),
+            Stage::Fade(op) => {
+                if self.fade.apply(*op) { self.fade.advance(overshoot); }
+            }
+            Stage::Shake { mask, x_amplitude, x_steps, y_amplitude, y_steps } => {
+                if self.shake.apply(*mask, *x_amplitude, *x_steps, *y_amplitude, *y_steps) {
+                    self.shake.advance(overshoot);
+                }
+            }
             Stage::Camera(op) => {
                 self.counts.camera_ops = self.counts.camera_ops.saturating_add(1);
                 // A late event is that far into its scroll already, as a late walk is into its walk.
@@ -496,14 +550,18 @@ impl Cast {
             }
             Stage::Move { entity, from, x, y, z, triangle, frames, how, .. } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
+                if *how == MoveHow::Jump && (actor.pos.is_none() || z.is_none()) {
+                    self.counts.moves_skipped = self.counts.moves_skipped.saturating_add(1);
+                    return;
+                }
                 actor.movement_animation = None;
-                // Only a loop already resolved before this FMOVE qualifies. Restoring a Once's
-                // default below must not promote that unsupported movement/gesture combination.
-                let keep_animation = *how == MoveHow::WalkKeepAnimation && actor.has_normal_loop()
+                // FMOVE and JUMP leave an explicitly resolved normal loop running. Restoring a
+                // Once's default below must not promote an unsupported movement/gesture combination.
+                let keep_animation = matches!(how, MoveHow::WalkKeepAnimation | MoveHow::Jump) && actor.has_normal_loop()
                     && actor.walk.is_none_or(|walk| walk.keep_animation);
                 if actor.animation.as_ref().is_some_and(|animation| animation.once) { actor.restore_default(0.0); }
-                // DFANM is a standing default, not the actor's walk/jump/ladder animation.
-                // Restart it when movement ends; any unused part of a tick advances the idle.
+                // Other movement uses its own clip rather than this standing default. Restart
+                // the default on arrival; any unused part of a tick advances it.
                 match &mut actor.animation {
                     Some(SceneAnimation { frame: ClipFrame::Loop(frame), .. }) if !keep_animation => *frame = 0.0,
                     Some(SceneAnimation { frame: ClipFrame::Loop(_), .. }) => {},
@@ -511,10 +569,13 @@ impl Cast {
                 }
                 // A second move of the same actor starts where the first one was going.
                 if let Some(walk) = actor.walk.take() {
-                    actor.pos = Some(walk.to);
+                    actor.pos = Some(walk.jump.map_or(walk.to, |jump| jump.at(f32::INFINITY)));
+                    if walk.jump.is_some() { actor.triangle = walk.landing_triangle; }
                 }
                 let target_xy = (f32::from(*x), f32::from(*y));
                 let start = match (from, actor.pos) {
+                    // Preserve the actual Q12 landing remainder across consecutive jumps.
+                    (_, Some(here)) if *how == MoveHow::Jump => here,
                     (Some((fx, fy)), here) => {
                         let z = here.map(|p| p[2]).or_else(|| height(*fx, *fy, None)).unwrap_or(0.0);
                         [f32::from(*fx), f32::from(*fy), z]
@@ -522,15 +583,26 @@ impl Cast {
                     (None, Some(here)) => here,
                     (None, None) => [target_xy.0, target_xy.1, 0.0],
                 };
-                let z = z.map(f32::from).or_else(|| height(*x, *y, *triangle)).unwrap_or(start[2]);
-                let to = [target_xy.0, target_xy.1, z];
+                // ScenePlay resolves a jump against the authored triangle's infinite plane.
+                // The renderer's generic ground callback is a walkability query and must not
+                // silently substitute another surface for an unresolved jump.
+                let z = z.map(f32::from).or_else(|| (*how != MoveHow::Jump).then(|| height(*x, *y, *triangle)).flatten());
+                let to = [target_xy.0, target_xy.1, z.unwrap_or(start[2])];
+                let jump = if *how == MoveHow::Jump {
+                    let Some(jump) = z.and_then(|_| JumpMotion::from_stage_frames(start, to, *frames)) else {
+                        self.counts.moves_skipped = self.counts.moves_skipped.saturating_add(1);
+                        return;
+                    };
+                    Some(jump)
+                } else { None };
                 let (dx, dy) = (to[0] - start[0], to[1] - start[1]);
                 if is_walk(*how) && dx.hypot(dy) > 0.5 {
                     actor.heading = dy.atan2(dx);
                     actor.turn = None;
                 }
                 actor.pos = Some(start);
-                actor.walk = Some(Walk { from: start, to, frames: *frames as f32, elapsed: 0.0, how: *how, keep_animation });
+                actor.walk = Some(Walk { from: start, to, frames: *frames as f32, elapsed: 0.0, how: *how, keep_animation,
+                    jump, landing_triangle: *triangle });
                 // (a walk of no frames is a jump to the place: `advance` finishes it at once)
                 actor.advance_walk(overshoot);
             }
@@ -625,7 +697,7 @@ mod tests {
 
     #[test]
     fn standing_loops_yield_to_movement_and_restart_after_arrival() {
-        for how in [MoveHow::Walk, MoveHow::Jump, MoveHow::Ladder] {
+        for how in [MoveHow::Walk, MoveHow::Ladder] {
             let mut cast = Cast::new([1]);
             cast.apply(&place(1, 0, 0), 0.0, &flat);
             cast.apply_loop(1, 0, "idle", 0.0, false);
@@ -639,6 +711,105 @@ mod tests {
             assert_eq!(cast.actor(1).unwrap().animation(), Some(("idle", ClipFrame::Loop(3.0))), "only time after arrival advances the restarted idle");
             assert_eq!(cast.actor(1).unwrap().pos(), Some([100.0, 0.0, 7.0]));
         }
+    }
+
+    #[test]
+    fn a_jump_keeps_the_explicit_normal_loop_and_its_phase_through_arrival() {
+        for chunks in [vec![23.0], vec![4.0, 5.0, 14.0]] {
+            let mut cast = Cast::new([11]);
+            cast.apply(&place(11, 0, 0), 0.0, &flat);
+            cast.apply_loop(11, 13, "btce", 0.0, false);
+            cast.advance(15.0); // cargoin: DFANM 13, WAIT 15, JUMP, VISI 0.
+            cast.apply(&Stage::Move { entity: 11, from: None, x: 100, y: 0, z: Some(7), triangle: Some(0),
+                frames: 20, how: MoveHow::Jump, animation: None }, 0.0, &flat);
+            assert_eq!(cast.actor(11).unwrap().animation(), Some(("btce", ClipFrame::Loop(15.0))));
+            let mut elapsed = 0.0;
+            for frames in chunks {
+                cast.advance(frames);
+                elapsed += frames;
+                let actor = cast.actor(11).unwrap();
+                assert_eq!(actor.animation(), Some(("btce", ClipFrame::Loop(15.0 + elapsed))));
+                let motion = JumpMotion::from_stage_frames([0.0, 0.0, 7.0], [100.0, 0.0, 7.0], 20).unwrap();
+                assert_eq!(actor.pos(), Some(motion.at(elapsed)));
+                assert!(!actor.moving(), "JUMP never substitutes a walking clip");
+                assert_eq!(actor.walked_frames(), 0.0);
+            }
+            assert_eq!(cast.actor(11).unwrap().pos(), Some([100.0, 0.0, 7.0]));
+            cast.apply(&Stage::Show { entity: 11, visible: false }, 0.0, &flat);
+            assert!(!cast.actor(11).unwrap().shown());
+            assert_eq!(cast.actor(11).unwrap().animation(), Some(("btce", ClipFrame::Loop(38.0))));
+            cast.apply(&walk(11, 120, 0, 4), 0.0, &flat);
+            assert_eq!(cast.actor(11).unwrap().animation(), None, "ordinary movement still replaces the jump clip");
+            cast.advance(5.0);
+            assert_eq!(cast.actor(11).unwrap().animation(), Some(("btce", ClipFrame::Loop(1.0))));
+        }
+    }
+
+    #[test]
+    fn a_jump_does_not_invent_a_clip_or_promote_a_doubled_loop_hold_or_once() {
+        for form in 0..4 {
+            let mut cast = Cast::new([11]);
+            cast.apply(&place(11, 0, 0), 0.0, &flat);
+            cast.remember_default(11, 13, "btce");
+            match form {
+                0 => {}, // Metadata alone does not select a clip to show.
+                1 => cast.apply_loop(11, 13, "btce", 0.0, true),
+                2 => cast.apply_hold(11, "btce", 2),
+                _ => { assert!(cast.apply_once_full(11, 13, "btce", 0.0)); },
+            }
+            cast.advance(15.0);
+            cast.apply(&Stage::Move { entity: 11, from: None, x: 100, y: 0, z: Some(7), triangle: None,
+                frames: 20, how: MoveHow::Jump, animation: None }, 0.0, &flat);
+            cast.advance(5.0);
+            assert_eq!(cast.actor(11).unwrap().animation(), None, "unsupported jump combination {form}");
+        }
+    }
+
+    #[test]
+    fn same_default_zero_frame_and_full_once_restart_the_verified_normal_clip() {
+        let mut cast = Cast::new([35]);
+        cast.apply(&place(35, 0, 0), 0.0, &flat);
+        cast.apply_loop(35, 4, "cdie", 0.0, false);
+        assert!(cast.apply_once(35, 4, "cdie", 0, 0, 0.0));
+        cast.advance(0.5);
+        assert_eq!(cast.actor(35).unwrap().animation().unwrap().1.in_clip(8), Some(0.0));
+        cast.advance(1.0);
+        assert_eq!(cast.actor(35).unwrap().animation(), Some(("cdie", ClipFrame::Loop(0.5))), "only time after the authored one-frame range advances the loop");
+        cast.advance(59.5);
+        assert_eq!(cast.actor(35).unwrap().animation(), Some(("cdie", ClipFrame::Loop(60.0))));
+        assert!(cast.apply_once_full(35, 4, "cdie", 0.0), "tin_1 restarts the same slot 61 frames after the bounded Once");
+        assert_eq!(cast.actor(35).unwrap().animation(), Some(("cdie", ClipFrame::OnceFull { elapsed: 0.0 })));
+        cast.advance(7.5);
+        let actor = cast.actor(35).unwrap();
+        assert_eq!(actor.animation().unwrap().1.in_clip(8), Some(7.0));
+        assert_eq!(actor.animation().unwrap().1.return_elapsed(8), None);
+        assert_eq!(actor.full_once_return(), Some("cdie"));
+        cast.advance(0.5);
+        assert_eq!(cast.actor(35).unwrap().animation().unwrap().1.return_elapsed(8), Some(0.0));
+        cast.advance(2.5);
+        assert_eq!(cast.actor(35).unwrap().animation().unwrap().1.return_elapsed(8), Some(2.5));
+        cast.apply_hold(35, "cdie", 3);
+        cast.advance(100.0);
+        assert_eq!(cast.actor(35).unwrap().animation(), Some(("cdie", ClipFrame::Hold(3))));
+        assert_eq!(cast.actor(35).unwrap().full_once_return(), None, "replacement cancels the pending same-slot return");
+    }
+
+    #[test]
+    fn same_default_once_still_rejects_other_ranges_rates_clips_and_active_movement() {
+        let mut cast = Cast::new([35]);
+        cast.apply(&place(35, 0, 0), 0.0, &flat);
+        assert!(!cast.apply_once(35, 4, "cdie", 0, 0, 0.0));
+        assert!(!cast.apply_once_full(35, 4, "cdie", 0.0), "no guessed default");
+        cast.apply_loop(35, 4, "cdie", 0.0, false);
+        for (first, last) in [(0, 1), (1, 1), (2, 5), (5, 2)] {
+            assert!(!cast.apply_once(35, 4, "cdie", first, last, 0.0), "unsupported same-slot range {first}..{last}");
+        }
+        assert!(!cast.apply_once(35, 4, "different", 0, 0, 0.0));
+        assert!(!cast.apply_once_full(35, 4, "different", 0.0), "slot identity alone cannot authorize another clip");
+        assert!(!cast.apply_once_full_doubled(35, 4, "cdie", 0.0), "same-slot doubled return would retain a different rate");
+        cast.apply(&walk(35, 100, 0, 20), 0.0, &flat);
+        assert!(!cast.apply_once(35, 4, "cdie", 0, 0, 0.0));
+        assert!(!cast.apply_once_full(35, 4, "cdie", 0.0), "gestures during movement remain unsupported");
     }
 
     #[test]
@@ -863,10 +1034,10 @@ mod tests {
         cast.advance(10.0);
         let heading = cast.actor(1).unwrap().heading();
         // A jump does not replace the turn. Catching up that jump must not tick the turn again.
-        let jump = Stage::Move { entity: 1, from: None, x: 120, y: 0, z: None, triangle: None, frames: 20, how: MoveHow::Jump, animation: None };
+        let jump = Stage::Move { entity: 1, from: None, x: 120, y: 0, z: Some(7), triangle: None, frames: 20, how: MoveHow::Jump, animation: None };
         cast.apply(&jump, 5.0, &flat);
         let a = cast.actor(1).unwrap();
-        assert_eq!(a.pos(), Some([105.0, 0.0, 7.0]));
+        assert_eq!(a.pos(), Some(JumpMotion::from_stage_frames([100.0, 0.0, 7.0], [120.0, 0.0, 7.0], 20).unwrap().at(5.0)));
         assert_eq!(a.heading(), heading, "late jump leaves the already advanced turn alone");
         assert_eq!(a.walked_frames(), 30.0, "jump time is not walking animation time");
     }
@@ -904,21 +1075,57 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_uses_its_landing_triangle_unless_it_has_an_explicit_height() {
+    fn a_jump_has_an_arc_and_changes_triangle_on_the_original_completion_update() {
         let mut cast = Cast::new([1]);
         cast.apply(&Stage::Place { entity: 1, x: 0, y: 0, z: Some(0), triangle: Some(0) }, 0.0, &flat);
-        let target = |_, _, triangle| match triangle { Some(1) => Some(100.0), _ => Some(0.0) };
-        let mut jump = Stage::Move { entity: 1, from: Some((0, 0)), x: 40, y: 20, z: None, triangle: Some(1), frames: 30, how: MoveHow::Jump, animation: None };
-        cast.apply(&jump, 0.0, &target);
-        cast.advance(15.0);
-        assert_eq!(cast.actor(1).unwrap().pos(), Some([20.0, 10.0, 50.0]));
+        let jump = Stage::Move { entity: 1, from: Some((0, 0)), x: 40, y: 20, z: Some(96), triangle: Some(1), frames: 14, how: MoveHow::Jump, animation: None };
+        cast.apply(&jump, 0.0, &flat);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([0.0; 3]), "step zero initializes without moving");
+        cast.advance(6.0);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([20.0, 10.0, 48.0 + 70.3125]));
         assert!(!cast.actor(1).unwrap().moving(), "a jump does not use the walking animation");
-        cast.advance(15.0);
-        assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 20.0, 100.0]));
+        cast.advance(6.0);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 20.0, 96.0]));
+        assert_eq!(cast.actor(1).unwrap().triangle(), Some(0));
+        assert!(cast.busy(), "the last movement step does not yet release the script");
+        cast.advance(1.0);
+        assert_eq!(cast.actor(1).unwrap().triangle(), Some(1));
+        assert!(cast.busy(), "the original completion update precedes the script's next pass");
+        cast.advance(1.0);
         assert!(!cast.busy());
-        if let Stage::Move { z, .. } = &mut jump { *z = Some(75); }
-        cast.apply(&jump, 30.0, &target);
-        assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 20.0, 75.0]), "explicit script height wins over the triangle");
+    }
+
+    #[test]
+    fn malformed_or_unresolved_jumps_are_not_replaced_with_linear_motion() {
+        for (frames, z) in [(0, Some(0)), (2, Some(0)), (32770, Some(0)), (14, None)] {
+            let mut cast = Cast::new([1]);
+            cast.apply(&place(1, 0, 0), 0.0, &flat);
+            cast.apply(&Stage::Move { entity: 1, from: None, x: 40, y: 20, z, triangle: Some(0), frames,
+                how: MoveHow::Jump, animation: None }, 0.0, &flat);
+            cast.advance(100.0);
+            assert_eq!(cast.actor(1).unwrap().pos(), Some([0.0, 0.0, 7.0]));
+            assert_eq!(cast.counts().moves_skipped, 1);
+            assert!(!cast.busy());
+        }
+    }
+
+    #[test]
+    fn a_late_jump_and_small_ticks_share_the_same_arc_and_keep_the_landing_remainder() {
+        let jump = Stage::Move { entity: 1, from: Some((9, -105)), x: 9, y: -247, z: Some(0), triangle: Some(1),
+            frames: 14, how: MoveHow::Jump, animation: None };
+        for elapsed in [0.0, 5.5, 12.0, 13.0, 14.0, 30.0] {
+            let mut live = Cast::new([1]);
+            live.apply(&Stage::Place { entity: 1, x: 9, y: -105, z: Some(0), triangle: Some(0) }, 0.0, &flat);
+            let mut late = live.clone();
+            live.apply(&jump, 0.0, &flat);
+            for _ in 0..(elapsed * 2.0) as usize { live.advance(0.5); }
+            late.apply(&jump, elapsed, &flat);
+            assert_eq!(live.actor(1).unwrap().pos(), late.actor(1).unwrap().pos());
+            assert_eq!(live.actor(1).unwrap().triangle(), late.actor(1).unwrap().triangle());
+            if elapsed >= 12.0 {
+                assert_eq!(late.actor(1).unwrap().pos(), Some([9.0, -246.99902, 0.0]), "no endpoint resnap");
+            }
+        }
     }
 
     #[test]
@@ -1006,6 +1213,94 @@ mod tests {
     }
 
     #[test]
+    fn fade_and_shake_advance_during_dialogue_without_advancing_actors_or_camera() {
+        use fmv_ff7::script::scene::{FadeBlend, FadeOp};
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        cast.apply(&walk(1, 100, 0, 10), 0.0, &flat);
+        cast.apply(&Stage::Camera(CameraOp::Scroll { x: 20, y: -10, frames: 12 }), 0.0, &flat);
+        cast.apply(&Stage::Fade(FadeOp::Nfade { kind: 11, rgb: [120, 60, 30], frames: 6 }), 0.0, &flat);
+        cast.apply(&Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 5, y_steps: 2 }, 0.0, &flat);
+        let actor = cast.actor(1).unwrap().clone();
+        let camera = cast.camera_clock();
+        // Two visible field frames pass while a dialogue holds script time.
+        for _ in 0..8 { cast.advance_effects(0.25); }
+        assert_eq!(cast.fade(), Some(FadeColor { blend: FadeBlend::Add, rgb: [40, 20, 10] }));
+        assert_eq!(cast.shake(), [0.0, 1.0]);
+        assert_eq!(cast.actor(1), Some(&actor));
+        assert_eq!(cast.camera_clock(), camera);
+        // A resumed scene frame advances the effects once, as well as its script clocks.
+        cast.advance(1.0);
+        assert_eq!(cast.fade(), Some(FadeColor { blend: FadeBlend::Add, rgb: [60, 30, 15] }));
+        assert_eq!(cast.shake(), [0.0, 3.0], "the third shake frame, not a double tick");
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([10.0, 0.0, 7.0]));
+        assert_eq!(cast.camera_clock().frames, 1.0);
+    }
+
+    #[test]
+    fn a_late_fade_catches_up_only_its_own_effect() {
+        use fmv_ff7::script::scene::{FadeBlend, FadeOp};
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        cast.apply(&Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 5, y_steps: 2 }, 0.0, &flat);
+        cast.advance_effects(3.0);
+        assert_eq!(cast.shake(), [0.0, 3.0]);
+        let actor = cast.actor(1).unwrap().clone();
+        let camera = cast.camera_clock();
+        cast.apply(&Stage::Fade(FadeOp::Nfade { kind: 11, rgb: [120, 60, 30], frames: 6 }), 2.0, &flat);
+        assert_eq!(cast.fade(), Some(FadeColor { blend: FadeBlend::Add, rgb: [40, 20, 10] }));
+        assert_eq!(cast.shake(), [0.0, 3.0], "the existing shake already reached the visible frame");
+        assert_eq!(cast.actor(1), Some(&actor));
+        assert_eq!(cast.camera_clock(), camera);
+        cast.advance_effects(1.0);
+        assert_eq!(cast.fade().unwrap().rgb, [60, 30, 15]);
+        assert_eq!(cast.shake(), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_late_shake_catches_up_only_its_own_effect() {
+        use fmv_ff7::script::scene::{FadeBlend, FadeOp};
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 0, 0), 0.0, &flat);
+        cast.apply(&Stage::Fade(FadeOp::Nfade { kind: 11, rgb: [120, 60, 30], frames: 6 }), 0.0, &flat);
+        cast.advance_effects(2.0);
+        let actor = cast.actor(1).unwrap().clone();
+        let camera = cast.camera_clock();
+        cast.apply(&Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 5, y_steps: 2 }, 3.0, &flat);
+        assert_eq!(cast.shake(), [0.0, 3.0]);
+        assert_eq!(cast.fade(), Some(FadeColor { blend: FadeBlend::Add, rgb: [40, 20, 10] }), "the existing fade must not consume the new shake's overshoot");
+        assert_eq!(cast.actor(1), Some(&actor));
+        assert_eq!(cast.camera_clock(), camera);
+        cast.advance_effects(1.0);
+        assert_eq!(cast.fade().unwrap().rgb, [60, 30, 15]);
+        assert_eq!(cast.shake(), [0.0, 1.0]);
+    }
+
+    #[test]
+    fn clearing_the_cast_resets_screen_effects_and_keeps_authored_background_changes() {
+        use fmv_ff7::script::scene::FadeOp;
+        let mut cast = Cast::new([1]);
+        let background = [BackgroundOp::On { group: 8, frame: 2 }, BackgroundOp::Off { group: 8, frame: 1 }];
+        for op in background { cast.apply(&Stage::Background(op), 0.0, &flat); }
+        cast.apply(&Stage::Camera(CameraOp::Scroll { x: 20, y: -10, frames: 12 }), 0.0, &flat);
+        cast.apply(&Stage::Fade(FadeOp::Nfade { kind: 11, rgb: [120, 60, 30], frames: 6 }), 0.0, &flat);
+        cast.apply(&Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 5, y_steps: 2 }, 0.0, &flat);
+        cast.advance(3.0);
+        assert!(cast.fade().is_some());
+        assert_eq!(cast.shake(), [0.0, 3.0]);
+        cast.clear();
+        assert_eq!(cast.actors().count(), 0);
+        assert_eq!((cast.camera_clock().state, cast.camera_clock().frames), (CameraState::Default, 0.0));
+        assert_eq!(cast.fade(), None);
+        assert_eq!(cast.shake(), [0.0, 0.0]);
+        assert_eq!(cast.background_ops(), &background);
+        cast.advance_effects(30.0);
+        assert_eq!(cast.fade(), None);
+        assert_eq!(cast.shake(), [0.0, 0.0], "cleared shake cannot restart its next segment");
+        assert_eq!(cast.background_ops(), &background, "field mutations survive scene teardown");
+    }
+
+    #[test]
     fn the_clips_are_counted_not_played_and_strangers_are_counted_too() {
         let mut cast = Cast::new([1]);
         let anim = |entity| Stage::Anim { entity, animation: 3, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 };
@@ -1016,7 +1311,7 @@ mod tests {
         cast.apply(&walk(9, 1, 1, 5), 0.0, &flat);
         cast.apply(&Stage::Face { entity: 9, heading: 1.0, frames: 0 }, 0.0, &flat);
         cast.apply(&Stage::Show { entity: 9, visible: false }, 0.0, &flat);
-        assert_eq!(cast.counts(), Counts { anims_skipped: 2, camera_ops: 0, off_cast: 5 });
+        assert_eq!(cast.counts(), Counts { anims_skipped: 2, moves_skipped: 0, camera_ops: 0, off_cast: 5 });
         assert!(cast.actor(9).is_none(), "an entity that is not in the cast never gets an actor");
     }
 

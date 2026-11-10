@@ -86,9 +86,11 @@ still absent.
 All eight bridge paths and the cargo arrival pass owned-data interpreter and offscreen
 presentation checks, with no skipped actor animations or camera misses. The cargo hides
 participant bodies/labels until durable completion, and field geometry is clipped to the
-camera range so guards do not appear in side bars. These checks do not establish movie,
-fade, background-opcode or all audio parity: bridge movie 23/fades and some cargo background
-and sound behavior remain unfinished. No live-store migration or deployment was performed.
+camera range so guards do not appear in side bars. At that bridge acceptance checkpoint,
+these checks did not establish movie, fade,
+background-opcode or all audio parity. The current wave below adds authored background,
+fade and shake support; movie 23 and remaining audiovisual limits are still open.
+No live-store migration or deployment was performed.
 
 Bridge acceptance now includes the real TCP route in `tests/bridge_real.rs`: both the no-fight
 path `[3,1,1]` and all-three-fight path `[2,0,0]` pass, with one actual Potion consumed on the
@@ -100,16 +102,149 @@ passes 42 injected crash cases. Final suites pass 552 server tests, 254 persiste
 1,417 client tests and 89 protocol tests (including the owned battle chain). All workspace
 targets compile; clippy retains only the previously existing FF7/client warnings.
 
-**Next route gap:** the cargo door sequence into `tin_1` is separate from the arrival and is
-not yet registered. Passenger-train, Sector 7 station, pillar, Sector 7 intro and early bar
-continuations remain unregistered. Their missing flags, inventory/affection effects and
-presentation still need review. The continuous-route audit below records the authored triggers.
+### Current wave: cargo door and passenger-train arrival, 48 to 51
+
+**Implemented and checked through moment 51, with the fidelity limits below.** `ff7/cargoin/passenger-door` and
+`ff7/tin_1/sector-seven-train` append at registry indices 16 and 17 and require
+`--story-extended-save`. This wave passes 1,456 client, 561 server and 257 persistence tests;
+the full FF7 library run passes 661, followed by 139 scene-unit and all 39 owned-scene checks
+after the final lint-only edits. The owned train TCP, host placement and bridge TCP regressions
+pass, as do the new scene/effect/background and existing graphics regressions. Workspace
+all-target clippy passes with three existing warnings. No live saves or deployment changed.
+
+Cargo's border1 entity 10 slot 2 starts at line `(-15,-104,0)` to `(53,-104,0)` after the
+moment-48 arrival. The scene binds the accepted crossing position and follows Cloud 11/8
+and the original door request. After `WAIT 15`, Cloud jumps to `(9,-247)`, triangle 0,
+then hides. `MAPJUMP 139` transfers to `tin_1` at `(-2,608)`, triangle 29, direction 252.
+There are no windows, questions, battles, story writes or gil effects in this connecting
+sequence. Its durable landing retains `tin_1` across restart even though the unchanged
+moment 48 normally returns a character to cargo.
+
+The train definition initializes environment entities 0–24 and its nine cast members,
+including the woman's original initializer. The employee's placement comes from his main.
+Reviewed ambient mains 9–12, 16 and 20 run beside the foreground employee/director work;
+producer 16 selects the active background mode, while main 20 supplies `SCR2D(18,2)` and
+shake. These use the ordinary interpreter and safety audit. Unrelated timer/lesson mains
+are not started. Foreground actor requests and their tails must finish before completion;
+a moment-51 write alone is not the completion boundary.
+
+The two windows precede Cloud's placement `(2,537,-53)`, triangle 28, direction 0, and
+moment 51. The same-field durable completion installs that pose before releasing control;
+it must not leave players at the incoming `(-2,608)` landing. Guest story/resources remain
+their own, connected guests wait for destination handshakes, and reconnect refreshes their
+retained participant identities. Participant bodies/labels stay hidden through cargo arrival,
+door crossing and train introduction; unrelated players remain visible.
+
+**Explicit timing difference:** original `UC 0` releases Cloud when he appears, before the
+remaining actor work ends. The port holds the cohort for that tail (about 200 more field
+frames in the port's trace of the owned scripts) and the durable acknowledgment. Actors and script
+windows also retain the port's scene-wide dialogue pause. This is not original input-release
+or full frame-timing parity. Dynamic `IDLCK` triangle locks are not yet part of authoritative
+field movement. The surveyed final triangle 28 connects to departure triangle 43 even with
+the observed locks, but floor connectivity does not establish that a story-gated exit is open.
+
+The cargo jump's authored path approaches and crosses the camera; its apex mesh spans camera
+depths about 15.9 to 65.0. The current projection therefore produces large foreground legs.
+The train employee at the second window stays in front of the camera, occupying about 213.5
+of 240 screen units. These measurements explain the rendered geometry but do not prove native
+near clipping or the existing base model-scale hypothesis. Those frames remain a visual-fidelity
+gap rather than being accepted solely because their automated assertions pass.
+
+### Background, fade, shake and jump presentation in this wave
+
+Literal `SOUND` and `AKAO`/`AKAO2` operations 40/41 now retain channels 1/2 through the
+scene player and mixer. Cargo's door sound 233 uses channel 2; the train's authored sequence
+59, 167, 427, 167 uses channel 1. Each channel has independent cancellation and pending
+decode state and replaces only its own field loop. Train ambient loop 154 remains on field
+channel 3; higher scene channels, other commands and banked operands are not enabled here.
+
+Authored `BGON`, `BGOFF`, `BGROL`, `BGROL2` and `BGCLR` update the backdrop's group masks.
+Quiet setup, replayed prefixes and timed commands retain their order, and same-field scene
+teardown preserves the resulting background. Reviewed entry initialization for `cargoin` and
+`tin_1` reads literal original initializer commands and refuses an unexpected script layout.
+Cargo's main door opens with `BGOFF(2,0)`; the passenger crossing later enables group 8 frame 2,
+which changes box occlusion. Train group 3 follows the authored closed/open/closed sequence.
+These are distinct effects; the box change must not be presented as the door-opening operation.
+
+Supported `FADE`/`NFADE` modes and `FADEW` use the pinned original fixed-point state machine.
+The GPU composites in display RGB after scene filters and before dialogue/HUD, including sRGB
+and unorm targets. System-transition modes 3/13 and unsupported durations remain explicit.
+The visible client advances fade/shake during dialogue, but the VM lacks user-dialogue elapsed
+time, so a future `FADEW` after a window can wait too long. Current registered waits occur
+before dialogue. Quiet setup does not yet export fade snapshots; current registered setup
+paths contain no reachable fade. A terminal map-jump fade survives scene teardown until the
+actual field change; an abort clears it.
+
+`SHAKE` moves the backdrop and models together after camera clamping/rounding, leaving dialogue
+stable. It preserves each axis's phase and private random-table index across supported scenes
+and field changes; all 256 easing values have original field-memory evidence. It does not
+reconstruct unexecuted ambient history or elapsed dialogue time after reconnect. The train's
+scripted camera therefore stays centered on the clamped view equivalent of `(-18,2)`, with
+shake added separately, rather than following a witness or Cloud.
+
+`JUMP` now interprets the signed operand as movement steps, retains the current animation,
+and follows the original Q12 trajectory and landing-triangle plane. Cargo's 12 movement
+steps give a 70.3125-unit midpoint rise on level ground; initialization/completion make the
+script wait 14 frames. Integer endpoint remainders are retained rather than snapped away.
+This behavior is proved by the pinned PSX implementation and corroborated by FFNx's frame-rate
+hooks, not by executing the unmodified PC routine. Invalid/unresolved jumps are refused rather
+than replaced with a guessed linear motion. Bridge movie 23 and later departure movie 24
+remain unplayed; these effects do not prove every sound, mod/body or original timing path.
+
+Coverage written for this wave, **with final combined results pending**:
+
+* `scene_real::cargo_door_uses_the_actual_crossing_and_transfers_without_changing_story_or_gil`
+  and `train_director_finishes_after_its_authored_actor_work`: accepted origin, exact transfer,
+  setup, two windows, full tail, camera and final state/pose.
+* `train_real::cargo_door_and_train_arrival_keep_their_landing_until_control_is_durably_returned`:
+  real TCP crossing, restart at the pending landing, unchanged resources, durable moment 51,
+  correct live placement and duplicate/relogin safety.
+* Continuation tests `a_door_guest_waits_for_shared_arrival_then_returns_to_control_without_a_story_write`
+  and `an_owner_rejoining_after_the_arrival_commit_refreshes_the_retained_guests_participants`:
+  co-op handshakes, holds and reconnect identities.
+* `scene::shots::train::offscreen_real_ff7_cargo_door_crossing` and
+  `offscreen_real_ff7_passenger_train_arrival`: original models, sampled jump arc/animation,
+  authored background frames, camera/shake, full tail and post-ack body handoff.
+* `scene::fade::tests::offscreen_authored_fade_composites_display_rgb_after_scene_filters_and_before_ui`
+  and the background/fade/shake/jump unit tests: GPU ordering and arithmetic, setup/replay
+  retention, unsupported operands and late-event timing.
+
+### Next route gap and initialization provenance
+
+The next complete segment is Jessie's train-map lesson, its return conversation, and the
+scripted departure to the Sector 7 station; the station then advances 51 to 63. Pillar,
+Sector 7 intro and early bar continuations also remain unregistered. The detailed audit below
+records their authored triggers, not permission to skip them.
+
+Jessie's first talk needs `Var[3][223]` bit 2 known clear, sets it, and jumps to `rootmap`.
+The lesson path needs bit 4 known clear. On return, the train's director and Jessie share
+scratch state for three windows and control release. The departure line's main enables it
+only with bit 2 set; calling its slot directly bypasses that guard. The station jump is
+preceded by ten windows and movie 24. Later Jessie choices can subtract from `Var[1][4]`
+and rely on a field-local latch, so neither affection nor repeat-talk behavior is supplied
+by the moment alone.
+
+A new-game provenance audit establishes a positive reset baseline: the pinned original PSX
+routine clears all 1,280 persistent bytes, then applies menu, party and location-buffer
+exceptions. Its new-game routine sets disc 1. The owned PC opening explicitly assigns
+`Var[1][3..6] = 50,30,10,0`, bytes 80–83 to 100, word 28 to 763 and then moment 1. All 12
+owned `md1stin` initializers add no other persistent script assignment. Thus reset-clear
+`Var[3][223]` bits 2/4 and first-control affection 30 have evidence independent of the current
+moment or an absence of writers. See the [pinned reset implementation](https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/main/cd.c#L39).
+
+This is **not yet a fresh-story registration implementation**. PC source corroborates the
+same bank layout, but the PC reset itself is unverified; a post-reset PSX menu routine is
+also missing from the pinned reconstruction. Engine-managed clocks, location text, counters,
+party mirrors and other derived bytes need authoritative writers or explicit unknown masks.
+Current exact story replacement cannot remove knownness later. No existing/legacy unknown
+record may receive reset defaults, and no migration or deployment belongs to this wave.
 
 ## Historical survey notes
 
 The following notes preserve earlier checkpoints and their evidence limits. Statements that
-the flower, bridge or cargo arrival was unregistered, their continuations were missing, or the
-story model could not carry these bits describe those checkpoints, not the current implementation above. Older notes on
+the flower, bridge, cargo arrival, cargo door or passenger-train arrival was unregistered,
+their continuations were missing, or the story model could not carry these bits describe
+those checkpoints, not the current implementation above. Older notes on
 `md8_4`/`md8_1` likewise predate their registration. The later scenes' unresolved work remains
 open unless explicitly updated in the current status or the dated continuous-route audit.
 
@@ -378,7 +513,10 @@ The original and Echo-S replacement scripts both produced that single window and
 moment-63 and scratch-variable writes in the measured run, and the Echo-S window had a local
 voice-file match. This is not a listening check or proof of live scene synchronization.
 
-## Continuous route after the flower scene: owned-data audit, 2026-11-10
+## Continuous route after the flower scene: historical owned-data audit, 2026-11-10
+
+The current implementation above supersedes this audit's earlier registration and missing-engine
+status. Its authored trigger/operand evidence remains useful; later lesson/station work remains open.
 
 This audit begins with a successfully completed flower scene at moment 39. It re-read the
 original English Steam `field/flevel.lgp` through the current field parser and scene VM;
@@ -407,7 +545,7 @@ The bridge's sole ordinary gateway goes **back** to `md8_3`, at `(-4027,17357)`,
 main-script `LINON` decision based on `Var[3][223]` bit 2. Static exit extraction alone is
 insufficient evidence that either forward exit is currently usable.
 
-### The next complete story segment is the bridge confrontation
+### The bridge confrontation at the earlier survey checkpoint
 
 The bridge line's initializer tests moment 39 at offset 2222 and runs `LINON 0` at offset
 2230 for other moments. Its slot 5 disables control/menu, requests the director's slot 3 and

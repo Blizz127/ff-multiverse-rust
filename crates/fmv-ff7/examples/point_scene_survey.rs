@@ -419,6 +419,7 @@ fn all_mains_root(info: &Info, site: &Site) -> Vec<Step> {
 fn step_name(info: &Info, step: &Step) -> String {
     match step {
         Step::StartMain(e) => format!("StartMain({})", ename(info, usize::from(*e))),
+        Step::StartAmbientMain(e) => format!("StartAmbientMain({})", ename(info, usize::from(*e))),
         Step::Await(r) => format!("Await({}.s{})", ename(info, usize::from(r.entity)), r.slot),
         Step::Start(r) => format!("Start({}.s{})", ename(info, usize::from(r.entity)), r.slot),
         Step::SetBit { bank, address, bit } => format!("SetBit({bank},{address},{bit})"),
@@ -528,7 +529,7 @@ struct Driven {
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
         Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
-        Stage::Sound { .. } | Stage::Camera(_) => None,
+        Stage::Sound { .. } | Stage::Camera(_) | Stage::Background(_) | Stage::Shake { .. } | Stage::Fade(_) => None,
     }
 }
 

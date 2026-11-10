@@ -127,6 +127,27 @@ fn offscreen_real_ff7_bridge_choices_and_battle_resumes() {
         assert_eq!(shadow.boundary(), Some(SceneBoundary::End(fmv_ff7::script::dialogue::End::MapJump { field: 138 })));
         assert_eq!(skipped, 0, "bridge path {mask}: every cast gesture is supported");
         assert!(camera_checked > 0 && camera_misses.is_empty(), "bridge path {mask}: Cloud stays in view at its windows");
+        if mask == 0 {
+            assert_eq!(rig.state.scene.player().unwrap().fade().map(|fade| fade.blend), Some(fmv_ff7::script::scene::FadeBlend::Black),
+                "the authored post-movie fade reaches black before MAPJUMP");
+            rig.picture_clipped(&mut gpu, "bridge-final-black", SIZE, true, camera.clip_range(rig.view.range));
+            rig.state.apply(0.0, ServerMsg::SceneEnded { run, outcome: SceneOutcome::Finished });
+            assert!(rig.state.scene.player().is_none());
+            assert_eq!(rig.state.scene.fade().map(|fade| fade.blend), Some(fmv_ff7::script::scene::FadeBlend::Black),
+                "acknowledging the transfer must not flash the old bridge");
+            rig.picture_clipped(&mut gpu, "bridge-transfer-still-black", SIZE, true, camera.clip_range(rig.view.range));
+            rig.state.change_area(AreaId { game: GameId::Ff7, key: "cargoin".into() }, Pos::new(-24.0, 16.0, 0.0), field_direction_to_facing(0), true);
+            assert!(rig.state.scene.fade().is_none(), "the actual destination change clears the old field's fade");
+            // Render the destination introduction too. Its separate fixture supplies the
+            // new field and authored cast; the assertion above used the transferring client.
+            let mut destination = make_rig_with_snapshot(&real, fmv_ff7::script::scene::cargo_train_scene(), true,
+                StoryState::at(39).into_extended().unwrap(), 600);
+            destination.start();
+            camera.snap();
+            let draw = destination.draw();
+            destination.view.bounds = camera.update(&camera_input(&destination.view, &destination.state, &draw, SIZE, 0.0));
+            destination.picture_clipped(&mut gpu, "cargo-after-bridge-fade-clear", SIZE, true, camera.clip_range(destination.view.range));
+        }
     }
 }
 

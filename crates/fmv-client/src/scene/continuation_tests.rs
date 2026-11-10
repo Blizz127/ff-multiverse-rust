@@ -1,12 +1,14 @@
 //! Durable scene continuation over a strict scripted source: no game data, GPU or network.
 
-use super::client::SceneClient;
+use super::client::{SceneBackground, SceneClient};
 use super::player::{SceneCmd, SceneEvent, SoundAction};
 use super::source::{Built, SceneBuilder, SceneSource};
-use fmv_core::EntityId;
+use crate::state::ClientState;
+use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos};
+use fmv_ff7::background::{BackgroundOp, BackgroundState};
 use fmv_ff7::script::dialogue::{Choice, End, Message, MessageOrigin, Piece};
 use fmv_ff7::script::scene::{
-    BattleCheckpoint, Beat, CameraOp, MoveHow, SceneBoundary, SceneResources, Stage, Then, Timed,
+    BattleCheckpoint, Beat, CameraOp, FadeBlend, FadeColor, FadeOp, MoveHow, SceneBoundary, SceneResources, Stage, Then, Timed,
     Window, WindowCheckpoint,
 };
 use fmv_ff7::story::StoryState;
@@ -20,6 +22,9 @@ const AREA: &str = "arena";
 const RUN: SceneRunId = SceneRunId(7);
 const SOURCE: [u8; 32] = [7; 32];
 const BATTLE: BattleId = BattleId(31);
+const BG_INITIAL: BackgroundOp = BackgroundOp::On { group: 7, frame: 1 };
+const BG_STEP: BackgroundOp = BackgroundOp::ShiftLeft { group: 7 };
+const BG_FINAL: BackgroundOp = BackgroundOp::ShiftRight { group: 7 };
 
 #[derive(Default)]
 struct Observed {
@@ -68,22 +73,27 @@ impl Scripted {
         let mut second = window(1, 30);
         if blank_second { second.message.pieces = vec![Piece::Text("  ".into())]; }
         let beats = vec![
-            (Beat { stage: vec![timed(0, Stage::Sound { id: 42, pan: 64 })], then: Then::Window(window(0, 0)) }, SceneBoundary::Window(window_checkpoint(0))),
+            (Beat { stage: vec![timed(0, Stage::Sound { channel: 1, id: 42, pan: 64 })], then: Then::Window(window(0, 0)) }, SceneBoundary::Window(window_checkpoint(0))),
             (Beat { stage: vec![
                 timed(20, Stage::Place { entity: 18, x: 100, y: 20, z: None, triangle: None }),
                 timed(30, Stage::Camera(CameraOp::Follow { entity: 18 })),
+                timed(30, Stage::Background(BG_STEP)),
             ], then: Then::End { at: 30, how: End::Battle } }, SceneBoundary::Battle(battle_checkpoint(0))),
             (Beat { stage: vec![timed(0, Stage::Move { entity: 18, from: None, x: 160, y: 20, z: None,
                 triangle: None, frames: 30, how: MoveHow::Walk, animation: None })], then: Then::Window(second) }, SceneBoundary::Window(window_checkpoint(1))),
             (Beat { stage: vec![], then: Then::End { at: 0, how: End::Battle } }, SceneBoundary::Battle(battle_checkpoint(1))),
-            (Beat { stage: vec![], then: Then::End { at: 0, how: End::Finished } }, SceneBoundary::End(End::Finished)),
+            (Beat { stage: vec![timed(0, Stage::Background(BG_FINAL))], then: Then::End { at: 0, how: End::Finished } }, SceneBoundary::End(End::Finished)),
         ];
         Self { beats: beats.into(), boundary: None, observed }
     }
 }
 
 impl SceneSource for Scripted {
-    fn initial(&self) -> Vec<Stage> { super::tests::places() }
+    fn initial(&self) -> Vec<Stage> {
+        let mut events = super::tests::places();
+        events.push(Stage::Background(BG_INITIAL));
+        events
+    }
     fn height_at(&self, _: i16, _: i16, _: Option<u16>) -> Option<f32> { Some(11.0) }
     fn fingerprint(&self) -> Option<[u8; 32]> { Some(SOURCE) }
     fn boundary(&self) -> Option<SceneBoundary> { self.boundary }
@@ -403,8 +413,6 @@ fn a_blank_current_window_after_replay_is_acknowledged_once() {
 #[test]
 fn suspended_scene_input_goes_to_combat_and_its_result_but_never_to_the_waiting_field() {
     use super::keys::{route_key, SceneRoute};
-    use crate::state::ClientState;
-    use fmv_core::{AccountId, AreaId, GameId, Pos};
     use fmv_protocol::{BattleMember, EscapePolicy, SyntheticRules};
 
     let (mut scene, _) = rig(SceneRole::Owner, vec![]);
@@ -495,5 +503,453 @@ fn game_over_back_disconnects_even_after_a_retry_was_requested() {
         client.key(KeyCode::Escape, true, false);
         assert!(client.is_active() && client.player().is_none() && client.failure().is_some());
         assert!(client.take_commands().is_empty(), "Back disconnects instead of retrying or releasing the saved scene (retry pending: {retry_requested})");
+    }
+}
+
+fn recently_moving_state() -> ClientState {
+    let mut state = ClientState::new(EntityId(1), AccountId(1), Pos::default(), AreaId { game: GameId::Ff7, key: AREA.into() });
+    state.own.set_motion(Pos::new(10.0, 20.0, 30.0), 1.25, AnimState::Run);
+    let sent = state.own.next_intent(10.0).expect("the predicted movement was sent before the scene started");
+    assert_eq!(sent.seq, 1);
+    state
+}
+
+fn own_pose_message(full_snapshot: bool, pos: Pos, facing: f32, anim: AnimState) -> ServerMsg {
+    let entities = vec![EntitySnapshot { id: EntityId(1), pos, facing, anim, avatar: AvatarAppearance::new("test", [1, 2, 3], None) }];
+    if full_snapshot {
+        ServerMsg::AreaSnapshot { area: AreaId { game: GameId::Ff7, key: AREA.into() }, tick: 1, entities, npcs: vec![] }
+    } else {
+        ServerMsg::EntityUpdate { tick: 1, entities }
+    }
+}
+
+fn start_held_scene(state: &mut ClientState, durable: bool, terminal: bool) {
+    let events = if terminal {
+        vec![ack_window(0, Some(2)), victory(0, 99), ack_window(1, None), victory(1, 123)]
+    } else {
+        vec![]
+    };
+    state.scene.set_builder(Box::new(Builder(Rc::new(RefCell::new(Observed::default())), false)));
+    let mut message = start(SceneRole::Owner, SceneReplay { origin: None, source: SOURCE, events });
+    let ServerMsg::SceneStart { replay, .. } = &mut message else { unreachable!("the fixture creates a scene start") };
+    if !durable { *replay = None; }
+    assert!(state.apply(10.015, message).is_none());
+    assert!(state.scene.is_active());
+    assert_eq!(state.scene.player().unwrap().played_out(), terminal);
+    state.scene.take_commands();
+}
+
+#[test]
+fn durable_scene_snapshots_adopt_the_exact_full_pose_without_echoing_or_restoring_deferred_prediction() {
+    for full_snapshot in [false, true] {
+        for terminal in [false, true] {
+            for authored in [Pos::new(10.0, 20.0, 30.25), Pos::new(10.25, 20.125, 30.25)] {
+                let mut state = recently_moving_state();
+                let predicted = state.own.pos();
+                // A rejected intent wants a resync. A later ordinary echo is also deferred while
+                // prediction is fresh; neither may survive the scene's authoritative final pose.
+                assert!(state.own.on_rejected(1, predicted));
+                assert!(state.own.has_unsent());
+                assert!(state.apply(10.01, own_pose_message(false, Pos::new(900.0, 800.0, 700.0), 2.0, AnimState::Walk)).is_none());
+                assert_eq!(state.own.pos(), predicted);
+                start_held_scene(&mut state, true, terminal);
+
+                assert!(state.apply(10.02, own_pose_message(full_snapshot, authored, -0.75, AnimState::Idle)).is_none());
+                let expected = (authored, -0.75, AnimState::Idle);
+                assert_eq!((state.own.pos(), state.own.facing(), state.own.anim()), expected,
+                    "the authored pose wins immediately even for z-only/subunit moves (full: {full_snapshot}, terminal: {terminal})");
+                assert!(!state.own.has_unsent(), "the complete pose is already known to the server");
+                assert!(state.apply(10.03, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished }).is_none());
+                assert!(!state.scene.is_active());
+                for now in [10.049, 10.05, 10.6, 12.0] {
+                    assert!(state.own.next_intent(now).is_none(), "no resync or move echo at {now}");
+                    assert_eq!((state.own.pos(), state.own.facing(), state.own.anim()), expected, "a deferred ordinary echo must not pull the player back after release");
+                }
+                let moved = Pos::new(authored.x + 5.0, authored.y, authored.z);
+                state.own.set_motion(moved, 0.25, AnimState::Walk);
+                let next = state.own.next_intent(12.1).expect("the player's next actual movement is sent");
+                assert_eq!((next.seq, next.pos, next.facing, next.anim), (2, moved, 0.25, AnimState::Walk), "snapshot adoption preserves the intent sequence");
+            }
+        }
+    }
+}
+
+#[test]
+fn adopting_a_durable_scene_pose_preserves_the_original_movement_rate_clock() {
+    for full_snapshot in [false, true] {
+        let mut state = recently_moving_state();
+        start_held_scene(&mut state, true, true);
+        let authored = Pos::new(10.0, 20.0, 30.25);
+        assert!(state.apply(10.02, own_pose_message(full_snapshot, authored, -0.75, AnimState::Idle)).is_none());
+        assert!(state.apply(10.025, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished }).is_none());
+        state.own.set_motion(Pos::new(11.0, 20.0, 30.25), 0.25, AnimState::Walk);
+        assert!(state.own.next_intent(10.049).is_none(), "the snapshot must not reset the rate clock to an unset value");
+        let next = state.own.next_intent(10.05).expect("the original send at 10.0, not snapshot receipt at 10.02, determines the next send time");
+        assert_eq!((next.seq, next.pos, next.facing, next.anim), (2, Pos::new(11.0, 20.0, 30.25), 0.25, AnimState::Walk));
+    }
+}
+
+#[test]
+fn ordinary_field_and_legacy_scene_snapshots_keep_the_existing_prediction_rules() {
+    for legacy_scene in [false, true] {
+        for full_snapshot in [false, true] {
+            for server_pos in [Pos::new(40.0, 50.0, 60.0), Pos::new(10.0, 20.0, 30.25), Pos::new(10.25, 20.125, 30.25)] {
+                let mut state = recently_moving_state();
+                let predicted = (state.own.pos(), state.own.facing(), state.own.anim());
+                if legacy_scene { start_held_scene(&mut state, false, false); }
+                assert!(state.apply(10.02, own_pose_message(full_snapshot, server_pos, -0.75, AnimState::Idle)).is_none());
+                assert_eq!((state.own.pos(), state.own.facing(), state.own.anim()), predicted, "ordinary recent prediction is unchanged (legacy: {legacy_scene}, full: {full_snapshot})");
+                assert!(state.own.next_intent(10.1).is_none());
+                assert_eq!((state.own.pos(), state.own.facing(), state.own.anim()), predicted);
+                assert!(state.own.next_intent(11.0).is_none());
+                let quiet_pos = if predicted.0.dist_xy(server_pos) > 1.0 { server_pos } else { predicted.0 };
+                assert_eq!((state.own.pos(), state.own.facing(), state.own.anim()), (quiet_pos, predicted.1, predicted.2), "ordinary quiet reconciliation keeps its existing position threshold and local facing/animation");
+            }
+        }
+    }
+}
+
+fn background(op: BackgroundOp) -> SceneBackground { SceneBackground { field: AREA.into(), op } }
+
+fn next_scene_start() -> ServerMsg {
+    let mut message = start(SceneRole::Owner, SceneReplay { origin: None, source: SOURCE, events: vec![] });
+    let ServerMsg::SceneStart { run, .. } = &mut message else { unreachable!("the fixture creates a scene start") };
+    *run = SceneRunId(RUN.0 + 1);
+    message
+}
+
+#[test]
+fn a_final_background_instruction_survives_scene_ended_before_the_next_render() {
+    let (mut client, _) = rig(SceneRole::Owner, vec![]);
+    at_battle(&mut client);
+    begun(&mut client, 1, BATTLE);
+    resumed(&mut client, RUN, 1, BATTLE, 99);
+    client.advance_visible(1.0, true);
+    let earlier = client.drain_background();
+    assert_eq!(earlier, [background(BG_INITIAL), background(BG_STEP)]);
+    let mut field = BackgroundState::default();
+    for event in earlier { field.apply(event.op); }
+    assert!(field.visible(2, 7, 4) && !field.visible(2, 7, 2));
+
+    client.autoplay(None);
+    let last_battle = BattleId(BATTLE.0 + 1);
+    begun(&mut client, 2, last_battle);
+    resumed(&mut client, RUN, 2, last_battle, 123);
+    client.advance_visible(0.0, true);
+    assert!(client.player().unwrap().played_out());
+    // The server's final acknowledgement arrives in the same frame, before a renderer can
+    // read the final shift from the scene player that this message removes.
+    client.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished });
+    assert!(!client.is_active());
+    let final_events = client.drain_background();
+    assert_eq!(final_events, [background(BG_FINAL)]);
+    for event in final_events { field.apply(event.op); }
+    assert!(field.visible(2, 7, 2) && !field.visible(2, 7, 4));
+    assert!(client.drain_background().is_empty(), "a second rendered frame must not shift the mask again");
+    client.advance_visible(1.0, true);
+    assert!(client.drain_background().is_empty());
+    assert!(field.visible(2, 7, 2));
+}
+
+#[test]
+fn a_same_field_scene_keeps_ordered_undrained_background_changes_from_its_predecessor() {
+    for server_ended_first in [false, true] {
+        let history = vec![ack_window(0, Some(2)), victory(0, 99), ack_window(1, None), victory(1, 123)];
+        let (mut client, _) = rig(SceneRole::Owner, history);
+        assert!(client.player().unwrap().played_out());
+        if server_ended_first {
+            client.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished });
+        }
+        // Both the explicit ended path and direct replacement call sites must preserve the
+        // prior field mutations until the renderer consumes them, then append the new scene's.
+        client.on_message(AREA, next_scene_start());
+        assert_eq!(client.drain_background(), [background(BG_INITIAL), background(BG_STEP), background(BG_FINAL), background(BG_INITIAL)]);
+        assert!(client.drain_background().is_empty());
+        client.advance_visible(1.0, true);
+        assert!(client.drain_background().is_empty(), "reaping the new scene again must not replay its initial operation");
+    }
+}
+
+#[test]
+fn replay_reconstructs_historical_background_state_once_without_repeating_shifts() {
+    let (mut client, _) = rig(SceneRole::Owner, vec![ack_window(0, Some(2)), victory(0, 99)]);
+    let events = client.drain_background();
+    assert_eq!(events, [background(BG_INITIAL), background(BG_STEP)], "historical stage operations still rebuild the field's current background");
+    let mut field = BackgroundState::default();
+    for event in events { field.apply(event.op); }
+    assert!(field.visible(2, 7, 4) && !field.visible(2, 7, 2));
+    assert!(client.drain_background().is_empty());
+    client.advance_visible(1.0, true);
+    assert!(client.drain_background().is_empty(), "the retained cast journal is consumed by suffix, not replayed each frame");
+    assert!(field.visible(2, 7, 4) && !field.visible(2, 7, 8), "duplicating the left shift would display a different frame");
+}
+
+#[test]
+fn changing_area_discards_old_visit_background_changes_even_when_reloading_the_same_field() {
+    for target in [AREA, "another-field"] {
+        let mut state = recently_moving_state();
+        let history = vec![ack_window(0, Some(2)), victory(0, 99), ack_window(1, None), victory(1, 123)];
+        state.scene = rig(SceneRole::Owner, history).0;
+        assert!(state.scene.player().unwrap().played_out());
+        state.change_area(AreaId { game: GameId::Ff7, key: target.into() }, Pos::default(), 0.0, true);
+        assert!(!state.scene.is_active());
+        assert!(state.scene.drain_background().is_empty(), "a new visit to {target} has its own field-entry mask baseline");
+        if target == AREA {
+            state.scene.on_message(AREA, next_scene_start());
+            assert_eq!(state.scene.drain_background(), [background(BG_INITIAL)], "the reloaded visit receives only its new scene's operation");
+            assert!(state.scene.drain_background().is_empty());
+        }
+    }
+}
+
+fn roster_refresh(events: Vec<SceneReplayEvent>) -> ServerMsg {
+    let mut message = start(SceneRole::Watcher, SceneReplay { origin: None, source: SOURCE, events });
+    let ServerMsg::SceneStart { owner, participants, .. } = &mut message else { unreachable!("the fixture creates a scene start") };
+    *owner = EntityId(99);
+    *participants = vec![SceneParticipant { entity: EntityId(99), spot: 0 }, SceneParticipant { entity: EntityId(2), spot: 1 }];
+    message
+}
+
+#[test]
+fn a_same_run_roster_refresh_preserves_the_stage_clock_and_pending_effects_without_replaying_them() {
+    for phase in 0..4 {
+        let prepare = || {
+            let (mut client, observed) = rig(SceneRole::Watcher, vec![]);
+            if phase > 0 {
+                client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 0, answer: Some(2) });
+                client.advance_visible(1.0, true);
+            }
+            if phase >= 2 {
+                begun(&mut client, 1, BATTLE);
+                resumed(&mut client, RUN, 1, BATTLE, 99);
+                client.advance_visible(0.25, true);
+            }
+            if phase == 3 {
+                client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 1, answer: None });
+            }
+            (client, observed)
+        };
+        let history = match phase {
+            0 => vec![],
+            1 => vec![ack_window(0, Some(2))],
+            2 => vec![ack_window(0, Some(2)), victory(0, 99)],
+            _ => vec![ack_window(0, Some(2)), victory(0, 99), ack_window(1, None)],
+        };
+        let (mut reference, _) = prepare();
+        let expected_background = reference.drain_background();
+        let expected_sounds = reference.take_sounds();
+        let expected_events = reference.take_events();
+        let expected_commands = reference.take_commands();
+        let (mut client, _) = prepare();
+        let state = |client: &SceneClient| {
+            let player = client.player().unwrap();
+            (player.actor(18).unwrap().pos(), player.camera_clock(), player.lines(), player.epoch(), player.has_window(), player.battle_input())
+        };
+        let before = state(&client);
+        client.on_message(AREA, roster_refresh(history.clone()));
+        assert_eq!(state(&client), before, "a reconnect updates the roster, not stage time or the accepted-step counter (phase {phase})");
+        assert_eq!(client.player().unwrap().witnesses().iter().map(|w| w.entity).collect::<Vec<_>>(), [EntityId(99), EntityId(2)]);
+        assert_eq!(client.started(), 1);
+        assert_eq!(client.drain_background(), expected_background, "undrained operations stay ordered and occur once");
+        assert_eq!(client.take_sounds(), expected_sounds, "no Begin/End or historical sound is appended or discarded");
+        assert_eq!(client.take_events(), expected_events, "no Started/Line event is appended or discarded");
+        assert_eq!(client.take_commands(), expected_commands);
+
+        client.on_message(AREA, roster_refresh(history.clone()));
+        assert_eq!(state(&client), before);
+        assert!(client.drain_background().is_empty() && client.take_sounds().is_empty() && client.take_events().is_empty() && client.take_commands().is_empty(), "a repeated roster refresh has no presentation or protocol effects");
+        if phase == 3 {
+            client.advance_visible(1.0, true);
+            assert_eq!(client.player().unwrap().lines(), 2, "the early accepted answer survives refresh until its window arrives");
+            assert!(client.player().unwrap().battle_input());
+            assert!(client.take_commands().is_empty(), "a watcher never echoes the retained answer");
+        }
+
+        // A fresh connection has no retained stage: the same prefix must still reconstruct all
+        // accepted background operations and battles, while suppressing historical commands.
+        let (mut fresh, fresh_observed) = rig(SceneRole::Watcher, history);
+        assert_eq!(fresh.player().unwrap().lines(), if phase == 3 { 2 } else { u32::from(phase > 0) });
+        assert_eq!(fresh_observed.borrow().resumes.len(), usize::from(phase >= 2));
+        let expected = if phase > 0 { vec![background(BG_INITIAL), background(BG_STEP)] } else { vec![background(BG_INITIAL)] };
+        assert_eq!(fresh.drain_background(), expected);
+        assert!(fresh.take_commands().is_empty());
+    }
+}
+
+#[test]
+fn a_same_run_refresh_with_changed_original_inputs_or_invalid_replay_holds_a_failure() {
+    for changed in ["gil", "source", "seed", "replay shape", "replay downgrade"] {
+        let (mut client, _) = rig(SceneRole::Watcher, vec![]);
+        let mut message = roster_refresh(vec![]);
+        let ServerMsg::SceneStart { gil, seed, replay, .. } = &mut message else { unreachable!("the fixture creates a scene start") };
+        match changed {
+            "gil" => *gil += 1,
+            "source" => replay.as_mut().unwrap().source[0] ^= 1,
+            "seed" => *seed += 1,
+            "replay downgrade" => *replay = None,
+            _ => replay.as_mut().unwrap().events.push(ack_window(1, None)),
+        }
+        client.on_message(AREA, message);
+        assert!(client.is_active() && client.failure().is_some(), "changed {changed} cannot silently rebuild or release the retained scene");
+        assert_eq!(client.started(), 1, "a bad refresh cannot replace the original scene");
+    }
+}
+
+#[test]
+fn a_same_run_refresh_rejects_changed_accepted_answers_rewards_and_boundary_identities() {
+    for changed in ["answer", "battle gil", "window identity", "battle identity"] {
+        let (mut client, _) = rig(SceneRole::Watcher, vec![]);
+        client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 0, answer: Some(2) });
+        client.advance_visible(1.0, true);
+        begun(&mut client, 1, BATTLE);
+        resumed(&mut client, RUN, 1, BATTLE, 99);
+        client.advance_visible(0.25, true);
+        client.drain_background();
+        let mut history = vec![ack_window(0, Some(2)), victory(0, 99)];
+        match changed {
+            "answer" => {
+                let SceneReplayEvent::Window { answer, .. } = &mut history[0] else { unreachable!() };
+                *answer = Some(1); // Another valid option is still a different accepted choice.
+            }
+            "battle gil" => {
+                let SceneReplayEvent::Battle { gil, .. } = &mut history[1] else { unreachable!() };
+                *gil += 1;
+            }
+            "window identity" => {
+                let SceneReplayEvent::Window { identity, .. } = &mut history[0] else { unreachable!() };
+                identity[0] ^= 1;
+            }
+            _ => {
+                let SceneReplayEvent::Battle { identity, .. } = &mut history[1] else { unreachable!() };
+                identity[0] ^= 1;
+            }
+        }
+        client.on_message(AREA, roster_refresh(history));
+        assert!(client.is_active() && client.failure().is_some(), "changed {changed} cannot rewrite accepted history during a roster refresh");
+        assert_eq!(client.started(), 1);
+        assert!(client.drain_background().is_empty(), "a failed refresh probe cannot publish historical background operations");
+    }
+}
+
+struct EffectsSource {
+    script: Scripted,
+    initial: Vec<Stage>,
+}
+
+impl SceneSource for EffectsSource {
+    fn initial(&self) -> Vec<Stage> { self.initial.clone() }
+    fn height_at(&self, _: i16, _: i16, _: Option<u16>) -> Option<f32> { Some(11.0) }
+    fn fingerprint(&self) -> Option<[u8; 32]> { Some(SOURCE) }
+    fn boundary(&self) -> Option<SceneBoundary> { self.script.boundary() }
+    fn next(&mut self, answer: Option<usize>) -> Beat { self.script.next(answer) }
+    fn next_checked(&mut self, answer: Option<usize>) -> Result<Beat, String> { self.script.next_checked(answer) }
+}
+
+struct EffectsBuilder {
+    field: &'static str,
+    x_steps: u8,
+    end: End,
+}
+
+impl SceneBuilder for EffectsBuilder {
+    fn build(&mut self, _: &str, _: &StoryState, _: u32, _: SceneResources) -> Result<Built, String> {
+        let checkpoint = WindowCheckpoint { dialog: Some(1), choices: None, ..window_checkpoint(0) };
+        let beats = vec![
+            (Beat { stage: vec![], then: Then::Window(window(1, 0)) }, SceneBoundary::Window(checkpoint)),
+            (Beat {
+                stage: vec![timed(0, Stage::Fade(FadeOp::Nfade { kind: 12, rgb: [255; 3], frames: 6 }))],
+                then: Then::End { at: 6, how: self.end },
+            }, SceneBoundary::End(self.end)),
+        ];
+        let mut initial = super::tests::places();
+        initial.push(Stage::Shake { mask: 3, x_amplitude: 20, x_steps: self.x_steps, y_amplitude: 5, y_steps: 2 });
+        let script = Scripted { beats: beats.into(), boundary: None, observed: Rc::new(RefCell::new(Observed::default())) };
+        Ok(Built { def: super::tests::def_in(self.field), source: Box::new(EffectsSource { script, initial }) })
+    }
+    fn reach(&mut self, _: usize, _: &str) -> Option<f32> { None }
+}
+
+fn effects_start(run: SceneRunId) -> ServerMsg {
+    let mut message = start(SceneRole::Owner, SceneReplay { origin: None, source: SOURCE, events: vec![] });
+    let ServerMsg::SceneStart { run: id, .. } = &mut message else { unreachable!("the fixture creates a scene start") };
+    *id = run;
+    message
+}
+
+#[test]
+fn shake_random_indices_survive_scene_and_field_handoffs_while_the_visible_offset_resets() {
+    for handoff in ["next scene", "scene ended", "same field reload", "different field"] {
+        let mut state = recently_moving_state();
+        state.scene.set_builder(Box::new(EffectsBuilder { field: AREA, x_steps: 8, end: End::Finished }));
+        state.scene.on_message(AREA, effects_start(RUN));
+        assert_eq!(state.scene.player().unwrap().shake_rng_indices(), [0, 0], "a new process begins at the first sample of each axis");
+        state.scene.advance_visible(0.25, true);
+        let previous = state.scene.player().unwrap();
+        assert_eq!(previous.shake_rng_indices(), [1, 2], "7.5 frames advance the differently paced axes independently");
+        assert_ne!(previous.shake(), [0.0, 0.0]);
+
+        let next_field = if handoff == "different field" { "another-field" } else { AREA };
+        match handoff {
+            "scene ended" => state.scene.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Aborted }),
+            "same field reload" | "different field" => state.change_area(AreaId { game: GameId::Ff7, key: next_field.into() }, Pos::default(), 0.0, true),
+            _ => {},
+        }
+        state.scene.set_builder(Box::new(EffectsBuilder { field: next_field, x_steps: 2, end: End::Finished }));
+        state.scene.on_message(next_field, effects_start(SceneRunId(RUN.0 + 1)));
+        let next = state.scene.player().unwrap();
+        assert_eq!(next.shake_rng_indices(), [1, 2], "the next scene inherits each axis's random cursor across {handoff}");
+        assert_eq!(next.shake(), [0.0, 0.0], "the previous visual phase does not leak across {handoff}");
+        state.scene.advance_visible(0.1, true);
+        let next = state.scene.player().unwrap();
+        assert_eq!(next.shake_rng_indices(), [2, 3]);
+        assert_eq!(next.shake(), [15.0, 4.0], "the next targets use samples 202 and 238; restarting at zero would produce [13, 3]");
+    }
+}
+
+#[test]
+fn a_completed_map_jump_keeps_its_fade_until_the_destination_field_is_loaded() {
+    for next_field in [AREA, "another-field"] {
+        let mut state = recently_moving_state();
+        state.scene.set_builder(Box::new(EffectsBuilder { field: AREA, x_steps: 8, end: End::MapJump { field: 138 } }));
+        state.scene.on_message(AREA, effects_start(RUN));
+        state.scene.autoplay(None);
+        state.scene.advance_visible(0.2, true);
+        let expected = Some(FadeColor { blend: FadeBlend::Subtract, rgb: [255; 3] });
+        assert!(state.scene.player().unwrap().played_out());
+        assert_eq!(state.scene.fade(), expected);
+        assert_eq!(state.scene.take_commands(), [SceneCmd::Step { run: RUN, step: 0, answer: None }, SceneCmd::End { run: RUN, skipped: false }]);
+
+        state.scene.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished });
+        assert!(state.scene.player().is_none());
+        assert_eq!(state.scene.fade(), expected, "the acknowledgement must not flash the old field while travel is pending");
+        state.scene.advance_visible(1.0, true);
+        state.scene.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome: fmv_protocol::SceneOutcome::Finished });
+        assert_eq!(state.scene.fade(), expected, "idle frames and duplicate acknowledgements retain the terminal picture");
+        state.change_area(AreaId { game: GameId::Ff7, key: next_field.into() }, Pos::default(), 0.0, true);
+        assert_eq!(state.scene.fade(), None, "the destination, including a new visit to the same field, establishes its own fade state");
+    }
+}
+
+#[test]
+fn only_a_successfully_completed_map_jump_retains_its_terminal_fade() {
+    use fmv_protocol::SceneOutcome;
+    for (end, outcome) in [
+        (End::MapJump { field: 138 }, SceneOutcome::Aborted),
+        (End::MapJump { field: 138 }, SceneOutcome::TimedOut),
+        (End::MapJump { field: 138 }, SceneOutcome::Skipped),
+        (End::Finished, SceneOutcome::Finished),
+    ] {
+        let mut client = SceneClient::new();
+        client.set_builder(Box::new(EffectsBuilder { field: AREA, x_steps: 8, end }));
+        client.on_message(AREA, effects_start(RUN));
+        client.autoplay(None);
+        client.advance_visible(0.2, true);
+        assert!(client.player().unwrap().played_out());
+        assert_eq!(client.fade(), Some(FadeColor { blend: FadeBlend::Subtract, rgb: [255; 3] }));
+        client.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome });
+        assert!(client.player().is_none());
+        assert_eq!(client.fade(), None, "{end:?} acknowledged as {outcome:?} must release its black screen");
+        client.advance_visible(1.0, true);
+        assert_eq!(client.fade(), None);
     }
 }

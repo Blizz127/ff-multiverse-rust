@@ -853,6 +853,21 @@ pub(crate) mod tests {
                     assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset), "returning to the default retains the base mesh");
                 }
             }
+            // A normal full Once can return to the exact same authored slot. The loaded
+            // endpoint still decides when to restart, and later draws use only scene time.
+            actor.scene_return = Some("range");
+            for elapsed in [4.0, 5.5, 12.5] {
+                let phase = elapsed - 4.0;
+                actor.scene_clip = Some(("range", ClipFrame::Loop(phase)));
+                let expected = avatars.frame(&view, &stage, &[actor], 0.0).frame.models.remove(0);
+                actor.scene_clip = Some(("range", ClipFrame::OnceFull { elapsed }));
+                for dt in [0.0, 20.0] {
+                    let returned = avatars.frame(&view, &stage, &[actor], dt).frame.models.remove(0);
+                    assert_eq!(returned.positions, expected.positions, "same-slot return restarts and wraps the loaded clip");
+                    assert!(std::sync::Arc::ptr_eq(&base.asset, &returned.asset));
+                }
+            }
+            actor.scene_return = Some("return");
             actor.scene_clip = Some(("range", ClipFrame::OnceFullDoubled { elapsed: 3.5 }));
             assert_eq!(avatars.frame(&view, &stage, &[actor], 20.0).frame.models[0].positions, full_last.positions,
                 "a doubled Once still shows the loaded final pose before its shortened deadline");

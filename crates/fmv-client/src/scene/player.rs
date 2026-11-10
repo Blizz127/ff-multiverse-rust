@@ -113,7 +113,8 @@ pub struct SceneSound {
 pub enum SoundAction {
     Begin,
     Prepare(u16),
-    Play { id: u16, pan: u8 },
+    /// A literal effect on scene-owned channel 1 or 2; id 0 stops only that channel.
+    Play { channel: u8, id: u16, pan: u8 },
     End,
 }
 
@@ -218,7 +219,7 @@ pub struct ScenePlayer {
     silent: bool,
     battle: Option<PausedBattle>,
     battles_resumed: u32,
-    /// Cargo has no authored spectator placement; participants reappear at durable control handoff.
+    /// Scenes without reviewed spectator placement reveal participants only at control handoff.
     participants_hidden: bool,
     cast: Cast,
     /// Frames since the last window opened.
@@ -246,6 +247,9 @@ pub struct ScenePlayer {
     skipped: bool,
     /// A watcher's scene has played to its end.
     played_out: bool,
+    terminal_travel: bool,
+    terminal_fade: Option<fmv_ff7::script::scene::FadeColor>,
+    initial_shake_rng: [u8; 2],
     sent_end: bool,
     /// No waiting: the clock never holds a beat back (a headless bot has no picture to wait for).
     instant: bool,
@@ -288,12 +292,18 @@ fn dialog_of(origin: &MessageOrigin) -> Option<usize> {
 impl ScenePlayer {
     /// Start `run` of `def` read through `source`: the cast is put where the scene begins and the first beat is pulled.
     /// `instant` is for a bot: no clock, the first window is open on return.
+    #[cfg(test)]
     pub fn new(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool) -> Self {
-        Self::new_mode(run, def, source, instant, false, false)
+        Self::new_seeded(run, def, source, instant, [0; 2])
     }
 
-    fn new_mode(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, continuation: bool, silent: bool) -> Self {
+    pub fn new_seeded(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, shake_rng: [u8; 2]) -> Self {
+        Self::new_mode(run, def, source, instant, false, false, shake_rng)
+    }
+
+    fn new_mode(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, continuation: bool, silent: bool, shake_rng: [u8; 2]) -> Self {
         let mut cast = Cast::new(def.cast.iter().map(|m| m.entity));
+        cast.seed_shake_rng(shake_rng);
         for member in &def.cast {
             if let Some((slot, clip)) = source.initial_default_animation_clip(member.entity) {
                 cast.remember_default(member.entity, slot, clip);
@@ -303,7 +313,7 @@ impl ScenePlayer {
             Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0, 0.0);
         }
         cast.settle();
-        let participants_hidden = def.id == fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID;
+        let participants_hidden = def.hides_participants();
         let mut player = Self {
             run,
             def,
@@ -329,6 +339,9 @@ impl ScenePlayer {
             failure_reason: None,
             skipped: false,
             played_out: false,
+            terminal_travel: false,
+            terminal_fade: None,
+            initial_shake_rng: shake_rng,
             sent_end: false,
             instant,
             outbox: Vec::new(),
@@ -344,15 +357,15 @@ impl ScenePlayer {
 
     /// Rebuild the exact accepted prefix from original data. Historical beats update only the
     /// local stage; every boundary, choice, source hash and committed victory is checked first.
-    pub fn with_replay(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, replay: &SceneReplay) -> Result<Self, String> {
+    pub fn with_replay_seeded(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, replay: &SceneReplay, shake_rng: [u8; 2]) -> Result<Self, String> {
         replay.validate().map_err(str::to_owned)?;
         if source.fingerprint() != Some(replay.source) {
             return Err("the scene replay source differs from the installed game".into());
         }
         if replay.events.is_empty() {
-            return Ok(Self::new_mode(run, def, source, instant, true, false));
+            return Ok(Self::new_mode(run, def, source, instant, true, false, shake_rng));
         }
-        let mut player = Self::new_mode(run, def, source, false, true, true);
+        let mut player = Self::new_mode(run, def, source, false, true, true, shake_rng);
         for event in &replay.events {
             player.reach_boundary()?;
             match event {
@@ -434,6 +447,8 @@ impl ScenePlayer {
         self.run.id
     }
 
+    pub fn is_durable(&self) -> bool { self.continuation }
+
     pub fn continuation_failure(&self) -> Option<&str> {
         self.failed.then_some(self.failure_reason.unwrap_or("Saved scene continuation failed validation. Reconnect with matching game data."))
     }
@@ -493,6 +508,22 @@ impl ScenePlayer {
         self.cast.camera_clock()
     }
 
+    pub fn background_ops(&self) -> &[fmv_ff7::background::BackgroundOp] { self.cast.background_ops() }
+
+    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> { self.cast.fade() }
+
+    pub fn shake(&self) -> [f32; 2] { self.cast.shake() }
+
+    pub fn shake_rng_indices(&self) -> [u8; 2] { self.cast.shake_rng_indices() }
+
+    pub fn initial_shake_rng_indices(&self) -> [u8; 2] { self.initial_shake_rng }
+
+    /// A completed authored map jump keeps its last screen colour until the field actually changes.
+    pub fn handoff_fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> {
+        if !self.terminal_travel { return None; }
+        if self.over { self.terminal_fade } else { self.cast.fade() }
+    }
+
     /// What the stage could not show.
     #[cfg(test)]
     pub fn counts(&self) -> super::stage::Counts {
@@ -547,20 +578,25 @@ impl ScenePlayer {
             .collect()
     }
 
+    /// A reconnect changes runtime entity ids, not the retained scene or its pending inputs.
+    pub fn refresh_participants(&mut self, participants: Vec<fmv_protocol::SceneParticipant>) {
+        self.run.participants = participants;
+    }
+
     pub fn hides_participant(&self, entity: EntityId) -> bool {
         !self.over && self.participants_hidden && self.run.participants.iter().any(|p| p.entity == entity)
     }
 
     // ---- time ----------------------------------------------------------------------------------------------------
 
-    /// Let `seconds` of real time go by: the stage moves on and what is due happens, unless a window is on show (it pauses
-    /// the whole scene) or the scene is over.
+    /// Advance visible field time. Dialogue holds actors and script time, while fades and shake keep moving.
+    /// A battle or its result panel freezes the field through `advance_visible`.
     pub fn advance(&mut self, seconds: f32) {
-        if self.over || self.played_out || self.panel.is_some() || self.battle.is_some() {
-            return;
-        }
+        if self.over || self.battle.is_some() { return; }
         let mut left = seconds * FRAMES_PER_SECOND as f32;
-        if left.partial_cmp(&0.0).is_none_or(|o| o.is_le()) {
+        if !left.is_finite() || left <= 0.0 { return; }
+        if self.played_out || self.panel.is_some() {
+            self.cast.advance_effects(left);
             return;
         }
         // Time is spent up to the moment the next window (or the end) is due and no further: a window pauses the stage at
@@ -571,7 +607,9 @@ impl ScenePlayer {
             self.advance_stage_to(self.clock + spend);
             left -= spend;
             self.settle();
-            if self.over || self.played_out || self.panel.is_some() || self.battle.is_some() || left <= 0.0 {
+            if self.over || self.battle.is_some() || left <= 0.0 { return; }
+            if self.played_out || self.panel.is_some() {
+                self.cast.advance_effects(left);
                 return;
             }
         }
@@ -622,10 +660,10 @@ impl ScenePlayer {
     }
 
     fn apply_event(&mut self, event: Timed<Stage>, motion_late: f32, sound_late: f32) {
-        if let Stage::Sound { id, pan } = event.what {
+        if let Stage::Sound { channel, id, pan } = event.what {
             // A stalled frame must not dump a burst of old effects. Stops still cancel a loop.
             if id == 0 || self.instant || sound_late <= FRAMES_PER_SECOND as f32 / 2.0 {
-                self.sound(SoundAction::Play { id, pan });
+                self.sound(SoundAction::Play { channel, id, pan });
             }
         }
         let movement_phase = self.move_phase(&event, motion_late);
@@ -770,7 +808,10 @@ impl ScenePlayer {
                     // The scene's own end (a jump on to another field, or, for the cutscene of a story point that starts a
                     // battle first, the battle the server then starts) is playing it out; any other stop is an incomplete run.
                     let natural = matches!(how, End::Finished | End::MapJump { .. }) || (how == End::Battle && self.def.presents.is_some());
-                    if natural { self.play_out(); } else { self.abort(); }
+                    if natural {
+                        self.terminal_travel = matches!(how, End::MapJump { .. });
+                        self.play_out();
+                    } else { self.abort(); }
                     return;
                 }
                 Next::Held => return,
@@ -1005,11 +1046,12 @@ impl ScenePlayer {
     }
 
     /// Only this durable acknowledgement, correlated to the active battle, permits a resume.
-    pub fn on_battle_resumed(&mut self, ordinal: u32, battle_id: BattleId, progress: &[u8], gil: u32) {
-        let Some(paused) = &mut self.battle else { return };
-        if paused.checkpoint.ordinal != ordinal || paused.battle != Some(battle_id) || paused.game_over || paused.resume.is_some() { return; }
-        let Some(story) = StoryState::decode(progress) else { self.abort(); return };
+    pub fn on_battle_resumed(&mut self, ordinal: u32, battle_id: BattleId, progress: &[u8], gil: u32) -> bool {
+        let Some(paused) = &mut self.battle else { return false };
+        if paused.checkpoint.ordinal != ordinal || paused.battle != Some(battle_id) || paused.game_over || paused.resume.is_some() { return false; }
+        let Some(story) = StoryState::decode(progress) else { self.abort(); return false };
         paused.resume = Some((story, gil));
+        true
     }
 
     pub fn on_game_over(&mut self, ordinal: u32, battle_id: BattleId) {
@@ -1057,6 +1099,7 @@ impl ScenePlayer {
         if self.over { return; }
         self.sound(SoundAction::End);
         if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        self.terminal_fade = self.handoff_fade();
         self.over = true;
         self.battle = None;
         self.panel = None;

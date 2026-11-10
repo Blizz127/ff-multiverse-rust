@@ -1,6 +1,9 @@
 //! Synthetic continuation lifecycle through the real store, with saver acknowledgements held
 //! explicitly. No game files, sockets, sleep, or live account data are involved.
 
+mod door_coop;
+mod size_bounds;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +76,65 @@ impl SceneHost for Host {
             _ => return None,
         };
         Some(SceneBoundary { source: SOURCE, progress: ORIGINAL.to_vec(), gil: current_gil, at })
+    }
+}
+
+const DOOR: &str = "fixture/zero-window-door";
+const ARRIVAL: &str = "fixture/linked-arrival";
+const DOOR_STORY: &[u8] = &[48];
+const ARRIVED_STORY: &[u8] = &[51];
+const DOOR_SOURCE: [u8; 32] = [31; 32];
+const ARRIVAL_SOURCE: [u8; 32] = [32; 32];
+
+/// A door with no dialogue or story write, followed by a two-window arrival in the destination.
+/// Its final control position deliberately differs from the map-jump landing in that same field.
+struct DoorHost { final_field: &'static str }
+
+impl DoorHost {
+    fn landing() -> Exit {
+        Exit { line: (Pos::default(), Pos::default()), target: YARD.into(),
+            arrival: Pos::new(150.0, -100.0, 0.0), arrival_facing: Some(1.5), arrival_hint: Some(29), kind: ExitKind::Gateway }
+    }
+    fn control(&self) -> Exit {
+        Exit { line: (Pos::default(), Pos::default()), target: self.final_field.into(),
+            arrival: Pos::new(80.0, 120.0, 0.0), arrival_facing: Some(0.25), arrival_hint: Some(28), kind: ExitKind::Gateway }
+    }
+}
+
+impl SceneHost for DoorHost {
+    fn scenes(&self) -> Vec<SceneInfo> {
+        vec![
+            SceneInfo { id: DOOR.into(), field: HALL.into(), arrival: Pos::default(), arrival_facing: 0.0, arrival_hint: None },
+            SceneInfo { id: ARRIVAL.into(), field: YARD.into(), arrival: Self::landing().arrival, arrival_facing: 1.5, arrival_hint: Some(29) },
+        ]
+    }
+    fn offered(&self, scene: &str, progress: &[u8]) -> bool { (scene == DOOR || scene == ARRIVAL) && progress == DOOR_STORY }
+    fn automatic(&self, scene: &str) -> bool { scene == ARRIVAL }
+    fn requires_landing(&self, scene: &str) -> bool { scene == ARRIVAL }
+    fn continuation(&self, scene: &str) -> bool { scene == DOOR || scene == ARRIVAL }
+    fn trigger(&self, _: &str, _: &[u8]) -> Option<TriggerInfo> { None }
+    fn preview_progress(&self, _: &str) -> Option<Vec<u8>> { None }
+    fn entry(&self, progress: &[u8]) -> Option<Exit> { (progress == ARRIVED_STORY).then(|| self.control()) }
+    fn finish(&self, _: &str, _: &[u8], _: u32, _: &[u8]) -> Option<SceneResult> { panic!("the door and arrival require durable completion") }
+    fn evaluate_continuation(&self, scene: &str, original: &[u8], _: u32, gil: u32, replay: Option<&SceneReplay>) -> Option<SceneBoundary> {
+        let source = match scene { DOOR => DOOR_SOURCE, ARRIVAL => ARRIVAL_SOURCE, _ => return None };
+        if original != DOOR_STORY || replay.is_some_and(|r| r.source != source || r.validate().is_err()) { return None; }
+        let events = replay.map_or(&[][..], |r| r.events.as_slice());
+        let complete = |progress: &[u8], travel| SceneBoundaryKind::Complete(SceneResult {
+            progress: progress.to_vec(), changed: progress != original, summary: "synthetic door/arrival".into(), travel,
+            transaction: Some(SceneTransaction { expected_gil: gil, next_gil: gil }),
+        });
+        let window = |step| SceneBoundaryKind::Window { step, identity: vec![40 + step as u8], choices: None };
+        let accepted = |event: &SceneReplayEvent, expected| matches!(event,
+            SceneReplayEvent::Window { step, identity, answer: None } if *step == expected && identity == &[40 + expected as u8]);
+        let (progress, at) = match (scene, events) {
+            (DOOR, []) => (DOOR_STORY, complete(DOOR_STORY, Some(Self::landing()))),
+            (ARRIVAL, []) => (DOOR_STORY, window(0)),
+            (ARRIVAL, [first]) if accepted(first, 0) => (DOOR_STORY, window(1)),
+            (ARRIVAL, [first, second]) if accepted(first, 0) && accepted(second, 1) => (ARRIVED_STORY, complete(ARRIVED_STORY, None)),
+            _ => return None,
+        };
+        Some(SceneBoundary { source, progress: progress.to_vec(), gil, at })
     }
 }
 
@@ -213,6 +275,248 @@ impl Rig {
         }
         panic!("synthetic actor never became ready to use its winning item");
     }
+}
+
+fn door_world(rules: SyntheticRules, home: &str, final_field: &'static str) -> (World, mpsc::UnboundedReceiver<Msg>) {
+    let (mut world, saves) = world_at(rules, 3, home);
+    world.configure_scenes(Some(SceneSettings { host: Arc::new(DoorHost { final_field }), debug_preview: false, debug_new_story: None }));
+    (world, saves)
+}
+
+fn door_rig(final_field: &'static str) -> Rig {
+    let rules = SyntheticRules::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("store")).unwrap();
+    let (account, _) = store.create_account("Door owner", 1).unwrap();
+    store.put_progression(&Progression::new(account, GameId::Fixture, DOOR_STORY.to_vec(), 1)).unwrap();
+    let mut character = progress::fresh(&rules, 0).to_record(account, GameId::Fixture, 1);
+    character.gil = 240;
+    character.inventory = Some(vec![InventoryEntry::new(0, 2), InventoryEntry::new(20, 2)]);
+    store.put_character_progress(&character).unwrap();
+    let (mut world, saves) = door_world(rules, HALL, final_field);
+    let now = Instant::now();
+    let state = store.get_scene_state(account, GameId::Fixture).unwrap();
+    let mut owner = join(&mut world, state.clone(), vec![state], now);
+    owner.drain();
+    let run = SceneRunId(71);
+    world.start_run(run, SceneRun { scene: DOOR.into(), owner: owner.entity, watchers: vec![], seed: 19,
+        progress: DOOR_STORY.to_vec(), gil: 240, answers: vec![], steps: 0, started: now, last_activity: now,
+        writes_story: true, preview: false, then: None }, &mut vec![]);
+    assert!(owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { scene, replay: Some(_), .. } if scene == DOOR)));
+    Rig { _dir: dir, store, world, saves, rules, formation: 3, owner, now, run }
+}
+
+/// Drop both process-side runtime and the store lock, reopen the exact durable files, and admit
+/// from their coherent group. The new world deliberately may have a different home field.
+fn restart_door(rig: Rig, home: &str, final_field: &'static str) -> Rig {
+    let Rig { _dir, store, world, saves, rules, formation, owner, now, .. } = rig;
+    let account = owner.account;
+    let root = store.root().to_path_buf();
+    drop(world);
+    drop(saves);
+    drop(owner);
+    drop(store);
+    let store = Store::open(root).unwrap();
+    let (mut world, saves) = door_world(rules, home, final_field);
+    let group = store.get_scene_group(account, GameId::Fixture).unwrap();
+    let state = group.iter().find(|state| state.pair.story.account_id == account).unwrap().clone();
+    let owner = join(&mut world, state, group, now);
+    let run = world.players[&owner.entity].scene.unwrap_or(SceneRunId(0));
+    Rig { _dir, store, world, saves, rules, formation, owner, now, run }
+}
+
+fn enter_door_destination(rig: &mut Rig) -> Vec<ServerMsg> {
+    let messages = rig.owner.drain();
+    let offer = messages.iter().find(|message| matches!(message, ServerMsg::AreaChange { .. })).cloned().expect("the retained destination is offered");
+    let ServerMsg::AreaChange { area, fingerprint, provenance, .. } = offer else { unreachable!() };
+    assert_eq!(rig.world.join_area(rig.owner.entity, &area, &fingerprint, &provenance, rig.now), crate::world::TravelReply::Done);
+    messages
+}
+
+fn door_resources(state: &SceneState) -> (Progress, Option<Vec<InventoryEntry>>) {
+    let record = state.pair.character.as_ref().unwrap();
+    (Progress::from_record(record), record.inventory.clone())
+}
+
+fn request_arrival_complete(rig: &mut Rig) {
+    rig.send(ClientMsg::SceneStep { run: rig.run, step: 0, answer: None });
+    rig.send(ClientMsg::SceneStep { run: rig.run, step: 1, answer: None });
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: false });
+    rig.snapshot();
+}
+
+#[test]
+fn a_zero_window_door_and_linked_arrival_publish_only_after_each_ack_and_release_at_final_control() {
+    let mut rig = door_rig(YARD);
+    let resources = door_resources(&rig.stored());
+    let initial_position = rig.world.players[&rig.owner.entity].snapshot.pos;
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: false });
+    rig.snapshot();
+    let (finish, done) = rig.pending_batch();
+    assert_eq!(finish.operation.kind, SceneOperationKind::Finish);
+    assert_eq!(finish.members[0].next_story.as_deref(), Some(DOOR_STORY), "zero-window travel keeps moment 48");
+    assert!(finish.members.iter().all(|member| member.battle.is_none()));
+    let landing = finish.members[0].checkpoint.as_ref().unwrap();
+    let payload: Payload = serde_json::from_slice(&landing.replay).unwrap();
+    assert!(payload.replay.events.is_empty(), "the door fabricated no dialogue or battle");
+    assert_eq!(landing.consumed_battles, 0);
+    assert_eq!(payload.landing, Some(Landing::from_exit(&DoorHost::landing())));
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneEnded { .. } | ServerMsg::AreaChange { .. })));
+    let landed = rig.apply(&finish);
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.pos, initial_position);
+    assert!(rig.world.players[&rig.owner.entity].transit.is_none());
+    assert_eq!(rig.stored().pair.story.blob, DOOR_STORY);
+    rig.ack(done, landed);
+    let released_door = enter_door_destination(&mut rig);
+    assert_eq!(released_door.iter().filter(|message| matches!(message, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. })).count(), 1);
+    let (arrival, done) = rig.pending_batch();
+    assert_eq!(arrival.operation.kind, SceneOperationKind::ContinueLanding);
+    let checkpoint = arrival.members[0].checkpoint.as_ref().unwrap();
+    assert_eq!(checkpoint.scene_key, ARRIVAL);
+    assert_ne!(checkpoint.instance, landing.instance);
+    assert!(matches!(checkpoint.phase, ScenePhase::Resume { segment: 0 }));
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { scene, .. } if scene == ARRIVAL)));
+    let arrived = rig.apply(&arrival);
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.pos, DoorHost::landing().arrival);
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { scene, .. } if scene == ARRIVAL)));
+    rig.ack(done, arrived);
+    assert!(rig.owner.drain().iter().any(|message| matches!(message,
+        ServerMsg::SceneStart { scene, progress, replay: Some(replay), .. }
+            if scene == ARRIVAL && progress == DOOR_STORY && replay.origin.is_none() && replay.events.is_empty())));
+    request_arrival_complete(&mut rig);
+    let (complete, done) = rig.pending_batch();
+    assert_eq!(complete.operation.kind, SceneOperationKind::Complete);
+    assert_eq!(complete.members[0].next_story.as_deref(), Some(ARRIVED_STORY));
+    assert!(complete.members[0].checkpoint.is_none() && complete.members[0].reservation.is_none());
+    assert_eq!(rig.stored().pair.story.blob, DOOR_STORY);
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneEnded { .. } | ServerMsg::AreaChange { .. })));
+    let completed = rig.apply(&complete);
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.pos, DoorHost::landing().arrival);
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.facing, DoorHost::landing().arrival_facing.unwrap());
+    assert_eq!(rig.world.players[&rig.owner.entity].progression, DOOR_STORY);
+    assert_eq!(rig.world.players[&rig.owner.entity].scene, Some(rig.run));
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneEnded { .. })));
+    rig.ack(done, completed.clone());
+    let control = DoorHost { final_field: YARD }.control();
+    let messages = rig.owner.drain();
+    let snapshot = messages.iter().position(|message| matches!(message,
+        ServerMsg::AreaSnapshot { area, entities, .. } if area.key == YARD && entities.iter().any(|entity|
+            entity.id == rig.owner.entity && entity.pos == control.arrival && Some(entity.facing) == control.arrival_facing)))
+        .expect("the acknowledged final pose is sent in the local snapshot");
+    let released = messages.iter().position(|message| matches!(message, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. })).unwrap();
+    assert!(snapshot < released, "control returns only after the final position is authoritative on the client");
+    assert_eq!(messages.iter().filter(|message| matches!(message, ServerMsg::SceneEnded { .. })).count(), 1);
+    assert!(!messages.iter().any(|message| matches!(message, ServerMsg::AreaChange { .. } | ServerMsg::EncounterStart { .. })));
+    let player = &rig.world.players[&rig.owner.entity];
+    assert_eq!((player.snapshot.pos, player.snapshot.facing, player.scene), (control.arrival, control.arrival_facing.unwrap(), None));
+    assert_eq!(player.progression, ARRIVED_STORY);
+    assert_eq!(door_resources(&rig.stored()), resources);
+    let duplicate = rig.apply(&complete);
+    assert_eq!(duplicate.commit, fmv_persist::SceneCommit::AlreadyApplied);
+    assert_eq!(duplicate.current, completed.current);
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: false });
+    rig.tick();
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneEnded { .. } | ServerMsg::AreaChange { .. })));
+    assert!(rig.saves.try_recv().is_err());
+}
+
+#[test]
+fn door_landing_arrival_resume_and_completed_control_survive_restart_at_unacknowledged_boundaries() {
+    let mut rig = door_rig(YARD);
+    let resources = door_resources(&rig.stored());
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: false });
+    rig.snapshot();
+    let (finish, pending_finish) = rig.pending_batch();
+    rig.apply(&finish);
+    let landing = rig.stored();
+    assert!(matches!(landing.checkpoint.as_ref().unwrap().phase, ScenePhase::Landing { .. }));
+    assert_eq!(landing.pair.story.blob, DOOR_STORY);
+    rig = restart_door(rig, HALL, YARD);
+    drop(pending_finish);
+    assert_eq!(rig.stored(), landing);
+    assert_eq!(rig.world.transit_target(rig.owner.entity).as_deref(), Some(YARD), "moment 48 alone cannot replace the retained destination");
+    enter_door_destination(&mut rig);
+    let (arrival, pending_arrival) = rig.pending_batch();
+    assert_eq!(arrival.operation.kind, SceneOperationKind::ContinueLanding);
+    rig.apply(&arrival);
+    let resume = rig.stored();
+    let checkpoint = resume.checkpoint.as_ref().unwrap();
+    assert!(matches!(checkpoint.phase, ScenePhase::Resume { segment: 0 }));
+    assert_eq!(checkpoint.scene_key, ARRIVAL);
+    assert_ne!(checkpoint.instance, landing.checkpoint.unwrap().instance);
+    rig = restart_door(rig, YARD, YARD);
+    drop(pending_arrival);
+    let messages = rig.owner.drain();
+    assert!(messages.iter().any(|message| matches!(message,
+        ServerMsg::SceneStart { scene, progress, replay: Some(replay), .. }
+            if scene == ARRIVAL && progress == DOOR_STORY && replay.origin.is_none() && replay.events.is_empty())));
+    assert!(!messages.iter().any(|message| matches!(message, ServerMsg::AreaChange { .. } | ServerMsg::EncounterStart { .. })));
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.pos, DoorHost::landing().arrival);
+    assert_eq!(rig.stored(), resume);
+    assert!(rig.saves.try_recv().is_err(), "a committed linked instance is recovered without another ContinueLanding");
+    request_arrival_complete(&mut rig);
+    let (complete, pending_complete) = rig.pending_batch();
+    rig.apply(&complete);
+    let completed = rig.stored();
+    assert_eq!(completed.pair.story.blob, ARRIVED_STORY);
+    assert!(completed.checkpoint.is_none() && completed.reservation.is_none());
+    assert_eq!(rig.world.players[&rig.owner.entity].snapshot.pos, DoorHost::landing().arrival);
+    assert!(rig.world.leave(rig.owner.entity), "disconnect does not undo the completed durable image");
+    rig = restart_door(rig, YARD, YARD);
+    drop(pending_complete);
+    let control = DoorHost { final_field: YARD }.control();
+    let player = &rig.world.players[&rig.owner.entity];
+    assert_eq!((player.area.as_str(), player.snapshot.pos, player.snapshot.facing, player.scene),
+        (YARD, control.arrival, control.arrival_facing.unwrap(), None), "checkpoint-free login uses final control, even when home is the same field");
+    let messages = rig.owner.drain();
+    let first_snapshot = messages.iter().find_map(|message| match message {
+        ServerMsg::AreaSnapshot { entities, .. } => Some(entities), _ => None,
+    }).unwrap();
+    assert!(first_snapshot.iter().any(|entity| entity.id == rig.owner.entity && entity.pos == control.arrival && Some(entity.facing) == control.arrival_facing));
+    assert!(!messages.iter().any(|message| matches!(message, ServerMsg::SceneStart { .. } | ServerMsg::AreaChange { .. } | ServerMsg::EncounterStart { .. })));
+    assert_eq!(rig.stored(), completed);
+    assert_eq!(door_resources(&rig.stored()), resources);
+    assert!(rig.saves.try_recv().is_err());
+}
+
+#[test]
+fn arrival_complete_cannot_change_fields_or_clear_its_retained_landing() {
+    let mut rig = door_rig(HALL);
+    let resources = door_resources(&rig.stored());
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: false });
+    rig.snapshot();
+    let (finish, done) = rig.pending_batch();
+    let saved = rig.apply(&finish);
+    rig.ack(done, saved);
+    enter_door_destination(&mut rig);
+    let (arrival, done) = rig.pending_batch();
+    let saved = rig.apply(&arrival);
+    rig.ack(done, saved);
+    rig.owner.drain();
+    let retained = rig.stored();
+    request_arrival_complete(&mut rig);
+    assert_eq!(rig.stored(), retained, "an unsupported cross-field final entry is rejected before Complete writes");
+    assert_eq!(door_resources(&rig.stored()), resources);
+    assert!(rig.saves.try_recv().is_err());
+    assert!(!rig.owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneEnded { outcome: SceneOutcome::Finished, .. } | ServerMsg::AreaChange { .. })));
+    assert!(rig.world.players.get(&rig.owner.entity).is_none_or(|player| player.scene.is_some()), "a rejected completion cannot release free control");
+}
+
+#[test]
+fn an_arrival_without_its_required_landing_is_not_started_or_held() {
+    let mut rig = door_rig(YARD);
+    rig.send(ClientMsg::SceneEnd { run: rig.run, skipped: true });
+    let original = rig.stored();
+    assert!(original.checkpoint.is_none() && original.reservation.is_none());
+    rig = restart_door(rig, YARD, YARD);
+    let messages = rig.owner.drain();
+    assert!(!messages.iter().any(|message| matches!(message, ServerMsg::SceneStart { scene, .. } if scene == ARRIVAL)),
+        "moment 48 in the field is not a durable arrival lineage");
+    assert!(rig.world.players[&rig.owner.entity].scene.is_none());
+    assert_eq!(rig.world.scene_count(), 0);
+    assert!(!rig.world.scenes.storage_failed);
+    assert_eq!(rig.stored(), original);
+    assert!(rig.saves.try_recv().is_err());
 }
 
 #[test]
@@ -580,14 +884,14 @@ fn a_mismatched_character_in_a_prepare_ack_is_refused_before_combat_or_mirror_ch
 }
 
 #[test]
-fn recovery_refuses_future_or_changed_script_identity_before_admitting_gameplay() {
+fn recovery_refuses_old_future_or_changed_script_identity_before_admitting_gameplay() {
     let mut rig = Rig::new(3);
     rig.prepare();
     let original = rig.stored();
-    for future_version in [false, true] {
+    for version in [None, Some(1), Some(u32::MAX)] {
         let mut state = original.clone();
         let checkpoint = state.checkpoint.as_mut().unwrap();
-        if future_version { checkpoint.replay_version = u32::MAX; }
+        if let Some(version) = version { checkpoint.replay_version = version; }
         else { checkpoint.source_hash[0] ^= 1; }
         let (mut fresh, mut saves) = world(rig.rules, rig.formation);
         let result = admit(&mut fresh, state.clone(), vec![state], rig.now);

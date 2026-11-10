@@ -1,3 +1,5 @@
+mod size_bounds;
+
 use super::*;
 use crate::{CharacterProgress, Progression};
 use fmv_core::InventoryEntry;

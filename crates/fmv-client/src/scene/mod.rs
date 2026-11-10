@@ -48,10 +48,12 @@
 mod bot;
 mod client;
 mod draw;
+pub(crate) mod fade;
 mod keys;
 mod panel;
 mod player;
 mod source;
+mod shake;
 mod stage;
 mod trigger;
 
@@ -63,7 +65,7 @@ pub(crate) mod tests;
 mod continuation_tests;
 
 pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};
-pub use client::{clean_id, SceneClient};
+pub use client::{clean_id, SceneBackground, SceneClient};
 pub use draw::{camera_shot, cast_players, label_hidden, participant_label_hidden, place_witnesses, speaker_spot, visible_npcs};
 pub use keys::{route_key, SceneRoute};
 pub use player::{SceneCmd, SceneSound, SoundAction};
