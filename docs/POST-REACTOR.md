@@ -153,8 +153,11 @@ moment 69 without unresolved positions or off-cast events. Its test verifies mod
 against the field loader. It still skips party/menu effects and assumes unsaved state; neither
 its witness nor the real route has been validated. A private floor-plan survey drew 23 actor
 walks across the bar with no witness. A candidate `(218, 292, triangle 37)` was visible and
-clear of the cast in the inspected offscreen samples, but the harness did not check every
-frame or assert a successful scene outcome. No safe player position has yet been established.
+clear of the cast in the inspected offscreen samples. A subsequent isolated client run on the
+first answer emitted an unskipped scene end and sampled 74 positions: the closest visible cast
+actor was 280.2 walkmesh units away, versus a 44-unit ring threshold. This does not cover the
+other answer, every rendered frame, screen occlusion throughout, or other player models. No
+safe player position has yet been established.
 An isolated interpreter comparison used the original director/setup slots and the corresponding
 manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
 rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
