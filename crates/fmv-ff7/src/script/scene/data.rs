@@ -564,6 +564,28 @@ pub fn jessie_ladder_scene() -> SceneDef {
     }
 }
 
+/// The AVALANCHE members run ahead through the reactor approach before the existing entry step to 8.
+pub const RUN_AHEAD_SCENE_ID: &str = "ff7/md1_2/run-ahead";
+
+pub fn run_ahead_scene() -> SceneDef {
+    let cast = [(2, "av_b", "bwfd"), (3, "av_c", "axdc"), (4, "av_w", "bxbe")]
+        .into_iter().map(|(entity, name, hrc)| CastMember {
+            entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: "acfe".into() }, start: None,
+        }).collect();
+    SceneDef {
+        id: RUN_AHEAD_SCENE_ID.into(), game: "ff7".into(), field: "md1_2".into(),
+        trigger: Trigger { entity: 2, name: "av_b".into(), slot: 0, talk_radius: 0, moments: 0..=7 },
+        setup: [2, 3, 4].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![],
+        // All three mains start together, as in the field. Biggs advances the moment; Jessie's and
+        // Wedge's authored waits and paths finish before the scene releases its witness.
+        root: [2, 3, 4].into_iter().map(Step::StartMain).collect(), cast,
+        speakers: vec![], witness: vec![],
+        arrival: Spot { x: 3560, y: 30579, triangle: 58, direction: 128 },
+        presents: Some(8), resume_after_battle: None, presents_bit: None,
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -758,7 +780,7 @@ pub fn proof_scene() -> SceneDef {
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

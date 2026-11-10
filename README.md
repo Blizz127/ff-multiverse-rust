@@ -1436,6 +1436,11 @@ conversation at a point, that conversation is now played too, as a **cutscene** 
 point moves the story to, or `SceneDef::presents_bit` for an existing saved flag):
 
 * **`ff7/md1_1/team-talk`** (the reactor's gate, the point to 7): Biggs, Jessie, Cloud and Barret, twelve windows.
+* **`ff7/md1_2/run-ahead`**: Biggs, Jessie and Wedge follow their own timed paths through the approach, then disappear.
+  This is a silent entry scene before the existing step to 8; it adds no dialogue or saved flags. Their NPC slots remain
+  stable, and their own init scripts keep them hidden after that step, including on re-login. Two independent arrivals
+  each play their own scene and can see each other afterward. It does not add late joining to an existing party scene.
+  Floor placement is checked against the owned data; rendered movement and camera visibility remain untested.
 * **`ff7/nmkin_1/reactor-door`** (the reactor's door, the line to 11): Barret and Cloud, five windows and the door's.
 * **`ff7/nmkin_5/guard-scorpion`** (the core, the point to 27 that starts the boss first): Barret and Cloud, eleven windows,
   and then the battle. For a point that starts a battle first the run's end starts the battle (not the step), and the step

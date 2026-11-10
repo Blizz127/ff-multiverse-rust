@@ -1341,3 +1341,81 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         assert!(!def.applies_at(moment));
     }
 }
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn run_ahead_plays_all_three_paths_and_only_the_existing_entry_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{auto_witnesses, cast_places, run_ahead_scene, scene, RUN_AHEAD_SCENE_ID, SKIPPED_STATE_OPS};
+    let f = field("md1_2").expect("FMV_FF7_DATA and md1_2");
+    let def = run_ahead_scene();
+    assert_eq!(scene(RUN_AHEAD_SCENE_ID), Some(def.clone()));
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&data_dir().unwrap()), provenance).unwrap();
+    let area = adapter.load_field("md1_2").unwrap();
+    let base = area.npcs();
+    assert_eq!(base.iter().map(|n| n.entity_name.as_str()).collect::<Vec<_>>(), ["av_b", "av_c", "av_w"]);
+    for moment in [0, 1, 7] {
+        let before = StoryState::at(moment);
+        let step = area.story_advance(&before.encode(), 0).expect("existing entry point");
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert!(def.presents_step("md1_2", &before, &after));
+        assert!(!def.starts_on_arrival() && !def.offered_to(&before));
+        assert!(!def.presents_step("md1_1", &before, &after));
+        assert!(area.story_advance(&step.progress, 0).is_none(), "entry step is paid once");
+        let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::Finished, 0, 0));
+        assert!(outcome.is_complete(), "{outcome:?}");
+        assert!(outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
+        assert!(outcome.party.is_empty() && outcome.jump.is_none() && outcome.writes.tracked.is_empty());
+        assert!(outcome.writes.untracked.keys().all(|(bank, _)| !(1..=4).contains(bank)));
+        assert!([&outcome.setup_stats, &outcome.stats].iter().all(|stats| stats.ignored.keys().all(|op| !SKIPPED_STATE_OPS.contains(op))));
+        let mut interpreted = before.clone();
+        outcome.writes.apply_to(&mut interpreted);
+        assert_eq!(interpreted, after, "exact existing step, no new saved state");
+        let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
+        let beat = play.next(None);
+        assert!(matches!(beat.then, Then::End { how: End::Finished, .. }));
+        for entity in [2, 3, 4] {
+            let moves: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+                Stage::Move { entity: actor, x, y, .. } if actor == entity => Some((event.at, x, y)),
+                _ => None,
+            }).collect();
+            assert_eq!(moves.len(), match entity { 2 => 5, 3 => 2, _ => 3 });
+            assert_eq!(moves.last().map(|(_, x, y)| (*x, *y)), Some((3010, 32350)));
+            let hidden = beat.stage.iter().find(|event| event.what == Stage::Show { entity, visible: false }).expect("actor leaves");
+            assert!(hidden.at >= moves.last().unwrap().0);
+        }
+        assert_eq!(play.off_cast(), 0);
+    }
+    let mesh = f.walkmesh().unwrap();
+    let parts = mesh_parts(&mesh);
+    let story = StoryState::at(7);
+    let spots = auto_witnesses(&f, &def, &story, 1, 3);
+    assert!(!spots.is_empty(), "the owner has a measured floor position");
+    let cast = cast_places(&f, &def, &story, 1).unwrap();
+    let ring = 5.5 * fmv_ff7::default_model_scale(FieldScript::from_field(&f).unwrap().header().scale);
+    for spot in &spots {
+        assert!(fmv_ff7::script::triangle_contains_xy(&mesh.triangles[usize::from(spot.triangle)], i32::from(spot.x), i32::from(spot.y)));
+        assert_eq!(parts[usize::from(spot.triangle)], parts[usize::from(def.arrival.triangle)]);
+        assert!(cast.iter().all(|&(x,y)| (x-f32::from(spot.x)).hypot(y-f32::from(spot.y)) >= 2.0*ring+16.0));
+        assert!(scenery_gap(&mesh, f32::from(spot.x), f32::from(spot.y)) >= 1.5*ring);
+    }
+    eprintln!("run-ahead: {} automatic witness spots; rendered visibility untested", spots.len());
+    for moment in [0, 7, 8, 27, 33, 32767, 32768, u16::MAX] {
+        let story = StoryState::at(moment);
+        let saved = story.encode();
+        let phase = area.phase_key(&saved).unwrap();
+        let init = ScenePlay::new(&f, &def, &story, 1).unwrap();
+        let mut expected = base.clone();
+        for event in init.initial_stage_events() {
+            if let Stage::Show { entity, visible } = *event {
+                if let Some(npc) = entity.checked_sub(2).and_then(|index| expected.get_mut(usize::from(index))) { npc.unconditional = visible; }
+            }
+        }
+        assert_eq!(area.npcs_in_phase(&phase), expected, "owned init, signed boundary, stable slots at {moment}");
+        assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase));
+        if moment >= 8 { assert!(!def.applies_at(moment)); }
+    }
+}
