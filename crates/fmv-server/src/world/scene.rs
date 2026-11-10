@@ -135,6 +135,9 @@ pub trait SceneHost: Send + Sync {
     fn offered(&self, scene: &str, progress: &[u8]) -> bool;
     /// Whether the scene starts automatically on entering its field.
     fn automatic(&self, _scene: &str) -> bool { false }
+    /// Whether this arrival must be linked to an acknowledged predecessor landing. Such a
+    /// scene is entered by the continuation handoff, never by an unrelated field login.
+    fn requires_landing(&self, _scene: &str) -> bool { false }
     /// Whether this scene uses strict, durable window and battle continuation instead of the
     /// presentation-only scene completion path.
     fn continuation(&self, _scene: &str) -> bool { false }
@@ -316,6 +319,12 @@ impl World {
     #[cfg(test)]
     pub fn scene_count(&self) -> usize {
         self.scenes.runs.len() + self.scenes.pending.len()
+    }
+
+    /// Authored login placement for an already saved story, before admission publishes its
+    /// first area snapshot. The scene host remains private to this module.
+    pub(super) fn saved_story_entry(&self, progress: &[u8]) -> Option<Exit> {
+        self.scenes.host.as_ref()?.entry(progress)
     }
 
     pub(crate) fn scene_save_epoch(&self) -> u64 { self.scenes.save_epoch }
@@ -1061,8 +1070,9 @@ impl World {
     }
 
     /// `entity` has just joined (in the entry area, like everyone): if its story stands somewhere else (`SceneHost::entry`),
-    /// send it there through the ordinary area handshake. A story that is still where everyone joins, a game without scenes
-    /// and an area that cannot be hosted all leave the player where it joined.
+    /// send it there through the ordinary area handshake. A same-field authored entry was
+    /// already placed before the initial snapshot in `join`; an unavailable field leaves the
+    /// player where it joined.
     pub(super) fn enter_at_story(&mut self, entity: EntityId, now: Instant) {
         let Some(host) = self.scenes.host.clone() else { return };
         let Some(player) = self.players.get(&entity) else { return };
@@ -1088,7 +1098,7 @@ impl World {
         // party leader's phase. Judge and replay only the player's own story, never the leader's.
         let progress = player.progression.clone();
         let Some(info) = self.scenes.list.iter().find(|info| info.field.eq_ignore_ascii_case(&area)
-            && host.automatic(&info.id) && host.offered(&info.id, &progress)).cloned() else { return };
+            && host.automatic(&info.id) && !host.requires_landing(&info.id) && host.offered(&info.id, &progress)).cloned() else { return };
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);

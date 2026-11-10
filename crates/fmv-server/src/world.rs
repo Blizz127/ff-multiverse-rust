@@ -511,10 +511,27 @@ impl World {
         // spawn point.
         let home = self.home.clone();
         let saved_home = if recovering { None } else { self.resume_home_spot(new.account, &new.progression) };
-        let pos = match saved_home {
-            Some((spot, _)) => spot,
-            None => self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point),
-        };
+        let mut pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
+        let mut facing = 0.0;
+        if let Some((spot, spot_facing)) = saved_home {
+            // On the spot it saved in the entry area (MMO-style saving: see `resume`).
+            pos = spot;
+            facing = spot_facing;
+        } else if !recovering {
+            // A completed continuation no longer has a checkpoint. If its authored control field
+            // is also this server's home, place its saved story there before the first snapshot
+            // and entry scripts; the usual cross-field handshake below cannot correct a same-field
+            // spawn. In particular this recovers a Complete written just before a server crash.
+            if let Some(entry) = self.saved_story_entry(&new.progression)
+                .filter(|entry| entry.target.eq_ignore_ascii_case(&home)) {
+                let Some(area) = self.areas.get(&home) else { return Err(JoinError::StorageUnavailable); };
+                pos = area.runtime().place_arrival(entry.arrival, entry.arrival_hint);
+                if !pos.is_finite() || entry.arrival_facing.is_some_and(|facing| !facing.is_finite()) {
+                    return Err(JoinError::StorageUnavailable);
+                }
+                facing = entry.arrival_facing.map_or(0.0, normalize_facing);
+            }
+        }
         let entity = new.entity;
         let account = new.account;
         let recovery_group = new.scene_group;
@@ -522,7 +539,7 @@ impl World {
         // `inventory`).
         let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), &new.progress));
         let inventory = self.battle.as_ref().map(|bw| Inventory::resolve(bw.rules(), new.progress.inventory.as_deref()));
-        let snapshot = EntitySnapshot { id: entity, pos, facing: saved_home.map_or(0.0, |(_, facing)| facing), anim: AnimState::Idle, avatar: new.avatar };
+        let snapshot = EntitySnapshot { id: entity, pos, facing, anim: AnimState::Idle, avatar: new.avatar };
         self.players.insert(
             entity,
             Player {

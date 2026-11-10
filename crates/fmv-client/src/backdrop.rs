@@ -19,10 +19,13 @@ use crate::avatar::scenery::Scenery;
 use crate::avatar::stage::{Stage, StageCamera};
 use fmv_adapter_api::{AreaRuntime, Bounds};
 use fmv_core::Pos;
-use fmv_ff7::background::{decode_background, BackgroundImage, Projection};
+use fmv_ff7::background::{decode_background_with, entry_background_ops, BackgroundImage, BackgroundOptions, BackgroundState, GroupFilter, Projection};
 use fmv_ff7::{default_model_scale, Ff7Adapter};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+mod background;
+use background::DynamicBackground;
 
 /// Largest backdrop side accepted (pixels). A field background is a few hundred pixels wide; the
 /// cap only keeps a corrupt image from asking the GPU for an absurd texture.
@@ -94,6 +97,8 @@ type ViewMap = Box<dyn Fn(Pos) -> Option<Pos> + Send + Sync>;
 /// for moving things, and the picture behind them if there is one.
 pub struct FieldView {
     map: ViewMap,
+    /// Script-selected background frames, retained until this field view is replaced.
+    background: Option<DynamicBackground>,
     /// Walkable triangles in view space (`x`, `y`; `z` is 0). Triangles that cannot be projected
     /// are left out.
     pub triangles: Vec<[Pos; 3]>,
@@ -131,6 +136,18 @@ fn finite_xy(p: Pos) -> bool {
 }
 
 impl FieldView {
+    /// Apply every authored change received since the previous draw, including final events of
+    /// an already-ended scene. Old-field events cannot change a newly loaded field.
+    pub fn apply_background_events(&mut self, events: impl IntoIterator<Item = crate::scene::SceneBackground>) {
+        let Some(background) = self.background.as_mut() else { return };
+        if let Err(error) = background.apply(events, &mut self.backdrop, self.stage.as_mut()) {
+            eprintln!("field background update unresolved: {error}; keeping the previous picture");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn background_state(&self) -> Option<&BackgroundState> { self.background.as_ref().map(DynamicBackground::shown_state) }
+
     /// World position -> view position (`z` is 0), or `None` if it cannot be drawn.
     pub fn to_view(&self, p: Pos) -> Option<Pos> {
         (self.map)(p).filter(|q| finite_xy(*q))
@@ -162,6 +179,7 @@ impl FieldView {
     pub fn top_down(area: &dyn AreaRuntime) -> Self {
         Self {
             map: Box::new(|p| Some(Pos::new(p.x, p.y, 0.0))),
+            background: None,
             triangles: area.walk_triangles(),
             bounds: area.bounds(),
             whole: area.bounds(),
@@ -191,7 +209,7 @@ impl FieldView {
             Some(b) => Bounds { min: Pos::new(b.min[0], b.min[1], 0.0), max: Pos::new(b.max[0], b.max[1], 0.0) },
             None => extent(&triangles).unwrap_or(fallback),
         };
-        Self { map: Box::new(map), triangles, bounds, whole: bounds, range: None, backdrop, description: description.into(), stage: None }
+        Self { map: Box::new(map), background: None, triangles, bounds, whole: bounds, range: None, backdrop, description: description.into(), stage: None }
     }
 
     /// An FF7 field seen through its own camera, with its decoded background behind it.
@@ -217,7 +235,17 @@ impl FieldView {
         let map = move |p: Pos| {
             projection.project([p.x, p.y, p.z]).map(|s| Pos::new(s.x, -s.y, 0.0))
         };
-        let (backdrop, canvas, picture, range) = match decode_background(area.field_file()) {
+        let mut background_state = BackgroundState::default();
+        let initial_note = match entry_background_ops(area.field_file(), key) {
+            Ok(ops) => { for op in ops { background_state.apply(op); } None },
+            Err(error) => {
+                let note = format!("background initializer unresolved ({error}); using static fallback");
+                eprintln!("field {key}: {note}");
+                Some(note)
+            },
+        };
+        let options = BackgroundOptions { groups: GroupFilter::State(background_state.clone()), ..BackgroundOptions::default() };
+        let (backdrop, canvas, picture, range) = match decode_background_with(area.field_file(), &options) {
             Ok(image) => {
                 let v = image.view_bounds;
                 let range = crate::camera::screen_rect_to_view(v.min_x, v.min_y, v.max_x, v.max_y);
@@ -236,6 +264,7 @@ impl FieldView {
             backdrop,
             format!("FF7 field {key} through its camera, {picture}"),
         );
+        if let Some(note) = initial_note { view.description.push_str(&format!("; {note}")); }
         if view.triangles.is_empty() {
             return Err(format!("no walkmesh triangle of field {key} is in front of its camera"));
         }
@@ -245,9 +274,10 @@ impl FieldView {
             view.description.push_str(&format!("; camera range {}x{}", r.max.x - r.min.x, r.max.y - r.min.y));
         }
         // The picture as depth-tested tiles, on the rectangle of the flat picture.
+        let prepare_scenery = scenery;
         let (scenery, note) = match (scenery, canvas) {
             (true, Some(canvas)) => {
-                let (scenery, note) = Scenery::from_field(area.field_file(), canvas);
+                let (scenery, note) = Scenery::from_field_with_options(area.field_file(), canvas, &options);
                 (scenery.map(Arc::new), note)
             }
             (true, None) => (None, "no picture, so nothing goes in front of the characters".to_string()),
@@ -261,6 +291,9 @@ impl FieldView {
             run_speed: area.run_speed(),
             scenery,
         });
+        if let Some(canvas) = canvas {
+            view.background = Some(DynamicBackground::new(key, area.field_file(), canvas, prepare_scenery, background_state));
+        }
         Ok(view)
     }
 }

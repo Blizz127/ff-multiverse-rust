@@ -35,10 +35,21 @@ use winit::keyboard::KeyCode;
 /// Events and notes kept until the loop takes them (a loop that never does, such as a window's, loses the oldest).
 const MAX_PENDING: usize = 256;
 
+/// A field mutation from the authored scene, delivered once even when its player ends between
+/// rendered frames. FieldView owns the resulting mask state, across successive scenes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneBackground {
+    pub field: String,
+    pub op: fmv_ff7::background::BackgroundOp,
+}
+
 /// The scenes of one client.
 pub struct SceneClient {
     builder: Box<dyn SceneBuilder>,
     player: Option<ScenePlayer>,
+    /// Immutable original inputs of the retained durable run, for idempotent roster refreshes.
+    binding: Option<StartBinding>,
+    authoritative: Vec<ReplayInput>,
     outbox: Vec<SceneCmd>,
     events: VecDeque<SceneEvent>,
     notes: VecDeque<String>,
@@ -59,6 +70,12 @@ pub struct SceneClient {
     visible: bool,
     /// A reserved continuation cannot be released locally. The session closes on this error.
     failure: Option<String>,
+    background: Vec<SceneBackground>,
+    background_seen: usize,
+    /// Presentation RNG belongs to the running client, independently of the VM gameplay RNG.
+    shake_rng: [u8; 2],
+    /// Only a terminal authored map jump may carry its screen colour into the field handoff.
+    handoff_fade: Option<(String, fmv_ff7::script::scene::FadeColor)>,
 }
 
 impl std::fmt::Debug for SceneClient {
@@ -85,6 +102,8 @@ impl SceneClient {
         Self {
             builder: Box::new(NoScenes),
             player: None,
+            binding: None,
+            authoritative: Vec::new(),
             outbox: Vec::new(),
             events: VecDeque::new(),
             notes: VecDeque::new(),
@@ -97,6 +116,10 @@ impl SceneClient {
             armed_epoch: 0,
             visible: true,
             failure: None,
+            background: Vec::new(),
+            background_seen: 0,
+            shake_rng: [0; 2],
+            handoff_fade: None,
         }
     }
 
@@ -117,6 +140,17 @@ impl SceneClient {
     }
 
     pub fn failure(&self) -> Option<&str> { self.failure.as_deref() }
+
+    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> {
+        self.player.as_ref().and_then(ScenePlayer::fade).or_else(|| self.handoff_fade.as_ref()
+            .filter(|(field, _)| self.player.as_ref().is_none_or(|p| p.def().field == *field))
+            .map(|(_, colour)| *colour))
+    }
+
+    /// A durable scene keeps the field held through its final authoritative placement.
+    pub fn holds_authoritative_pose(&self) -> bool {
+        self.player.as_ref().is_some_and(ScenePlayer::is_durable)
+    }
 
     pub fn player(&self) -> Option<&ScenePlayer> {
         self.player.as_ref()
@@ -149,6 +183,10 @@ impl SceneClient {
             }
             ServerMsg::SceneStep { run, step, answer } => {
                 if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
+                    if player.is_durable() && !player.is_owner()
+                        && step as usize == self.authoritative.iter().filter(|e| matches!(e, ReplayInput::Window { .. })).count() {
+                        self.authoritative.push(ReplayInput::Window { step, answer });
+                    }
                     player.on_step(step, answer);
                     self.reap();
                 }
@@ -163,7 +201,9 @@ impl SceneClient {
             }
             ServerMsg::SceneBattleResumed { run, ordinal, battle_id, progress, gil } => {
                 if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
-                    player.on_battle_resumed(ordinal, battle_id, &progress, gil);
+                    if player.on_battle_resumed(ordinal, battle_id, &progress, gil) {
+                        self.authoritative.push(ReplayInput::Battle { ordinal, progress, gil });
+                    }
                     self.reap();
                 }
             }
@@ -184,8 +224,40 @@ impl SceneClient {
     fn start(&mut self, start: Start, area: &str) {
         let Start { run, scene, seed, progress, gil, replay, participants, you } = start;
         let durable = replay.is_some();
+        let binding = replay.as_ref().map(|r| StartBinding {
+            scene: scene.clone(), seed, progress: progress.clone(), gil, role: you,
+            source: r.source, origin: r.origin,
+        });
+        if self.player.as_ref().is_some_and(|p| p.run_id() == run && p.is_durable()) {
+            // A returning owner gets a new entity id. Existing guests have already received the
+            // ordered step stream, including answers queued ahead of their visible animation.
+            let Some(replay) = replay.as_ref() else {
+                self.unavailable(run, you, &scene, "a retained durable scene lost its replay binding", true);
+                return;
+            };
+            let matches = binding == self.binding && replay.validate().is_ok()
+                && replay.events.iter().map(ReplayInput::from).eq(self.authoritative.iter().cloned())
+                && self.player.as_ref().is_some_and(|p| p.def().field.eq_ignore_ascii_case(area));
+            // Compare the authoritative history above, then validate its opaque boundary identities
+            // through a fresh strict source. Do not replace the live player or drain this probe's queues.
+            let initial_rng = self.player.as_ref().map_or([0; 2], ScenePlayer::initial_shake_rng_indices);
+            let valid = matches && StoryState::decode(&progress).is_some_and(|story| {
+                self.builder.build_with_origin(&scene, &story, seed, SceneResources { gil: Some(gil) }, replay.origin.as_ref())
+                    .and_then(|built| ScenePlayer::with_replay_seeded(
+                        Run { id: run, participants: participants.clone(), role: you }, built.def, built.source, false, replay, initial_rng))
+                    .is_ok()
+            });
+            if !valid {
+                self.unavailable(run, you, &scene, "a retained scene's original inputs or accepted history changed", true);
+            } else if let Some(player) = self.player.as_mut() {
+                player.refresh_participants(participants);
+            }
+            return;
+        }
         // A run still on show is a stale one (the server holds a player in one run at a time): it is replaced.
         self.end_local();
+        self.binding = binding;
+        self.authoritative = replay.as_ref().map(|r| r.events.iter().map(ReplayInput::from).collect()).unwrap_or_default();
         self.finished = None;
         self.failure = None;
         self.armed.clear();
@@ -218,8 +290,8 @@ impl SceneClient {
                 ));
                 let identity = Run { id: run, participants, role: you };
                 let player = match replay {
-                    Some(replay) => ScenePlayer::with_replay(identity, built.def, built.source, self.instant, &replay),
-                    None => Ok(ScenePlayer::new(identity, built.def, built.source, self.instant)),
+                    Some(replay) => ScenePlayer::with_replay_seeded(identity, built.def, built.source, self.instant, &replay, self.shake_rng),
+                    None => Ok(ScenePlayer::new_seeded(identity, built.def, built.source, self.instant, self.shake_rng)),
                 };
                 match player {
                     Ok(player) => { self.player = Some(player); self.reap(); }
@@ -245,14 +317,20 @@ impl SceneClient {
     }
 
     fn ended(&mut self, run: SceneRunId, outcome: SceneOutcome) {
+        self.collect_background();
         let lines = if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
+            if outcome == SceneOutcome::Finished {
+                if let Some(colour) = player.handoff_fade() { self.handoff_fade = Some((player.def().field.clone(), colour)); }
+            } else { self.handoff_fade = None; }
             player.on_ended();
+            self.shake_rng = player.shake_rng_indices();
             let lines = player.lines();
             self.sound(SceneSound { run, action: SoundAction::End });
             self.player = None;
             self.finished = None;
             lines
         } else if let Some((finished, lines)) = self.finished.filter(|(r, _)| *r == run) {
+            if outcome != SceneOutcome::Finished { self.handoff_fade = None; }
             let _ = finished;
             self.finished = None;
             lines
@@ -329,21 +407,53 @@ impl SceneClient {
 
     /// The scene cannot go on here (the area changed under it): drop it without a word.
     pub fn end_local(&mut self) {
+        self.collect_background();
         if let Some(player) = self.player.take() {
+            self.shake_rng = player.shake_rng_indices();
+            if let Some(colour) = player.handoff_fade() { self.handoff_fade = Some((player.def().field.clone(), colour)); }
             self.sound(SceneSound { run: player.run_id(), action: SoundAction::End });
             self.finished = Some((player.run_id(), player.lines()));
         }
+        self.background_seen = 0;
+        self.binding = None;
+        self.authoritative.clear();
     }
+
+    fn collect_background(&mut self) {
+        let Some(player) = &self.player else { return };
+        let ops = player.background_ops();
+        for &op in ops.get(self.background_seen..).unwrap_or_default() {
+            self.background.push(SceneBackground { field: player.def().field.clone(), op });
+        }
+        self.background_seen = ops.len();
+    }
+
+    pub fn drain_background(&mut self) -> Vec<SceneBackground> { std::mem::take(&mut self.background) }
+
+    /// A new field visit creates a new background baseline; old-visit commands cannot leak in.
+    pub fn discard_background(&mut self) { self.background.clear(); }
+
+    /// A new field's initialization resets active effects, but process-local shake indices survive.
+    pub fn discard_field_effects(&mut self) { self.handoff_fade = None; }
 
     // ---- what is owed and what happened ----------------------------------------------------------------------------
 
     /// Collect what the player has to say, and drop it when it is over.
     fn reap(&mut self) {
+        self.collect_background();
         let Some(player) = self.player.as_mut() else { return };
         if let Some(reason) = player.continuation_failure() {
             self.failure = Some(reason.to_string());
         }
-        self.outbox.extend(player.take_commands());
+        let commands = player.take_commands();
+        if player.is_durable() && player.is_owner() {
+            for command in &commands {
+                if let SceneCmd::Step { step, answer, .. } = command {
+                    self.authoritative.push(ReplayInput::Window { step: *step, answer: *answer });
+                }
+            }
+        }
+        self.outbox.extend(commands);
         let events: Vec<SceneEvent> = player.take_events();
         let sounds = player.take_sounds();
         let over = player.is_over().then(|| (player.run_id(), player.lines()));
@@ -352,6 +462,10 @@ impl SceneClient {
             self.event(event);
         }
         if let Some(over) = over {
+            if let Some(player) = &self.player {
+                self.shake_rng = player.shake_rng_indices();
+                if let Some(colour) = player.handoff_fade() { self.handoff_fade = Some((player.def().field.clone(), colour)); }
+            }
             self.player = None;
             self.finished = Some(over);
         }
@@ -405,6 +519,33 @@ impl SceneClient {
         }
         self.notes.push_back(line);
     }
+}
+
+/// Accepted wire inputs, independent of how far the visible stage has animated.
+#[derive(Clone, PartialEq)]
+enum ReplayInput {
+    Window { step: u32, answer: Option<u8> },
+    Battle { ordinal: u32, progress: Vec<u8>, gil: u32 },
+}
+
+impl From<&fmv_protocol::SceneReplayEvent> for ReplayInput {
+    fn from(event: &fmv_protocol::SceneReplayEvent) -> Self {
+        match event {
+            fmv_protocol::SceneReplayEvent::Window { step, answer, .. } => Self::Window { step: *step, answer: *answer },
+            fmv_protocol::SceneReplayEvent::Battle { ordinal, progress, gil, .. } => Self::Battle { ordinal: *ordinal, progress: progress.clone(), gil: *gil },
+        }
+    }
+}
+
+#[derive(PartialEq)]
+struct StartBinding {
+    scene: String,
+    seed: u32,
+    progress: Vec<u8>,
+    gil: u32,
+    role: SceneRole,
+    source: [u8; 32],
+    origin: Option<fmv_protocol::SceneOrigin>,
 }
 
 /// The fields of a `SceneStart`.

@@ -20,11 +20,15 @@ impl Ff7SceneHost {
         let original = def.prepare_story(&StoryState::decode(original_progress)?).ok()?;
         let area = self.field(&def.field)?;
         let origin = replay.map_or(initial_origin, |replay| replay.origin);
-        let def = if def.id == fmv_ff7::script::scene::BRIDGE_SCENE_ID {
+        let def = if def.origin_actor().is_some() {
             let origin = origin?;
             origin.validate().ok()?;
             fmv_ff7::script::scene::with_trigger_position(area.field_file(), def, origin.pos, origin.facing, origin.triangle).ok()?
-        } else { def.clone() };
+        } else {
+            // An arrival has its authored setup, not an unrelated unbound crossing pose.
+            if origin.is_some() { return None; }
+            def.clone()
+        };
         let mut play = ScenePlay::with_resources(area.field_file(), &def, &original, seed,
             SceneResources { gil: Some(original_gil) }).ok()?;
         let source = play.replay_identity().fingerprint;
@@ -109,6 +113,99 @@ fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs owner's FMV_FF7_DATA; reads owned scripts without writing live state"]
+    fn owned_cargo_door_and_train_keep_landing_and_control_positions_distinct() {
+        use crate::ff7::{open_ff7, Ff7Labels, Ff7Source};
+        use fmv_ff7::script::scene::{cargo_door_scene, train_scene, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID};
+        let data = std::path::PathBuf::from(std::env::var_os("FMV_FF7_DATA").expect("owned field data"));
+        let opened = open_ff7(&Ff7Source::Flevel { path: data.join("field/flevel.lgp"), labels: Ff7Labels::default() }).unwrap();
+        let mut host = Ff7SceneHost::with_extended_save(opened.adapter, true);
+        host.defs.retain(|def| ![CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID].contains(&def.id.as_str()));
+        host.defs.extend([cargo_door_scene(), train_scene()]);
+        assert!(!host.automatic(CARGO_DOOR_SCENE_ID) && host.automatic(TRAIN_SCENE_ID));
+        let legacy = StoryState::at(48).encode();
+        let mut known = StoryState::at(48).into_extended().unwrap();
+        known.set_bit(3, 66, 0, true);
+        // An unrelated, partially known selector must survive both transitions unchanged.
+        known.set_bit(3, 111, 0, false);
+        let extended = known.encode();
+        for original in [&legacy, &extended] {
+            for gil in [0, 617] {
+                let at = |x, y| fmv_core::Pos::new(x, y, 0.0);
+                let origin = SceneOrigin { pos: at(9.0, -105.0), facing: fmv_ff7::field_direction_to_facing(0), triangle: None };
+                assert_eq!(host.line_scene("cargoin", original, at(9.0, -103.0), origin.pos), Some(CARGO_DOOR_SCENE_ID.into()));
+                assert!(host.line_scene("cargoin", original, at(100.0, -103.0), at(100.0, -105.0)).is_none());
+                for moment in [39, 47, 49, 51] {
+                    assert!(host.line_scene("cargoin", &StoryState::at(moment).encode(), at(9.0, -103.0), origin.pos).is_none());
+                }
+                assert!(host.initial_continuation(CARGO_DOOR_SCENE_ID, original, 7, gil, None).is_none(),
+                    "the door jump needs the accepted crossing, not a survey placement");
+                let first = host.initial_continuation(CARGO_DOOR_SCENE_ID, original, 7, gil, Some(origin)).expect("door sequence");
+                let replay = SceneReplay { source: first.source, origin: Some(origin), events: Vec::new() };
+                let mut wrong = replay.clone();
+                wrong.origin.as_mut().unwrap().facing += 0.5;
+                assert!(host.evaluate_continuation(CARGO_DOOR_SCENE_ID, original, 7, gil, Some(&wrong)).is_none());
+                let mut trailing = replay.clone();
+                trailing.events.push(SceneReplayEvent::Window { step: 0, identity: vec![1], answer: None });
+                assert!(host.evaluate_continuation(CARGO_DOOR_SCENE_ID, original, 7, gil, Some(&trailing)).is_none(),
+                    "a zero-window script cannot accept a manufactured acknowledgment");
+                let door = host.evaluate_continuation(CARGO_DOOR_SCENE_ID, original, 7, gil, Some(&replay)).unwrap();
+                let SceneBoundaryKind::Complete(result) = door.at else { panic!("door has no dialogue or combat boundary") };
+                let promoted = StoryState::decode(original).unwrap().into_extended().unwrap();
+                assert_eq!(StoryState::decode(&result.progress), Some(promoted.clone()));
+                assert_eq!(door.gil, gil);
+                let transaction = result.transaction.unwrap();
+                assert_eq!((transaction.expected_gil, transaction.next_gil), (gil, gil));
+                let landing = result.travel.unwrap();
+                assert_eq!(landing.target, "tin_1");
+                assert_eq!(landing.arrival, at(-2.0, 608.0));
+                assert_eq!(landing.arrival_hint, Some(29));
+                assert_eq!(landing.arrival_facing, Some(fmv_ff7::field_direction_to_facing(252)));
+                // The moment alone still points back to cargo; only the pending landing
+                // can recover this interval before the arrival has durably written 51.
+                assert_eq!(host.entry(&result.progress).unwrap().target, "cargoin");
+
+                let first = host.initial_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, None).expect("train arrival");
+                assert!(host.initial_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, Some(origin)).is_none(),
+                    "an automatic scene cannot carry unbound crossing metadata");
+                let mut replay = SceneReplay { source: first.source, origin: None, events: Vec::new() };
+                for step in 0..2 {
+                    let boundary = host.evaluate_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, Some(&replay)).expect("train window");
+                    let SceneBoundaryKind::Window { step: actual, identity, choices } = boundary.at else { panic!("train ended before window {step}") };
+                    assert_eq!((actual, choices, boundary.gil), (step, None, gil));
+                    let mut wrong = replay.clone();
+                    wrong.events.push(SceneReplayEvent::Window { step, identity: identity.clone(), answer: Some(0) });
+                    assert!(host.evaluate_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, Some(&wrong)).is_none(),
+                        "a non-choice window accepts no answer");
+                    replay.events.push(SceneReplayEvent::Window { step, identity, answer: None });
+                }
+                let final_boundary = host.evaluate_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, Some(&replay)).expect("train actor tail finishes");
+                let SceneBoundaryKind::Complete(finished) = final_boundary.at else { panic!("train did not finish after two windows") };
+                let mut expected = promoted;
+                expected.moment = 51;
+                assert_eq!(StoryState::decode(&finished.progress), Some(expected));
+                assert_eq!(final_boundary.gil, gil);
+                assert!(finished.travel.is_none());
+                let transaction = finished.transaction.unwrap();
+                assert_eq!((transaction.expected_gil, transaction.next_gil), (gil, gil));
+                assert!(!host.offered(TRAIN_SCENE_ID, &finished.progress));
+                let control = host.entry(&finished.progress).expect("completed train control position");
+                assert_eq!(control.target, "tin_1");
+                assert_eq!(control.arrival, at(2.0, 537.0));
+                assert_eq!(control.arrival_hint, Some(28));
+                assert_eq!(control.arrival_facing, Some(fmv_ff7::field_direction_to_facing(0)));
+                assert_ne!(landing.arrival, control.arrival);
+                let mut trailing = replay.clone();
+                trailing.events.push(replay.events.last().unwrap().clone());
+                assert!(host.evaluate_continuation(TRAIN_SCENE_ID, &result.progress, 7, gil, Some(&trailing)).is_none());
+            }
+        }
+        host.extended_save = false;
+        assert!(!host.continuation(CARGO_DOOR_SCENE_ID) && !host.continuation(TRAIN_SCENE_ID));
+        assert!(!host.offered(CARGO_DOOR_SCENE_ID, &legacy) && !host.offered(TRAIN_SCENE_ID, &legacy));
+    }
 
     #[test]
     #[ignore = "needs owner's FMV_FF7_DATA; reads owned scripts without writing live state"]

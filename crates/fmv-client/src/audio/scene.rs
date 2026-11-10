@@ -1,5 +1,6 @@
-//! Timed SOUND commands from a local scene. Channel 1 belongs to the run, with one
-//! cancellable voice at a time; delayed decoding cannot resurrect a stopped sound.
+//! Timed SOUND and reviewed AKAO commands from a local scene. Channels 1 and 2 have
+//! independent cancellable voices; delayed decoding cannot resurrect a stopped sound.
+//! Channels 3 and 4 remain with the field's ambient plan.
 use super::Live;
 use crate::scene::{SceneSound, SoundAction};
 use fmv_audio::SfxHandle;
@@ -9,23 +10,31 @@ use std::time::Duration;
 #[derive(Default)]
 pub(super) struct SceneAudio {
     run: Option<SceneRunId>,
+    channels: [Channel; 2],
+}
+
+#[derive(Default)]
+struct Channel {
     handle: Option<SfxHandle>,
     pending: Option<(u16, u8, f64)>,
     touched: bool,
 }
 
 impl Live {
-    fn stop_scene_sound(&mut self) {
-        self.scene_audio.pending = None;
-        if let Some(handle) = self.scene_audio.handle.take() {
+    fn stop_scene_sound(&mut self, index: usize) {
+        let Some(channel) = self.scene_audio.channels.get_mut(index) else { return };
+        channel.pending = None;
+        if let Some(handle) = channel.handle.take() {
             self.engine.stop_sfx_loop(handle, Duration::ZERO);
         }
     }
 
     fn end_scene_audio(&mut self) {
-        self.stop_scene_sound();
-        if self.scene_audio.touched {
-            self.field.scene_channel(&self.engine, &self.log, false);
+        for index in 0..self.scene_audio.channels.len() {
+            self.stop_scene_sound(index);
+            if self.scene_audio.channels[index].touched {
+                self.field.scene_channel(&self.engine, &self.log, index as u8 + 1, false);
+            }
         }
         self.scene_audio = SceneAudio::default();
     }
@@ -47,15 +56,16 @@ impl Live {
                 SoundAction::Prepare(id) => {
                     if id != 0 && self.sounds_asked.insert(id) { wanted.push(id); }
                 }
-                SoundAction::Play { id, pan } => {
-                    self.stop_scene_sound();
-                    self.field.scene_channel(&self.engine, &self.log, true);
-                    self.scene_audio.touched = true;
+                SoundAction::Play { channel, id, pan } => {
+                    let Some(index) = usize::from(channel).checked_sub(1).filter(|&index| index < self.scene_audio.channels.len()) else { continue };
+                    self.stop_scene_sound(index);
+                    self.field.scene_channel(&self.engine, &self.log, channel, true);
+                    self.scene_audio.channels[index].touched = true;
                     if id == 0 {
-                        self.say(&format!("scene sound stop ch1 run={}", cue.run.0));
+                        self.say(&format!("scene sound stop ch{channel} run={}", cue.run.0));
                     } else {
                         if self.sounds_asked.insert(id) { wanted.push(id); }
-                        self.scene_audio.pending = Some((id, pan, now));
+                        self.scene_audio.channels[index].pending = Some((id, pan, now));
                     }
                 }
                 SoundAction::End => self.end_scene_audio(),
@@ -63,16 +73,18 @@ impl Live {
         }
         if !wanted.is_empty() { self.worker.load_sounds(wanted); }
         self.pump_worker();
-        let Some((id, pan, at)) = self.scene_audio.pending else { return };
-        if now - at > super::STALE_SOUND_S {
-            self.scene_audio.pending = None;
-            self.say(&format!("scene sound {id} missed its decode deadline; skipped"));
-            return;
+        for index in 0..self.scene_audio.channels.len() {
+            let Some((id, pan, at)) = self.scene_audio.channels[index].pending else { continue };
+            if now - at > super::STALE_SOUND_S {
+                self.scene_audio.channels[index].pending = None;
+                self.say(&format!("scene sound {id} missed its decode deadline; skipped"));
+                continue;
+            }
+            let Some(clip) = self.battle_clips.get(id) else { continue };
+            let pan = (f32::from(pan.min(127)) - 63.5) / 63.5;
+            self.scene_audio.channels[index].handle = Some(self.engine.play_sfx_controlled(clip, 0.8, pan));
+            self.scene_audio.channels[index].pending = None;
+            self.say(&format!("scene sound ch{} {id} run={}", index + 1, self.scene_audio.run.unwrap().0));
         }
-        let Some(clip) = self.battle_clips.get(id) else { return };
-        let pan = (f32::from(pan.min(127)) - 63.5) / 63.5;
-        self.scene_audio.handle = Some(self.engine.play_sfx_controlled(clip, 0.8, pan));
-        self.scene_audio.pending = None;
-        self.say(&format!("scene sound ch1 {id} run={}", self.scene_audio.run.unwrap().0));
     }
 }

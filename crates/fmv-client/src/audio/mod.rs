@@ -26,7 +26,7 @@
 //!   them with the effects' volume path: they share the master volume, the mute key and `--mute`/`FMV_AUDIO` with the rest.
 //!   `FMV_BATTLE_SOUNDS` says which ones are played: `off` none, `data` (the default) what the data names, `all` also
 //!   the two that only a hand-made list of the sound bank names (an enemy's death, an escape; see [`BattleSounds`]).
-//! * **Scene sounds.** Literal SOUND commands follow the local scene clock on cancellable channel 1.
+//! * **Scene sounds.** Literal SOUND and reviewed AKAO commands follow the local scene clock on cancellable channels 1 and 2.
 //!   Stops, replacement and scene end cancel pending decodes; other channels keep playing.
 //! * **Field sounds.** What the field's own scripts play for the player's story ([`field`]): ambient loops (the hum of
 //!   the reactor before the boss, its alarm after it), and the sounds of the ladders, jumps, lift and doors the player uses.
@@ -2373,6 +2373,89 @@ mod tests {
 
     use crate::scene::{SceneSound, SoundAction};
     use fmv_protocol::SceneRunId;
+
+    #[test]
+    #[allow(clippy::chunks_exact_to_as_chunks)] // as_chunks needs Rust 1.88; retain the workspace's older MSRV.
+    fn scene_sound_channels_replace_and_stop_independently_and_begin_releases_both() {
+        let mut rig = Rig::new(&[], &[]);
+        let cue = |run, action| SceneSound { run: SceneRunId(run), action };
+        let play = |channel, id, pan| SoundAction::Play { channel, id, pan };
+        let feed = |rig: &mut Rig, actions, at| rig.audio.live.as_mut().unwrap().scene_sounds(actions, at);
+        feed(&mut rig, vec![cue(7, SoundAction::Begin), cue(7, play(1, 59, 0)), cue(7, play(2, 233, 127))], 0.0);
+        let samples = rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 2, "the two effect channels coexist");
+        assert!(samples.chunks_exact(2).any(|s| s[0] > 0.01 && s[1] > 0.01));
+        feed(&mut rig, vec![cue(7, play(1, 61, 0))], 0.1);
+        rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 2, "replacing channel 1 preserves channel 2");
+        feed(&mut rig, vec![cue(7, play(1, 0, 63))], 0.2);
+        rig.audio.pump(64);
+        let samples = rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 1);
+        assert!(samples.chunks_exact(2).all(|s| s[0].abs() < 0.001 && s[1] > 0.01), "only channel 2's right-panned sound remains");
+        feed(&mut rig, vec![cue(8, SoundAction::Begin)], 0.3);
+        rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 0, "a new run ends the prior run's remaining channel");
+        let asks = rig.state.borrow().asked.len();
+        feed(&mut rig, vec![cue(7, play(1, 66, 0)), cue(8, play(0, 67, 0)), cue(8, play(3, 154, 0)), cue(8, play(4, 68, 0)), cue(8, play(255, 69, 0))], 0.4);
+        assert_eq!(rig.state.borrow().asked.len(), asks, "old runs and unsupported channels neither decode nor play");
+        feed(&mut rig, vec![cue(8, play(1, 59, 0)), cue(8, play(2, 233, 127))], 0.5);
+        rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 2);
+        feed(&mut rig, vec![cue(8, SoundAction::End)], 0.6);
+        rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 0, "end cancels both channels");
+    }
+
+    #[test]
+    fn scene_sound_delayed_decodes_stay_with_their_channel_and_latest_request() {
+        let mut rig = Rig::new(&[], &[]);
+        rig.state.borrow_mut().hold = true;
+        let cue = |action| SceneSound { run: SceneRunId(7), action };
+        let play = |channel, id| cue(SoundAction::Play { channel, id, pan: 127 });
+        let feed = |rig: &mut Rig, actions, at| rig.audio.live.as_mut().unwrap().scene_sounds(actions, at);
+        feed(&mut rig, vec![cue(SoundAction::Begin), play(1, 59), play(2, 233)], 0.0);
+        feed(&mut rig, vec![play(1, 0), play(2, 167)], 0.1);
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        rig.state.borrow_mut().inbox.extend(held);
+        feed(&mut rig, vec![], 0.2);
+        rig.audio.pump(64);
+        assert_eq!(rig.audio.status().unwrap().sfx_playing, 1);
+        let starts: Vec<_> = rig.lines().into_iter().filter(|l| l.starts_with("scene sound ch")).collect();
+        assert_eq!(starts, ["scene sound ch2 167 run=7"], "stopped channel 1 and replaced channel 2 decodes cannot reappear");
+        rig.audio.pump(4_800);
+        feed(&mut rig, vec![play(1, 61), play(2, 427)], 1.0);
+        feed(&mut rig, vec![], 1.6);
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        rig.state.borrow_mut().inbox.extend(held);
+        feed(&mut rig, vec![], 1.7);
+        assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001), "both stale requests expire before their decodes arrive");
+        assert_eq!(rig.lines().iter().filter(|l| l.contains("missed its decode deadline")).count(), 2);
+    }
+
+    #[test]
+    fn scene_sounds_take_only_their_field_channels_and_give_them_back_on_end() {
+        let mut rig = field_rig("tin_1", plan_of(vec![ambient(1, 41), ambient(2, 42), ambient(3, 154)]), &[41, 42, 154]);
+        let story = blob(48);
+        follow(&mut rig, &frame("tin_1", &story, 0.0));
+        follow(&mut rig, &frame("tin_1", &story, 0.05));
+        assert_eq!(rig.audio.field_loops(), [(1, 41), (2, 42), (3, 154)]);
+        let cue = |action| SceneSound { run: SceneRunId(7), action };
+        let play = |channel, id| cue(SoundAction::Play { channel, id, pan: 63 });
+        let feed = |rig: &mut Rig, actions, at| rig.audio.live.as_mut().unwrap().scene_sounds(actions, at);
+        feed(&mut rig, vec![cue(SoundAction::Begin), play(2, 233)], 0.1);
+        follow(&mut rig, &frame("tin_1", &story, 0.15));
+        assert_eq!(rig.audio.field_loops(), [(1, 41), (3, 154)], "only the field's channel 2 yields, and stays yielded");
+        feed(&mut rig, vec![play(1, 59)], 0.2);
+        follow(&mut rig, &frame("tin_1", &story, 0.25));
+        assert_eq!(rig.audio.field_loops(), [(3, 154)], "the train hum is never taken by either scene channel");
+        feed(&mut rig, vec![cue(SoundAction::End)], 0.3);
+        follow(&mut rig, &frame("tin_1", &story, 0.35));
+        assert_eq!(rig.audio.field_loops(), [(1, 41), (2, 42), (3, 154)], "end releases both channel claims to the field plan");
+        let lines = rig.lines();
+        assert_eq!(lines.iter().filter(|l| l.as_str() == "field loop start ch3 154").count(), 1, "the train hum never restarts or duplicates");
+    }
+
     #[test]
     fn scene_sound_replacement_stop_delayed_decode_and_off_are_bounded_to_the_run() {
         // Shared test rig supplies a manual sink and delayed worker; no sound device.
@@ -2380,23 +2463,23 @@ mod tests {
         let call = |action| SceneSound { run: SceneRunId(7), action };
         let feed = |rig: &mut Rig, actions: Vec<SceneSound>, at| rig.audio.live.as_mut().unwrap().scene_sounds(actions, at);
         feed(&mut rig, vec![call(SoundAction::Begin), call(SoundAction::Prepare(61))], 0.0);
-        feed(&mut rig, vec![call(SoundAction::Play { id: 61, pan: 63 })], 0.5);
+        feed(&mut rig, vec![call(SoundAction::Play { channel: 1, id: 61, pan: 63 })], 0.5);
         assert!(rig.audio.pump(64).iter().any(|s| s.abs() > 0.01));
-        feed(&mut rig, vec![call(SoundAction::Play { id: 0, pan: 63 })], 0.6);
+        feed(&mut rig, vec![call(SoundAction::Play { channel: 1, id: 0, pan: 63 })], 0.6);
         rig.audio.pump(64); // stop ramp
         assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001));
         rig.state.borrow_mut().hold = true;
-        feed(&mut rig, vec![call(SoundAction::Play { id: 59, pan: 0 })], 1.0);
+        feed(&mut rig, vec![call(SoundAction::Play { channel: 1, id: 59, pan: 0 })], 1.0);
         feed(&mut rig, vec![call(SoundAction::End)], 1.1);
         let held = std::mem::take(&mut rig.state.borrow_mut().held);
         rig.state.borrow_mut().inbox.extend(held);
         feed(&mut rig, vec![], 1.2);
         assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001), "late clip cannot restart an ended run");
-        feed(&mut rig, vec![call(SoundAction::Play { id: 61, pan: 63 })], 1.3);
+        feed(&mut rig, vec![call(SoundAction::Play { channel: 1, id: 61, pan: 63 })], 1.3);
         assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001), "stale run ignored");
         rig.audio = rig.audio.with_field_sounds(FieldSounds::Off);
         let asks = rig.state.borrow().asked.len();
-        feed(&mut rig, vec![call(SoundAction::Begin), call(SoundAction::Prepare(236)), call(SoundAction::Play { id: 236, pan: 63 })], 2.0);
+        feed(&mut rig, vec![call(SoundAction::Begin), call(SoundAction::Prepare(236)), call(SoundAction::Play { channel: 1, id: 236, pan: 63 })], 2.0);
         assert_eq!(rig.state.borrow().asked.len(), asks, "off neither loads nor plays");
     }
 }

@@ -599,7 +599,7 @@ fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_bat
     loop {
         let beat = play.next(None);
         sounds.extend(beat.stage.into_iter().filter_map(|event| match event.what {
-            Stage::Sound { id, pan } => Some((event.at, id, pan)),
+            Stage::Sound { channel, id, pan } => Some((event.at, channel, id, pan)),
             _ => None,
         }));
         match beat.then {
@@ -608,8 +608,16 @@ fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_bat
         }
     }
     assert_eq!(openers, [4, 4, 3, 4, 3, 3, 3, 3, 4, 3, 3]);
-    assert_eq!(sounds.iter().map(|(_, id, pan)| (*id, *pan)).collect::<Vec<_>>(),
-        [(236, 64), (0, 64), (61, 64), (59, 64), (60, 64), (0, 64)]);
+    // Cloud's script6 stops SOUND's channel1 at061C, then explicitly stops channel2
+    // with AKAO41@0621 before BATTLE324. The second stop is not a duplicate channel1 cue.
+    let script = FieldScript::from_field(&f).unwrap();
+    let cloud = script.disassemble(3, 6).unwrap();
+    let stop = cloud.iter().find(|ins| ins.offset == 0x0621).unwrap();
+    assert_eq!((stop.mnemonic, ["op", "p1", "p2"].map(|name| stop.literal(name))),
+        ("AKAO", [Some(41), Some(64), Some(0)]));
+    assert_eq!(sounds.iter().map(|(_, channel, id, pan)| (*channel, *id, *pan)).collect::<Vec<_>>(),
+        [(1, 236, 64), (1, 0, 64), (1, 61, 64), (1, 59, 64), (1, 60, 64), (1, 0, 64), (2, 0, 64)]);
+    assert_eq!(sounds[5].0, sounds[6].0, "both channels stop on the same authored frame before battle");
     assert_eq!(sounds[3].0 - sounds[2].0, 60, "the bomb's two sounds are separated by WAIT 60");
     // cl.6: WAIT10@05DE, blocking ANIM!2@05E1, WAIT20@05E4, SOUND60@05E7.
     // Full-clip lengths still use the VM's 15-frame estimate; ANIM!2 has waited since e1def05.
@@ -720,6 +728,24 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
             // registered or currently traversable by the host.
             continue;
         }
+        if row.field == "tin_1" {
+            assert!(gateways.is_empty(), "the passenger car also leaves through authored scripts");
+            let script = FieldScript::from_field(&f).unwrap();
+            let mut archive = LgpArchive::open_path(flevel_path(&data_dir().unwrap())).unwrap();
+            let maps = fmv_ff7::script::Maplist::from_archive(&mut archive).unwrap();
+            let exit = script.script_exits(&maps).into_iter().find(|exit| exit.entity == 27 && exit.offset == 4229).expect("border2's authored station departure");
+            assert!(matches!(exit.trigger, fmv_ff7::script::ExitTrigger::Line { slot: 2 }));
+            assert_eq!(exit.path.iter().map(|script| (script.entity, script.slot)).collect::<Vec<_>>(), [(27, 2), (30, 7), (31, 10), (17, 1)]);
+            assert_eq!((exit.target.as_deref(), exit.target_id, exit.x, exit.y, exit.triangle, exit.direction), (Some("mds7st3"), 146, -2891, 3392, 26, 0));
+            let line = exit.line.expect("the decoded border2 line");
+            assert_eq!((line.a, line.b), ([-55, -210, -53], [52, -220, -53]));
+            let (mx, my) = ((i32::from(line.a[0]) + i32::from(line.b[0])) / 2, (i32::from(line.a[1]) + i32::from(line.b[1])) / 2);
+            let on: Vec<usize> = (0..mesh.triangles.len()).filter(|&t| fmv_ff7::script::triangle_contains_xy(&mesh.triangles[t], mx, my)).collect();
+            assert!(on.iter().any(|&t| parts[t] == here), "the final train control position and authored exit midpoint share the floor");
+            // The later departure has its own script and state conditions. Floor connectivity does not register it,
+            // enable its line, or prove that its uncarried selectors have known values at moment 51.
+            continue;
+        }
         assert!(!gateways.is_empty(), "{}: a field somebody is put in has a way out", row.field);
         for g in &gateways {
             let (mx, my) = ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2);
@@ -743,7 +769,10 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
     assert_eq!(story_entry(47).map(|e| e.field), Some("md8_2"), "the train arrival must complete before the return entry changes");
     let cargo = story_entry(48).unwrap();
     assert_eq!((cargo.field, cargo.spot.x, cargo.spot.y, cargo.spot.triangle, cargo.spot.direction), ("cargoin", -24, 16, 20, 0));
-    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("cargoin"), "until a later row says otherwise");
+    assert_eq!(story_entry(50).map(|e| e.field), Some("cargoin"), "the train's durable completion establishes its return entry");
+    let train = story_entry(51).unwrap();
+    assert_eq!((train.field, train.spot.x, train.spot.y, train.spot.triangle, train.spot.direction), ("tin_1", 2, 537, 28, 0));
+    assert_eq!(story_entry(u16::MAX).map(|e| e.field), Some("tin_1"), "until a later row says otherwise");
 
     // Each scene's witness stands on its own triangle, on the floor the entry is on (the player walks away from it after).
     for def in [fmv_ff7::script::scene::post_escape_scene(), fmv_ff7::script::scene::station_scene(), fmv_ff7::script::scene::flower_station_scene()] {
@@ -762,8 +791,11 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
 /// an arrival scene is offered at moments no other arrival scene of its field is (two could not both start).
 #[test]
 fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
-    use fmv_ff7::script::scene::scenes;
+    use fmv_ff7::script::scene::{scenes, BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID};
     let all = scenes();
+    assert_eq!(all.len(), 18);
+    assert_eq!(all[14..].iter().map(|scene| scene.id.as_str()).collect::<Vec<_>>(),
+        [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID], "door and train append after the shipped bridge and cargo slots");
     for (i, a) in all.iter().enumerate() {
         assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
         assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && !a.is_point_cutscene() && a.line_trigger().is_none());
@@ -798,22 +830,90 @@ fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
 }
 
 #[test]
-#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); the train scene is not yet enabled"]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn train_director_finishes_after_its_authored_actor_work() {
+    use fmv_ff7::script::scene::{run_to_end_with_resources_strict, train_scene, CameraOp, Resources, SceneBoundary, WindowAck};
     let f = field("tin_1").expect("FMV_FF7_DATA and tin_1");
-    let def = fmv_ff7::script::scene::train_scene();
-    let outcome = run_to_end(&f, &def, &StoryState::at(48), 1, &[]).unwrap();
-    assert!(!outcome.setup_stats.setup_incomplete, "train setup must not stop on a budget or scene end");
-    assert_eq!(outcome.end, End::Finished);
-    assert_eq!(outcome.windows, 2);
-    assert_eq!(outcome.writes.moment, Some(51));
-    assert_eq!(outcome.stats.quiescent_tails, 1);
-    assert_eq!(outcome.stats.unresolved, 0);
-    assert_eq!(outcome.stats.dropped_requests, 0);
-    assert!(outcome.stats.unknown.is_empty());
-    let mut play = ScenePlay::new(&f, &def, &StoryState::at(48), 1).unwrap();
-    loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
+    let def = train_scene();
+    let original = StoryState::at(48);
+    let story = def.prepare_story(&original).unwrap();
+    let resources = Resources { gil: Some(600) };
+    let outcome = run_to_end_with_resources_strict(&f, &def, &original, 1, resources, &[]).unwrap();
+    assert_eq!((outcome.end, outcome.windows, outcome.questions, outcome.writes.moment), (End::Finished, 2, 0, Some(51)));
+    assert!(outcome.jump.is_none() && outcome.is_complete() && outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
+    assert!(outcome.party.is_empty() && outcome.resources.gil_ops.is_empty());
+    assert_eq!((outcome.resources.gil_before, outcome.resources.gil_after), (Some(600), Some(600)));
+    let mut after = story.clone();
+    assert_eq!(outcome.writes.apply_extended_to(&mut after, &story), Some(true));
+    let mut expected = story.clone();
+    expected.moment = 51;
+    assert_eq!(after.encode(), expected.encode(), "only the authored moment changes; unknown flags stay unknown");
+
+    let script = FieldScript::from_field(&f).unwrap();
+    let cloud = script.disassemble(30, 3).unwrap();
+    let place = cloud.iter().find(|ins| ins.offset == 5394).unwrap();
+    assert_eq!((place.mnemonic, ["x", "y", "z", "triangle"].map(|name| place.literal(name))),
+        ("XYZI", [Some(2), Some(537), Some(-53), Some(28)]));
+    let moment = cloud.iter().find(|ins| ins.offset == 5431).unwrap();
+    assert_eq!((moment.mnemonic, moment.literal("value")), ("SETWORD", Some(51)));
+    assert_eq!(moment.operand("var").map(|v| (v.bank, v.value)), Some((2, 0)));
+    for (offset, name) in [(5436, "UC"), (5438, "MENU2")] {
+        let ins = cloud.iter().find(|ins| ins.offset == offset).unwrap();
+        assert_eq!((ins.mnemonic, ins.literal("disabled")), (name, Some(0)), "controls return after the moment write");
+    }
+    // The four arrival effects are literal AKAO operation40 (channel1), never guessed
+    // from animation names. The train hum's operation42 remains field-owned on channel3.
+    for (entity, slot, offset, id, pan) in [(17, 0, 0x104A, 59, 64), (31, 3, 0x18F4, 167, 64),
+        (31, 3, 0x1958, 427, 0), (30, 3, 0x1526, 167, 64)] {
+        let instructions = script.disassemble(entity, slot).unwrap();
+        let ins = instructions.iter().find(|ins| ins.offset == offset).unwrap();
+        assert_eq!((ins.mnemonic, ["op", "p1", "p2"].map(|name| ins.literal(name))),
+            ("AKAO", [Some(40), Some(pan), Some(id)]));
+    }
+    let camera_script = script.disassemble(20, 0).unwrap();
+    let camera = camera_script.iter().find(|ins| ins.offset == 4766).unwrap();
+    assert_eq!((camera.mnemonic, camera.literal("x"), camera.literal("y")), ("SCR2D", Some(18), Some(2)));
+
+    let mut play = ScenePlay::with_resources(&f, &def, &original, 1, resources).unwrap();
+    assert!(play.initial_stage_events().contains(&Stage::Place { entity: 41, x: -91, y: -292, z: Some(-53), triangle: Some(51) }),
+        "the woman's own initializer positions her before her first walk");
+    let mut events = play.initial_stage_events().to_vec();
+    let mut ack = None;
+    let mut marks = Vec::new();
+    loop {
+        let beat = play.next_strict(ack.take()).unwrap();
+        events.extend(beat.stage.into_iter().map(|event| event.what));
+        match beat.then {
+            Then::Window(_) => {
+                let Some(SceneBoundary::Window(checkpoint)) = play.boundary() else { panic!("a window checkpoint") };
+                marks.push((checkpoint.entity, checkpoint.instruction_offset, checkpoint.dialog));
+                assert!(marks.len() <= 2, "the arrival has only its two authored windows");
+                ack = Some(WindowAck { checkpoint, answer: None });
+            }
+            Then::End { how, .. } => { assert_eq!(how, End::Finished); break; }
+        }
+    }
+    assert_eq!(marks, [(17, Some(4198), Some(32)), (37, Some(10356), Some(39))]);
+    let sounds: Vec<_> = events.iter().filter_map(|event| match *event {
+        Stage::Sound { channel, id, pan } => Some((channel, id, pan)),
+        _ => None,
+    }).collect();
+    assert_eq!(sounds, [(1, 59, 64), (1, 167, 64), (1, 427, 0), (1, 167, 64)],
+        "announcement, opening door, impact and closing door play once; field hum154 is not duplicated");
     assert_eq!(play.off_cast(), 0, "the authored stage events have a cast actor");
+    assert!(events.iter().any(|event| matches!(event, Stage::Move { entity: 41, from: Some((-91, -292)), x: -28, y: -339, .. })));
+    assert!(events.iter().any(|event| matches!(event, Stage::Move { entity: 37, from: Some((91, -292)), x: -1, y: -377, .. })),
+        "the employee's own main must position him before the director requests his walk");
+    let final_place = events.iter().rev().find(|event| matches!(event, Stage::Place { entity: 30, .. } | Stage::Move { entity: 30, .. }));
+    assert_eq!(final_place, Some(&Stage::Place { entity: 30, x: 2, y: 537, z: Some(-53), triangle: Some(28) }));
+    assert_eq!(events.iter().rev().find(|event| matches!(event, Stage::Face { entity: 30, .. })),
+        Some(&Stage::Face { entity: 30, heading: fmv_ff7::field_direction_to_facing(0), frames: 0 }));
+    assert_eq!(events.iter().rev().find(|event| matches!(event, Stage::Show { entity: 30, .. })), Some(&Stage::Show { entity: 30, visible: true }));
+    assert_eq!(events.iter().rev().find(|event| matches!(event, Stage::Camera(_))), Some(&Stage::Camera(CameraOp::Scroll { x: 18, y: 2, frames: 0 })),
+        "the field's authored fixed camera runs alongside the arrival, independently of the cast's lead");
+    assert!(play.snapshot().unwrap().unknown_persistent_reads.is_empty());
+    let controls = |name| outcome.stats.handled.get(name).copied().unwrap_or(0) + outcome.stats.ignored.get(name).copied().unwrap_or(0);
+    assert_eq!((controls("UC"), controls("MENU2")), (2, 2), "both the lock and release instructions were interpreted");
     let models = f.model_loader().unwrap();
     for (cast, model_index) in def.cast.iter().zip([0usize, 1, 3, 4, 5, 6, 7, 10, 11]) {
         let Look::Model { hrc, idle } = &cast.look else { panic!("expected field model") };
@@ -988,7 +1088,7 @@ fn the_registered_flower_route_and_return_use_authored_walkable_positions() {
     }
     assert!(adapter.load_field("md8_2").unwrap().story_points().is_empty(), "the arrival scene owns the flower choices");
     let bridge = adapter.load_field("md8brdg").unwrap();
-    assert!(!bridge.exits().iter().any(|e| e.target == "cargoin"), "the unimplemented battle/movie route stays withheld");
+    assert!(!bridge.exits().iter().any(|e| e.target == "cargoin"), "the bridge requires its durable scene instead of an ordinary exit");
     for answers in [&[2usize][..], &[3, 2, 0], &[3, 3, 0], &[3, 2, 1], &[3, 3, 1]] {
         let mut play = ScenePlay::with_resources(&f, &def, &StoryState::at(36), 1, Resources { gil: Some(1) }).unwrap();
         let mut answers = answers.iter().copied();
@@ -1065,6 +1165,74 @@ fn cargo_train_runs_director_and_field_staging() {
         assert_eq!(model.hrc_stem(), *hrc);
         assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
     }
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn cargo_door_uses_the_actual_crossing_and_transfers_without_changing_story_or_gil() {
+    use fmv_core::Pos;
+    use fmv_ff7::script::scene::{cargo_door_scene, run_to_end_with_resources_strict, with_trigger_position, Resources, SceneBoundary, SceneJump};
+    let f = field("cargoin").expect("FMV_FF7_DATA and cargoin");
+    let def = cargo_door_scene();
+    assert_eq!((def.trigger.entity, def.trigger.slot, def.origin_actor()), (10, 2, Some(11)));
+    assert!(!def.starts_on_arrival() && def.requires_continuation());
+    assert!(def.applies_at(48) && !def.applies_at(39) && !def.applies_at(51));
+    assert!(def.cast[0].start.is_none(), "the authored door script supplies no jump origin");
+    let line = def.line_trigger().expect("the authored border1 line");
+    assert_eq!((line.a, line.b), ([-15, -104, 0], [53, -104, 0]));
+    let script = FieldScript::from_field(&f).unwrap();
+    let caller = script.disassemble(10, 2).unwrap();
+    for (offset, name) in [(0x067B, "UC"), (0x067D, "MENU2")] {
+        let ins = caller.iter().find(|ins| ins.offset == offset).unwrap();
+        assert_eq!((ins.mnemonic, ins.literal("disabled")), (name, Some(1)));
+    }
+    let request = caller.iter().find(|ins| ins.offset == 0x067F).unwrap();
+    assert_eq!((request.mnemonic, request.literal("entity"), request.literal("script")), ("REQEW", Some(11), Some(8)));
+    let cloud = script.disassemble(11, 8).unwrap();
+    let authored_sound = cloud.iter().find(|ins| ins.offset == 0x087A).unwrap();
+    assert_eq!((authored_sound.mnemonic, ["op", "p1", "p2"].map(|name| authored_sound.literal(name))),
+        ("AKAO", [Some(41), Some(64), Some(233)]));
+    let authored_jump = cloud.iter().find(|ins| ins.offset == 0x0888).unwrap();
+    assert_eq!(["x", "y", "triangle", "steps"].map(|name| authored_jump.literal(name)), [Some(9), Some(-247), Some(0), Some(12)]);
+    assert!(!cloud.iter().any(|ins| matches!(ins.mnemonic, "XYZI" | "XYI" | "XYZ")), "Cloud jumps from his existing position");
+    let original = StoryState::at(48);
+    let story = def.prepare_story(&original).unwrap();
+    let resources = Resources { gil: Some(123) };
+    let destination = SceneJump { field: 139, x: -2, y: 608, triangle: 29, direction: 252 };
+    let mut identities = Vec::new();
+    for y in [-103, -105] {
+        let bound = with_trigger_position(&f, &def, Pos::new(19.0, f32::from(y), 0.0), 0.0, Some(15)).unwrap();
+        let mut play = ScenePlay::with_resources(&f, &bound, &original, 1, resources).unwrap();
+        identities.push(play.replay_identity());
+        assert!(play.initial_stage_events().contains(&Stage::Place { entity: 11, x: 19, y, z: Some(0), triangle: Some(15) }));
+        assert_eq!(play.animation_clip(11, 13), Some("btce"));
+        let beat = play.next_strict(None).unwrap();
+        assert!(matches!(beat.then, Then::End { how: End::MapJump { field: 139 }, .. }), "no window or combat before the transfer");
+        let jump_at = beat.stage.iter().position(|event| matches!(event.what,
+            Stage::Move { entity: 11, from: Some((19, from_y)), x: 9, y: -247, triangle: Some(0), how: MoveHow::Jump, .. } if from_y == y)).unwrap();
+        assert_eq!(beat.stage[jump_at].at, 15, "the authored WAIT15 precedes the jump");
+        let sounds: Vec<_> = beat.stage.iter().filter_map(|event| match event.what {
+            Stage::Sound { channel, id, pan } => Some((event.at, channel, id, pan)),
+            _ => None,
+        }).collect();
+        assert_eq!(sounds, [(15, 2, 233, 64)], "the jump's effect plays once on its authored channel2");
+        assert!(beat.stage[..jump_at].iter().any(|event|
+            event.what == Stage::Sound { channel: 2, id: 233, pan: 64 }), "sound precedes JUMP at the same frame");
+        assert!(beat.stage[jump_at + 1..].iter().any(|event| event.what == Stage::Show { entity: 11, visible: false }));
+        assert_eq!(play.off_cast(), 0);
+        let snapshot = play.snapshot().unwrap();
+        assert_eq!((snapshot.boundary, snapshot.jump), (SceneBoundary::End(End::MapJump { field: 139 }), Some(destination)));
+        let outcome = run_to_end_with_resources_strict(&f, &bound, &original, 1, resources, &[]).unwrap();
+        assert_eq!((outcome.windows, outcome.questions), (0, 0));
+        assert!(outcome.is_complete() && outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
+        assert!(outcome.writes.is_story_neutral() && outcome.party.is_empty() && outcome.resources.gil_ops.is_empty());
+        assert_eq!((outcome.resources.gil_before, outcome.resources.gil_after), (Some(123), Some(123)));
+        let mut after = story.clone();
+        assert_eq!(outcome.writes.apply_extended_to(&mut after, &story), Some(false));
+        assert_eq!(after.encode(), story.encode(), "the landing retains moment 48 and every known/unknown bit");
+    }
+    assert_ne!(identities[0], identities[1], "the source fingerprint binds the accepted crossing position");
+    assert!(with_trigger_position(&f, &def, Pos::new(19.0, -103.0, 0.0), 0.0, Some(0)).is_err(), "a mismatched floor hint is refused");
 }
 
 #[test]
@@ -1800,6 +1968,8 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
     let clip_stem = model_record.animations.get(5).expect("Jessie's wind-up slot").stem();
     assert_eq!(clip_stem, "btce");
     let talk = script.disassemble(4, 1).unwrap();
+    let jump = talk.iter().find(|ins| ins.opcode == 0xC0).expect("Jessie's authored jump before the ladder");
+    assert_eq!(jump.literal("steps"), Some(17));
     let turn = talk.iter().find(|ins| ins.offset == 0x072E).unwrap();
     assert_eq!((turn.opcode, turn.literal("direction"), turn.literal("turns"), turn.literal("speed"), turn.literal("unknown")),
         (0xB4, Some(16), Some(0), Some(15), Some(1)));
@@ -1896,9 +2066,11 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         assert!(faces.windows(2).any(|pair| pair == [(fmv_ff7::field_direction_to_facing(16), 15), (fmv_ff7::field_direction_to_facing(64), 0)]),
             "LADER replaces the preceding TURNGEN heading: {faces:?}");
         assert_eq!(ladder_starts.len(), 1);
-        assert_eq!(ladder_starts[0].checked_sub(jump_times[0]), Some(30), "the existing JUMP duration still leads directly into the ladder");
-        let landing_height = Ground::new(mesh.clone()).height(242, 1850, Some(37), None).unwrap().round() as i16;
-        assert_eq!(jumps, [(242, 1850, Some(landing_height), Some(37))], "owned JUMP preserves its landing triangle and floor");
+        assert_eq!(ladder_starts[0].checked_sub(jump_times[0]), Some(19), "the authored 17 movement steps plus initialization/completion lead directly into the ladder");
+        // Triangle 37's vertices are (267,1806,2166), (197,1872,2165), (267,1872,2166).
+        // Its plane at (242,1850) is 10005270 / 4620 = 2165.642857... . The original
+        // FieldEntityCalculateZ integer division truncates to 2165, rather than rounding 2166.
+        assert_eq!(jumps, [(242, 1850, Some(2165), Some(37))], "owned JUMP uses the authored integer landing plane");
         assert_eq!(play.off_cast(), 0);
         let cast = cast_places(&f, &def, &before, 1).unwrap();
         for spot in def.witness.iter().chain(std::iter::once(&def.arrival)) {

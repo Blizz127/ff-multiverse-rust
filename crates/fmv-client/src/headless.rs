@@ -434,6 +434,8 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         if scene_visible {
             session.state.scene.autoplay(if scene_bot.is_active() { scene_bot.answer() } else { args.scene_answer.map(usize::from) });
         }
+        // The headless loop has no field image; still consume its bounded scene deltas.
+        session.state.scene.discard_background();
         audio.follow_scene(&mut session.state.scene, now);
         for event in session.state.scene.take_events() {
             if scene_bot.is_active() {

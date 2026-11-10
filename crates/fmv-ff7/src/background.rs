@@ -83,8 +83,9 @@
 //!   what is behind them using the PlayStation semi-transparency mode chosen by `type_trans`:
 //!   0 average, 1 additive, 2 subtractive, 3 add a quarter. Nothing behind counts as black.
 //! * Animation groups: layer 2-4 tiles with `param != 0` belong to a script-controlled group
-//!   (`BGON`/`BGOFF`); their `state` is a single frame bit (1, 2, 4, 8, ...). Which groups are on
-//!   at field start is script state this crate does not evaluate, so the default
+//!   (`BGON`/`BGOFF`); their `state` is a mask of the frames that show them (usually one bit).
+//!   [`BackgroundState`] applies resolved instructions and [`GroupFilter::State`] selects tiles by
+//!   mask intersection. Which groups are on after initialization depends on script execution, so the default
 //!   [`GroupFilter::Static`] draws only `param == 0` tiles (a coherent base scene). 19% of the
 //!   owned tiles are in groups. [`LayerInfo::groups`] lists what is there; pick frames with
 //!   [`GroupFilter::Only`].
@@ -137,11 +138,15 @@
 use crate::field::{Background, Camera, FieldError, FieldFile, Palette, TileSprite, MAX_TILE_DST};
 
 pub mod depth;
+pub mod state;
+mod entry;
 
 pub use depth::{
     decode_background_tiles_with_depth, decode_background_tiles_with_depth_options, depth_of_id, depth_of_point,
     tile_depth, tile_hides_point, DepthTile, TILE_DEPTH_PER_ID,
 };
+pub use state::{BackgroundOp, BackgroundState};
+pub use entry::entry_background_ops;
 
 /// Logical width of the field screen in field-screen units.
 pub const SCREEN_WIDTH: i32 = 320;
@@ -199,6 +204,8 @@ pub enum GroupFilter {
     All,
     /// `param == 0` tiles plus tiles whose `(param, state)` is listed.
     Only(Vec<(u8, u8)>),
+    /// Tiles whose state intersects their group's enabled bits, plus unconditional tiles.
+    State(BackgroundState),
 }
 
 impl GroupFilter {
@@ -210,6 +217,7 @@ impl GroupFilter {
             Self::Static => false,
             Self::All => true,
             Self::Only(list) => list.contains(&(tile.param, tile.state)),
+            Self::State(state) => state.visible(tile.layer, tile.param, tile.state),
         }
     }
 }
@@ -903,6 +911,30 @@ mod tests {
         assert_eq!((no_l1.layers[0].tiles_drawn, no_l1.layers[0].tiles_hidden), (0, 2));
         // the canvas does not depend on the options
         assert_eq!((no_l1.width, no_l1.height, no_l1.origin_x), (default.width, default.height, default.origin_x));
+    }
+
+    #[test]
+    fn scripted_group_masks_select_the_same_tiles_in_flat_and_depth_decodes() {
+        // The synthetic layer-2 tile belongs to group 5 and accepts either bit 1 or bit 2 (state 6).
+        let f = parse(&FieldSpec::default());
+        let mut state = BackgroundState::default();
+        let visible = |state: &BackgroundState| {
+            let options = BackgroundOptions { groups: GroupFilter::State(state.clone()), ..BackgroundOptions::default() };
+            let image = decode_background_with(&f, &options).unwrap();
+            let tiles = decode_background_tiles_with_depth_options(&f, &options).unwrap();
+            (image.layers[1].tiles_drawn, tiles.iter().filter(|t| t.layer == 2).count())
+        };
+        assert_eq!(visible(&state), (0, 0));
+        state.apply(BackgroundOp::On { group: 5, frame: 1 });
+        assert_eq!(visible(&state), (1, 1), "state 6 intersects enabled bit 2");
+        let exact = BackgroundOptions { groups: GroupFilter::Only(vec![(5, 2)]), ..BackgroundOptions::default() };
+        assert_eq!(decode_background_with(&f, &exact).unwrap().layers[1].tiles_drawn, 0, "Only still selects exact pairs");
+        state.apply(BackgroundOp::Off { group: 5, frame: 1 });
+        assert_eq!(visible(&state), (0, 0));
+        state.apply(BackgroundOp::On { group: 5, frame: 2 });
+        assert_eq!(visible(&state), (1, 1), "the other accepted bit also shows the tile");
+        state.apply(BackgroundOp::Clear { group: 5 });
+        assert_eq!(visible(&state), (0, 0));
     }
 
     #[test]

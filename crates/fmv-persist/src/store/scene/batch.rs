@@ -15,10 +15,16 @@ use super::{ProgressPair, SceneCommit};
 
 /// One battle's participating accounts, including its owner.
 pub const MAX_SCENE_BATCH_ACCOUNTS: usize = 16;
-/// Encoded checkpoint, including its original input and the bounded replay transcript.
-pub const MAX_SCENE_CHECKPOINT_BYTES: usize = 64 * 1024;
-/// Adapter-validated replay events. This is not storage for raw VM memory or game assets.
-pub const MAX_SCENE_REPLAY_BYTES: usize = 32 * 1024;
+/// Compact JSON checkpoint, including the original input and replay. The replay is itself
+/// encoded data stored as a byte array: each byte can require four JSON bytes, so its bound
+/// alone needs more than 1 MiB before the original story, landing and metadata are included.
+/// The character-file cap separately allows pretty-printed arrays and retained receipts.
+pub const MAX_SCENE_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
+/// Adapter-validated replay events, before the containing checkpoint JSON encodes these
+/// bytes again. Fully known FF7 banks need about 5 KiB per battle snapshot; three victories,
+/// windows, the frozen roster and inventories must fit without discarding known story bits.
+/// This is not storage for raw VM memory or game assets. Wire frame limits still apply.
+pub const MAX_SCENE_REPLAY_BYTES: usize = 256 * 1024;
 
 /// Where an account's authoritative continuation stopped. A landing is kept durably; a
 /// network acknowledgment alone cannot erase the only place a reconnect can recover.

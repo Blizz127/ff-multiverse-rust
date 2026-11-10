@@ -133,7 +133,13 @@ pub fn place_witnesses(players: &mut [AvatarPlayer<'_>], scene: &ScenePlayer) {
 pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView, vw: u32, vh: u32) -> Option<SpeakerSpot> {
     let entity = scene.speaker()?;
     let built = built?;
-    let pixels = |p: Pos| view_to_window(&view.bounds, vw, vh, p.x, p.y);
+    // The original dialogue windows stay still while the field shakes. Undo only that offset
+    // for automatic speaker placement; body anchors and name labels still follow the field.
+    let [x, y] = scene.shake();
+    let mut bounds = view.bounds;
+    bounds.min.x += x; bounds.max.x += x;
+    bounds.min.y -= y; bounds.max.y -= y;
+    let pixels = |p: Pos| view_to_window(&bounds, vw, vh, p.x, p.y);
     let casts = scene.cast_draws();
     let person = |who: Who, stands: Pos| -> Option<((f32, f32), (f32, f32))> {
         let head = pixels(*built.anchors.get(&who)?);

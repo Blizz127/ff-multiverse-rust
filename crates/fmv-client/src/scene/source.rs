@@ -265,7 +265,7 @@ impl SceneBuilder for Ff7Scenes {
         // A scene that names no witness spots gets the ones its own data gives (the same on every machine): the owner and up
         // to two watchers stand clear of the cast instead of where they happen to be (a cutscene's owner would otherwise stand
         // on the spot the cast's Cloud starts from).
-        if def.witness.is_empty() {
+        if def.witness.is_empty() && !def.hides_participants() {
             def.witness = fmv_ff7::script::scene::auto_witnesses_with_resources(area.field_file(), &def, story, seed, resources, 3);
         }
         Ok(Built { def, source: Box::new(play) })

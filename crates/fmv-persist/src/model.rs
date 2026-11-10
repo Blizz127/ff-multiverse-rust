@@ -46,7 +46,14 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024;
 /// those receipts are never evicted. Ordinary receipts require schema 2; batch receipts,
 /// checkpoints and reservations require schema 3. The first batch also upgrades the index
 /// header so older servers refuse the entire store. Records without metadata retain schema 1.
-pub const MAX_CHARACTER_RECORD_BYTES: u64 = 512 * 1024;
+/// A checkpoint's replay has up to 256 KiB of bytes; pretty JSON puts each on an indented
+/// line. This cap includes that expansion, a complete inventory and all 2,048 receipts.
+/// A conservative character bound is `12 * 256 KiB + 16 * (2 * 8 KiB)` for replay,
+/// original story and landing arrays, `256 * 2048` for receipts, and 32 KiB for the
+/// remaining fields: 3,964,928 bytes. The actual widest validated envelope is exercised
+/// in `store::scene::batch::tests::size_bounds`, including the deeper intent indentation.
+/// Raising the bound changes no serialization, receipt identity or recovery checksum.
+pub const MAX_CHARACTER_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// Longest accepted `base_archetype` (bytes).
 pub const MAX_ARCHETYPE_BYTES: usize = 64;
 /// Longest accepted per-game appearance reference, in **characters**: exactly the limit the

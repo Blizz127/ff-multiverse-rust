@@ -138,6 +138,19 @@ impl OwnPlayer {
         }
     }
 
+    /// While a durable scene holds input, its server snapshot is an authoritative placement,
+    /// including the facing and animation at final control handoff. Keep the movement sequence
+    /// and rate clock, but retire prediction/resync state and do not echo this placement back.
+    fn adopt_held_pose(&mut self, pos: Pos, facing: f32, anim: AnimState) {
+        self.pos = pos;
+        self.facing = facing;
+        self.anim = anim;
+        self.last_sent = (pos, facing, anim);
+        self.server_pos = None;
+        self.resync = false;
+        self.resync_seq = None;
+    }
+
     /// `MoveRejected { seq, corrected }`. Applied (returns true) only when `seq` is the newest
     /// intent we sent; a rejection of an older one is stale (see the module docs) and ignored.
     pub fn on_rejected(&mut self, seq: u32, corrected: Pos) -> bool {
@@ -475,6 +488,8 @@ impl ClientState {
         self.own = OwnPlayer::at(arrival, facing);
         // A scene is played in one field: the area changing under it ends it here (the server never moves a held player).
         self.scene.end_local();
+        self.scene.discard_background();
+        self.scene.discard_field_effects();
         if forward {
             self.area_changes += 1;
         }
@@ -638,7 +653,11 @@ impl ClientState {
         if snap.id == self.self_entity {
             self.own_echoes = self.own_echoes.saturating_add(1);
             self.own_echo_at = Some(snap.pos);
-            self.own.note_server_pos(now, snap.pos);
+            if self.scene.holds_authoritative_pose() {
+                self.own.adopt_held_pose(snap.pos, snap.facing, snap.anim);
+            } else {
+                self.own.note_server_pos(now, snap.pos);
+            }
             self.own_appearance = kept_appearance(&snap.avatar);
             self.own_tint = Some(snap.avatar.tint);
             return;

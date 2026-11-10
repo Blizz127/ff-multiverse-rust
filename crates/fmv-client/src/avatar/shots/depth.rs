@@ -1019,7 +1019,7 @@ fn real_ff7_graphics_comparison(supersample: bool) {
     let own = view.to_view(place).map(|p| [p.x, p.y]);
     view.bounds = FieldCamera::default().update(&CameraInput {
         range: view.range, whole: view.whole, window: [1100.0, 680.0], margin: MARGIN_PX,
-        own, scene: None, dt: 0.0,
+        own, scene: None, shake: [0.0; 2], dt: 0.0,
     });
     let scene = Scene { bounds: view.bounds, triangles: &[], players: &[], fixture_banner: false, backdrop: view.backdrop.as_ref() };
     let mut overlay = DrawList::new();

@@ -69,7 +69,9 @@ impl SceneBatchJob {
                 && checkpoint.original_story.len() <= fmv_protocol::MAX_STORY_PROGRESS_BYTES
                 && checkpoint.replay.len() <= MAX_SCENE_REPLAY_BYTES
                 && (match &checkpoint.phase {
-                    fmv_persist::ScenePhase::Landing { destination } => destination.len() <= MAX_SCENE_REPLAY_BYTES,
+                    // Storage bounds this small placement payload to the same 8 KiB as
+                    // an original scene input, independently of the larger replay.
+                    fmv_persist::ScenePhase::Landing { destination } => destination.len() <= fmv_protocol::MAX_STORY_PROGRESS_BYTES,
                     _ => true,
                 })
                 && serde_json::to_vec(checkpoint).is_ok_and(|bytes| bytes.len() <= MAX_SCENE_CHECKPOINT_BYTES)

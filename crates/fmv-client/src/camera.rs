@@ -86,6 +86,8 @@ pub struct CameraInput {
     pub own: Option<[f32; 2]>,
     /// What a story scene asks, while one runs.
     pub scene: Option<SceneShot>,
+    /// Authored field-screen displacement, applied after clamping, without moving the base camera.
+    pub shake: [f32; 2],
     /// Seconds since the last frame.
     pub dt: f32,
 }
@@ -140,7 +142,7 @@ impl FieldCamera {
             (CameraMode::Follow, Some(range)) if sound(&range) => range,
             _ => {
                 self.snap();
-                return input.whole;
+                return shaken(input.whole, input.shake);
             }
         };
         let [vw, vh] = input.window;
@@ -200,8 +202,20 @@ impl FieldCamera {
             if pixels.is_finite() && pixels > 2.0 * m { 1.0 - 2.0 * m / pixels } else { 1.0 }
         };
         let (hw, hh) = (size[0] / 2.0 * inset(vw), size[1] / 2.0 * inset(vh));
-        Bounds { min: Pos::new(cx - hw, cy - hh, 0.0), max: Pos::new(cx + hw, cy + hh, 0.0) }
+        shaken(Bounds { min: Pos::new(cx - hw, cy - hh, 0.0), max: Pos::new(cx + hw, cy + hh, 0.0) }, input.shake)
     }
+}
+
+fn shaken(mut bounds: Bounds, [x, y]: [f32; 2]) -> Bounds {
+    if finite([x, y]) {
+        // The engine adds screen offsets after clamping. View Y points upward, so moving
+        // the picture right/down translates its camera centre left/up. Do not reclamp.
+        bounds.min.x -= x;
+        bounds.max.x -= x;
+        bounds.min.y += y;
+        bounds.max.y += y;
+    }
+    bounds
 }
 
 fn aim_kind(aim: &SceneAim) -> u8 {
@@ -279,7 +293,25 @@ mod tests {
     }
 
     fn input(range: Option<Bounds>, own: Option<[f32; 2]>, scene: Option<SceneShot>) -> CameraInput {
-        CameraInput { range, whole: rect(-300.0, -300.0, 300.0, 300.0), window: [640.0, 480.0], margin: 0.0, own, scene, dt: 1.0 / 60.0 }
+        CameraInput { range, whole: rect(-300.0, -300.0, 300.0, 300.0), window: [640.0, 480.0], margin: 0.0, own, scene, shake: [0.0; 2], dt: 1.0 / 60.0 }
+    }
+
+    #[test]
+    fn authored_shake_moves_the_picture_after_clamping_without_changing_the_base_camera() {
+        let mut cam = FieldCamera::default();
+        let mut i = input(Some(big()), Some([400.0, 400.0]), None);
+        let base = cam.update(&i);
+        i.shake = [3.0, -5.0];
+        let moved = cam.update(&i);
+        assert_eq!([moved.min.x - base.min.x, moved.min.y - base.min.y], [-3.0, -5.0]);
+        assert_eq!([moved.max.x - base.max.x, moved.max.y - base.max.y], [-3.0, -5.0]);
+        i.shake = [0.0; 2];
+        assert_eq!(cam.update(&i), base, "shake never feeds the follow easing or clamps");
+        i.shake = [f32::NAN, 9.0];
+        assert_eq!(cam.update(&i), base, "invalid offsets cannot poison projection");
+        cam.toggle();
+        i.shake = [3.0, -5.0];
+        assert_eq!(cam.update(&i), shaken(i.whole, i.shake), "overview uses the same authored displacement");
     }
 
     fn centre(b: &Bounds) -> [f32; 2] {

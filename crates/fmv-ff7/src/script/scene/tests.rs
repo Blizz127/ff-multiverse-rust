@@ -324,6 +324,113 @@ fn a_background_idle_loop_does_not_hold_the_scene_open() {
 }
 
 #[test]
+fn authored_ambient_main_and_descendants_run_without_cutting_off_finite_actor_tails() {
+    let camera = cat(&[vec![0x64, 0], words(&[18, 2])]);
+    let section = script(vec![
+        ("director", vec![(1, vec![reqsw(2, 1)])]),
+        ("ambient", vec![(0, vec![vec![RET], camera, reqsw(3, 1), idle()])]),
+        ("actor", vec![(1, vec![xyzi(0, 0, 0, 0), wait(25), mov(12, 0), message(0, 0), setword(2, 0, 51)])]),
+        ("ambient-child", vec![(1, vec![sound(42, 64), wait(2), vec![0x12, 8]])]),
+    ], texts(1));
+    let (beats, vm) = run_root(&section, vec![Step::StartAmbientMain(1), Step::Start(ScriptRef::new(0, 1))], &[]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(dialogs_of(&beats), [0], "an asynchronous foreground actor still owns completion");
+    assert!(windows(&beats)[0].at >= 25);
+    assert_eq!(vm.writes().get(&(2, 0)), Some(&51));
+    let events = stage(&beats);
+    assert!(events.iter().any(|(_, s)| *s == Stage::Camera(CameraOp::Scroll { x: 18, y: 2, frames: 0 })));
+    assert!(events.iter().filter(|(_, s)| matches!(s, Stage::Sound { id: 42, .. })).count() > 5,
+        "the requested ambient loop ran on the same scene clock");
+    assert!(events.iter().any(|(_, s)| matches!(s, Stage::Move { entity: 2, x: 12, .. })));
+}
+
+#[test]
+fn foreground_polling_and_slot_waits_are_not_mistaken_for_ambient_completion() {
+    let poll = vec![if_ub(5, 1, 0, 1, &[0x10, 3]), vec![0x12, 8], message(0, 0)];
+    let section = script(vec![
+        ("poll", vec![(1, poll)]),
+        ("ambient", vec![(0, vec![vec![RET], wait(20), setbyte(5, 1, 1), sound(42, 64), wait(2), vec![0x12, 8]])]),
+    ], texts(1));
+    let (beats, _) = run_root(&section, vec![Step::Start(ScriptRef::new(0, 1)), Step::StartAmbientMain(1)], &[]);
+    assert_eq!(dialogs_of(&beats), [0], "the parked condition must see the future ambient write");
+    assert_eq!(windows(&beats)[0].at, 20);
+    assert_eq!(end_of(&beats), End::Finished);
+
+    // A foreground request queued at the ambient main's occupied priority cannot fake its RET.
+    let section = script(vec![("same-slot", vec![(0, vec![vec![RET], idle()]), (1, vec![message(0, 0)])])], texts(1));
+    let (beats, _) = run_root(&section, vec![Step::StartAmbientMain(0), Step::Await(ScriptRef::new(0, 1))], &[]);
+    assert_eq!(end_of(&beats), End::Budget);
+    assert!(windows(&beats).is_empty());
+
+    let section = script(vec![
+        ("poll", vec![(1, vec![if_ub(5, 1, 0, 1, &[0x10, 3]), vec![0x12, 8], message(0, 0)])]),
+        ("ambient", vec![(0, vec![vec![RET], vec![RET]])]),
+    ], texts(1));
+    let (beats, _) = run_root(&section, vec![Step::Start(ScriptRef::new(0, 1)), Step::StartAmbientMain(1)], &[]);
+    assert_eq!(end_of(&beats), End::Budget, "an unsatisfied conditional poll is not completion even without runnable work");
+    assert!(windows(&beats).is_empty());
+}
+
+#[test]
+fn ambient_work_keeps_unknown_read_and_execution_budgets() {
+    let section = script(vec![
+        ("finite", vec![(1, vec![wait(20)])]),
+        ("ambient", vec![(0, vec![vec![RET], if_ub(1, 44, 0, 0, &sound(42, 64)), idle()])]),
+    ], vec![]);
+    let vm = Vm::new(SceneVars::new(StoryState::at(48).into_extended().unwrap(), &[]), 7, Limits::default());
+    let (beats, vm) = run_with(&section, vec![Step::StartAmbientMain(1), Step::Start(ScriptRef::new(0, 1))], &[], vm);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert!(vm.vars().unknown_persistent_reads().contains(&(1, 44)));
+
+    let section = script(vec![
+        ("finite", vec![(1, vec![wait(20)])]),
+        ("ambient", vec![(0, vec![vec![RET], sound(42, 64), vec![0x12, 5]])]),
+    ], vec![]);
+    let vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 7, Limits { steps: 40, ..Limits::default() });
+    let (beats, _) = run_with(&section, vec![Step::StartAmbientMain(1), Step::Start(ScriptRef::new(0, 1))], &[], vm);
+    assert_eq!(end_of(&beats), End::Budget, "a fast ambient effect loop is still bounded");
+}
+
+#[test]
+fn ambient_random_epoch_churn_cannot_keep_a_proven_foreground_tail_alive() {
+    let tail = vec![vec![0xBB, 1, 0, 0, 1], wait(1), vec![0xA3, 1, 1], wait(1), vec![0x12, 14]];
+    let section = script(vec![
+        ("ambient", vec![(0, vec![vec![RET], vec![0x99, 5, 18], vec![0x12, 3]])]),
+        ("finite", vec![(1, vec![wait(20), message(0, 0), reqsw(2, 1)])]),
+        ("tail", vec![(1, tail)]),
+        ("idle", vec![(1, vec![wait(40), idle()])]),
+    ], texts(1));
+    let root = vec![Step::StartAmbientMain(0), Step::Start(ScriptRef::new(1, 1)), Step::Start(ScriptRef::new(3, 1))];
+    let (beats, vm) = run_root(&section, root, &[]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(dialogs_of(&beats), [0]);
+    let elapsed: u32 = beats.iter().map(|beat| match beat.then { Then::Window(ref w) => w.at, Then::End { at, .. } => at }).sum();
+    assert!(elapsed >= 40, "the foreground WAIT before its inert self-jump remains binding: {elapsed}");
+    assert_eq!(vm.stats().quiescent_tails, 1);
+}
+
+#[test]
+fn shake_reads_only_enabled_axes_and_never_blocks_the_script() {
+    // Disabled X has unknown persistent operands. Only Y (literal amplitude5/steps2) is read.
+    let section = script(vec![("camera", vec![(1, vec![
+        vec![0x5E, 0x11, 0, 2, 44, 45, 5, 2],
+        vec![0x5E, 0x11, 0x11, 0, 44, 45, 46, 47], message(0, 0),
+    ])])], texts(1));
+    let vm = Vm::new(SceneVars::new(StoryState::at(48).into_extended().unwrap(), &[]), 7, Limits::default());
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm);
+    assert_eq!(windows(&beats)[0].at, 0);
+    assert_eq!(stage(&beats), vec![
+        (0, Stage::Shake { mask: 2, x_amplitude: 0, x_steps: 0, y_amplitude: 5, y_steps: 2 }),
+        (0, Stage::Shake { mask: 0, x_amplitude: 0, x_steps: 0, y_amplitude: 0, y_steps: 0 }),
+    ]);
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    assert_eq!(vm.stats().unresolved, 0);
+    let section = script(vec![("camera", vec![(1, vec![vec![0x5E, 0, 0, 2, 0, 0, 5, 0]])])], vec![]);
+    let (_, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(vm.stats().unresolved, 1, "enabled zero steps cannot be claimed as supported");
+}
+
+#[test]
 fn animation_tail_cannot_cut_off_other_work_or_a_waiter() {
     let tail = vec![vec![0xBB, 1, 0, 0, 1], wait(1), vec![0xA3, 1, 1], wait(1), vec![0x12, 14]];
     let section = script(vec![("background", vec![(1, tail.clone())]), ("speaker", vec![(1, vec![wait(20), message(0, 0)])]), ("parked", vec![(1, vec![idle()])])], texts(1));
@@ -338,6 +445,14 @@ fn animation_tail_cannot_cut_off_other_work_or_a_waiter() {
     let (beats, vm) = run_with(&section, vec![Step::Await(ScriptRef::new(0, 1))], &[], vm);
     assert_eq!(end_of(&beats), End::Budget, "a waiter must not be released while its script still loops");
     assert_eq!(vm.stats().quiescent_tails, 0);
+
+    let tail = vec![wait(101), vec![0xBB, 1, 0, 0, 1], wait(1), vec![0xA3, 1, 1], wait(1), vec![0x12, 14]];
+    let section = script(vec![("tail", vec![(1, tail)])], vec![]);
+    for limits in [Limits { frames: 100, ..Limits::default() }, Limits { steps: 2, ..Limits::default() }] {
+        let vm = Vm::new(SceneVars::new(StoryState::new_game(), &[]), 7, limits);
+        let (beats, _) = run_with(&section, start(0, 1), &[], vm);
+        assert_eq!(end_of(&beats), End::Budget, "proving a quiet tail cannot bypass frame or instruction limits");
+    }
 }
 
 #[test]
@@ -448,13 +563,41 @@ fn only_ordinary_move_selects_a_walk_or_run_slot() {
         (2, Some((10, 0)), (20, 0), 2, MoveHow::Walk, None),
         (4, Some((20, 0)), (30, 0), 2, MoveHow::WalkKeepAnimation, None),
         (6, Some((30, 0)), (40, 0), 2, MoveHow::Walk, None),
-        (8, Some((40, 0)), (50, 0), 30, MoveHow::Jump, None),
-        (38, Some((50, 0)), (60, 0), 15, MoveHow::Ladder, None),
-        (53, Some((60, 0)), (70, 0), 5, MoveHow::Walk, Some(1)),
+        (8, Some((40, 0)), (50, 0), 22, MoveHow::Jump, None),
+        (30, Some((50, 0)), (60, 0), 15, MoveHow::Ladder, None),
+        (45, Some((60, 0)), (70, 0), 5, MoveHow::Walk, Some(1)),
     ]);
-    assert_eq!(windows(&beats)[0].at, 58, "clip metadata leaves the existing movement clock unchanged");
+    assert_eq!(windows(&beats)[0].at, 50, "JUMP uses its twenty steps and two completion frames");
     assert_eq!(end_of(&beats), End::Finished);
     assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn jump_reads_signed_steps_and_blocks_for_setup_motion_and_completion() {
+    for banked in [false, true] {
+        for steps in [1i16, 12, 0, -1] {
+            let mut code = vec![xyzi(9, -105, 0, 0), wait(15)];
+            if banked { code.push(setword(5, 22, steps as u16)); }
+            code.push(cat(&[vec![0xC0, 0, if banked { 5 } else { 0 }], words(&[9, -247, 0, if banked { 22 } else { steps }])]));
+            code.extend([visi(0), vec![RET]]);
+            let section = SynthScript::default().entity("jump", vec![(1, cat(&code))]).build();
+            let (beats, vm) = run_root(&section, start(0, 1), &[]);
+            let events = stage(&beats);
+            if steps > 0 {
+                let frames = steps as u32 + 2;
+                assert!(events.iter().any(|(at, what)| *at == 15 && matches!(what,
+                    Stage::Move { frames: actual, how: MoveHow::Jump, .. } if *actual == frames)), "{events:?}");
+                assert!(events.iter().any(|(at, what)| *at == 15 + frames && matches!(what,
+                    Stage::Show { visible: false, .. })), "{events:?}");
+                assert_eq!(end_of(&beats), End::Finished);
+                assert_eq!(vm.stats().unresolved, 0);
+            } else {
+                assert!(!events.iter().any(|(_, what)| matches!(what, Stage::Move { .. } | Stage::Show { .. })));
+                assert_eq!(end_of(&beats), End::Budget);
+                assert_eq!(vm.stats().unresolved, 1);
+            }
+        }
+    }
 }
 
 #[test]
@@ -796,14 +939,51 @@ fn literal_sounds_and_stops_follow_waits_and_window_boundaries() {
     ])])], texts(2));
     let (beats, vm) = run_root(&section, start(0, 1), &[]);
     assert_eq!(stage(&beats), [
-        (0, Stage::Sound { id: 61, pan: 0 }),
-        (12, Stage::Sound { id: 59, pan: 127 }),
-        (7, Stage::Sound { id: 0, pan: 64 }),
+        (0, Stage::Sound { channel: 1, id: 61, pan: 0 }),
+        (12, Stage::Sound { channel: 1, id: 59, pan: 127 }),
+        (7, Stage::Sound { channel: 1, id: 0, pan: 64 }),
     ]);
     assert_eq!(windows(&beats).iter().map(|w| w.at).collect::<Vec<_>>(), [12, 7]);
     assert_eq!(end_of(&beats), End::Finished);
     assert_eq!(vm.stats().handled.get("SOUND"), Some(&3));
     assert!(!vm.stats().ignored.contains_key("SOUND"));
+    assert_eq!(vm.stats().unresolved, 0);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn literal_akao_channels_one_and_two_keep_their_channels_stops_and_window_clock() {
+    let akao = |op: u8, pan: u8, id: u16| {
+        let [lo, hi] = id.to_le_bytes();
+        vec![0xF2, 0, 0, 0, op, pan, lo, hi, 0, 0, 0, 0, 0, 0]
+    };
+    let akao2 = |op: u8, pan: u16, id: u16| {
+        let mut bytes = vec![0xDA, 0, 0, 0, op];
+        for word in [pan, id, 0, 0, 0] { bytes.extend(word.to_le_bytes()); }
+        bytes
+    };
+    let mut banked = akao(40, 7, 59);
+    banked[1] = 0x10;
+    let mut banked2 = akao2(41, 64, 7);
+    banked2[1] = 0x01;
+    let section = script(vec![("a", vec![(1, vec![
+        akao(40, 64, 59), wait(12), akao(41, 0, 233), message(0, 0),
+        wait(7), akao2(41, 127, 0), akao2(40, 64, 167),
+        akao(42, 64, 154), akao(43, 64, 59), akao(162, 64, 0), banked, banked2,
+        message(0, 1),
+    ])])], texts(2));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(stage(&beats), [
+        (0, Stage::Sound { channel: 1, id: 59, pan: 64 }),
+        (12, Stage::Sound { channel: 2, id: 233, pan: 0 }),
+        (7, Stage::Sound { channel: 2, id: 0, pan: 127 }),
+        (7, Stage::Sound { channel: 1, id: 167, pan: 64 }),
+    ]);
+    assert_eq!(windows(&beats).iter().map(|w| w.at).collect::<Vec<_>>(), [12, 7]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!((vm.stats().handled.get("AKAO"), vm.stats().handled.get("AKAO2")), (Some(&2), Some(&2)));
+    assert_eq!((vm.stats().ignored.get("AKAO"), vm.stats().ignored.get("AKAO2")), (Some(&4), Some(&1)),
+        "higher channels, volume operations and banked operands remain explicitly skipped");
     assert_eq!(vm.stats().unresolved, 0);
     assert!(vm.writes().is_empty());
 }
@@ -816,7 +996,7 @@ fn banked_sound_operands_are_reported_and_never_guessed() {
         sound(59, 64), message(0, 0),
     ])])], texts(1));
     let (beats, vm) = run_root(&section, start(0, 1), &[]);
-    assert_eq!(stage(&beats), [(0, Stage::Sound { id: 59, pan: 64 })]);
+    assert_eq!(stage(&beats), [(0, Stage::Sound { channel: 1, id: 59, pan: 64 })]);
     assert_eq!(dialogs_of(&beats), [0]);
     assert_eq!(vm.stats().ignored.get("SOUND"), Some(&2));
     assert_eq!(vm.stats().handled.get("SOUND"), Some(&1));
@@ -837,7 +1017,7 @@ fn setup_sounds_do_not_replay_and_sounds_need_no_cast_member() {
     let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
     assert!(play.initial_stage_events().is_empty());
     let beat = play.next(None);
-    assert_eq!(stage(&[beat]), [(0, Stage::Sound { id: 61, pan: 64 })]);
+    assert_eq!(stage(&[beat]), [(0, Stage::Sound { channel: 1, id: 61, pan: 64 })]);
     assert_eq!(play.off_cast(), 0);
 }
 
@@ -1379,9 +1559,10 @@ fn jumps_land_on_the_authored_floor_and_following_walks_keep_it() {
         (Some(0), Some(0), MoveHow::Jump),
         (Some(0), None, MoveHow::Walk),
         (Some(100), Some(1), MoveHow::Jump),
-        (Some(0), Some(99), MoveHow::Jump), // Invalid triangle retains the old geometric fallback.
-        (None, Some(1), MoveHow::Jump),    // No floor is invented for an off-mesh destination.
+        (None, Some(99), MoveHow::Jump), // Invalid authored triangle cannot silently pick another floor.
+        (Some(100), Some(1), MoveHow::Jump), // JUMP uses the infinite plane even beyond its edges.
     ]);
+    assert_eq!(play.stats().unresolved, 1, "the invalid authored triangle prevents strict settlement");
     assert!(play.writes().is_story_neutral());
 }
 
@@ -1706,7 +1887,7 @@ fn flower_registration_promotes_only_its_local_playback_snapshot() {
     assert_eq!(def.prepare_story(&tracked).unwrap().known_bit(1, 225, 0), Some(true));
     assert!(!tracked.supports_extended(), "legacy tracked bits are preserved without migrating their source");
     for other in scenes().into_iter().filter(|s| s.id != def.id) {
-        if [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID].contains(&other.id.as_str()) {
+        if [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID].contains(&other.id.as_str()) {
             assert!(other.requires_exact_transaction());
             assert_eq!(other.prepare_story(&original), original.clone().into_extended());
         } else {
@@ -1952,7 +2133,7 @@ fn victory_continuation_resumes_the_waiting_parent_after_the_matching_battle() {
     assert!(vm.seek_after_battle(&field, 324));
     let beats = vec![vm.resume(&field, None), vm.resume(&field, None), vm.resume(&field, None)];
     assert_eq!(dialogs_of(&beats), [2, 3]);
-    assert_eq!(stage(&beats), [(0, Stage::Sound { id: 61, pan: 64 })], "seeking past the battle never replays prelude sounds");
+    assert_eq!(stage(&beats), [(0, Stage::Sound { channel: 1, id: 61, pan: 64 })], "seeking past the battle never replays prelude sounds");
     assert!(matches!(beats[2].then, Then::End { how: End::Finished, .. }));
     assert_eq!(vm.stats().handled.get("BATTLE"), Some(&1));
 }
@@ -2138,6 +2319,9 @@ fn strict_replay_acknowledges_every_exact_window_and_never_invents_a_choice() {
     let mut wrong_identity = identity;
     wrong_identity.version += 1;
     assert!(matches!(replay_scene(&field, &def, &story, resources, wrong_identity, &[]), Err(SceneError::ReplayIdentity)));
+    let old_identity = ReplayIdentity { version: 1, ..identity };
+    assert!(matches!(replay_scene(&field, &def, &story, resources, old_identity, &[]), Err(SceneError::ReplayIdentity)),
+        "version 1 checkpoints must not silently adopt ambient, background, fade, shake or jump semantics");
     let mut preview = ScenePlay::with_resources(&field, &def, &story, 77, resources).unwrap();
     preview.next(None);
     assert_eq!(preview.next_strict(None), Err(SceneError::UncheckedReplay));

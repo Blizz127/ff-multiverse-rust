@@ -44,6 +44,7 @@ pub(super) fn fingerprint(section: &[u8], def: &SceneDef) -> [u8; 32] {
             Step::Await(reference) => { out.byte(1); out.script(reference); }
             Step::Start(reference) => { out.byte(2); out.script(reference); }
             Step::StartMain(entity) => { out.0.update(&[3, entity]); }
+            Step::StartAmbientMain(entity) => { out.0.update(&[4, entity]); }
         }
     }
     out.len(def.cast.len());
@@ -123,6 +124,7 @@ mod tests {
             |d| d.root[1] = Step::Start(ScriptRef::new(2, 1)),
             |d| d.root[2] = Step::Start(ScriptRef::new(3, 2)),
             |d| d.root[3] = Step::StartMain(5), |d| d.root.reverse(),
+            |d| d.root[3] = Step::StartAmbientMain(4),
             |d| d.cast[0].entity += 1,
             |d| d.cast[0].start.as_mut().unwrap().x += 1,
             |d| d.cast[0].start.as_mut().unwrap().y += 1,

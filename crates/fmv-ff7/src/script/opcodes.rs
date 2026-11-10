@@ -133,7 +133,7 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
         0x22 => op!("BTMD2", [S32("mode")]),
         0x23 => op!("BTRLD", [Banks(1), Bu8("var", 1)]),
         0x24 => op!("WAIT", [U16("frames")]),
-        0x25 => op!("NFADE", [Banks(2), U8("type"), Bu8("r", 0), Bu8("g", 1), Bu8("b", 2), Bu16("speed", 3)]),
+        0x25 => op!("NFADE", [Banks(2), U8("type"), Bu8("r", 0), Bu8("g", 1), Bu8("b", 2), Bs16("speed", 3)]),
         0x26 => op!("BLINK", [U8("closed")]),
         0x27 => op!("BGMOVIE", [U8("disabled")]),
         0x28 => op!("KAWAI", []),
@@ -209,7 +209,8 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
         0x68 => op!("SCR2DL", [Banks(2), Bs16("x", 0), Bs16("y", 1), Bu16("speed", 2)]),
         0x69 => op!("MPDSP", [U8("unknown")]),
         0x6A => op!("VWOFT", [Banks(1), Bu16("unknown1", 0), Bu16("unknown2", 1), U8("enable")]),
-        0x6B => op!("FADE", [Banks(2), Bu8("r", 0), Bu8("g", 1), Bu8("b", 2), U8("speed"), U8("type"), U8("adjust")]),
+        // FADE's blue operand uses the fourth bank nibble (NFADE uses the third).
+        0x6B => op!("FADE", [Banks(2), Bu8("r", 0), Bu8("g", 1), Bu8("b", 3), U8("speed"), U8("type"), U8("adjust")]),
         0x6C => op!("FADEW", []),
         0x6D => op!("IDLCK", [U16("triangle"), U8("locked")]),
         0x6E => op!("LSTMP", [Banks(1), Bu8("var", 1)]),
@@ -300,7 +301,7 @@ pub(crate) fn info(op: u8) -> Option<OpInfo> {
         0xBD => op!("ASPED", [Banks(1), Bu16("speed", 1)]),
         0xBF => op!("CC", [U8("entity")]),
         // 0xC0-0xCF: movement, solidity, party
-        0xC0 => op!("JUMP", [Banks(2), Bs16("x", 0), Bs16("y", 1), Bu16("triangle", 2), Bs16("height", 3)]),
+        0xC0 => op!("JUMP", [Banks(2), Bs16("x", 0), Bs16("y", 1), Bu16("triangle", 2), Bs16("steps", 3)]),
         0xC1 => op!("AXYZI", [Banks(2), U8("entity"), Bu8("var_x", 0), Bu8("var_y", 1), Bu8("var_z", 2), Bu8("var_triangle", 3)]),
         0xC2 => op!(
             "LADER",

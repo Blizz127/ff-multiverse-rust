@@ -91,6 +91,8 @@ use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
 mod continuation;
+mod effects;
+mod train;
 
 /// The most of a witness's picture another's may cover on the screen.
 const MAX_COVERED: f32 = 0.10;
@@ -983,8 +985,8 @@ fn offscreen_real_ff7_the_field_camera() {
 /// The half second the camera eases in after the scene starts or its camera changes is left out, and so is a lead outside
 /// the field's camera range (FF7's screen does not show that place either). Prints each scene's count and writes one
 /// picture of its middle step (`camera-scene-<field>-<name>.png`); fails if any step has the lead out of the window.
-/// The bridge's accepted crossing and battle handoffs are exercised by the dedicated all-choice
-/// continuation test, rather than inventing battle acknowledgements in this general scene walk.
+/// The bridge and cargo door need an accepted crossing, covered by their dedicated tests;
+/// this general scene walk does not invent an origin or battle acknowledgements.
 #[test]
 #[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
 fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
@@ -1007,6 +1009,7 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
             "ff7/nrthmk/reactor-finale" => (27, Some((1, 225, 5))),
             "ff7/md8_2/flower" => (36, None),
             fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID => (39, None),
+            fmv_ff7::script::scene::TRAIN_SCENE_ID => (48, None),
             _ => (0, None),
         };
         let mut story = StoryState::at(moment);
@@ -1015,7 +1018,8 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
     };
     let mut failures = Vec::new();
     for def in fmv_ff7::script::scene::scenes().into_iter().filter(|d|
-        ![fmv_ff7::script::scene::PROOF_SCENE_ID, fmv_ff7::script::scene::BRIDGE_SCENE_ID].contains(&d.id.as_str())) {
+        ![fmv_ff7::script::scene::PROOF_SCENE_ID, fmv_ff7::script::scene::BRIDGE_SCENE_ID,
+            fmv_ff7::script::scene::CARGO_DOOR_SCENE_ID].contains(&d.id.as_str())) {
         let id = def.id.clone();
         let mut rig = make_rig(&real, def, true);
         rig.story = story_for(&id);
@@ -1082,6 +1086,7 @@ impl Rig {
 
     /// One frame of the field as the window builds it (the first call loads the models the field names).
     fn draw(&mut self) -> FieldDraw {
+        self.view.apply_background_events(self.state.scene.drain_background());
         field_draw(Some(&mut self.avatars), &mut self.npc_epoch, &self.view, &self.state, self.own_tint, 1.0, 0.0)
     }
 
@@ -1292,6 +1297,13 @@ impl Rig {
     /// no range, matching F2; their pictures keep the full field and its actors.
     fn picture_clipped(&mut self, gpu: &mut Offscreen, name: &str, (w, h): (u32, u32), window: bool,
         range: Option<fmv_adapter_api::Bounds>) -> (Vec<u8>, FieldDraw) {
+        let fade = self.state.scene.fade();
+        self.picture_with_fade(gpu, name, (w, h), window, range, fade)
+    }
+
+    /// The same owned frame with a selected fade, used to compare the field and unchanged HUD.
+    fn picture_with_fade(&mut self, gpu: &mut Offscreen, name: &str, (w, h): (u32, u32), window: bool,
+        range: Option<fmv_adapter_api::Bounds>, fade: Option<fmv_ff7::script::scene::FadeColor>) -> (Vec<u8>, FieldDraw) {
         // The first frame loads the models the field names; the second is the steady state.
         self.draw();
         let draw = self.draw();
@@ -1308,7 +1320,7 @@ impl Rig {
             let spot = speaker_spot(story, draw.built.as_ref(), &self.view, w, h);
             story.draw(w, h, 0.0, spot.as_ref(), &mut overlay);
         }
-        let img = gpu.render_field_clipped(w, h, &scene, Some(&built.frame), &overlay, range);
+        let img = gpu.render_field_effects(w, h, &scene, Some(&built.frame), &overlay, range, fade);
         save(name, w, h, &img);
         (img, draw)
     }
