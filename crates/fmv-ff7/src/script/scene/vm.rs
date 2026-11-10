@@ -1364,6 +1364,10 @@ impl Vm {
                 let triangle = u16::try_from(self.num(ins, "triangle", Width::U16)).ok();
                 let from_z = self.places.get(&me).and_then(|w| w.z).unwrap_or(z);
                 let frames = (u32::from(from_z.abs_diff(z)) / 4).clamp(JUMP_FRAMES / 2, MAX_MOVE_FRAMES);
+                // LADER sets its literal facing directly, independently of the climb's path.
+                if let Some(direction) = ins.literal("direction").map(clamp_u8) {
+                    self.do_face(idx, me, field_direction_to_facing(direction), 0);
+                }
                 self.do_move(idx, me, Goal { x, y, z: Some(z), triangle, how: MoveHow::Ladder, animation: None, frames: Some(frames) });
                 Flow::Yield
             }

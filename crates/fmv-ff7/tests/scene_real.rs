@@ -1628,7 +1628,16 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
     assert_eq!((model_record.hrc_stem(), hrc.as_str()), ("axdc".to_string(), "axdc"));
     let clip_stem = model_record.animations.get(5).expect("Jessie's wind-up slot").stem();
     assert_eq!(clip_stem, "btce");
-    assert!(script.disassemble(4, 1).unwrap().iter().any(|ins| ins.opcode == 0xB1
+    let talk = script.disassemble(4, 1).unwrap();
+    let turn = talk.iter().find(|ins| ins.offset == 0x072E).unwrap();
+    assert_eq!((turn.opcode, turn.literal("direction"), turn.literal("turns"), turn.literal("speed"), turn.literal("unknown")),
+        (0xB4, Some(16), Some(0), Some(15), Some(1)));
+    let ladder = talk.iter().find(|ins| ins.offset == 0x075C).unwrap();
+    assert_eq!((ladder.opcode, ladder.literal("x"), ladder.literal("y"), ladder.literal("z"), ladder.literal("triangle")),
+        (0xC2, Some(-167), Some(1816), Some(1641), Some(28)));
+    assert_eq!((ladder.literal("way"), ladder.literal("animation"), ladder.literal("direction"), ladder.literal("speed")),
+        (Some(1), Some(6), Some(64), Some(1)), "LADER supplies its own heading after TURNGEN16");
+    assert!(talk.iter().any(|ins| ins.opcode == 0xB1
         && ins.literal("animation") == Some(5) && ins.literal("first") == Some(0)
         && ins.literal("last") == Some(39) && ins.literal("speed") == Some(1)), "the original script requests the bounded asynchronous Hold");
     let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
@@ -1674,6 +1683,8 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         let mut origin = 0u32;
         let mut windups = Vec::new();
         let mut jump_times = Vec::new();
+        let mut faces = Vec::new();
+        let mut ladder_starts = Vec::new();
         loop {
             let beat = play.next(None);
             for event in &beat.stage {
@@ -1682,7 +1693,18 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
                     Stage::Anim { entity: 4, animation: 5, how: fmv_ff7::script::scene::AnimHow::Hold,
                         first: Some(0), last: Some(39), speed: 16, divisor: 1 } => windups.push(at),
                     Stage::Move { entity: 4, how: MoveHow::Jump, .. } => jump_times.push(at),
+                    Stage::Face { entity: 4, heading, frames } => faces.push((heading, frames)),
                     _ => {},
+                }
+            }
+            for pair in beat.stage.windows(2) {
+                if let Stage::Move { entity: 4, from, x, y, z, triangle, frames, how: MoveHow::Ladder, animation } = pair[1].what {
+                    assert_eq!(pair[0].what, Stage::Face { entity: 4, heading: fmv_ff7::field_direction_to_facing(64), frames: 0 },
+                        "the authored direction is applied immediately before the ladder starts");
+                    assert_eq!(pair[0].at, pair[1].at, "the heading adds no wait");
+                    assert_eq!((from, x, y, z, triangle, frames, animation),
+                        (Some((242, 1850)), -167, 1816, Some(1641), Some(28), 15, None), "the existing ladder geometry, duration and animation metadata are unchanged");
+                    ladder_starts.push(origin + pair[1].at);
                 }
             }
             jumps.extend(beat.stage.iter().filter_map(|event| match event.what {
@@ -1700,6 +1722,10 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         assert_eq!(lines, [(4, 72)]);
         assert_eq!((windups.len(), jump_times.len()), (1, 1));
         assert_eq!(jump_times[0].checked_sub(windups[0]), Some(15), "CANM!1 starts asynchronously; only the authored WAIT15 precedes JUMP");
+        assert!(faces.windows(2).any(|pair| pair == [(fmv_ff7::field_direction_to_facing(16), 15), (fmv_ff7::field_direction_to_facing(64), 0)]),
+            "LADER replaces the preceding TURNGEN heading: {faces:?}");
+        assert_eq!(ladder_starts.len(), 1);
+        assert_eq!(ladder_starts[0].checked_sub(jump_times[0]), Some(30), "the existing JUMP duration still leads directly into the ladder");
         let landing_height = Ground::new(mesh.clone()).height(242, 1850, Some(37), None).unwrap().round() as i16;
         assert_eq!(jumps, [(242, 1850, Some(landing_height), Some(37))], "owned JUMP preserves its landing triangle and floor");
         assert_eq!(play.off_cast(), 0);

@@ -1471,6 +1471,10 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
   other watchers keep their actual positions. It adds no saved fields and cannot start again after moment 14.
   Scripted jumps retain their destination triangle so overlapping walkways select the authored landing floor;
   Jessie's jump to triangle 37 is checked against the owned field.
+  Her following ladder climb applies its authored facing immediately: direction 64 replaces the earlier turn's
+  direction 16 without adding a delay. This follows the original
+  [LADER handler](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L669-L756);
+  the existing ladder path, duration estimate and animation fallback are unchanged.
   Floor clearance is checked against the owned walkmesh; camera visibility has not been checked on a rendered frame.
 
 `python3 scripts/ladder-smoke.py <package-bin-dir> [--echo-s <archive>]` checks this last scene with two headless party

@@ -684,6 +684,32 @@ mod tests {
     }
 
     #[test]
+    fn an_authored_ladder_face_cancels_an_old_turn_and_survives_arrival() {
+        let mut cast = Cast::new([1]);
+        cast.apply(&place(1, 10, -20), 0.0, &flat);
+        cast.apply_loop(1, 0, "idle", 0.0);
+        cast.apply(&Stage::Face { entity: 1, heading: 1.0, frames: 30 }, 0.0, &flat);
+        cast.advance(6.0);
+        assert!((cast.actor(1).unwrap().heading() - 0.2).abs() < 1e-5);
+        cast.apply(&Stage::Face { entity: 1, heading: 1.5, frames: 0 }, 0.0, &flat);
+        cast.apply(&Stage::Move { entity: 1, from: None, x: 30, y: 20, z: Some(87), triangle: Some(11),
+            frames: 20, how: MoveHow::Ladder, animation: None }, 0.0, &flat);
+        assert_eq!(cast.actor(1).unwrap().heading(), 1.5);
+        cast.advance(10.0);
+        let actor = cast.actor(1).unwrap();
+        assert_eq!((actor.pos(), actor.heading()), (Some([20.0, 0.0, 47.0]), 1.5));
+        assert!(cast.busy() && !actor.moving(), "ladder travel keeps its existing non-walking fallback");
+        assert_eq!((actor.animation(), actor.walked_frames()), (None, 0.0));
+        cast.advance(10.0);
+        let actor = cast.actor(1).unwrap();
+        assert_eq!((actor.pos(), actor.heading()), (Some([30.0, 20.0, 87.0]), 1.5));
+        assert!(!cast.busy(), "the old turn was cancelled, and the ladder still lasts twenty frames");
+        assert_eq!(actor.animation(), Some(("idle", ClipFrame::Loop(0.0))));
+        cast.advance(40.0);
+        assert_eq!(cast.actor(1).unwrap().heading(), 1.5, "the former turn cannot resume after arrival");
+    }
+
+    #[test]
     fn a_turn_goes_the_short_way_round_at_once_or_over_its_frames() {
         let mut cast = Cast::new([1]);
         cast.apply(&Stage::Face { entity: 1, heading: 3.0, frames: 0 }, 0.0, &flat);

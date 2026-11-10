@@ -458,6 +458,43 @@ fn only_ordinary_move_selects_a_walk_or_run_slot() {
 }
 
 #[test]
+fn ladder_sets_authored_facing_before_movement_without_adding_time() {
+    for direction in [0, 64, 128, 192, 255] {
+        let climb = vec![
+            xyzi(10, 20, 10, 0), dir(128), wait(3),
+            cat(&[vec![0xC2, 0, 0], words(&[40, 50, 90, 2]), vec![0, 1, direction, 1]]),
+        ];
+        let mut visible = climb.clone();
+        visible.push(message(0, 0));
+        let section = script(vec![("actor", vec![(1, visible), (2, vec![message(0, 0)]), (3, climb)])], texts(1));
+        let heading = crate::field_direction_to_facing(direction);
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(stage(&beats), [
+            (0, Stage::Place { entity: 0, x: 10, y: 20, z: Some(10), triangle: Some(0) }),
+            (0, Stage::Face { entity: 0, heading: crate::field_direction_to_facing(128), frames: 0 }),
+            (3, Stage::Face { entity: 0, heading, frames: 0 }),
+            (3, Stage::Move { entity: 0, from: Some((10, 20)), x: 40, y: 50, z: Some(90), triangle: Some(2), frames: 20, how: MoveHow::Ladder, animation: None }),
+        ], "direction={direction}");
+        assert_eq!(windows(&beats)[0].at, 23, "facing does not extend the existing climb duration");
+        assert_eq!(vm.heading_of(0), Some(heading));
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+
+        let field = field_of(section);
+        let mut def = demo_def(vec![member(0, "actor")], start(0, 2));
+        def.setup = vec![ScriptRef::new(0, 3)];
+        let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+        assert_eq!(play.initial_stage_events(), [
+            Stage::Place { entity: 0, x: 40, y: 50, z: Some(90), triangle: Some(2) },
+            Stage::Face { entity: 0, heading, frames: 0 },
+        ], "quiet setup retains the ladder's facing: {direction}");
+        let beat = play.next(None);
+        assert!(beat.stage.is_empty(), "setup does not replay the climb or its facing");
+        assert!(matches!(beat.then, Then::Window(Window { at: 0, .. })));
+    }
+}
+
+#[test]
 fn a_script_turns_towards_another_entity_it_knows_the_place_of() {
     let a = vec![xyzi(0, 0, 0, 0), dira(1), message(0, 0)];
     let b = vec![xyzi(0, 100, 0, 0)];
