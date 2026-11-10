@@ -1614,12 +1614,12 @@ No game bytes, protocol or saved state are added. Movement selection follows the
 [Q-Gears MOVE reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L444-L477).
 The normal-rate default-loop interpretation follows the [Q-Gears DFANM reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L72-L95);
 exact PC visual timing and real mod overlays remain untested.
-The cropped held-animation pair follows its original dispatch: `CANM!1` starts asynchronously, while `CANM!2`
-waits on the existing animation deadline. `ANIMW` can still join an asynchronous clip's deadline. This removes an
-extra 40-frame wait before Jessie's ladder jump: her script explicitly waits 15 frames after starting the clip.
-The VM's existing duration estimates and treatment of other animation opcodes are unchanged; arbitrary divisors
-and clip-bound completion timing are not claimed to match the engine. The dispatch distinction follows the
-[original handler reconstruction](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L308-L365).
+The cropped animation pairs follow their original dispatch: `CANIM1` and `CANM!1` start asynchronously;
+`CANIM2` and `CANM!2` wait on the existing animation deadline. `ANIMW` can still join an asynchronous clip's deadline.
+Jessie's ladder jump follows its authored 15-frame wait; the team-talk director waits for Biggs's ten-frame gesture,
+then its explicit six-frame pause before requesting Jessie. The VM's existing duration estimates remain;
+full-clip lengths, arbitrary divisors and clip-bound completion timing are not claimed to match the engine.
+The dispatch distinctions follow the [original cropped-animation handlers](https://github.com/Akari1982/q-gears_reverse/blob/e0fabf7e121818e5abe2f873e34a07d0eb32742d/ffvii/DISC/FIELD/FIELD.BIN_event_code_entity.cpp#L246-L365).
 A watcher opens window 0 itself and every later one only when the owner's `SceneStep` for the one before arrives, so the two screens
 show the same line at the same time. A client that cannot build the scene (no field data) tells the server at once (`SceneEnd`
 skipped, or `SceneLeave`), so a player is never left held.

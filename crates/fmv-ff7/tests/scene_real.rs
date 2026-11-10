@@ -250,15 +250,39 @@ fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
         assert_eq!((model.hrc_stem(), model.animations.first().map(|a| a.stem())), (hrc.clone(), Some(idle.clone())), "{}", member.name);
         assert_eq!(init.name, member.name);
     }
+    // Biggs's requested CANIM2 uses a ten-frame range of his original clip.
+    assert!(script.disassemble(3, 3).unwrap().iter().any(|ins| ins.opcode == 0xBB
+        && ins.literal("animation") == Some(3) && ins.literal("first") == Some(10)
+        && ins.literal("last") == Some(19) && ins.literal("speed") == Some(1)));
+    let mut characters = LgpArchive::open_path(dir.join("field/char.lgp")).unwrap();
+    let clip = fmv_ff7::load_field_animation(&mut characters, "bxic").unwrap();
+    let model = fmv_ff7::load_field_model(&mut characters, "bwfd").unwrap();
+    assert_eq!((clip.frame_count(), clip.bone_count()), (20, 21));
+    assert!(model.fits(&clip) && clip.frame(10).is_some() && clip.frame(19).is_some());
     // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
     let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
+    assert_eq!(play.animation_clip(3, 3), Some("bxic"));
     let mut openers = Vec::new();
+    let mut origin = 0u32;
+    let (mut biggs_at, mut jessie_at) = (None, None);
     loop {
-        match play.next(None).then {
+        let beat = play.next(None);
+        for event in &beat.stage {
+            let at = origin + event.at;
+            match event.what {
+                Stage::Anim { entity: 3, animation: 3, how: fmv_ff7::script::scene::AnimHow::Once,
+                    first: Some(10), last: Some(19), speed: 16, divisor: 1 } => { biggs_at.get_or_insert(at); },
+                Stage::Anim { entity: 4, animation: 4, how: fmv_ff7::script::scene::AnimHow::Hold,
+                    first: None, last: None, speed: 16, divisor: 1 } if biggs_at.is_some() => { jessie_at.get_or_insert(at); },
+                _ => {},
+            }
+        }
+        match beat.then {
             Then::End { .. } => break,
-            Then::Window(w) => openers.push(w.opener),
+            Then::Window(w) => { origin += w.at; openers.push(w.opener); },
         }
     }
+    assert_eq!(jessie_at.unwrap().checked_sub(biggs_at.unwrap()), Some(16), "REQEW waits for Biggs's CANIM2 range, then WAIT6 precedes Jessie's animation");
     assert_eq!(openers, [3, 4, 4, 3, 3, 1, 3, 1, 2, 2, 2, 2]);
     assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
 }

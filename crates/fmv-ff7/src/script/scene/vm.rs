@@ -1388,13 +1388,22 @@ impl Vm {
                 self.do_anim(idx, me, ins, AnimHow::Loop, false);
                 Flow::Next
             }
-            0xA3 | 0xB0 => {
+            0xA3 => {
                 self.do_anim(idx, me, ins, AnimHow::Once, true);
                 Flow::Yield
             }
-            0xAE | 0xBB => {
+            0xAE => {
                 self.do_anim(idx, me, ins, AnimHow::Once, false);
                 Flow::Next
+            }
+            // CANIM1 starts asynchronously; CANIM2 waits for the existing clip deadline.
+            0xB0 => {
+                self.do_anim(idx, me, ins, AnimHow::Once, false);
+                Flow::Next
+            }
+            0xBB => {
+                self.do_anim(idx, me, ins, AnimHow::Once, true);
+                Flow::Yield
             }
             0xAF => {
                 self.do_anim(idx, me, ins, AnimHow::Hold, true);

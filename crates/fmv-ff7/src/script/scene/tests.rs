@@ -500,6 +500,46 @@ fn animw_joins_the_existing_cropped_hold_deadline() {
 }
 
 #[test]
+fn cropped_once_dispatches_async_b0_and_sync_bb_before_explicit_waits() {
+    for (opcode, expected_at) in [(0xB0, 15), (0xBB, 55)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 3, 0, 39, 1], wait(15), message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(stage(&beats), [(0, Stage::Anim { entity: 0, animation: 3, how: AnimHow::Once,
+            first: Some(0), last: Some(39), speed: 16, divisor: 1 })]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "only BB adds the existing clip wait before WAIT15");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn animw_joins_the_existing_cropped_once_deadline() {
+    for (opcode, expected_at) in [(0xB0, 40), (0xBB, 55)] {
+        let section = script(vec![("a", vec![(1, vec![vec![opcode, 3, 0, 39, 1], wait(15), vec![0xAC], message(0, 0)])])], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "ANIMW joins the original deadline without waiting for the clip twice");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
+fn reqew_observes_the_cropped_once_childs_dispatch() {
+    for (opcode, expected_at) in [(0xB0, 6), (0xBB, 16)] {
+        let section = script(vec![
+            ("director", vec![(1, vec![reqew(1, 1), wait(6), message(0, 0)])]),
+            ("actor", vec![(1, vec![vec![opcode, 3, 10, 19, 1]])]),
+        ], texts(1));
+        let (beats, vm) = run_root(&section, start(0, 1), &[]);
+        assert_eq!(stage(&beats), [(0, Stage::Anim { entity: 1, animation: 3, how: AnimHow::Once,
+            first: Some(10), last: Some(19), speed: 16, divisor: 1 })]);
+        assert_eq!(windows(&beats)[0].at, expected_at, "REQEW waits for the child script; BB waits ten frames before returning");
+        assert_eq!(end_of(&beats), End::Finished);
+        assert!(vm.writes().is_empty());
+    }
+}
+
+#[test]
 fn animation_literal_speed_is_preserved_separately_without_changing_waits() {
     let a = vec![vec![0xA2, 3, 2], vec![0xBD, 0, 32, 0], vec![0xAF, 4, 3], vec![0xA2, 5, 0], message(0, 0)];
     let section = script(vec![("a", vec![(1, a)])], texts(1));
