@@ -40,8 +40,9 @@ That candidate therefore remains unsuitable even though its walkmesh separation 
 Another candidate `(-3785, 20901, triangle 31)` was visible in inspected frames of the short
 and one purchase path. The short path and all four later-choice combinations ended unskipped;
 the closest visible actor was 203.3 units away in 100–105 position samples per run. Full visual
-occlusion, other models and the actual route are still unverified, so this is not an accepted
-live spot.
+occlusion, all model/path combinations and the actual route are still unverified, so this is not an accepted
+live spot. Two other placeholder bodies were also rendered on one purchase path and were
+visible in the inspected samples; this was not an all-frame or Ninostyle-model check.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.
@@ -176,8 +177,9 @@ walks across the bar with no witness. A candidate `(218, 292, triangle 37)` was 
 clear of the cast in the inspected offscreen samples. Subsequent isolated client runs on both
 answers each emitted an unskipped scene end and sampled 74 positions: the closest visible cast
 actor was 280.2 walkmesh units away, versus a 44-unit ring threshold. This does not cover every
-rendered frame, screen occlusion throughout, or other player models. No safe player position
-has yet been established.
+rendered frame, screen occlusion throughout, or all model/path combinations. No safe player position
+has yet been established. Two other placeholder bodies were rendered on one answer path and
+were visible in inspected samples; Ninostyle models and all-frame occlusion remain untested.
 An isolated interpreter comparison used the original director/setup slots and the corresponding
 manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
 rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
