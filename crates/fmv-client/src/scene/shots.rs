@@ -17,6 +17,17 @@
 //! `FMV_EXPLORATORY_MASK` (choice ordinals). They save sample pictures and check walkmesh
 //! distance, but do not validate all-frame screen occlusion, live progression or audio.
 //!
+//! The two post-escape scenes ask nothing, so their surveys (`offscreen_survey_post_escape_witness`, field `md8_4`, and
+//! `offscreen_survey_station_witness`, field `md8_1`; also `FMV_EXPLORATORY_SPOT`, plus `FMV_SCENE_WITNESS_BODY` for the other
+//! placeholder bodies) play the scene to its end and save a 960 x 720 picture every second step and one of each window as it
+//! opens (`<prefix>-<step>.png`, the window drawn as the player sees it). They print, for the spot: its distance to every place
+//! and walk the interpreter's stage events give the cast and to the nearest boundary edge (held to `2 * 5.5 * model_scale + 16`
+//! and `1.5 * 5.5 * model_scale`, the rule `fmv-ff7`'s `tests/scene_real.rs` holds the proof scene's spots to); how much of
+//! each placeholder body shows in front of the picture's foreground tiles; and, at every step, how much of the witness's picture
+//! a nearer model's covers and how much of a farther model's the witness's covers (rectangle against rectangle, as `covered`;
+//! `boxes_of` cannot tell the cast apart, every field model being `"npc"`, so [`Rig::pics_of`] tells models apart by their
+//! feet), with the steps over [`MAX_COVERED`]. Those overlaps are printed, not asserted.
+//!
 //! The measurements read whatever witness spots and arrival `fmv_ff7::script::scene::proof_scene()` has, so they judge the
 //! game's data as it is. Two environment variables try data that is not in `fmv_ff7` yet, without editing it:
 //! `FMV_SCENE_SPOTS="x,y,triangle,direction;x,y,triangle,direction;..."` (the witness spots, the owner's first) and
@@ -67,7 +78,7 @@ use crate::window::{field_draw, label_anchor, FieldDraw};
 use fmv_adapter_api::AreaRuntime;
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos};
 use fmv_ff7::playable::PLACEHOLDER_BODIES;
-use fmv_ff7::script::scene::{proof_scene, trigger_npc, SceneDef, ScenePlay, Spot, PROOF_FIELD};
+use fmv_ff7::script::scene::{proof_scene, trigger_npc, MoveHow, SceneDef, ScenePlay, Spot, Stage, Then, PROOF_FIELD};
 use fmv_ff7::script::triangle_contains_xy;
 use fmv_ff7::story::StoryState;
 use fmv_ff7::{field_direction_to_facing, Ff7Adapter};
@@ -157,6 +168,18 @@ struct Body {
     /// asset at the field's model scale.
     head: f32,
     feet: (f32, f32),
+}
+
+/// One drawn model's picture on the screen, told apart from the others' by where its feet stand (every cast member that is a
+/// field model has the same `appearance_ref`, `"npc"`, so [`Rig::boxes_of`] cannot tell them apart).
+#[derive(Debug, Clone, Copy)]
+struct Pic {
+    /// Where the model's feet are, in field x and y.
+    feet: (f32, f32),
+    /// The camera-space depth at its feet: the smaller, the nearer the camera (the nearer model is drawn over the other).
+    depth: f32,
+    /// The rectangle its skinned vertices fill, in window pixels.
+    rect: Rect,
 }
 
 /// A camera-space point in field space: the camera is `cam = R * world + T` (the matrix is column-major, `R[i][j] =
@@ -321,7 +344,14 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
         person(2, "PlayerB", [240, 120, 40], looks[1], beside(60.0, 0.0)),
         person(3, "PlayerC", [70, 200, 90], looks[2], beside(0.0, 60.0)),
     ];
-    if def.id == fmv_ff7::script::scene::EARLY_BAR_SCENE_ID || def.id == fmv_ff7::script::scene::FLOWER_STATION_SCENE_ID { entities.truncate(1); }
+    // (the surveys start the scene for the owner alone: no watcher bodies stand about in the pictures)
+    let owner_alone = [
+        fmv_ff7::script::scene::EARLY_BAR_SCENE_ID,
+        fmv_ff7::script::scene::FLOWER_STATION_SCENE_ID,
+        fmv_ff7::script::scene::POST_ESCAPE_SCENE_ID,
+        fmv_ff7::script::scene::STATION_SCENE_ID,
+    ];
+    if owner_alone.contains(&def.id.as_str()) { entities.truncate(1); }
     assert!(state.apply(0.0, ServerMsg::AreaSnapshot { area: area_id, tick: 1, entities, npcs }).is_none());
     if moved {
         state.scene.set_builder(Box::new(Moved { adapter: Arc::clone(&real.adapter), def: def.clone(), reach: Ff7Scenes::new(Some(Arc::clone(&real.adapter))) }));
@@ -332,13 +362,220 @@ fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
     Rig { view, state, avatars, npc_epoch: 0, own_tint, own_real, looks, def, story, play, scale, report: Report { min_separation: f32::MAX, ..Report::default() } }
 }
 
+/// Every place the cast takes in a played scene, as the interpreter's stage events say it: the initial placements and every
+/// walk (a `Walk`, `Jump` or `Ladder` move), sampled each ten units, hidden actors too. The same rule as `cast_path` in
+/// `fmv-ff7`'s `tests/scene_real.rs`.
+fn cast_path(stage: &[Stage]) -> Vec<(u8, f32, f32)> {
+    let mut at: BTreeMap<u8, (f32, f32)> = BTreeMap::new();
+    let mut out = Vec::new();
+    for s in stage {
+        match *s {
+            Stage::Place { entity, x, y, .. } => {
+                at.insert(entity, (f32::from(x), f32::from(y)));
+                out.push((entity, f32::from(x), f32::from(y)));
+            }
+            Stage::Move { entity, from, x, y, how, .. } => {
+                let start = from.map(|(fx, fy)| (f32::from(fx), f32::from(fy))).or_else(|| at.get(&entity).copied());
+                let end = (f32::from(x), f32::from(y));
+                if let (Some(a), MoveHow::Walk | MoveHow::Jump | MoveHow::Ladder) = (start, how) {
+                    let n = ((end.0 - a.0).hypot(end.1 - a.1) / 10.0).ceil().max(1.0) as u32;
+                    for k in 0..=n {
+                        let t = k as f32 / n as f32;
+                        out.push((entity, a.0 + (end.0 - a.0) * t, a.1 + (end.1 - a.1) * t));
+                    }
+                }
+                at.insert(entity, end);
+                out.push((entity, end.0, end.1));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every place the cast of `def` takes over its whole scene (a scene that asks nothing), from the interpreter alone.
+fn scene_path(real: &Real, def: &SceneDef) -> Vec<(u8, f32, f32)> {
+    let area = real.adapter.load_field(&def.field).expect("the scene's field loads");
+    let story = StoryState::at(*def.trigger.moments.start());
+    let mut play = ScenePlay::new(area.field_file(), def, &story, SEED).expect("the scene plays here");
+    let mut stage: Vec<Stage> = play.initial_stage_events().to_vec();
+    for _ in 0..200 {
+        let beat = play.next(None);
+        stage.extend(beat.stage.iter().map(|t| t.what.clone()));
+        if matches!(beat.then, Then::End { .. }) {
+            return cast_path(&stage);
+        }
+    }
+    panic!("the scene never ends");
+}
+
+/// The distance in x and y from `(x, y)` to the nearest boundary edge of the walkmesh (an edge with no neighbour: a wall, or the
+/// edge of a hole). The same measure as `scenery_gap` in `fmv-ff7`'s `tests/scene_real.rs`.
+fn boundary_gap(mesh: &fmv_ff7::field::Walkmesh, x: f32, y: f32) -> f32 {
+    let mut best = f32::INFINITY;
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        for e in 0..3 {
+            if mesh.neighbor(i, e).is_some() {
+                continue;
+            }
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            best = best.min(segment_distance((x, y), (f32::from(a.x), f32::from(a.y)), (f32::from(b.x), f32::from(b.y))));
+        }
+    }
+    best
+}
+
+/// The distance from the point `p` to the segment `a`-`b`.
+fn segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    (p.0 - (a.0 + dx * t)).hypot(p.1 - (a.1 + dy * t))
+}
+
+/// What the other models' pictures did to the witness's over a quiet survey, at every step, on the screen the pictures are made for
+/// (rectangle against rectangle: the rectangles the skinned vertices fill, the measure of [`covered`]). Which of two overlapping
+/// pictures is drawn over the other is the one NEARER the camera.
+#[derive(Debug, Clone)]
+struct Overlap {
+    /// The most of the witness's picture a nearer model's covers, at which step, and which cast entity it was.
+    hidden: (f32, usize, Option<u8>),
+    /// The most of a farther model's picture the witness's covers (the witness is in its way), at which step, and which entity.
+    blocks: (f32, usize, Option<u8>),
+    /// The least distance from the witness's picture to the screen's edge, in pixels (negative: part of it is off the screen).
+    margin: f32,
+    /// Steps measured, and the steps the witness's own model was found in the frame.
+    steps: usize,
+    found: usize,
+    /// The steps at which a model covered more than [`MAX_COVERED`] of the witness's picture (`true`) or the witness covered more
+    /// than that of a farther model's (`false`): step, the part, the cast entity.
+    over: Vec<(usize, f32, bool, Option<u8>)>,
+}
+
+impl Overlap {
+    fn new() -> Self {
+        Self { hidden: (0.0, 0, None), blocks: (0.0, 0, None), margin: f32::MAX, steps: 0, found: 0, over: Vec::new() }
+    }
+
+    /// Note one step: every model of the frame as a [`Pic`], the witness's place and where each cast member stands.
+    fn note(&mut self, step: usize, pics: &[Pic], witness: Pos, cast: &[(u8, Pos)], scale: f32, (w, h): (u32, u32)) {
+        self.steps += 1;
+        let near = |p: &Pic, at: Pos| (p.feet.0 - at.x).hypot(p.feet.1 - at.y);
+        let Some(mine) = pics.iter().filter(|p| near(p, witness) <= 4.0 * scale).min_by(|a, b| near(a, witness).total_cmp(&near(b, witness))) else { return };
+        self.found += 1;
+        self.margin = self.margin.min(mine.rect.0).min(mine.rect.1).min(w as f32 - mine.rect.2).min(h as f32 - mine.rect.3);
+        for other in pics.iter().filter(|p| !std::ptr::eq(*p, mine)) {
+            let who = cast.iter().filter(|c| near(other, c.1) <= 4.0 * scale).map(|c| c.0).next();
+            if other.depth < mine.depth {
+                let c = covered(mine.rect, other.rect);
+                if c > self.hidden.0 {
+                    self.hidden = (c, step, who);
+                }
+                if c > MAX_COVERED {
+                    self.over.push((step, c, true, who));
+                }
+            } else {
+                let c = covered(other.rect, mine.rect);
+                if c > self.blocks.0 {
+                    self.blocks = (c, step, who);
+                }
+                if c > MAX_COVERED {
+                    self.over.push((step, c, false, who));
+                }
+            }
+        }
+    }
+}
+
+/// How many pixels differ between two renders.
+fn changed(a: &[u8], b: &[u8]) -> usize {
+    a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(p, q)| (0..3).map(|i| u32::from(p[i].abs_diff(q[i]))).sum::<u32>() > 30).count()
+}
+
+/// The witness alone on the field, without the marks on the floor under it (the widest part of its picture, and a ledge in
+/// front of the feet would hide them, which says nothing about the body), in a colour of its own, drawn with the picture's
+/// foreground tiles or, when `flat`, over the flat picture with nothing in front of it.
+fn render_alone(rig: &mut Rig, gpu: &mut Offscreen, look: &'static str, tint: [u8; 3], spot: &Spot, size: (u32, u32), flat: bool) -> Vec<u8> {
+    let stage = rig.view.stage.clone().expect("stage");
+    let players = [player(tint, Who(1), look, (spot_pos(rig, spot), field_direction_to_facing(spot.direction)), false)];
+    let mut built = rig.avatars.frame(&rig.view, &stage, &players, 0.0);
+    built.frame.ground.clear();
+    if flat {
+        built.frame.scenery = None;
+    }
+    let scene = Scene { bounds: rig.view.bounds, triangles: &[], players: &[], fixture_banner: false, backdrop: rig.view.backdrop.as_ref() };
+    gpu.render_field(size.0, size.1, &scene, Some(&built.frame), &DrawList::new())
+}
+
+/// The part of a body (`look`) standing on `spot` that shows in front of the picture's foreground (a field's picture is tiles
+/// with a depth of their own, and a body behind a near tile is hidden by it, whatever the walkmesh says): the pixels that two
+/// colours of the same body differ in (a placeholder body takes its player's colour, so they differ exactly where the body is
+/// drawn) with the foreground tiles, over the same with the flat picture.
+fn visible_fraction(rig: &mut Rig, gpu: &mut Offscreen, look: &'static str, spot: &Spot, size: (u32, u32)) -> f32 {
+    let (a, b) = ([240, 60, 60], [60, 240, 60]);
+    let (on_a, on_b) = (render_alone(rig, gpu, look, a, spot, size, false), render_alone(rig, gpu, look, b, spot, size, false));
+    let (off_a, off_b) = (render_alone(rig, gpu, look, a, spot, size, true), render_alone(rig, gpu, look, b, spot, size, true));
+    changed(&on_a, &on_b) as f32 / changed(&off_a, &off_b).max(1) as f32
+}
+
+/// What a quiet survey measures at every step besides the cast's sampled distance (see [`Survey::Quiet`]).
+struct Quiet {
+    size: (u32, u32),
+    overlap: Overlap,
+    /// Where each cast member was one step before, so that the walk between two steps counts as places the cast takes.
+    last: BTreeMap<u8, Pos>,
+    /// The least distance from the witness to a cast member or to the straight walk it made since the step before.
+    between: f32,
+}
+
+impl Quiet {
+    fn step(&mut self, rig: &mut Rig, step: usize) {
+        let draw = rig.draw();
+        let pics = rig.pics_of(draw.built.as_ref().expect("the models were built"), self.size);
+        let Some(scene) = rig.state.scene.player() else { return };
+        let Some(w) = scene.witnesses().first().copied() else { return };
+        let cast: Vec<(u8, Pos)> = scene.cast_draws().iter().map(|c| (c.entity, c.pos)).collect();
+        for (entity, at) in &cast {
+            let from = self.last.insert(*entity, *at).unwrap_or(*at);
+            self.between = self.between.min(segment_distance((w.pos.x, w.pos.y), (from.x, from.y), (at.x, at.y)));
+        }
+        self.overlap.note(step, &pics, w.pos, &cast, rig.scale, self.size);
+    }
+}
+
+/// How a survey takes its pictures and what it asks of the scene.
+#[derive(Debug, Clone, Copy)]
+enum Survey {
+    /// The scene asks a question (the early bar, the flower seller): a picture every 20 of the first 100 steps at [`SIZE`], and the
+    /// run must take a choice and the path `FMV_EXPLORATORY_MASK` asks for.
+    Asks,
+    /// The scene asks nothing (the two post-escape scenes): a picture every `every` steps through the WHOLE scene at `size`, with
+    /// the scene's window on it while one is open (as the player sees it), the witness's picture measured against the cast's at
+    /// every step, and the spot held to the walkmesh rule `tests/scene_real.rs` holds the proof scene's spots to.
+    Quiet { every: usize, size: (u32, u32) },
+}
+
+/// A survey of the witness on a scene that asks a question (see [`Survey::Asks`]).
+fn survey_witness(def: SceneDef, default: Spot, prefix: &str) {
+    survey(def, default, prefix, Survey::Asks);
+}
+
+/// A survey of the witness on a scene that asks nothing (see [`Survey::Quiet`]): `FMV_EXPLORATORY_SPOT` replaces `default`,
+/// `FMV_SHOT_DIR` is where the pictures go (one every two steps and one of each window as it opens, `<prefix>-<step>.png`,
+/// 960 x 720).
+fn survey_quiet_witness(def: SceneDef, default: Spot, prefix: &str) {
+    survey(def, default, prefix, Survey::Quiet { every: 2, size: (960, 720) });
+}
+
 /// A survey, not visual acceptance: sample one witness's walkmesh distance to visible cast
-/// while saving a few frames. Background occlusion, other bodies and intermediate frames must
+/// while saving frames. Background occlusion, other bodies and the frames between pictures must
 /// still be inspected; neither survey definition is in the live scene registry.
-fn survey_witness(mut def: SceneDef, default: Spot, prefix: &str) {
+fn survey(mut def: SceneDef, default: Spot, prefix: &str, mode: Survey) {
     let Some(real) = open() else { return };
     let mut gpu = Offscreen::new().expect("software or physical GPU");
     def.witness = vec![std::env::var("FMV_EXPLORATORY_SPOT").ok().and_then(|s| parse_spot(&s)).unwrap_or(default)];
+    let spot = def.witness[0];
+    let path = matches!(mode, Survey::Quiet { .. }).then(|| scene_path(&real, &def));
     let mut rig = make_rig(&real, def, true);
     let msg = ServerMsg::SceneStart {
         run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), owner: EntityId(1),
@@ -348,15 +585,38 @@ fn survey_witness(mut def: SceneDef, default: Spot, prefix: &str) {
     assert!(rig.state.scene.is_active());
     let mask = std::env::var("FMV_EXPLORATORY_MASK").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let (mut samples, mut actor_samples, mut nearest, mut choice_epoch, mut choice_index) = (0usize, 0usize, f32::MAX, None, 0usize);
-    for step in 0..400 {
+    let mut quiet = match mode {
+        Survey::Quiet { size, .. } => Some(Quiet { size, overlap: Overlap::new(), last: BTreeMap::new(), between: f32::MAX }),
+        Survey::Asks => None,
+    };
+    // (a scene that asks a question is looked at for 400 steps at most; one that asks nothing is played to its end)
+    let (cap, started, mut steps, mut pictures) = (if quiet.is_some() { 6000 } else { 400 }, std::time::Instant::now(), 0usize, 0usize);
+    let mut last_window: Option<u32> = None;
+    for step in 0..cap {
         if !rig.state.scene.is_active() { break; }
+        steps = step + 1;
         if let Some(scene) = rig.state.scene.player() {
             if let Some(w) = scene.witnesses().first() {
                 for actor in scene.cast_draws() { nearest = nearest.min(w.pos.dist_xy(actor.pos)); actor_samples += 1; }
                 samples += 1;
             }
         }
-        if step % 20 == 0 && step < 100 { rig.picture(&mut gpu, &format!("{prefix}-{}", step / 20), SIZE, false); }
+        match (&mut quiet, mode) {
+            (Some(quiet), Survey::Quiet { every, size }) => {
+                quiet.step(&mut rig, step);
+                // a picture every `every` steps, and one of each window as it opens (the window changes what the picture shows)
+                let window = rig.state.scene.player().filter(|p| p.has_window()).map(|p| p.epoch());
+                let opened = window.is_some() && window != last_window;
+                last_window = window.or(last_window);
+                if step % every == 0 || opened {
+                    rig.picture(&mut gpu, &format!("{prefix}-{step:03}"), size, true);
+                    pictures += 1;
+                }
+            }
+            _ => {
+                if step % 20 == 0 && step < 100 { rig.picture(&mut gpu, &format!("{prefix}-{}", step / 20), SIZE, false); }
+            }
+        }
         if rig.state.scene.player().is_some_and(|p| p.has_window()) {
             let selection = rig.state.scene.player().and_then(|p| p.panel().filter(|panel| panel.window().message.choice.is_some() && panel.on_choices(SIZE)).map(|_| p.epoch()));
             if let Some(epoch) = selection.filter(|e| Some(*e) != choice_epoch) {
@@ -370,8 +630,51 @@ fn survey_witness(mut def: SceneDef, default: Spot, prefix: &str) {
     let commands = rig.state.scene.take_commands();
     let threshold = 2.0 * RING_RADIUS_UNITS * rig.scale;
     eprintln!("{prefix}: samples={samples} actor_samples={actor_samples} nearest={nearest:.1} threshold={threshold:.1} commands={commands:?}");
+    // The numbers of a quiet survey are printed before anything is asserted, so that a spot that fails shows why. How much of each
+    // placeholder body shows in front of the picture's foreground does not change over the scene (the camera and the spot are fixed).
+    if let Survey::Quiet { size, .. } = mode {
+        let shown: Vec<String> = PLACEHOLDER_BODIES.iter().map(|b| format!("{} {:.0}%", b.archetype, 100.0 * visible_fraction(&mut rig, &mut gpu, b.model.appearance_ref, &spot, size))).collect();
+        eprintln!("{prefix}: the body shows in front of the picture's foreground: {}", shown.join(", "));
+    }
+    let walkmesh = quiet.as_ref().zip(path.as_ref()).map(|(quiet, path)| {
+        let mesh = rig.play.ground().mesh();
+        let (x, y) = (f32::from(spot.x), f32::from(spot.y));
+        let on_path = path.iter().map(|&(_, px, py)| (px - x).hypot(py - y)).fold(f32::MAX, f32::min);
+        let gap = boundary_gap(mesh, x, y);
+        let inside = mesh.triangles.get(usize::from(spot.triangle)).is_some_and(|t| triangle_contains_xy(t, i32::from(spot.x), i32::from(spot.y)));
+        let ring = RING_RADIUS_UNITS * rig.scale;
+        let o = &quiet.overlap;
+        let who = |e: Option<u8>| e.map_or_else(|| "?".to_string(), |e| e.to_string());
+        eprintln!(
+            "{prefix}: spot ({}, {}) triangle {} direction {} (inside its triangle: {inside}); {steps} steps, {pictures} pictures in {:.1} s",
+            spot.x, spot.y, spot.triangle, spot.direction, started.elapsed().as_secs_f32()
+        );
+        eprintln!(
+            "{prefix}: nearest cast over every place and walk of the scene {on_path:.1} (needs {:.1}); between samples {:.1}; boundary gap {gap:.1} (needs {:.1}); ring {ring:.1}",
+            threshold + 16.0, quiet.between, 1.5 * ring
+        );
+        eprintln!(
+            "{prefix}: witness picture found in {} of {} steps; a nearer model covers up to {:.0}% of it (step {}, entity {}); it covers up to {:.0}% of a farther model's (step {}, entity {}); {:.0} px from the screen's edge",
+            o.found, o.steps, o.hidden.0 * 100.0, o.hidden.1, who(o.hidden.2), o.blocks.0 * 100.0, o.blocks.1, who(o.blocks.2), o.margin
+        );
+        // every step at which one of the two is more than the project's bound (10%), as step:percent:H(idden)/B(locks):entity
+        let steps_over: std::collections::BTreeSet<usize> = o.over.iter().map(|e| e.0).collect();
+        let list: Vec<String> = o.over.iter().map(|(s, c, hidden, e)| format!("{s}:{:.0}%:{}:{}", c * 100.0, if *hidden { "H" } else { "B" }, who(*e))).collect();
+        eprintln!("{prefix}: {} of {} steps have a picture covered more than {:.0}%: {}", steps_over.len(), o.steps, MAX_COVERED * 100.0, list.join(" "));
+        (on_path, gap, inside)
+    });
     assert!(commands.iter().any(|c| matches!(c, super::SceneCmd::End { skipped: false, .. })), "scene must finish without skipping");
     assert!(samples > 0 && actor_samples > 0 && nearest >= threshold, "sampled cast must stay clear of the witness");
+    if let (Some(quiet), Some((on_path, gap, inside))) = (&quiet, walkmesh) {
+        let ring = RING_RADIUS_UNITS * rig.scale;
+        assert_eq!(choice_index, 0, "the scene asks nothing");
+        assert!(commands.iter().all(|c| !matches!(c, super::SceneCmd::Step { answer: Some(_), .. })), "and nothing is answered");
+        assert!(inside, "the spot is inside the triangle it names");
+        assert!(on_path >= threshold + 16.0, "the cast comes within {on_path:.1} of the witness, over every place and walk of the scene (needs {:.1})", threshold + 16.0);
+        assert!(gap >= 1.5 * ring, "the witness stands {gap:.1} from the nearest boundary edge (needs {:.1})", 1.5 * ring);
+        assert!(quiet.overlap.steps > 0 && quiet.overlap.found == quiet.overlap.steps, "the witness's picture was found at every step");
+        return;
+    }
     assert!(choice_index > 0, "the survey must exercise a choice");
     let answers: Vec<usize> = commands.iter().filter_map(|c| match c { super::SceneCmd::Step { answer: Some(n), .. } => Some(usize::from(*n)), _ => None }).collect();
     let expected = if prefix == "early-bar" { vec![1 + (mask & 1)] }
@@ -390,6 +693,27 @@ fn offscreen_survey_early_bar_witness() {
 #[ignore = "requires owned FF7 data and an offscreen GPU; exploratory flower-scene staging"]
 fn offscreen_survey_flower_witness() {
     survey_witness(fmv_ff7::script::scene::flower_station_scene(), Spot { x: -3785, y: 20901, triangle: 31, direction: 192 }, "flower");
+}
+
+/// The tunnel mouth `md8_4`. NO spot of its floor clears every bar (surveyed over the whole floor: 621 places): the only floor
+/// that shows in front of the picture's foreground is the narrow ledge the cast stands and walks on, and the camera looks along
+/// it, so a witness anywhere on it is drawn among the cast. This default is the least bad place that keeps the walkmesh rule
+/// (60 from every place the cast takes, 33 from a boundary edge): the far left end of the ledge, which shows nearly all of the
+/// body but has the nearest cast member's picture over most of it, and the witness's over a part of the next one's, in
+/// nearly every step. The data's own spot, (-133, 144, 0), keeps the rule but is behind the foreground (about 10% of the body shows).
+#[test]
+#[ignore = "requires owned FF7 data and an offscreen GPU; exploratory post-escape (md8_4) staging"]
+fn offscreen_survey_post_escape_witness() {
+    survey_quiet_witness(fmv_ff7::script::scene::post_escape_scene(), Spot { x: -114, y: 260, triangle: 2, direction: 102 }, "post-escape");
+}
+
+/// The street `md8_1`. The left end of the walkable strip, left of where the cast talks (about (1347, -5270)) and facing it:
+/// the whole body shows in front of the foreground, no picture is covered while a window is open, and four of the 105 steps have
+/// a picture covered more than 10% (the cast's Wedge, entity 5, runs by in front of it).
+#[test]
+#[ignore = "requires owned FF7 data and an offscreen GPU; exploratory post-escape station (md8_1) staging"]
+fn offscreen_survey_station_witness() {
+    survey_quiet_witness(fmv_ff7::script::scene::station_scene(), Spot { x: 1074, y: -5183, triangle: 28, direction: 52 }, "station");
 }
 
 impl Rig {
@@ -461,6 +785,40 @@ impl Rig {
                     }
                 }
                 (m.asset.appearance.appearance_ref.to_string(), b)
+            })
+            .collect()
+    }
+
+    /// Every model of a frame as a [`Pic`] on a `w` x `h` screen, in the order the frame holds them.
+    fn pics_of(&self, built: &Drawn, (w, h): (u32, u32)) -> Vec<Pic> {
+        let camera = self.view.stage.as_ref().expect("stage").camera.matrix();
+        built
+            .frame
+            .models
+            .iter()
+            .filter_map(|m| {
+                let mut used = vec![false; m.positions.len()];
+                for &i in &m.asset.mesh.indices {
+                    used[i as usize] = true;
+                }
+                // (each drawn vertex in camera space and in the field)
+                let drawn: Vec<([f32; 3], [f32; 3])> = m.positions.iter().zip(&used).filter(|(_, u)| **u).map(|(p, _)| (*p, to_world(&camera, *p))).collect();
+                let lowest = drawn.iter().map(|(_, field)| field[2]).fold(f32::MAX, f32::min);
+                let feet: Vec<&([f32; 3], [f32; 3])> = drawn.iter().filter(|(_, field)| field[2] <= lowest + 1.5 * self.scale).collect();
+                let n = feet.len() as f32;
+                if feet.is_empty() {
+                    return None;
+                }
+                let at = (feet.iter().map(|(_, f)| f[0]).sum::<f32>() / n, feet.iter().map(|(_, f)| f[1]).sum::<f32>() / n);
+                let depth = feet.iter().map(|(c, _)| c[2]).sum::<f32>() / n;
+                let mut b = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for (_, field) in &drawn {
+                    if let Some(v) = self.view.to_view(Pos::new(field[0], field[1], field[2])) {
+                        let px = view_to_window(&self.view.bounds, w, h, v.x, v.y);
+                        b = (b.0.min(px[0]), b.1.min(px[1]), b.2.max(px[0]), b.3.max(px[1]));
+                    }
+                }
+                (b.0 <= b.2 && b.1 <= b.3).then_some(Pic { feet: at, depth, rect: b })
             })
             .collect()
     }
