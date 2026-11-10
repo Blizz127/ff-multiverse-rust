@@ -105,6 +105,15 @@ proof those slots are reached, that their skipped side effects are safe, or that
 can be played. In particular, `tin_1`'s director starts Barret's slot 3 at moment 48, and
 its concurrent actor requests must run before concluding the scene.
 
+Further static inspection of `mds7pb_1` connects the early bar sequence: director entity 7
+requests Cloud slot 5 and Marlene slot 4 before starting Tifa slot 4. Tifa slot 4 requests
+Marlene slot 5, which requests Tifa slot 5. That slot asks a two-position question; its first
+answer turns on `Var[3][211]` bit 0, then the script runs `MMBud` and `MENU` before setting
+moment 69. Later Tifa slot 10 requests Barret slot 5, which sets moment 72 and requests other
+actors. These links are static script references, not proof of complete scheduling, reachability,
+effects, or dialogue equivalence. The untracked flag and party/menu operations must be handled
+before this sequence can safely advance a player's saved story.
+
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
 background animations and requests. It is not safe to commit the partial write or enable the
