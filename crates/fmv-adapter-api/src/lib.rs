@@ -664,6 +664,14 @@ pub trait AreaRuntime: Send + Sync {
         Vec::new()
     }
 
+    /// The press/talk targets in the player's effective phase. An NPC that moves between phases
+    /// must move its talk target with it; hidden targets may be omitted. Preserve existing point IDs
+    /// and all movement/entry triggers. This selects a location, never permission to advance a story.
+    fn story_points_in_phase(&self, phase: &PhaseKey) -> Vec<StoryPoint> {
+        let _ = phase;
+        self.story_points()
+    }
+
     /// What reaching story point `point` does to an account whose progression is `progress`: the
     /// new progression, or `None` when it does nothing (the point does not apply to that story state,
     /// the point is unknown, or `progress` cannot be read: an unreadable blob is never replaced).

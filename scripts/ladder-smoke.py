@@ -21,7 +21,10 @@ def main():
     parser.add_argument("--echo-s", type=Path)
     parser.add_argument("--timeout", type=int, default=90)
     parser.add_argument("--battle", action="store_true", help="continue through the materia step and shared Guard Scorpion battle")
+    parser.add_argument("--rescue", action="store_true", help="after --battle, have the leader return and rescue Jessie downstairs")
     args = parser.parse_args()
+    if args.rescue and not args.battle:
+        parser.error("--rescue requires --battle")
     package, library = args.bin_dir.resolve(), args.library.resolve()
     if not (library / "library/sets").is_dir():
         parser.error("--library must contain the imported library/sets directory")
@@ -75,9 +78,10 @@ def main():
         route = "nmkin_3,nmkin_4,nmkin_5" if args.battle else "nmkin_3"
         for name, flags in [("leader", ["--party-invite-first-peer", "--story-advance"]),
                             ("member", ["--party-accept"])]:
+            client_route = route + ",nmkin_4,nmkin_3,nmkin_2" if args.rescue and name == "leader" else route
             spawn(name, "fmv-client", "--game", "ff7", "--server", address, "--headless", "--name", name,
                   "--state-dir", work / name, "--ff7-library", work / "lib-state", "--duration", args.timeout + 10,
-                  "--bot", "idle", "--travel", route, "--battle-auto", *flags, *mods)
+                  "--bot", "idle", "--travel", client_route, "--battle-auto", *flags, *mods)
         scene = "ff7/nmkin_3/jessie-ladder"
         until(lambda: all(re.search(r"scene: ended run=\d+ outcome=Finished windows=1", read(n))
                           for n in ["leader", "member"]), args.timeout)
@@ -86,6 +90,10 @@ def main():
             until(lambda: all(re.search(r"battle#\d+ ended in Victory.*verified: the server's", read(n))
                               for n in ["leader", "member"]), args.timeout)
             until(lambda: re.search(r"story saved account=\d+ bytes=\d+ progress=0[12]1b00[0-9a-f]*", read("server")), 10)
+        if args.rescue:
+            until(lambda: "scene: ended run=4 outcome=Finished windows=3" in read("leader")
+                  and "headless: now in Ff7/nmkin_2" in read("leader"), args.timeout)
+            until(lambda: "bytes=7 progress=021b000101e120" in read("server"), 10)
         sl = read("server")
         matches = re.findall(rf"scene started run=(\d+) scene={scene} owner=(\d+) watchers=\[(\d+)\] preview=false writes_story=false", sl)
         assert len(matches) == 1, "one shared scene with one watcher"
@@ -116,6 +124,17 @@ def main():
                 assert "headless: npc area=Ff7/nmkin_5 id=0 name=mtr " in cl
                 assert "headless: 0 NPC(s) in Ff7/nmkin_5" in cl, "materia disappears on both clients"
             print("PASS: materia disappears on both clients, one shared boss victory with matched replays, one saved 15->27 step/countdown")
+        if args.rescue:
+            assert sl.count("var1.225=0->32") == 1, "one existing rescue bit"
+            assert sl.count("bytes=7 progress=021b000101e120") == 1, "saved rescue, no lift bit invented"
+            cl = read("leader")
+            start = cl.index("ff7/nmkin_3/jessie-rescue as owner")
+            cast_line = r"headless: npc area=Ff7/nmkin_3 id=(\d+) name=(\S+) model=(\S+)"
+            before = {int(i): (name, model) for i, name, model in re.findall(cast_line, cl[:start])}
+            after = {int(i): (name, model) for i, name, model in re.findall(cast_line, cl[start:])}
+            assert after == {i: actor for i, actor in before.items() if actor[0] != "av_j"}
+            assert len(after) == 1, "potion keeps its slot"
+            print("PASS: leader rescues Jessie at her lower talk target, saves bit5 once, then returns to nmkin_2")
         for name in ["server", "leader", "member"]:
             for line in read(name).splitlines():
                 if "scene started" in line or line.startswith("scene:") or "moment=" in line or "story saved" in line or "battle#" in line or "battle started" in line or "battle ended" in line:

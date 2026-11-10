@@ -208,6 +208,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 // Distinct from AreaStory's moment tag (0x4D); never stored in a progression blob.
 const JESSIE_RESCUED_PHASE: u8 = b'J';
+const JESSIE_LOWER_PHASE: u8 = b'L';
+const JESSIE_TRAPPED_PHASE: u8 = b'T';
 const MATERIA_HIDDEN_PHASE: u8 = b'H';
 
 /// Cap on a decompressed field file (16 MiB). The largest part of a PC field is its
@@ -1022,10 +1024,15 @@ impl AreaRuntime for Ff7FieldArea {
         let mut phase = self.story.phase_key(progress)?;
         if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
             let story = story::StoryState::decode(progress)?;
-            if story.moment >= 27 && story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) == Some(true) {
-                // A runtime phase only: the existing rescue flag now changes the cast. Prefixing the moment
-                // interval keeps its distinctions and causes an immediate snapshot after the rescue step.
-                phase.0.insert(0, JESSIE_RESCUED_PHASE);
+            let moment = story.moment as i16; // the owned init's IFSW comparisons are signed
+            let marker = if moment >= 27 {
+                Some(if story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) == Some(true) {
+                    JESSIE_RESCUED_PHASE
+                } else { JESSIE_TRAPPED_PHASE })
+            } else if moment >= 14 { Some(JESSIE_LOWER_PHASE) } else { None };
+            if let Some(marker) = marker {
+                // Runtime placement only; preserve the existing interval and saved bytes.
+                phase.0.insert(0, marker);
             }
         }
         if self.info.id.key.eq_ignore_ascii_case("nmkin_5") {
@@ -1041,11 +1048,14 @@ impl AreaRuntime for Ff7FieldArea {
 
     fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
         let mut npcs = self.npcs();
-        if self.info.id.key.eq_ignore_ascii_case("nmkin_3") && phase.0.first() == Some(&JESSIE_RESCUED_PHASE) {
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
+            let marker = phase.0.first().copied();
             for npc in &mut npcs {
-                if npc.entity_name.eq_ignore_ascii_case("av_j") {
+                if npc.entity_name.eq_ignore_ascii_case("av_j") && matches!(marker, Some(JESSIE_LOWER_PHASE | JESSIE_TRAPPED_PHASE | JESSIE_RESCUED_PHASE)) {
+                    npc.pos = Pos::new(-183.0, 1191.0, 1643.0); // owned init: lower platform, triangle 20
+                    npc.facing = crate::field_direction_to_facing(if marker == Some(JESSIE_TRAPPED_PHASE) { 0 } else { 128 });
                     // Retain the slot so the other characters keep their server IDs.
-                    npc.unconditional = false;
+                    npc.unconditional = marker != Some(JESSIE_RESCUED_PHASE);
                 }
             }
         }
@@ -1062,6 +1072,25 @@ impl AreaRuntime for Ff7FieldArea {
 
     fn story_points(&self) -> Vec<StoryPoint> {
         self.story.points()
+    }
+
+    fn story_points_in_phase(&self, phase: &PhaseKey) -> Vec<StoryPoint> {
+        let mut points = self.story_points();
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
+            if let Some(original) = self.npcs.iter().find(|npc| npc.entity_name.eq_ignore_ascii_case("av_j")) {
+                let current = self.npcs_in_phase(phase).into_iter().find(|npc| npc.entity_name.eq_ignore_ascii_case("av_j") && npc.unconditional);
+                points.retain_mut(|point| {
+                    if let fmv_adapter_api::StoryTrigger::Talk { center, .. } = &mut point.trigger {
+                        if center.dist_xy(original.pos) <= fmv_adapter_api::SAME_SPOT {
+                            let Some(npc) = &current else { return false };
+                            *center = npc.pos;
+                        }
+                    }
+                    true
+                });
+            }
+        }
+        points
     }
 
     /// What reaching a story point does (a talk point runs its character's talk script, which needs the field's own

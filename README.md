@@ -648,7 +648,9 @@ party can do of it. Everything below is pinned against the real data in `crates/
   turns bit 5 of the reactor byte on, which is carried for it: a talk that moves the story, once, `var1.225=1->33` with the
   lift down; no exit or point waits for the bit, which only decides where she and her namesake of `nmkin_1` stand and
   whether the second door of `nmkin_1` opens. Saving the rescue now changes the `nmkin_3` phase and hides Jessie immediately,
-  including after re-login; other NPC slots retain their IDs. Her pre-rescue position and the `nmkin_1` cast/door remain as
+  including after re-login; other NPC slots retain their IDs. Her position and facing follow the existing moment: upper
+  platform before 14, downstairs after her ladder explanation, and facing the rescue approach from 27. Her talk target
+  follows the same phase and still checks distance, height and story permission. Her static idle animation and the `nmkin_1` cast/door remain as
   before, and the walkmesh has no door locks). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
   goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
   the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
@@ -710,7 +712,7 @@ built from this version or later.
 
 Not done: exits a talk or a director decides (the finale's jump from `nrthmk` to `md8_4` among them), the script exits, story
 points and links of every field but the first mission's ten (they are left off until reviewed), general conditional NPC
-placement (only rescued Jessie's visibility currently follows her flag), NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
+placement outside the reviewed Jessie/materia changes, NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
 
 ## Accounts, avatars and parties
 
@@ -1456,6 +1458,8 @@ clients walking from `nmkin_2` into the real `nmkin_3`. It requires one shared r
 and one saved 13-to-14 step, using temporary state and read-only owned assets. Shared scenes use the original script.
 Add `--battle --timeout 180` to continue through the materia's disappearance into one shared Guard Scorpion fight,
 requiring both clients' replays to match and one saved victory step/countdown.
+Add `--rescue` to have the leader return to Jessie's downstairs talk target, rescue her once, and climb back to `nmkin_2`;
+the other player stays in the core after the shared battle. All saves are temporary test accounts.
 
 How it works (`World::start_point_scene`, `SceneHost::point_scene`):
 

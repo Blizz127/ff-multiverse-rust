@@ -145,7 +145,7 @@ impl World {
             let addressed = npc.and_then(|id| area.npc_position(id, &phase));
             let talking = addressed.is_some();
             let points: Vec<u32> = area
-                .story_points()
+                .story_points_in_phase(&phase)
                 .iter()
                 .filter(|point| matches!(point.trigger, StoryTrigger::Talk { .. }) == talking && point.is_pressed_at(pos, addressed))
                 .map(|point| point.id)
@@ -354,6 +354,7 @@ mod tests {
         assert_eq!(at(&w, &a).y, 60.0);
         // touching the line and pressing puts the player where the ladder leads
         assert_eq!(go(&mut w, &a, 0.0, 95.0, &mut now), MoveOutcome::Applied);
+        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().story_advance_allowed = false;
         assert_eq!(w.press(a.entity, None, now), PressOutcome::Relocated { corrected: pos(LINK_C_TO) });
         assert_eq!(at(&w, &a), pos(LINK_C_TO));
         assert!(log_text(&mut w).contains("link=2 (ladder) to=(0,-150)"));
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn pressing_ok_next_to_the_character_a_talk_point_belongs_to_is_the_talk_and_nothing_else_is() {
         let t0 = Instant::now();
-        let (mut w, _saved) = world();
+        let (mut w, mut saved) = world();
         let mut a = seat(&mut w, "A", t0);
         let mut now = t0;
         arrive_in_the_yard(&mut w, &mut a, &mut now);
@@ -421,17 +422,32 @@ mod tests {
         assert_eq!(w.press(a.entity, Some(7), now), PressOutcome::Nothing);
         assert!(progression(&w, &a).is_empty());
         // Address what this player's effective phase shows, not the base cast or personal story.
-        let phase = w.players[&a.entity].placement.as_ref().unwrap().key.phase.clone();
         w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().key.phase = fmv_core::PhaseKey(fmv_fixture::rooms::STORY_ADVANCED_PHASE.to_vec());
         assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
         assert!(progression(&w, &a).is_empty(), "a hidden character cannot be addressed");
-        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().key.phase = phase;
-        // next to it, naming it, is the talk: the story's step
+        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().key.phase = fmv_core::PhaseKey(fmv_fixture::rooms::STORY_MOVED_PHASE.to_vec());
+        assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty(), "the old talk location is no longer the target");
+        let player = w.players.get_mut(&a.entity).unwrap();
+        player.snapshot.pos = Pos::new(-50.0, -100.0, Link::LEVEL + 1.0);
+        assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty(), "wrong floor");
+        let player = w.players.get_mut(&a.entity).unwrap();
+        player.snapshot.pos.z = 0.0;
+        player.placement.as_mut().unwrap().story_advance_allowed = false;
+        assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty(), "party phase does not grant personal story permission");
+        assert!(saved_stories(&mut saved).is_empty());
+        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().story_advance_allowed = true;
+        // The same NPC/point IDs at their new position, with permission, pay the existing step once.
         assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
         assert_eq!(progression(&w, &a), STORY_ADVANCED);
+        assert_eq!(saved_stories(&mut saved), [STORY_ADVANCED.to_vec()]);
         let log = log_text(&mut w);
         assert!(log.contains("area=Fixture/yard point=0 moment=0->1"), "{log}");
         assert!(a.drain().iter().any(|msg| matches!(msg, ServerMsg::AreaSnapshot { npcs, .. } if npcs.is_empty())), "the guard leaves immediately in the new phase");
+        assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
+        assert!(saved_stories(&mut saved).is_empty(), "no repeated save");
     }
 
     #[test]

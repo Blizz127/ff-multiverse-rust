@@ -23,8 +23,9 @@
 //!   answer the same, so the field looks the same to both players; the key of an interval is its
 //!   first moment. **The interval that holds [`NEW_GAME_MOMENT`] is the empty key in every field**,
 //!   which is what makes all existing accounts one phase and keeps their placements byte for byte
-//!   what they were. The field runtime additionally distinguishes `nmkin_3` after Jessie's existing rescue
-//!   bit is set from moment 27 on, so her disappearance is sent immediately. That phase key is not saved.
+//!   what they were. The field runtime additionally distinguishes Jessie's upper, lower, trapped and rescued
+//!   placements in `nmkin_3`, and hidden materia in `nmkin_5`, so their changes are sent immediately. These phase
+//!   markers use the existing counter/rescue bit and are never saved.
 //! * **Story points** ([`AreaStory::points`]): where a field's own scripts advance the story on
 //!   something the server can see. See below.
 //!

@@ -280,6 +280,10 @@ impl AreaState {
         &self.story_points
     }
 
+    pub(super) fn story_points_in_phase(&self, phase: &PhaseKey) -> Vec<StoryPoint> {
+        self.runtime.story_points_in_phase(phase).into_iter().take(MAX_STORY_POINTS_PER_AREA).collect()
+    }
+
     /// The lines that put a player somewhere else in this area.
     pub(super) fn links(&self) -> &[Link] {
         &self.links

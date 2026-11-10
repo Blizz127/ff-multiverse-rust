@@ -50,6 +50,9 @@ pub const STORY_ADVANCED: &[u8] = &[1];
 /// With [`RoomsAdapter::with_story`], the phase key of both rooms for [`STORY_ADVANCED`] (a new
 /// account's is the empty key, as the adapter API requires).
 pub const STORY_ADVANCED_PHASE: &[u8] = &[0xA1];
+/// Synthetic effective phase used to check an interactive NPC and its talk target moving together.
+pub const STORY_MOVED_PHASE: &[u8] = &[0xA2];
+pub const YARD_MOVED_NPC_POS: (f32, f32) = (-100.0, -100.0);
 /// With [`RoomsAdapter::with_story`], the corners of the hall's story region: stepping into it takes an
 /// account from the empty progression to [`STORY_ADVANCED`].
 pub const STORY_REGION: [(f32, f32); 4] = [(150.0, -50.0), (250.0, -50.0), (250.0, 50.0), (150.0, 50.0)];
@@ -531,6 +534,9 @@ impl AreaRuntime for Room {
         if self.interactive {
             return self.npcs().into_iter().map(|mut npc| {
                 npc.unconditional = phase.0 != STORY_ADVANCED_PHASE;
+                if phase.0 == STORY_MOVED_PHASE {
+                    npc.pos = Pos::new(YARD_MOVED_NPC_POS.0, YARD_MOVED_NPC_POS.1, 0.0);
+                }
                 npc
             }).collect();
         }
@@ -538,6 +544,18 @@ impl AreaRuntime for Room {
             return Vec::new();
         }
         self.npcs()
+    }
+
+    fn story_points_in_phase(&self, phase: &PhaseKey) -> Vec<StoryPoint> {
+        let mut points = self.story_points();
+        if self.interactive && self.is_yard() && phase.0 == STORY_MOVED_PHASE {
+            for point in &mut points {
+                if let StoryTrigger::Talk { center, .. } = &mut point.trigger {
+                    *center = Pos::new(YARD_MOVED_NPC_POS.0, YARD_MOVED_NPC_POS.1, 0.0);
+                }
+            }
+        }
+        points
     }
 }
 

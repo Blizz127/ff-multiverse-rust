@@ -387,7 +387,7 @@ impl StoryBot {
     /// character that the area has announced and that it talks to. The points that start a battle come last (the party
     /// is better off with its story done first), the nearest to `from` first.
     fn target(&self, area: &dyn AreaRuntime, progress: &[u8], from: Pos) -> Option<Target> {
-        area.story_points()
+        area.story_points_in_phase(&area.phase_key(progress).unwrap_or_default())
             .into_iter()
             .filter_map(|point| {
                 let kind = match &point.trigger {

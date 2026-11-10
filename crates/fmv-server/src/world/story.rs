@@ -127,6 +127,11 @@ impl World {
     pub(super) fn reach_story_point(&mut self, entity: EntityId, point: u32, battle_clock: Option<Instant>, now: Instant, on_entry: bool) -> Reached {
         let (step, battle) = {
             let Some(player) = self.players.get(&entity) else { return Reached::Nothing };
+            // Every trigger, including OK presses, obeys the same phase permission as walking.
+            // Reject only the story step: a follower may still use an ordinary ladder or jump.
+            if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
+                return Reached::Nothing;
+            }
             let Some(area) = self.areas.get(&player.area) else { return Reached::Nothing };
             (area.runtime().story_advance(&player.progression, point), area.runtime().story_battle(point))
         };
@@ -471,6 +476,8 @@ mod tests {
         assert_eq!(go(&mut w, &b, 100.0, 0.0, &mut now), MoveOutcome::Applied);
         assert_eq!(go(&mut w, &b, 200.0, 0.0, &mut now), MoveOutcome::Applied);
         assert!(progression_of(&w, &b).is_empty(), "story_advance_allowed was false");
+        assert_eq!(w.reach_story_point(b.entity, 0, Some(now), now, false), Reached::Nothing, "talk/press entry obeys the same permission");
+        assert!(progression_of(&w, &b).is_empty());
         assert!(saved_stories(&mut saved).is_empty());
 
         // Leaving the party puts B back in the instance of its own phase (A hears it leave)...

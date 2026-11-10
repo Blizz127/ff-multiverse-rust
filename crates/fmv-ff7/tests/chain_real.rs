@@ -1047,6 +1047,12 @@ fn nobody_is_stranded_at_27_or_33_in_any_reviewed_field() {
             if field == "nmkin_5" {
                 expected.iter_mut().filter(|npc| npc.entity_name == "mtr").for_each(|npc| npc.unconditional = false);
             }
+            if field == "nmkin_3" {
+                for npc in expected.iter_mut().filter(|npc| npc.entity_name == "av_j") {
+                    npc.pos = fmv_core::Pos::new(-183.0, 1191.0, 1643.0);
+                    npc.facing = fmv_ff7::field_direction_to_facing(0);
+                }
+            }
             assert_eq!(area.npcs_in_phase(&phase), expected, "{field} at {name}: only reviewed cast changes");
         }
     }
@@ -1142,7 +1148,7 @@ fn the_woman_of_nmkin_3_is_freed_on_the_way_out_once_and_it_changes_nothing_else
 
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
-fn jessies_saved_rescue_changes_only_her_visibility_and_field_phase() {
+fn jessies_saved_story_places_her_and_moves_her_talk_target() {
     use fmv_ff7::script::scene::{jessie_rescue_scene, ScenePlay, Stage};
     let adapter = adapter().expect("FMV_FF7_DATA");
     let area = adapter.load_field("nmkin_3").unwrap();
@@ -1151,28 +1157,41 @@ fn jessies_saved_rescue_changes_only_her_visibility_and_field_phase() {
     assert!(base.len() > 1 && base[jessie].unconditional);
     let mut archive = fmv_ff7::lgp::LgpArchive::open_path(flevel_path(&data_dir().unwrap())).unwrap();
     let field = script_common::load_field(&mut archive, "nmkin_3").unwrap();
-    for moment in [1, 13, 14, 26, 27, 28, 33, 40] {
-        let before = StoryState::at(moment);
-        let phase = area.phase_key(&before.encode()).unwrap();
-        assert_eq!(area.npcs_in_phase(&phase), base);
-        let mut after = before.clone();
-        after.set_bit(1, 225, 5, true);
-        let rescued_phase = area.phase_key(&after.encode()).unwrap();
-        let mut expected = base.clone();
-        if moment >= 27 {
-            assert_ne!(phase, rescued_phase, "same moment, changed cast");
-            expected[jessie].unconditional = false;
-            // The owned setup hides Jessie at exactly these story states.
-            let scene = ScenePlay::new(&field, &jessie_rescue_scene(), &after, 1).unwrap();
-            assert!(scene.initial_stage_events().iter().any(|e| matches!(e, Stage::Show { entity: 4, visible: false })));
-        } else {
-            assert_eq!(phase, rescued_phase, "rescue flag is irrelevant before escape");
+    for moment in [0, 1, 13, 14, 26, 27, 28, 33, 40, 32767, 32768, u16::MAX] {
+        for rescued in [false, true] {
+            let mut story = StoryState::at(moment);
+            story.set_bit(1, 225, 5, rescued);
+            let saved = story.encode();
+            let phase = area.phase_key(&saved).unwrap();
+            let scene = ScenePlay::new(&field, &jessie_rescue_scene(), &story, 1).unwrap();
+            let mut expected = base.clone();
+            // The expectation comes from the owned init, including signed-word boundaries.
+            for event in scene.initial_stage_events() {
+                match *event {
+                    Stage::Place { entity: 4, x, y, z: Some(z), .. } => expected[jessie].pos = fmv_core::Pos::new(f32::from(x), f32::from(y), f32::from(z)),
+                    Stage::Face { entity: 4, heading, .. } => expected[jessie].facing = heading,
+                    Stage::Show { entity: 4, visible } => expected[jessie].unconditional = visible,
+                    _ => {},
+                }
+            }
+            assert_eq!(area.npcs_in_phase(&phase), expected, "owned placement, facing, visibility; other slots unchanged at {moment}/{rescued}");
+            let points = area.story_points_in_phase(&phase);
+            assert_eq!(points.len(), usize::from(expected[jessie].unconditional));
+            if let Some(point) = points.first() {
+                assert_eq!(point.id, 0);
+                assert!(matches!(point.trigger, StoryTrigger::Talk { center, radius: 80.0 } if center == expected[jessie].pos));
+                assert!(point.is_pressed_at(expected[jessie].pos, Some(expected[jessie].pos)));
+                if (moment as i16) >= 14 {
+                    assert!(!point.is_pressed_at(base[jessie].pos, Some(expected[jessie].pos)), "old upper talk position rejected");
+                }
+            }
+            assert_eq!(story.encode(), saved, "presentation never changes saved bytes");
+            assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase.clone()), "same after reload");
+            story.set_bit(1, 225, 0, true);
+            assert_eq!(area.phase_key(&story.encode()), Some(phase), "lift does not change this cast");
         }
-        assert_eq!(area.npcs_in_phase(&rescued_phase), expected, "slots, other NPCs and coordinates preserved");
-        assert_eq!(area.phase_key(&StoryState::decode(&after.encode()).unwrap().encode()), Some(rescued_phase.clone()), "same after re-login");
-        after.set_bit(1, 225, 0, true);
-        assert_eq!(area.phase_key(&after.encode()), Some(rescued_phase), "lift does not change this cast");
     }
+    assert_ne!(area.phase_key(&StoryState::at(13).encode()), area.phase_key(&StoryState::at(14).encode()), "ladder step refreshes both players' cast");
     assert_eq!(area.phase_key(&[255, 1, 2]), None, "unreadable progression is not guessed");
 }
 
