@@ -660,6 +660,16 @@ fn a_scene_that_writes_nothing_the_story_carries_is_story_neutral() {
 }
 
 #[test]
+fn untracked_bits_in_a_partly_tracked_byte_are_reported() {
+    let a = vec![biton(1, 225, 0), biton(1, 225, 1), message(0, 0)];
+    let field = field_of(script(vec![("a", vec![(1, a)])], vec![dialog("Hello.")]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let result = run_to_end(&field, &def, &StoryState::at(72), 1, &[]).unwrap();
+    assert_eq!(result.writes.tracked, [((1, 225), 3)]);
+    assert_eq!(result.writes.untracked.get(&(1, 225)), Some(&3));
+}
+
+#[test]
 fn the_answers_a_player_gave_decide_what_the_headless_run_writes() {
     // answering line 2 sets the moment to 90, line 1 leaves it
     let question = [dialog("Q").split_last().map(|(_, r)| r.to_vec()).unwrap(), vec![0xE7], vec![b'A' - 0x20], vec![0xE7], vec![b'B' - 0x20, 0xFF]].concat();

@@ -43,7 +43,7 @@ pub struct Writes {
     pub moment: Option<u16>,
     /// The variables the story model carries ([`crate::story::TRACKED_VARS`]) that the scene changed, as the new byte.
     pub tracked: Vec<((u8, u8), u8)>,
-    /// Every other variable the scene changed (the field's own flags): not part of the story model, so not carried.
+    /// Every other variable or untracked bit the scene changed: not part of the story model, so not carried.
     pub untracked: BTreeMap<(u8, u8), u8>,
 }
 
@@ -325,8 +325,14 @@ impl ScenePlay {
                 continue;
             }
             match tracked_var(bank, address) {
-                Some(t) if value & t.bits != self.story.var(bank, address) & t.bits => out.tracked.push(((bank, address), value)),
-                Some(_) => {}
+                Some(t) => {
+                    if value & t.bits != self.story.var(bank, address) & t.bits {
+                        out.tracked.push(((bank, address), value));
+                    }
+                    if (value ^ base.byte(bank, address)) & !t.bits != 0 {
+                        out.untracked.insert((bank, address), value);
+                    }
+                }
                 None => {
                     out.untracked.insert((bank, address), value);
                 }

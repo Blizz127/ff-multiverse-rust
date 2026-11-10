@@ -20,11 +20,20 @@ transaction and its persistence need to be implemented before serving that branc
 
 The branch has an arrival-scene trigger and a scene jump through the ordinary area handshake.
 Scene jumps only resolve to reviewed fields, so `md8_1` remains closed until its transition and
-story are ready. The server refuses to apply incomplete interpretations or ignored item and gil
-operations, and preflights a destination before saving a scene's story change. Debug previews never
+story are ready. The server refuses to apply incomplete interpretations or ignored party, resource,
+inventory, clock and menu operations, and preflights a destination before saving a scene's story change. Debug previews never
 save or perform a scene jump. An automatic scene is judged and saved against the entering player's
 own story, even when its field uses the party leader's phase. A member whose story has not reached
 the scene's moment is not advanced or teleported; how such a follower catches up remains unfinished.
+Both bar answers change additional untracked bits of `Var[3][212]`; the long answer also changes
+Tifa's affection (`Var[1][4]`). The current story model carries neither effect. A real scene must
+refuse those writes instead of silently discarding them; debug
+preview can still show it on made-up state. Safely carrying affection needs its own reviewed
+persistence design and owner decision under the existing data gate.
+The existing story merge unions tracked bits and is not a numeric affection merge. The correct
+initial affection and the behavior of later increases/decreases must be established from owned
+game data before proposing a durable numeric representation; treating the observed `+5` as a
+complete value or simply OR-ing bytes would be incorrect.
 An owner whose client cannot build or finish the interpreter run aborts without saving; a timed-out
 run also leaves progress untouched rather than silently choosing any remaining answers.
 Echo-S uses a

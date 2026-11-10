@@ -18,14 +18,30 @@ use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 
 use crate::world::{SceneHost, SceneInfo, SceneResult, TriggerInfo};
 
-fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     (match outcome.end {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
         fmv_ff7::script::dialogue::End::MapJump { field } => outcome.jump.is_some_and(|jump| jump.field == field),
         _ => false,
-    })
-        && outcome.stats.unknown.is_empty() && outcome.stats.unresolved == 0 && outcome.stats.dropped_requests == 0
-        && !["GOLDu", "GOLDd", "STITM", "SMTRA"].iter().any(|op| outcome.stats.ignored.contains_key(op))
+    }) && outcome.stats.unknown.is_empty() && outcome.stats.unresolved == 0 && outcome.stats.dropped_requests == 0
+}
+
+fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+    // These ignored instructions read or change the player's party, resources, inventory,
+    // clock or menu-owned state. Advancing past one without carrying it out can lose state or
+    // select the wrong branch. They remain blocked until the server implements their effects.
+    const UNSUPPORTED_STATE: &[&str] = &[
+        "PREQ", "PRQSW", "PRQEW", "JOIN", "SPLIT", "SPTYE", "GTPYE", "SPECIAL", "STTIM",
+        "GOLDu", "GOLDd", "CHGLD", "HMPMAX1", "HMPMAX2", "MHMMX", "HMPMAX3",
+        "MPu", "MPd", "MENU", "HPu", "HPd", "STITM", "DLITM", "CKITM", "SMTRA", "DMTRA", "CMTRA",
+        "PRTYP", "PRTYM", "PRTYE", "MMBud", "MMBLK", "MMBUK",
+    ];
+    complete_outcome(outcome)
+        && !UNSUPPORTED_STATE.iter().any(|op| outcome.stats.ignored.contains_key(op))
+        // Banks 1–4 may contain persistent game state (for example Tifa's affection in
+        // bank 1). Local field scratch variables remain allowed, but untracked persistent
+        // writes must not be silently discarded when the story is saved.
+        && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank))
 }
 
 /// The scenes of FF7 over an opened adapter.
@@ -48,6 +64,32 @@ impl Ff7SceneHost {
     fn field(&self, name: &str) -> Option<Arc<Ff7FieldArea>> {
         let mut fields = self.fields.lock().unwrap_or_else(PoisonError::into_inner);
         fields.entry(name.to_string()).or_insert_with(|| self.adapter.load_field(name).ok().map(Arc::new)).clone()
+    }
+
+    fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool) -> Option<SceneResult> {
+        let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
+        let area = self.field(&def.field)?;
+        let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
+        let outcome = run_to_end(area.field_file(), def, &story, seed, &answers).ok()?;
+        if !(if preview { complete_outcome(&outcome) } else { safe_outcome(&outcome) }) { return None; }
+        let mut after = story.clone();
+        let changed = outcome.writes.apply_to(&mut after);
+        let mut summary = Vec::new();
+        if after.moment != story.moment { summary.push(format!("moment={}->{}", story.moment, after.moment)); }
+        for ((bank, address), value) in after.vars() {
+            if story.var(bank, address) != value { summary.push(format!("var[{bank}][{address}]={value}")); }
+        }
+        let travel = if let Some(jump) = outcome.jump {
+            let target = self.adapter.field_key_for_id(jump.field)?;
+            if !fmv_ff7::is_reviewed_field(&target) { return None; }
+            Some(fmv_adapter_api::Exit {
+                line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)), target,
+                arrival: Pos::new(f32::from(jump.x), f32::from(jump.y), 0.0),
+                arrival_facing: Some(field_direction_to_facing(jump.direction)),
+                arrival_hint: u32::try_from(jump.triangle).ok(), kind: fmv_adapter_api::ExitKind::Gateway,
+            })
+        } else { None };
+        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel })
     }
 }
 
@@ -90,37 +132,11 @@ impl SceneHost for Ff7SceneHost {
     }
 
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
-        let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
-        let area = self.field(&def.field)?;
-        let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
-        let outcome = run_to_end(area.field_file(), def, &story, seed, &answers).ok()?;
-        // Never advance or travel on a partial interpretation, or across an inventory/currency
-        // operation that the scene VM currently only displays without performing.
-        if !safe_outcome(&outcome) { return None; }
-        let mut after = story.clone();
-        let changed = outcome.writes.apply_to(&mut after);
-        let mut summary = Vec::new();
-        if after.moment != story.moment {
-            summary.push(format!("moment={}->{}", story.moment, after.moment));
-        }
-        for ((bank, address), value) in after.vars() {
-            if story.var(bank, address) != value {
-                summary.push(format!("var[{bank}][{address}]={value}"));
-            }
-        }
-        let travel = if let Some(jump) = outcome.jump {
-            let target = self.adapter.field_key_for_id(jump.field)?;
-            // Never send a real player to a field whose story has not been reviewed.
-            if !fmv_ff7::is_reviewed_field(&target) { return None; }
-            Some(fmv_adapter_api::Exit {
-                line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)), target,
-                arrival: Pos::new(f32::from(jump.x), f32::from(jump.y), 0.0),
-                arrival_facing: Some(field_direction_to_facing(jump.direction)),
-                arrival_hint: u32::try_from(jump.triangle).ok(),
-                kind: fmv_adapter_api::ExitKind::Gateway,
-            })
-        } else { None };
-        Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel })
+        self.finish_scene(scene, progress, seed, answers, false)
+    }
+
+    fn finish_preview(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
+        self.finish_scene(scene, progress, seed, answers, true)
     }
 }
 
@@ -136,6 +152,17 @@ mod tests {
         outcome.stats.ignored.insert("GOLDu", 1);
         assert!(!safe_outcome(&outcome));
         outcome.stats.ignored.clear();
+        for op in ["HMPMAX3", "PRTYM", "CHGLD", "HPd", "DLITM"] {
+            outcome.stats.ignored.insert(op, 1);
+            assert!(!safe_outcome(&outcome), "ignored stateful operation {op} must refuse the write");
+            outcome.stats.ignored.clear();
+        }
+        outcome.writes.untracked.insert((1, 4), 5);
+        assert!(!safe_outcome(&outcome), "untracked persistent affection cannot be discarded");
+        outcome.writes.untracked.clear();
+        outcome.writes.untracked.insert((5, 13), 1);
+        assert!(safe_outcome(&outcome), "field-local scratch variables do not require persistence");
+        outcome.writes.untracked.clear();
         outcome.stats.unknown.insert("GOLDd", 1);
         assert!(!safe_outcome(&outcome));
         outcome.stats.unknown.clear();

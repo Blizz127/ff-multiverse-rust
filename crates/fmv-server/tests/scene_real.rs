@@ -77,11 +77,13 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
     // (`Var[3][212]` bit 2: the story model carries it so that the conversation is had once per story): the moment stays 72, the
     // story now holds the mark, applying the run to the story that holds it changes nothing (once), and the scene is no longer
     // offered to it (acceptance 5: nothing replays after the story is saved and read back).
-    let finished = host.finish(PROOF_SCENE_ID, &moment_72, 1, &[2]).expect("the scene runs");
+    assert!(host.finish(PROOF_SCENE_ID, &moment_72, 1, &[2]).is_none(), "the real write must not discard Tifa's untracked affection");
+    assert!(host.finish(PROOF_SCENE_ID, &moment_72, 1, &[1]).is_none(), "the other path also changes untracked persistent bits");
+    let finished = host.finish_preview(PROOF_SCENE_ID, &moment_72, 1, &[2]).expect("the made-up preview can run");
     assert!(finished.changed, "the proof scene writes the bar's mark: {finished:?}");
     assert_eq!(finished.progress, [2, 72, 0, 1, 3, 212, 4], "moment 72 and the mark (var 3/212 = 0b100), the one way to write it");
     assert!(!host.offered(PROOF_SCENE_ID, &finished.progress), "a story that has had the conversation is not offered it again");
-    let again = host.finish(PROOF_SCENE_ID, &finished.progress, 1, &[2]).expect("the scene runs again for a story that has it");
+    let again = host.finish_preview(PROOF_SCENE_ID, &finished.progress, 1, &[2]).expect("the preview runs again for a story that has it");
     assert!(!again.changed && again.progress == finished.progress, "its write is applied once: {again:?}");
 
     // A real server over the same archive, entry field md1stin, previews on, a private state directory.

@@ -127,6 +127,10 @@ pub trait SceneHost: Send + Sync {
     fn preview_progress(&self, scene: &str) -> Option<Vec<u8>>;
     /// Run scene `scene` headless against the story `progress` with `seed` and the owner's `answers`, and say what it wrote.
     fn finish(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult>;
+    /// Debug preview runs on made-up state which is never saved and never travels.
+    fn finish_preview(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8]) -> Option<SceneResult> {
+        self.finish(scene, progress, seed, answers)
+    }
 }
 
 /// What the server runs scenes with (`ServerConfig::scenes`).
@@ -483,7 +487,10 @@ impl World {
         }
         let apply = matches!(outcome, SceneOutcome::Finished | SceneOutcome::Skipped);
         let mut result = if !apply || !record.writes_story { None } else {
-            self.scenes.host.as_ref().and_then(|host| host.finish(&record.scene, &record.progress, record.seed, &record.answers))
+            self.scenes.host.as_ref().and_then(|host| {
+                if record.preview { host.finish_preview(&record.scene, &record.progress, record.seed, &record.answers) }
+                else { host.finish(&record.scene, &record.progress, record.seed, &record.answers) }
+            })
         };
         // A story write must not strand a player when its required destination cannot load or
         // place an arrival. The same loaded area and placement are used by start_travel below.
