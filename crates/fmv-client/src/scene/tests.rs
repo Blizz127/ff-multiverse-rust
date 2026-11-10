@@ -176,6 +176,8 @@ struct Fake {
     asked: Asked,
     fail: bool,
     built: Rc<RefCell<u32>>,
+    /// The built scene is the cutscene of a story point that moves the story to this moment (`SceneDef::presents`).
+    presents: Option<u16>,
 }
 
 impl SceneBuilder for Fake {
@@ -185,7 +187,7 @@ impl SceneBuilder for Fake {
         if self.fail {
             return Err("test: no data".to_string());
         }
-        Ok(Built { def: def(), source: Box::new(Scripted { initial: self.initial.clone(), beats: self.beats.clone().into(), asked: Rc::clone(&self.asked) }) })
+        Ok(Built { def: SceneDef { presents: self.presents, ..def() }, source: Box::new(Scripted { initial: self.initial.clone(), beats: self.beats.clone().into(), asked: Rc::clone(&self.asked) }) })
     }
 
     fn reach(&mut self, index: usize, area: &str) -> Option<f32> {
@@ -209,7 +211,15 @@ pub(crate) fn places() -> Vec<Stage> {
 fn rig_with(beats: Vec<Beat>, fail: bool) -> Rig {
     let (asked, built) = (Asked::default(), Rc::new(RefCell::new(0)));
     let mut client = SceneClient::new();
-    client.set_builder(Box::new(Fake { initial: places(), beats, asked: Rc::clone(&asked), fail, built: Rc::clone(&built) }));
+    client.set_builder(Box::new(Fake { initial: places(), beats, asked: Rc::clone(&asked), fail, built: Rc::clone(&built), presents: None }));
+    Rig { client, asked, built }
+}
+
+/// [`rig_with`] whose scene is the cutscene of a story point (to moment 73).
+fn cutscene_rig(beats: Vec<Beat>) -> Rig {
+    let (asked, built) = (Asked::default(), Rc::new(RefCell::new(0)));
+    let mut client = SceneClient::new();
+    client.set_builder(Box::new(Fake { initial: places(), beats, asked: Rc::clone(&asked), fail: false, built: Rc::clone(&built), presents: Some(73) }));
     Rig { client, asked, built }
 }
 
@@ -564,7 +574,7 @@ fn an_instant_player_has_no_clock_to_wait_for() {
 
 fn state() -> ClientState {
     let mut state = ClientState::new(EntityId(1), AccountId(1), Pos::new(0.0, 0.0, 0.0), AreaId { game: GameId::Ff7, key: AREA.to_string() });
-    state.scene.set_builder(Box::new(Fake { initial: places(), beats: talk(), asked: Asked::default(), fail: false, built: Rc::default() }));
+    state.scene.set_builder(Box::new(Fake { initial: places(), beats: talk(), asked: Asked::default(), fail: false, built: Rc::default(), presents: None }));
     state
 }
 
@@ -735,6 +745,23 @@ fn an_incomplete_interpreter_run_leaves_without_claiming_completion() {
             assert!(!rig.client.is_active());
             assert_eq!(rig.client.take_commands(), [SceneCmd::Leave { run: RUN }], "{role:?}, {how:?}");
         }
+    }
+}
+
+/// The cutscene of a story point that starts a battle first ends at that battle (the server then starts it): that is the scene
+/// played out, not an incomplete run. The other stops still are.
+#[test]
+fn a_cutscene_that_ends_at_its_battle_is_played_out() {
+    let mut rig = cutscene_rig(vec![Beat { stage: vec![], then: Then::End { at: 0, how: End::Battle } }]);
+    rig.client.set_instant(true);
+    begin(&mut rig, SceneRole::Owner);
+    assert!(!rig.client.is_active());
+    assert_eq!(rig.client.take_commands(), [SceneCmd::End { run: RUN, skipped: false }]);
+    for how in [End::Broken, End::Budget, End::MiniGame, End::GameOver] {
+        let mut rig = cutscene_rig(vec![Beat { stage: vec![], then: Then::End { at: 0, how } }]);
+        rig.client.set_instant(true);
+        begin(&mut rig, SceneRole::Owner);
+        assert_eq!(rig.client.take_commands(), [SceneCmd::Leave { run: RUN }], "{how:?}");
     }
 }
 

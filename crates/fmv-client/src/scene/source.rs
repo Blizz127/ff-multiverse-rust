@@ -143,7 +143,8 @@ fn compatible_bar(field: &fmv_ff7::field::FieldFile, def: &SceneDef, story: &Sto
 fn compatible_without_questions(field: &fmv_ff7::field::FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8]) -> bool {
     use fmv_ff7::script::scene::{run_section_to_end, run_to_end};
     let (Ok(original), Ok(echo)) = (run_to_end(field, def, story, seed, &[]), run_section_to_end(field, def, story, seed, section, &[])) else { return false };
-    let ended = |how: End| matches!(how, End::Finished | End::MapJump { .. });
+    // (a cutscene of a story point that starts a battle first ends at that battle, which the server then starts)
+    let ended = |how: End| matches!(how, End::Finished | End::MapJump { .. }) || (how == End::Battle && def.presents.is_some());
     original.questions == 0 && echo.questions == 0 && ended(original.end) && echo.windows > 0 && original.same_story_as(&echo)
 }
 

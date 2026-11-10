@@ -447,7 +447,10 @@ impl ScenePlayer {
                         self.next = Next::End { at, how };
                         return;
                     }
-                    if matches!(how, End::Finished | End::MapJump { .. }) { self.play_out(); } else { self.abort(); }
+                    // The scene's own end (a jump on to another field, or, for the cutscene of a story point that starts a
+                    // battle first, the battle the server then starts) is playing it out; any other stop is an incomplete run.
+                    let natural = matches!(how, End::Finished | End::MapJump { .. }) || (how == End::Battle && self.def.presents.is_some());
+                    if natural { self.play_out(); } else { self.abort(); }
                     return;
                 }
                 Next::Held => return,
