@@ -4,7 +4,7 @@ use fmv_ff7::field::FieldFile;
 use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::lzss;
 use fmv_ff7::script::dialogue::MessageOrigin;
-use fmv_ff7::script::scene::{post_escape_scene, proof_scene, sector7_station_scene, station_scene, train_scene, ScenePlay, Then};
+use fmv_ff7::script::scene::{post_escape_scene, proof_scene, sector7_intro_scene, sector7_station_scene, station_scene, train_scene, ScenePlay, Then};
 use fmv_ff7::script::FieldScript;
 use fmv_ff7::story::StoryState;
 use fmv_mods::{Layers, ModSources, Mods};
@@ -14,7 +14,7 @@ fn main() {
     let data = std::env::var_os("FMV_FF7_DATA").expect("FMV_FF7_DATA required");
     let mut lgp = LgpArchive::open_path(std::path::Path::new(&data).join("field/flevel.lgp")).expect("original archive");
     let mods = Mods::open(&ModSources { echo_s: Some(archive.into()), ..Default::default() }, Layers::ALL);
-    for (def, moment) in [(post_escape_scene(), 33), (station_scene(), 33), (train_scene(), 48), (sector7_station_scene(), 51), (proof_scene(), 72)] {
+    for (def, moment) in [(post_escape_scene(), 33), (station_scene(), 33), (train_scene(), 48), (sector7_station_scene(), 51), (sector7_intro_scene(), 63), (proof_scene(), 72)] {
         let raw = lzss::decompress(&lgp.read(&def.field).expect("field")).expect("decompress");
         let field = FieldFile::parse(raw).expect("field parse");
         let section = mods.script_section(&def.field).expect("Echo-S section");

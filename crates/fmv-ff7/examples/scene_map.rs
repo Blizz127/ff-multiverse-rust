@@ -82,6 +82,7 @@ fn main() {
         fmv_ff7::script::scene::POST_ESCAPE_SCENE_ID => Some(fmv_ff7::script::scene::post_escape_scene()),
         fmv_ff7::script::scene::EARLY_BAR_SCENE_ID => Some(fmv_ff7::script::scene::early_bar_scene()),
         fmv_ff7::script::scene::SECTOR7_STATION_SCENE_ID => Some(fmv_ff7::script::scene::sector7_station_scene()),
+        fmv_ff7::script::scene::SECTOR7_INTRO_SCENE_ID => Some(fmv_ff7::script::scene::sector7_intro_scene()),
         _ => scene(&id),
     };
     let Some(def) = def else {

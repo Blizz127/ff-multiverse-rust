@@ -220,6 +220,8 @@ pub const TRAIN_SCENE_ID: &str = "ff7/tin_1/sector-seven-train";
 pub const EARLY_BAR_SCENE_ID: &str = "ff7/mds7pb_1/early-bar-survey";
 /// Survey-only station arrival in Sector 7; not registered for play.
 pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
+/// Survey-only Sector 7 intro; not registered for play.
+pub const SECTOR7_INTRO_SCENE_ID: &str = "ff7/mds7/intro-survey";
 
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
@@ -323,6 +325,26 @@ pub fn sector7_station_scene() -> SceneDef {
         setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
         witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 },
+    }
+}
+
+/// Offline intro survey. The producer assumes persistent flags and changes other untracked
+/// flags; this data must not be registered until those effects and presentation are ready.
+pub fn sector7_intro_scene() -> SceneDef {
+    let cast = [
+        (22, "ballet", "acgd", "adcb"), (23, "tifa", "aagb", "abcd"),
+        (24, "avaw", "axdc", "acfe"), (25, "avas", "bxbe", "acfe"),
+        (26, "aval", "bwfd", "acfe"), (27, "man1", "cjif", "cgcc"),
+        (28, "oyaji1", "asbf", "acfe"), (29, "woman1", "cwed", "coab"),
+        (30, "child1", "cgda", "bvcc"), (31, "obasan", "coad", "coab"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: SECTOR7_INTRO_SCENE_ID.into(), game: "ff7".into(), field: "mds7".into(),
+        trigger: Trigger { entity: 7, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
+        setup: vec![], given: vec![], root: vec![Step::StartMain(7)], cast, speakers: vec![],
+        witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 },
     }
 }
 
