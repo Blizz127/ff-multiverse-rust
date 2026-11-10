@@ -1,4 +1,4 @@
-//! FF Multiverse wire protocol v17.
+//! FF Multiverse wire protocol v18.
 //!
 //! v16 is v15 plus [`ClientMsg::DeleteCharacter`] and [`ServerMsg::CharacterDeleted`]: a player deletes their own
 //! character on the server with that character's login token (sent as the first message instead of a Hello). The
@@ -410,8 +410,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-// Older clients cannot command companions, so they must not join a server that expects them to.
-pub const PROTOCOL_VERSION: u16 = 17;
+// Older clients cannot decode scene messages or safely participate in scene holds.
+pub const PROTOCOL_VERSION: u16 = 18;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 /// Default TCP port for development. Deployment port is UNASSIGNED (see DEPLOYMENT-CONTRACT.md).
@@ -917,8 +917,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_seventeen() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+    fn the_version_is_eighteen() {
+        assert_eq!(PROTOCOL_VERSION, 18);
     }
 
     // -----------------------------------------------------------------------------------------

@@ -1,9 +1,8 @@
 //! Story scenes on the wire: a player's OK on a scene's trigger starts a scene for that player; party members in range
 //! watch it; its lines are the game's own, read by every client from its own files.
 //!
-//! **Not a version bump.** These messages are new variants of [`ClientMsg`](crate::ClientMsg) and
-//! [`ServerMsg`](crate::ServerMsg); `PROTOCOL_VERSION` is unchanged here (the integrator bumps it): a peer that predates
-//! them cannot decode them, and a server only sends them to a client whose player started or watches a scene.
+//! These messages add variants to [`ClientMsg`](crate::ClientMsg) and [`ServerMsg`](crate::ServerMsg).
+//! Protocol v18 rejects older peers, which cannot decode them or participate in a scene hold.
 //!
 //! # What crosses the wire, and what does not
 //!
@@ -142,8 +141,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_not_bumped_by_scenes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 14, "the integrator bumps it");
+    fn scenes_require_the_new_protocol() {
+        assert_eq!(crate::PROTOCOL_VERSION, 18);
     }
 
     #[test]
