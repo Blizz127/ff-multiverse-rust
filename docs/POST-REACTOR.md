@@ -38,9 +38,10 @@ The longer sampled purchase path also ended unskipped with a 212.4-unit minimum 
 position samples, but an inspected frame showed the witness partly covered by scene actors.
 That candidate therefore remains unsuitable even though its walkmesh separation was ample.
 Another candidate `(-3785, 20901, triangle 31)` was visible in inspected frames of the short
-and one purchase path. Both runs ended unskipped; the closest visible actor was 203.3 units away
-in 100 and 104 position samples respectively. The remaining choices, full visual occlusion,
-other models and actual route are still unverified, so this is not an accepted live spot.
+and one purchase path. The short path and all four later-choice combinations ended unskipped;
+the closest visible actor was 203.3 units away in 100–105 position samples per run. Full visual
+occlusion, other models and the actual route are still unverified, so this is not an accepted
+live spot.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.
