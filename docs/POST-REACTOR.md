@@ -116,6 +116,13 @@ and the witness, actual starting flags and full route remain unverified.
 An offline floor plan drew 102 actor walks with no witness. The Echo-S replacement changes
 several actor names in `mds7`; the standard identity rebind rejects this intro, so the
 original-only survey is not an Echo-S playback check.
+An isolated raw-VM comparison with manually identified producer indices did run both layers at
+moment 63 with unavailable flags assumed clear. The original left the moment at 63 and wrote
+`Var[3][209]=173`; Echo-S wrote moment 64 and that byte as 45. The replacement's producer has
+an explicit moment-64 write at its moment-63 branch. Both runs used uncarried flags, so these
+results do not establish behavior for every player; they do establish that substituting the
+replacement without reconciling effects would be unsafe. The comparison example requires the
+owner's local archives and does not enable the scene.
 
 Further static inspection of `mds7pb_1` connects the early bar sequence: director entity 7
 requests Cloud slot 5 and Marlene slot 4 before starting Tifa slot 4. Tifa slot 4 requests
