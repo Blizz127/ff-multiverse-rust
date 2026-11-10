@@ -37,6 +37,7 @@ mod headless;
 mod interp;
 mod login;
 mod mods;
+mod model_layer;
 mod nav;
 mod net;
 mod npc;

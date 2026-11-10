@@ -128,6 +128,7 @@ pub struct Shell {
     listed_at: Instant,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    preview: Option<super::preview::Preview>,
     connector: Option<Connector>,
     /// The delete the player is waiting for, if there is one (never together with a connection attempt: the menu waits
     /// for one thing at a time).
@@ -163,6 +164,7 @@ impl Shell {
             listed_at: now,
             window: None,
             renderer: None,
+            preview: super::preview::Preview::local(),
             connector: None,
             deleting: None,
             plan: None,
@@ -517,7 +519,8 @@ impl Shell {
         let (w, h) = renderer.size();
         let mut overlay = DrawList::new();
         screens::draw_menu(&self.menu, w, h, &mut overlay);
-        let result = renderer.render_with(&screens::menu_scene(), Some(&overlay));
+        let preview = self.preview.as_mut().and_then(|preview| preview.frame(&self.menu, (w, h)));
+        let result = renderer.render_layers_with_preview(&screens::menu_scene(), None, Some(&overlay), preview.as_ref());
         let gpu_error = renderer.first_gpu_error();
         // The first frame on screen: from now on the window can be typed into.
         if result == FrameResult::Presented {

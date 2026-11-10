@@ -136,6 +136,7 @@ pub struct LgpEntry {
 /// A parsed LGP table of contents over a seekable reader. The data itself is read on demand.
 pub struct LgpArchive<R> {
     reader: R,
+    overlay: Option<Box<dyn FnMut(&str) -> Option<io::Result<Vec<u8>>> + Send>>,
     file_len: u64,
     entries: Vec<LgpEntry>,
     /// ASCII-lowercased bare name -> index of the FIRST entry with that name.
@@ -210,7 +211,7 @@ impl<R: Read + Seek> LgpArchive<R> {
             entries.push(LgpEntry { name, offset, check_code, path_index });
         }
 
-        Ok(Self { reader, file_len, entries, by_name })
+        Ok(Self { reader, overlay: None, file_len, entries, by_name })
     }
 
     /// All table-of-contents entries in stored order.
@@ -243,8 +244,20 @@ impl<R: Read + Seek> LgpArchive<R> {
 
     /// Read the named entry's bytes (case-insensitive name).
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>, LgpError> {
+        if let Some(result) = self.overlay.as_mut().and_then(|overlay| overlay(name)) {
+            let bytes = result?;
+            if bytes.len() > MAX_ENTRY_LEN as usize {
+                return Err(LgpError::EntryTooLarge { name: name.to_string(), len: u32::try_from(bytes.len()).unwrap_or(u32::MAX), limit: MAX_ENTRY_LEN });
+            }
+            return Ok(bytes);
+        }
         let index = self.find_index(name).ok_or_else(|| LgpError::NotFound(name.to_string()))?;
         self.read_index(index)
+    }
+
+    /// Install a read-only overlay. Returning `None` falls back to the original archive.
+    pub fn set_overlay(&mut self, overlay: impl FnMut(&str) -> Option<io::Result<Vec<u8>>> + Send + 'static) {
+        self.overlay = Some(Box::new(overlay));
     }
 
     /// Read the entry at `index` in table order.
@@ -292,6 +305,14 @@ mod tests {
 
     fn sample() -> Vec<u8> {
         build_lgp(&[("md1stin", b"first field"), ("MAPLIST", b"names"), ("empty", b""), ("md1stin", b"duplicate")])
+    }
+
+    #[test]
+    fn overlay_replaces_named_files_and_preserves_original_fallback() {
+        let mut archive = open(sample()).unwrap();
+        archive.set_overlay(|name| (name == "md1stin").then(|| Ok(b"replacement".to_vec())));
+        assert_eq!(archive.read("md1stin").unwrap(), b"replacement");
+        assert_eq!(archive.read("MAPLIST").unwrap(), b"names");
     }
 
     #[test]

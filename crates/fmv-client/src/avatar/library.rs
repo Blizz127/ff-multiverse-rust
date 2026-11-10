@@ -53,7 +53,8 @@ impl std::fmt::Debug for AvatarAsset {
 impl AvatarAsset {
     /// Merge a loaded character into a drawable asset.
     pub fn new(character: Character) -> Result<Self, String> {
-        let mesh = MergedMesh::build(&character.model).map_err(|e| e.to_string())?;
+        let mesh = if is_placeholder_body(&character.appearance) { MergedMesh::build_body(&character.model) } else { MergedMesh::build(&character.model) }
+            .map_err(|e| e.to_string())?;
         // The idle pose's highest point (native y points down, so the head top is the minimum y).
         let height_units = character
             .pose(fmv_core::AnimState::Idle, 0)

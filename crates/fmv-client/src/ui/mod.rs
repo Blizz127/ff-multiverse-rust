@@ -38,6 +38,7 @@ pub mod input;
 pub mod looks;
 pub mod menu;
 pub mod palette;
+pub mod preview;
 pub mod screens;
 pub mod shell;
 pub mod text;

@@ -1482,10 +1482,10 @@ for a link whose sound has no time to give it), `audio: field loop start ch3 38`
 was left)` (or `(the story moved)`, `(a battle)`), `audio: field sound ch1 62 (link)` (or `(lift)`, `(door)`) at the moment an
 event's sound plays, and, when the run ends, `audio: field sounds played: 4 sounds (21x1 42x1 62x2), 4 loops (38x4)`.
 
-## Mods (Echo-S and Cosmo Memory)
+## Mods (Echo-S, Cosmo Memory and Ninostyle)
 
-Two free community mods (Tsunamods, for 7th Heaven) can be layered over your own FF7. **The accurate base game comes first and
-the mods are layers on top of it, each switched off on its own; all four layers are ON by default when their files are
+Community mods for 7th Heaven can be layered over your own FF7. **The accurate base game comes first and
+the mods are layers on top of it, each switched off on its own; all layers are ON by default when their files are
 found.** Whatever a layer lacks, the original plays, so nothing is silent or blank because a layer is on.
 
 | Layer | What it is | It replaces | Switch |
@@ -1494,17 +1494,26 @@ found.** Whatever a layer lacks, the original plays, so nothing is silent or bla
 | **voice** | Echo-S's voice acting, played when a dialog window opens | nothing: the original has no voices | `--mods-voice off` |
 | **music** | Echo-S's "Echoes of the Planet" | the original track of the same `music.idx` name | `--mods-music off` |
 | **sound** | [Cosmo Memory](https://www.tsunamods.com/cosmo-memory/) 1.22's sound effects (Echo-S's own set after it) | the original `audio.dat` clip of the same sound id | `--mods-sound off` |
+| **models** | Ninostyle Chibi field models and Ninostyle battle models | character models, with original files as fallback | `--mods-models off` |
+
+The creator previews the selected body beside the form when the window has enough space; smaller windows retain the body picker.
+The model layer uses the Chibi base, L@zar0 and Efryt field folders and the default battle models. Equipment-dependent dynamic
+field weapons are not supported. The settings file accepts `"models": false`, and `FMV_MODS_MODELS=off` is also supported.
 
 Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"), not upscaled field backgrounds; there is no
 background layer.
 
 **The files** are yours to fetch, onto each machine separately; the client only ever reads them (nothing is extracted, copied,
-written or sent, and they are never committed or put in a library). The two in use are
+written or sent, and they are never committed or put in a library). The audio and text archives in use are
 
 | File | Mod | Bytes | sha256 |
 |---|---|---|---|
 | `Echo-s.iro` | `[Tsunamods] Echo-S 7` 1.24 (2026-07-19), from the 7th Heaven catalog's link `https://gp-mc.net/tsunamods/echo-s-7/latest_full/Echo-s.iro` | 4 335 170 582 (4.04 GiB) | `bc5a4a5f30b50ac80a74613595c680b356eae6ef433b7c6f62672ddb645b3789` |
 | `[Tsunamods]_Cosmo_Memory.iro` | `[Tsunamods] Cosmo Memory` 1.22 (2026-11-07), `https://bonez.7thheaven.rocks/%5BTsunamods%5D_Cosmo_Memory.iro` | 333 643 683 (318.2 MiB) | `836024222598c4ff745a766fb471b4fd2bf254f1a44244fb6f935703b0535af2` |
+
+The model layer also reads `Ninostyle Chibi.iro` (1,777,952,217 bytes, SHA-256 `4b70c4935e9ba7c1d6776fd4c65a6c0e99a85cf8b898712020dbb09c0b0d308f`)
+and `Ninostyle Battle.iro` (476,307,513 bytes, SHA-256 `a071eea19457f8683d364843986a22052d9d50db1c997622174cf1a7318628d5`),
+obtained from the 7th Heaven catalog's field and battle packages. Both stay in your own mods folder.
 
 **Where they go.** Put them in `<state>/mods/` (`~/.local/share/ff-multiverse/mods/` by default, or `mods` inside the directory
 `--ff7-library` names; the launcher's data directory has one): the files themselves or a folder each, one level down. The client looks

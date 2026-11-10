@@ -283,7 +283,7 @@ MODS:
   mod.xml, not by its name. The same files are fetched separately onto each machine.
   Where the switches are, one order for each layer: a flag, else an environment variable, else the
   settings file, else on. --mods on|off (FMV_MODS) switches every layer; --mods-text, --mods-voice,
-  --mods-music and --mods-sound (FMV_MODS_TEXT, FMV_MODS_VOICE, FMV_MODS_MUSIC, FMV_MODS_SOUND) one
+  --mods-music, --mods-sound and --mods-models (FMV_MODS_TEXT, FMV_MODS_VOICE, FMV_MODS_MUSIC, FMV_MODS_SOUND, FMV_MODS_MODELS) one
   each; the settings file is `settings.json` in the mods folder (--mods-settings FILE or
   FMV_MODS_SETTINGS names another): a JSON object of booleans, for example {\"voice\": false}, read
   and never written. With nothing found every layer plays the base game.
@@ -559,7 +559,7 @@ const DEFAULT_SERVER: &str = "127.0.0.1:47770";
 /// game files and runs no bot; the bot's flags need `--headless`, a requirement clap waives next to an argument that
 /// conflicts with it, so they have to be named here or they would be accepted and ignored. A unit test checks that every
 /// flag of [`Args`] is either here or one of those three, so a flag added later has to be decided about.
-const DELETE_CONFLICTS: [&str; 37] = [
+const DELETE_CONFLICTS: [&str; 38] = [
     // who it is
     "name",
     "register",
@@ -601,6 +601,7 @@ const DELETE_CONFLICTS: [&str; 37] = [
     "voice",
     "music",
     "sound",
+    "models",
     "settings",
 ];
 

@@ -830,6 +830,7 @@ impl BattleClient {
         if let Some(why) = failure {
             self.diverged(why);
         }
+        self.reconcile_turns();
         // The menu model outlives a battle: this battle's spells (and the inventory's items) replace
         // whatever the last one left.
         self.refresh_menu_model();
