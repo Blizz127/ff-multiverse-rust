@@ -57,6 +57,10 @@ game data before proposing a durable numeric representation; treating the observ
 complete value or simply OR-ing bytes would be incorrect.
 An owner whose client cannot build or finish the interpreter run aborts without saving; a timed-out
 run also leaves progress untouched rather than silently choosing any remaining answers.
+The server also checks the setup interpreter's unknown instructions, unresolved positions,
+dropped requests and ignored stateful operations before accepting an outcome. Setup itself can
+still stop at its budget and discard running threads without recording a completion reason, so
+these checks do not establish that every setup finished correctly.
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that all scene dialogue and voices use it.
@@ -119,9 +123,11 @@ registering them; its pictures remain outside the repository. A first train floo
 46 actor walks and no witness, so it does not establish a safe witness position.
 An isolated offscreen exploration later exercised one candidate each in the train and station,
 and the existing post-escape witness spot. All three scene drivers ended in that harness; this
-was a rendering exploration, not a route or all-frame clearance test. The train candidate
-`(169, 571, triangle 69)` filled much of the foreground in the first sampled frame and obscured
-the scene, and the post-escape witness was partly hidden behind scenery in sampled frames. The
+was a rendering exploration, not a route or all-frame clearance test. The train candidates
+`(169, 571, triangle 69)` and `(-172, 548, triangle 71)` were partly hidden in sampled frames;
+an oversized foreground actor seen in both is part of the scene, not the witness. The original
+post-escape witness was partly hidden behind scenery, and candidate `(-332, 150, triangle 16)`
+was fully hidden in the sampled frames. The
 station candidate `(1041, -5165, triangle 28)` appeared clear in the inspected samples, but
 neither temporal clearance nor the complete route has been checked. None of these spots is
 accepted for live use on this evidence. The exploratory harness's field label is hard-coded to

@@ -81,6 +81,8 @@ pub struct Outcome {
     pub windows: usize,
     pub writes: Writes,
     pub jump: Option<super::vm::SceneJump>,
+    /// Interpreter observations from the stage setup, before the main scene starts.
+    pub setup_stats: Stats,
     pub stats: Stats,
 }
 
@@ -369,7 +371,7 @@ pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u
             }
         }
     };
-    Ok(Outcome { end, windows, writes: play.writes(), jump: play.vm.destination(), stats: play.stats().clone() })
+    Ok(Outcome { end, windows, writes: play.writes(), jump: play.vm.destination(), setup_stats: play.setup_stats().clone(), stats: play.stats().clone() })
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).

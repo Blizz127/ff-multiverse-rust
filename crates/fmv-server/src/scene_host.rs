@@ -23,7 +23,7 @@ fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
         fmv_ff7::script::dialogue::End::MapJump { field } => outcome.jump.is_some_and(|jump| jump.field == field),
         _ => false,
-    }) && outcome.stats.unknown.is_empty() && outcome.stats.unresolved == 0 && outcome.stats.dropped_requests == 0
+    }) && [&outcome.setup_stats, &outcome.stats].iter().all(|s| s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
 }
 
 fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
@@ -37,7 +37,7 @@ fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
         "PRTYP", "PRTYM", "PRTYE", "MMBud", "MMBLK", "MMBUK",
     ];
     complete_outcome(outcome)
-        && !UNSUPPORTED_STATE.iter().any(|op| outcome.stats.ignored.contains_key(op))
+        && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !UNSUPPORTED_STATE.iter().any(|op| s.ignored.contains_key(op)))
         // Banks 1–4 may contain persistent game state (for example Tifa's affection in
         // bank 1). Local field scratch variables remain allowed, but untracked persistent
         // writes must not be silently discarded when the story is saved.
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn incomplete_or_economic_scenes_cannot_advance_or_travel() {
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), stats: Stats::default() };
         assert!(safe_outcome(&outcome));
         outcome.stats.ignored.insert("GOLDu", 1);
         assert!(!safe_outcome(&outcome));
@@ -169,6 +169,19 @@ mod tests {
         outcome.stats.unresolved = 1;
         assert!(!safe_outcome(&outcome));
         outcome.stats.unresolved = 0;
+        outcome.setup_stats.unknown.insert("unknown", 1);
+        assert!(!complete_outcome(&outcome));
+        outcome.setup_stats.unknown.clear();
+        outcome.setup_stats.dropped_requests = 1;
+        assert!(!complete_outcome(&outcome));
+        outcome.setup_stats.dropped_requests = 0;
+        outcome.setup_stats.unresolved = 1;
+        assert!(!complete_outcome(&outcome));
+        outcome.setup_stats.unresolved = 0;
+        outcome.setup_stats.ignored.insert("GOLDd", 1);
+        assert!(complete_outcome(&outcome), "preview may show a complete simulated run");
+        assert!(!safe_outcome(&outcome), "setup must not discard economic effects");
+        outcome.setup_stats.ignored.clear();
         outcome.end = End::Budget;
         assert!(!safe_outcome(&outcome));
     }

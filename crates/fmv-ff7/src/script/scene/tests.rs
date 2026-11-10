@@ -619,6 +619,18 @@ fn the_stage_scripts_place_the_cast_and_their_loops_do_not_hold_the_scene() {
 }
 
 #[test]
+fn headless_outcome_includes_setup_interpreter_observations() {
+    let section = script(vec![("a", vec![(1, vec![message(0, 0)]), (3, vec![unknown_op()])])], vec![dialog("Hello.")]);
+    let field = field_of(section);
+    let mut def = demo_def(vec![member(0, "aya")], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 3)];
+    let result = run_to_end(&field, &def, &StoryState::at(4), 1, &[]).unwrap();
+    assert_eq!(result.end, End::Finished);
+    assert!(result.setup_stats.unknown.contains_key("RDMSD"));
+    assert!(result.stats.unknown.is_empty(), "setup and main observations remain distinct");
+}
+
+#[test]
 fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
     // the script sets the moment to 80, a tracked bit (the reactor lift) and a field flag of its own
     let a = vec![setword(2, 0, 80), biton(1, 225, 0), biton(3, 213, 2), message(0, 0)];
