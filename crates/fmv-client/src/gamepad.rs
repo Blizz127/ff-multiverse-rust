@@ -84,11 +84,13 @@ pub enum PadKey {
     Escape,
     /// The left trigger, held: Shift, walk instead of run.
     Walk,
+    /// The right stick pressed in (R3): F2, the field camera (FF7's screen or the whole field).
+    Camera,
 }
 
 impl PadKey {
     /// Every key, in the order events are produced.
-    pub const ALL: [PadKey; 12] = [
+    pub const ALL: [PadKey; 13] = [
         PadKey::Up,
         PadKey::Down,
         PadKey::Left,
@@ -101,6 +103,7 @@ impl PadKey {
         PadKey::Battle,
         PadKey::Escape,
         PadKey::Walk,
+        PadKey::Camera,
     ];
     /// The four directions: the only keys that repeat.
     pub const DIRECTIONS: [PadKey; 4] = [PadKey::Up, PadKey::Down, PadKey::Left, PadKey::Right];
@@ -127,6 +130,7 @@ impl PadKey {
             PadKey::Battle => KeyCode::KeyB,
             PadKey::Escape => KeyCode::Escape,
             PadKey::Walk => KeyCode::ShiftRight,
+            PadKey::Camera => KeyCode::F2,
         }
     }
 }
@@ -146,6 +150,7 @@ pub fn button_key(button: Button) -> Option<PadKey> {
         Button::Start => PadKey::Escape,
         Button::RightTrigger => PadKey::Battle,
         Button::LeftTrigger2 => PadKey::Walk,
+        Button::RightThumb => PadKey::Camera,
         _ => return None,
     })
 }
@@ -509,6 +514,7 @@ mod tests {
             (Button::Start, PadKey::Escape),
             (Button::RightTrigger, PadKey::Battle),
             (Button::LeftTrigger2, PadKey::Walk),
+            (Button::RightThumb, PadKey::Camera),
         ] {
             assert_eq!(button_key(button), Some(key), "{button:?}");
         }
@@ -516,7 +522,6 @@ mod tests {
         for button in [
             Button::Mode,
             Button::LeftThumb,
-            Button::RightThumb,
             Button::LeftTrigger,
             Button::RightTrigger2,
             Button::C,
@@ -545,6 +550,7 @@ mod tests {
                 KeyCode::KeyB,
                 KeyCode::Escape,
                 KeyCode::ShiftRight,
+                KeyCode::F2,
             ]
         );
         for (i, a) in codes.iter().enumerate() {

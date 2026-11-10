@@ -304,8 +304,8 @@ token is never printed.
 like); in an FF7 field you run, and walk while **Shift** is held (at the field's run and walk
 speeds: hypotheses used for pacing only, the server's own cap is unchanged). **P** invites the
 nearest player to your party, **Y** accepts the pending invite, **L** leaves the party, Esc
-quits, **F1** shows or hides the walkmesh over the picture (hidden by default), **F2** switches the field camera
-between FF7's scrolling screen and the whole field at once (see below). The window shows
+quits, **F1** shows or hides the walkmesh over the picture (hidden by default), **F2** (a controller's right stick
+pressed in) switches the field camera between FF7's scrolling screen and the whole field at once (see below). The window shows
 player names (over the head of a model, or the marker), your party (leader starred) in the top
 right, the area name (`FF7 md1stin`), the connection status (players, round-trip time) and a
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title

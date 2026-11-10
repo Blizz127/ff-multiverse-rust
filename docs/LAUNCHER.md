@@ -243,6 +243,7 @@ takes it as the same menu input. With no controller nothing changes.
 | Start / Menu | Esc | quit prompt: a second press quits | backs out of the menu, never quits | Esc: back, cancel, or quit |
 | right bumper (R1/RB) | B | ask for a debug battle | - | - |
 | left trigger (L2/LT), held | Shift | walk instead of run | - | - |
+| right stick pressed in (R3/RS) | F2 | the field camera: FF7's scrolling screen or the whole field | - | - |
 
 Nothing else is bound (the Guide/Steam button belongs to Steam). Details: a stick axis presses at 60 %
 of its travel and lets go at 40 %; in menus and battles only the stronger axis counts and a held

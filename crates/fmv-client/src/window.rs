@@ -1744,6 +1744,7 @@ mod tests {
             (PadKey::Battle, KeyRoute::Battle(BattleKey::Request), KeyRoute::Battle(BattleKey::Request)),
             (PadKey::Escape, KeyRoute::Escape, KeyRoute::Escape),
             (PadKey::Walk, KeyRoute::Movement, KeyRoute::Movement),
+            (PadKey::Camera, KeyRoute::Camera, KeyRoute::Camera),
         ];
         assert_eq!(table.len(), PadKey::ALL.len(), "every key is in the table");
         for (key, field, battle) in table {
