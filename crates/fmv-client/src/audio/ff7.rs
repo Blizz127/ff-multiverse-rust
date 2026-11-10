@@ -186,16 +186,26 @@ fn tasks_with(
     analyze: impl FnOnce(Arc<MusicList>) -> AnalyzeTask,
     field: impl FnOnce(Arc<ResolvedAudio>) -> FieldTask,
 ) -> Option<Tasks> {
+    // Echo-S voices and named music tracks can be decoded without the original audio files.
+    // Keep the original-only behavior when those layers are off or the archive is absent.
+    let mod_audio = layer.mods.as_ref().is_some_and(|mods| mods.has_echo() && (mods.layers().voice || mods.layers().music));
     let files = match resolved {
         Ok(files) => files,
+        Err(error) if mod_audio => {
+            log(&format!("cannot look for the original sound files ({error}); using available Echo-S audio"));
+            ResolvedAudio::default()
+        }
         Err(error) => {
             log(&format!("cannot look for the sound files ({error}); playing without sound"));
             return None;
         }
     };
     if files.is_empty() {
-        log("this library has no sound files, so the game plays without sound (to add them, import the install again: fmv-import import-pc with the same labels, or the launcher once with FMV_FF7_REIMPORT=1; the README says how)");
-        return None;
+        if !mod_audio {
+            log("this library has no sound files, so the game plays without sound (to add them, import the install again: fmv-import import-pc with the same labels, or the launcher once with FMV_FF7_REIMPORT=1; the README says how)");
+            return None;
+        }
+        log("this library has no original sound files; using available Echo-S audio (field music needs music.idx, and original effects are unavailable)");
     }
     let list = match files.music_idx.as_deref().map(std::fs::read) {
         Some(Ok(bytes)) => MusicList::parse(&bytes),
@@ -566,6 +576,26 @@ mod tests {
         let seen = seen.lock().expect("log");
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0].contains("no sound files") && seen[0].contains("FMV_FF7_REIMPORT=1"), "{}", seen[0]);
+    }
+
+    #[test]
+    fn echo_voice_and_named_music_work_without_original_audio_files() {
+        let mut spec = EchoSpec::default();
+        spec.blobs.push(("VO\\Voice\\md1stin\\4a.wav", synthetic_wav(8_000, &[500; 800])));
+        spec.blobs.push(("EchoeS Of The Planet\\vgmstream\\bat.wav", synthetic_wav(8_000, &[500; 800])));
+        let (_tmp, layer, _) = layer(&spec, None, Layers::ALL);
+        let (log, seen) = lines();
+        let tasks = tasks_with(Ok(ResolvedAudio::default()), &log, layer.clone(), no_script, no_field).expect("Echo-S has audio");
+        let cue = VoiceCue::Say { field: "md1stin".into(), window: 0, dialog: 4, page: 0 };
+        assert_eq!((tasks.voice)(&cue).unwrap().unwrap().length, Duration::from_millis(100));
+        assert_eq!((tasks.decode)("bat").unwrap().frames(), 800);
+        assert!((tasks.cues)().is_err(), "missing original effects are not claimed to play");
+        assert!(seen.lock().unwrap().iter().any(|s| s.contains("field music needs music.idx")));
+        let no_audible_mods = SoundLayer::new(layer.mods.as_ref().map(|m| Arc::new(m.with_layers(Layers { voice: false, music: false, ..Layers::ALL }))), log.clone());
+        let error = Ff7ResolveError::NoLibrary { dir: "/nowhere".into() };
+        let tasks = tasks_with(Err(error), &log, layer, no_script, no_field).expect("Echo-S survives a resolver error");
+        assert!((tasks.voice)(&cue).unwrap().is_some());
+        assert!(tasks_with(Ok(ResolvedAudio::default()), &log, no_audible_mods, no_script, no_field).is_none());
     }
 
     #[test]
