@@ -124,6 +124,15 @@ stage director as setup. With the same two answers in owned data, it reaches six
 moment 69 without unresolved positions or off-cast events. Its test verifies model/idle stems
 against the field loader. It still skips party/menu effects and assumes unsaved state; neither
 its witness nor the real route has been validated.
+An isolated interpreter comparison used the original director/setup slots and the corresponding
+manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
+rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
+answer seven. The choice ranges were 1–2 and 0–1 respectively; aligned by ordinal, both layers
+produced moment 69 and the same `Var[3][211]` values. On each sampled Echo-S path the local voice
+lookup found clips for six of the seven windows; the choice window had no match from that lookup.
+The original skipped `MENU` and `MMBud`, while Echo-S skipped `SPECIAL` and `MMBud`; both read
+uncarried persistent bytes. This comparison does not establish equivalent effects, multiplayer
+synchronization, speaker anchors, or audible playback, and it does not enable Echo-S here.
 
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
