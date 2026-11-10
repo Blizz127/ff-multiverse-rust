@@ -26,6 +26,8 @@ four combinations of the later two choices. A local original/Echo-S comparison a
 by position: sampled paths agree on the `GOLDd` occurrence, moment 39, and persistent flag values,
 but Echo-S has more windows and different choice line numbers. These observations do not prove
 choice meaning, voice playback, safe persistence, or multiplayer synchronization.
+The sampled Echo-S section's `GOLDd` instruction also has the literal amount 1; the scene VM
+does not execute that debit.
 The `md8_1` director also runs `PRTYM` for character 1 (Barret) and `HMPMAX3`; the current
 story party table otherwise continues to offer Cloud and Barret at later moments. Those
 operations and the correct later party must be modeled before this scene advances real progress.
@@ -153,11 +155,11 @@ moment 69 without unresolved positions or off-cast events. Its test verifies mod
 against the field loader. It still skips party/menu effects and assumes unsaved state; neither
 its witness nor the real route has been validated. A private floor-plan survey drew 23 actor
 walks across the bar with no witness. A candidate `(218, 292, triangle 37)` was visible and
-clear of the cast in the inspected offscreen samples. A subsequent isolated client run on the
-first answer emitted an unskipped scene end and sampled 74 positions: the closest visible cast
-actor was 280.2 walkmesh units away, versus a 44-unit ring threshold. This does not cover the
-other answer, every rendered frame, screen occlusion throughout, or other player models. No
-safe player position has yet been established.
+clear of the cast in the inspected offscreen samples. Subsequent isolated client runs on both
+answers each emitted an unskipped scene end and sampled 74 positions: the closest visible cast
+actor was 280.2 walkmesh units away, versus a 44-unit ring threshold. This does not cover every
+rendered frame, screen occlusion throughout, or other player models. No safe player position
+has yet been established.
 An isolated interpreter comparison used the original director/setup slots and the corresponding
 manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
 rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
