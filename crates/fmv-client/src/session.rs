@@ -7,6 +7,7 @@ use crate::state::ClientState;
 use fmv_adapter_api::{AreaRuntime, GameAdapter};
 use fmv_core::{AreaId, AvatarAppearance, EntityId, EntitySnapshot, Fingerprint, Pos, ProvenanceSummary};
 use fmv_protocol::{CharacterCard, ServerMsg};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +76,9 @@ pub struct Session {
     /// The session already has to end because of a message from the handshake backlog; the first
     /// `pump` reports it.
     pending_end: Option<String>,
+    /// Recovery can begin before the handshake snapshot. Apply its ordered suffix only after
+    /// the caller has installed the scene and battle data providers, on the first pump.
+    scene_backlog: VecDeque<ServerMsg>,
     /// This machine's own game content, to check an `AreaChange` against and load the new area
     /// from (the same content the handshake used). Without it the session cannot follow the server
     /// to another area: it refuses (`CannotJoin`) and the server sends it back.
@@ -111,7 +115,14 @@ impl Session {
         let player = if character.name == UNKNOWN_CHARACTER_NAME { name.as_str() } else { character.name.as_str() };
         state.progress.set_player(player);
         let mut pending_end = None;
+        let mut scene_backlog = VecDeque::new();
+        let mut defer = false;
         for msg in backlog {
+            defer |= matches!(msg, ServerMsg::SceneStart { .. });
+            if defer {
+                scene_backlog.push_back(msg);
+                continue;
+            }
             // The handshake already refuses a Reject, a foreign snapshot and a second manifest, so
             // nothing here should end the session; if something does, say so on the first pump.
             if let Some(reason) = state.apply(0.0, msg) {
@@ -132,6 +143,7 @@ impl Session {
             info,
             origin,
             pending_end,
+            scene_backlog,
             content: None,
             area_changed: None,
         }
@@ -167,6 +179,12 @@ impl Session {
     pub fn pump(&mut self) -> Option<String> {
         if let Some(reason) = self.pending_end.take() {
             return Some(reason);
+        }
+        if let Some(reason) = self.state.scene.failure() {
+            return Some(reason.to_string());
+        }
+        while let Some(msg) = self.scene_backlog.pop_front() {
+            if let Some(reason) = self.state.apply(self.now(), msg) { return Some(reason); }
         }
         while let Some(ev) = self.net.try_next() {
             let now = self.now();
@@ -574,6 +592,67 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_durable_scene_data_failure_ends_the_session_without_waiting_for_scene_leave() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, vec![]));
+        tokio::task::spawn_blocking(move || {
+            let mut net = NetHandle::spawn(config(addr), Box::new(RoomsAdapter::new())).unwrap();
+            let joined = net.wait_joined().unwrap();
+            let mut session = Session::new(net, joined);
+            // Model a failure outside network dispatch, as when checked VM advancement rejects
+            // a durable continuation. No server acknowledgement is needed to close safely.
+            session.state.scene.on_message(HALL, ServerMsg::SceneStart {
+                run: fmv_protocol::SceneRunId(7), scene: "test/missing/continuation".into(), seed: 1,
+                progress: fmv_ff7::story::StoryState::at(39).encode(), gil: 0,
+                replay: Some(fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] }),
+                owner: EntityId(7), participants: vec![fmv_protocol::SceneParticipant { entity: EntityId(7), spot: 0 }],
+                you: fmv_protocol::SceneRole::Owner,
+            });
+            assert!(session.state.scene.is_active(), "movement stays held until the session closes");
+            assert!(session.pump().is_some_and(|reason| reason.contains("Saved scene cannot be resumed safely")));
+            session.leave(Duration::from_secs(2));
+        }).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_recovered_scene_in_the_handshake_waits_for_the_installed_data_provider() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Installed(Arc<AtomicBool>);
+        impl crate::scene::SceneBuilder for Installed {
+            fn build(&mut self, _: &str, _: &fmv_ff7::story::StoryState, _: u32,
+                _: fmv_ff7::script::scene::SceneResources) -> Result<crate::scene::Built, String> {
+                self.0.store(true, Ordering::SeqCst);
+                Err("installed provider was consulted".into())
+            }
+            fn reach(&mut self, _: usize, _: &str) -> Option<f32> { None }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, vec![]));
+        tokio::task::spawn_blocking(move || {
+            let mut net = NetHandle::spawn(config(addr), Box::new(RoomsAdapter::new())).unwrap();
+            let mut joined = net.wait_joined().unwrap();
+            joined.backlog.push(ServerMsg::SceneStart {
+                run: fmv_protocol::SceneRunId(7), scene: "test/recovery/provider".into(), seed: 1,
+                progress: fmv_ff7::story::StoryState::at(39).encode(), gil: 0,
+                replay: Some(fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] }),
+                owner: EntityId(7), participants: vec![fmv_protocol::SceneParticipant { entity: EntityId(7), spot: 0 }],
+                you: fmv_protocol::SceneRole::Owner,
+            });
+            let mut session = Session::new(net, joined);
+            assert!(session.state.scene.failure().is_none(), "the default NoScenes provider was not used");
+            let called = Arc::new(AtomicBool::new(false));
+            session.state.scene.set_builder(Box::new(Installed(Arc::clone(&called))));
+            assert!(session.pump().is_some_and(|reason| reason.contains("installed provider was consulted")));
+            assert!(called.load(Ordering::SeqCst));
+            session.leave(Duration::from_secs(2));
+        }).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

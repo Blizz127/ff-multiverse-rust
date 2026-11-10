@@ -722,6 +722,8 @@ impl BattleClient {
                 formation_id,
                 seed,
                 party,
+                initial_party,
+                escape_policy,
                 preemptive,
                 back_attack,
                 battle_speed,
@@ -731,7 +733,7 @@ impl BattleClient {
                 now,
                 Start {
                     battle_id,
-                    setup: BattleSetup { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second },
+                    setup: BattleSetup { formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second },
                     data_fingerprint,
                 },
             ),

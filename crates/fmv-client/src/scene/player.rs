@@ -28,6 +28,12 @@
 //! In both roles [`ScenePlayer::on_ended`] (the server says the run is over) finishes the player at once, and finishing is
 //! idempotent: nothing is sent twice, and nothing is sent after the player is over.
 //!
+//! A durable continuation pauses at an exact authored battle boundary. Its cast, camera and
+//! interpreter remain alive while combat owns input. Only the server's matching durable victory
+//! acknowledgement resumes it, after the battle result panel closes. Defeat holds that boundary
+//! for an explicit retry. Reconnect rebuilds accepted windows and victories silently from the
+//! fingerprinted original script, without sending historical commands or replaying their audio.
+//!
 //! # The end
 //!
 //! A finished player has no window and no actors and the camera is the field's again; the caller drops it and the field's
@@ -43,8 +49,9 @@ use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
-use fmv_ff7::script::scene::{AnimHow, Look, MoveHow, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
-use fmv_protocol::{ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, MAX_SCENE_STEPS};
+use fmv_ff7::script::scene::{AnimHow, BattleCheckpoint, Look, MoveHow, SceneBoundary, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
+use fmv_ff7::story::StoryState;
+use fmv_protocol::{BattleId, ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneReplayEvent, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use winit::keyboard::KeyCode;
@@ -60,6 +67,10 @@ pub enum SceneCmd {
     Leave { run: SceneRunId },
     /// Debug only: put this player in the field of scene `scene` on a made-up story.
     Preview { scene: String },
+    /// The authored combat boundary has reached the screen; no scene advancement is allowed yet.
+    BattleReady { run: SceneRunId, ordinal: u32, step: u32 },
+    /// Explicitly retry a defeated durable battle from its saved start.
+    Retry { run: SceneRunId },
 }
 
 impl SceneCmd {
@@ -70,6 +81,8 @@ impl SceneCmd {
             SceneCmd::End { run, skipped } => ClientMsg::SceneEnd { run, skipped },
             SceneCmd::Leave { run } => ClientMsg::SceneLeave { run },
             SceneCmd::Preview { scene } => ClientMsg::SceneDebugPreview { scene },
+            SceneCmd::BattleReady { run, ordinal, step } => ClientMsg::SceneBattleReady { run, ordinal, step },
+            SceneCmd::Retry { run } => ClientMsg::SceneRetry { run },
         }
     }
 }
@@ -186,11 +199,27 @@ struct MoveContinuation {
     phase_at_end: u32,
 }
 
+struct PausedBattle {
+    checkpoint: BattleCheckpoint,
+    battle: Option<BattleId>,
+    /// Acknowledged resources wait until the battle's presentation is no longer on screen.
+    resume: Option<(StoryState, u32)>,
+    game_over: bool,
+    retry_sent: bool,
+}
+
 /// One run of a scene on this machine (see the module docs).
 pub struct ScenePlayer {
     run: Run,
     def: SceneDef,
     source: Box<dyn SceneSource>,
+    continuation: bool,
+    /// Replay reconstructs stage state without audio, window reports, or other historical effects.
+    silent: bool,
+    battle: Option<PausedBattle>,
+    battles_resumed: u32,
+    /// Cargo has no authored spectator placement; participants reappear at durable control handoff.
+    participants_hidden: bool,
     cast: Cast,
     /// Frames since the last window opened.
     clock: f32,
@@ -212,6 +241,8 @@ pub struct ScenePlayer {
     early: VecDeque<Option<u8>>,
     /// The scene is over for this player (it played to its end, was skipped, or the server ended it).
     over: bool,
+    failed: bool,
+    failure_reason: Option<&'static str>,
     skipped: bool,
     /// A watcher's scene has played to its end.
     played_out: bool,
@@ -258,6 +289,10 @@ impl ScenePlayer {
     /// Start `run` of `def` read through `source`: the cast is put where the scene begins and the first beat is pulled.
     /// `instant` is for a bot: no clock, the first window is open on return.
     pub fn new(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool) -> Self {
+        Self::new_mode(run, def, source, instant, false, false)
+    }
+
+    fn new_mode(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, continuation: bool, silent: bool) -> Self {
         let mut cast = Cast::new(def.cast.iter().map(|m| m.entity));
         for member in &def.cast {
             if let Some((slot, clip)) = source.initial_default_animation_clip(member.entity) {
@@ -268,10 +303,16 @@ impl ScenePlayer {
             Self::apply_stage(&mut cast, source.as_ref(), &event, 0.0, 0.0);
         }
         cast.settle();
+        let participants_hidden = def.id == fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID;
         let mut player = Self {
             run,
             def,
             source,
+            continuation,
+            silent,
+            battle: None,
+            battles_resumed: 0,
+            participants_hidden,
             cast,
             clock: 0.0,
             elapsed_frames: 0.0,
@@ -284,6 +325,8 @@ impl ScenePlayer {
             accepted: 0,
             early: VecDeque::new(),
             over: false,
+            failed: false,
+            failure_reason: None,
             skipped: false,
             played_out: false,
             sent_end: false,
@@ -299,10 +342,100 @@ impl ScenePlayer {
         player
     }
 
+    /// Rebuild the exact accepted prefix from original data. Historical beats update only the
+    /// local stage; every boundary, choice, source hash and committed victory is checked first.
+    pub fn with_replay(run: Run, def: SceneDef, source: Box<dyn SceneSource>, instant: bool, replay: &SceneReplay) -> Result<Self, String> {
+        replay.validate().map_err(str::to_owned)?;
+        if source.fingerprint() != Some(replay.source) {
+            return Err("the scene replay source differs from the installed game".into());
+        }
+        if replay.events.is_empty() {
+            return Ok(Self::new_mode(run, def, source, instant, true, false));
+        }
+        let mut player = Self::new_mode(run, def, source, false, true, true);
+        for event in &replay.events {
+            player.reach_boundary()?;
+            match event {
+                SceneReplayEvent::Window { step, identity, answer } => {
+                    let Some(SceneBoundary::Window(checkpoint)) = player.source.boundary() else {
+                        return Err("scene replay window does not match its boundary".into());
+                    };
+                    let valid_answer = match (checkpoint.choices, answer) {
+                        (None, None) => true,
+                        (Some([first, last]), Some(a)) => (first..=last).contains(a),
+                        _ => false,
+                    };
+                    if *step != player.passed || checkpoint.identity_bytes() != *identity || !valid_answer {
+                        return Err("scene replay window identity, order, or answer differs".into());
+                    }
+                    let panel = player.panel.take().ok_or("scene replay window has no local panel")?;
+                    player.pass(panel, answer.map(usize::from));
+                    player.settle();
+                }
+                SceneReplayEvent::Battle { ordinal, identity, formation, progress, gil } => {
+                    let Some(paused) = player.battle.as_ref() else { return Err("scene replay victory has no pending battle".into()) };
+                    let checkpoint = paused.checkpoint;
+                    if checkpoint.ordinal != *ordinal || checkpoint.formation != *formation || checkpoint.identity_bytes() != *identity {
+                        return Err("scene replay victory differs from its authored battle".into());
+                    }
+                    let story = StoryState::decode(progress).ok_or("scene replay victory has an unreadable story")?;
+                    player.source.resume_battle(checkpoint, story, *gil)?;
+                    player.battles_resumed = checkpoint.ordinal;
+                    player.battle = None;
+                    player.next = Next::Pull(None);
+                    player.settle();
+                }
+            }
+        }
+        player.reach_boundary()?;
+        player.silent = false;
+        player.instant = instant;
+        player.accepted = player.passed;
+        if player.over || player.played_out {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::End { run: player.run.id, skipped: false });
+            }
+        } else if let Some(paused) = &player.battle {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::BattleReady { run: player.run.id, ordinal: paused.checkpoint.ordinal, step: player.passed });
+            }
+        } else {
+            player.sound(SoundAction::Begin);
+            // The current window is new work, even when its text is empty. Only the accepted
+            // historical prefix was silent; normal owner auto-acknowledgement resumes here.
+            if player.is_owner() && player.panel.as_ref().is_some_and(Panel::is_blank) {
+                let panel = player.panel.take().expect("the blank current panel");
+                player.pass(panel, None);
+                player.settle();
+            }
+        }
+        Ok(player)
+    }
+
+    fn reach_boundary(&mut self) -> Result<(), String> {
+        for _ in 0..=MAX_SCENE_STEPS {
+            if self.over {
+                return if !self.failed && matches!(self.source.boundary(), Some(SceneBoundary::End(End::Finished | End::MapJump { .. }))) {
+                    Ok(())
+                } else { Err("scene replay reached an unsupported boundary".into()) };
+            }
+            if self.panel.is_some() || self.battle.is_some() || self.played_out { return Ok(()); }
+            let at = self.due_at();
+            if !at.is_finite() { return Err("scene replay has no advancing boundary".into()); }
+            self.advance_stage_to(at.max(self.clock));
+            self.settle();
+        }
+        Err("scene replay did not reach a boundary".into())
+    }
+
     // ---- what it is ----------------------------------------------------------------------------------------------
 
     pub fn run_id(&self) -> SceneRunId {
         self.run.id
+    }
+
+    pub fn continuation_failure(&self) -> Option<&str> {
+        self.failed.then_some(self.failure_reason.unwrap_or("Saved scene continuation failed validation. Reconnect with matching game data."))
     }
 
     pub fn is_owner(&self) -> bool {
@@ -414,12 +547,16 @@ impl ScenePlayer {
             .collect()
     }
 
+    pub fn hides_participant(&self, entity: EntityId) -> bool {
+        !self.over && self.participants_hidden && self.run.participants.iter().any(|p| p.entity == entity)
+    }
+
     // ---- time ----------------------------------------------------------------------------------------------------
 
     /// Let `seconds` of real time go by: the stage moves on and what is due happens, unless a window is on show (it pauses
     /// the whole scene) or the scene is over.
     pub fn advance(&mut self, seconds: f32) {
-        if self.over || self.played_out || self.panel.is_some() {
+        if self.over || self.played_out || self.panel.is_some() || self.battle.is_some() {
             return;
         }
         let mut left = seconds * FRAMES_PER_SECOND as f32;
@@ -434,7 +571,7 @@ impl ScenePlayer {
             self.advance_stage_to(self.clock + spend);
             left -= spend;
             self.settle();
-            if self.over || self.played_out || self.panel.is_some() || left <= 0.0 {
+            if self.over || self.played_out || self.panel.is_some() || self.battle.is_some() || left <= 0.0 {
                 return;
             }
         }
@@ -540,18 +677,21 @@ impl ScenePlayer {
                 return;
             }
         }
-        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
+        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: speed @ (16 | 32), divisor: 1 } = event {
             if first <= last {
                 if let Some(clip) = source.animation_clip(*entity, *animation) {
                     if first == last { cast.apply_hold(*entity, clip, *first); }
+                    else if *speed == 32 { cast.apply_hold_range_doubled(*entity, clip, *first, *last, late); }
                     else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
                     return;
                 }
             }
         }
-        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: None, last: None, speed: 16, divisor: 1 } = event {
+        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
             if let Some(clip) = source.animation_clip(*entity, *animation) {
-                if cast.apply_once_full(*entity, *animation, clip, late) { return; }
+                let applied = if *speed == 32 { cast.apply_once_full_doubled(*entity, *animation, clip, late) }
+                    else { cast.apply_once_full(*entity, *animation, clip, late) };
+                if applied { return; }
             }
         }
         if let Stage::Anim { entity, animation, how: AnimHow::Once, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
@@ -574,7 +714,7 @@ impl ScenePlayer {
     /// windows: a source of nothing but empty windows ends instead of running away.)
     fn settle(&mut self) {
         loop {
-            if self.over || self.panel.is_some() {
+            if self.over || self.panel.is_some() || self.battle.is_some() {
                 return;
             }
             match std::mem::replace(&mut self.next, Next::Held) {
@@ -584,7 +724,12 @@ impl ScenePlayer {
                         return;
                     }
                     self.move_continuations.clear();
-                    let beat = self.source.next(answer);
+                    let beat = if self.continuation {
+                        match self.source.next_checked(answer) {
+                            Ok(beat) => beat,
+                            Err(_) => { self.abort(); return; }
+                        }
+                    } else { self.source.next(answer) };
                     self.clock = if self.instant { f32::INFINITY } else { 0.0 };
                     for event in &beat.stage {
                         if let Stage::Sound { id, .. } = event.what {
@@ -611,6 +756,17 @@ impl ScenePlayer {
                         self.next = Next::End { at, how };
                         return;
                     }
+                    if how == End::Battle && self.continuation && self.def.presents.is_none() {
+                        let Some(SceneBoundary::Battle(checkpoint)) = self.source.boundary() else { self.abort(); return };
+                        if checkpoint.ordinal != self.battles_resumed.saturating_add(1) { self.abort(); return; }
+                        self.battle = Some(PausedBattle { checkpoint, battle: None, resume: None, game_over: false, retry_sent: false });
+                        self.sound(SoundAction::End);
+                        self.epoch = self.epoch.wrapping_add(1);
+                        if self.is_owner() && !self.silent {
+                            self.outbox.push(SceneCmd::BattleReady { run: self.run.id, ordinal: checkpoint.ordinal, step: self.passed });
+                        }
+                        return;
+                    }
                     // The scene's own end (a jump on to another field, or, for the cutscene of a story point that starts a
                     // battle first, the battle the server then starts) is playing it out; any other stop is an incomplete run.
                     let natural = matches!(how, End::Finished | End::MapJump { .. }) || (how == End::Battle && self.def.presents.is_some());
@@ -628,11 +784,11 @@ impl ScenePlayer {
         self.opened += 1;
         self.epoch = self.epoch.wrapping_add(1);
         let panel = Panel::new(window);
-        if self.is_owner() && panel.is_blank() {
+        if self.is_owner() && panel.is_blank() && !self.silent {
             self.pass(panel, None);
             return;
         }
-        if self.source.echo_voice() {
+        if self.source.echo_voice() && !self.silent {
             if let MessageOrigin::Canon { dialog, .. } = &panel.window().message.origin {
                 Global.cue(VoiceCue::Say { field: self.def.field.clone(), window: panel.window().id, dialog: *dialog, page: 0 });
             }
@@ -646,24 +802,32 @@ impl ScenePlayer {
 
     /// Move past a window: count it, say so, report it if this player is the owner, and ask the source what comes next.
     fn pass(&mut self, panel: Panel, answer: Option<usize>) {
+        if self.continuation && !self.is_owner() {
+            let valid = match (panel.window().message.choice, answer) {
+                (None, None) => true,
+                (Some(c), Some(a)) => (c.first..=c.last).contains(&a),
+                _ => false,
+            };
+            if !valid { self.abort(); return; }
+        }
         let answer = panel.resolve(answer);
         let window = panel.window();
         let server_answer = if self.is_owner() {
             match self.source.server_answer(window, answer) { Ok(value) => value, Err(()) => { self.abort(); return; } }
         } else { answer };
-        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        if self.source.echo_voice() && !self.silent { Global.cue(VoiceCue::Stop); }
         let step = self.passed;
         self.passed += 1;
         self.epoch = self.epoch.wrapping_add(1);
-        self.events.push(SceneEvent::Line {
+        if !self.silent { self.events.push(SceneEvent::Line {
             index: step,
             opener: window.opener,
             speaker: window.speaker,
             dialog: dialog_of(&window.message.origin),
             asks: panel.asks(),
             answer,
-        });
-        if self.is_owner() {
+        }); }
+        if self.is_owner() && !self.silent {
             let answer = server_answer.map(|line| u8::try_from(line).unwrap_or(u8::MAX));
             self.outbox.push(SceneCmd::Step { run: self.run.id, step, answer });
         }
@@ -683,8 +847,11 @@ impl ScenePlayer {
         self.move_continuations.clear();
         self.next = Next::Held;
         if self.is_owner() {
-            self.finish();
-            if !std::mem::replace(&mut self.sent_end, true) {
+            if self.continuation {
+                self.played_out = true;
+                self.sound(SoundAction::End);
+            } else { self.finish(); }
+            if !std::mem::replace(&mut self.sent_end, true) && !self.silent {
                 self.outbox.push(SceneCmd::End { run: self.run.id, skipped: false });
             }
         } else {
@@ -697,7 +864,17 @@ impl ScenePlayer {
     /// Give the scene a key. Confirm turns a page, moves past the window or answers its question (the owner; a watcher
     /// only turns pages); the arrows move a question's pointer; Back skips the whole scene.
     pub fn key(&mut self, key: SceneKey) {
-        if self.over {
+        if self.over || self.played_out {
+            return;
+        }
+        let owner = self.is_owner();
+        if let Some(paused) = &mut self.battle {
+            if key == SceneKey::Back {
+                self.skip();
+            } else if owner && paused.game_over && !paused.retry_sent && key == SceneKey::Confirm {
+                paused.retry_sent = true;
+                self.outbox.push(SceneCmd::Retry { run: self.run.id });
+            }
             return;
         }
         let panel_key = match key {
@@ -743,12 +920,20 @@ impl ScenePlayer {
 
     /// Skip the whole scene: the owner tells the server it is over (skipped), a watcher that it leaves. Once.
     pub fn skip(&mut self) {
-        if self.over {
+        if self.over || self.played_out {
+            return;
+        }
+        if self.continuation {
+            // A checkpoint may already be reserved even with no battles consumed (cargo).
+            // Back leaves the session; only SceneEnded can release its saved scene in place.
+            self.failed = true;
+            self.failure_reason = Some("Left the saved scene. Reconnect to continue from its checkpoint.");
+            self.finish();
             return;
         }
         self.finish();
         self.skipped = true;
-        if !std::mem::replace(&mut self.sent_end, true) {
+        if !std::mem::replace(&mut self.sent_end, true) && !self.silent {
             let run = self.run.id;
             self.outbox.push(if self.is_owner() { SceneCmd::End { run, skipped: true } } else { SceneCmd::Leave { run } });
         }
@@ -757,8 +942,9 @@ impl ScenePlayer {
     /// A failed or unsupported interpreter run must not be treated as the player's choice to skip.
     fn abort(&mut self) {
         if self.over { return; }
+        self.failed = self.continuation;
         self.finish();
-        if !std::mem::replace(&mut self.sent_end, true) {
+        if !std::mem::replace(&mut self.sent_end, true) && !self.silent {
             self.outbox.push(SceneCmd::Leave { run: self.run.id });
         }
     }
@@ -780,6 +966,87 @@ impl ScenePlayer {
         }
     }
 
+    /// The scene continues to hold the field while its battle owns input and presentation.
+    pub fn battle_input(&self) -> bool { self.battle.is_some() }
+
+    /// Watchers may still be animating an acknowledged prefix. Catch up to its boundary without
+    /// replaying sound; wire ordering guarantees the preceding window acknowledgements came first.
+    pub fn on_battle_started(&mut self, ordinal: u32, battle_id: BattleId) {
+        if !self.continuation || self.over { return; }
+        // An owner can close its result panel before a watcher does. If its next battle has
+        // already begun, the preceding durable victory and accepted windows are now historical
+        // for this watcher. Reconstruct that prefix silently before attaching the new battle.
+        if !self.is_owner() && ordinal == self.battles_resumed.saturating_add(2)
+            && self.battle.as_ref().is_some_and(|b| b.resume.is_some()) {
+            let silent = self.silent;
+            self.silent = true;
+            let caught_up = self.resume_pending().and_then(|_| self.reach_boundary());
+            self.silent = silent;
+            if caught_up.is_err() { self.abort(); return; }
+        }
+        if ordinal != self.battles_resumed.saturating_add(1) { return; }
+        if self.battle.is_none() {
+            let silent = self.silent;
+            self.silent = true;
+            let reached = self.reach_boundary();
+            self.silent = silent;
+            if reached.is_err() { self.abort(); return; }
+        }
+        let Some(paused) = &mut self.battle else { return };
+        if paused.checkpoint.ordinal != ordinal { return; }
+        if paused.battle == Some(battle_id) { return; }
+        if paused.battle.is_some() && !paused.game_over { return; }
+        paused.battle = Some(battle_id);
+        paused.game_over = false;
+        paused.retry_sent = false;
+        paused.resume = None;
+        self.sound(SoundAction::End);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Only this durable acknowledgement, correlated to the active battle, permits a resume.
+    pub fn on_battle_resumed(&mut self, ordinal: u32, battle_id: BattleId, progress: &[u8], gil: u32) {
+        let Some(paused) = &mut self.battle else { return };
+        if paused.checkpoint.ordinal != ordinal || paused.battle != Some(battle_id) || paused.game_over || paused.resume.is_some() { return; }
+        let Some(story) = StoryState::decode(progress) else { self.abort(); return };
+        paused.resume = Some((story, gil));
+    }
+
+    pub fn on_game_over(&mut self, ordinal: u32, battle_id: BattleId) {
+        let Some(paused) = &mut self.battle else { return };
+        if paused.checkpoint.ordinal != ordinal || paused.battle != Some(battle_id) || paused.resume.is_some() { return; }
+        paused.game_over = true;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Apply an acknowledged victory only after the battle screen, including its result panel,
+    /// has gone. The original stage and its clock survive the fight unchanged.
+    pub fn advance_visible(&mut self, seconds: f32, visible: bool) {
+        if !visible { return; }
+        if self.battle.is_some() {
+            match self.resume_pending() {
+                Ok(true) => {},
+                Ok(false) => return,
+                Err(_) => { self.abort(); return; }
+            }
+        }
+        self.advance(seconds);
+    }
+
+    fn resume_pending(&mut self) -> Result<bool, String> {
+        let Some(paused) = &mut self.battle else { return Ok(false) };
+        let Some((story, gil)) = paused.resume.take() else { return Ok(false) };
+        let checkpoint = paused.checkpoint;
+        self.source.resume_battle(checkpoint, story, gil)?;
+        self.battles_resumed = checkpoint.ordinal;
+        self.battle = None;
+        self.next = Next::Pull(None);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.sound(SoundAction::Begin);
+        self.settle();
+        Ok(true)
+    }
+
     /// The server says the run is over, however it ended: the scene is over for this player at once. Nothing is sent.
     pub fn on_ended(&mut self) {
         self.finish();
@@ -791,6 +1058,7 @@ impl ScenePlayer {
         self.sound(SoundAction::End);
         if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         self.over = true;
+        self.battle = None;
         self.panel = None;
         self.early.clear();
         self.next = Next::Held;
@@ -801,6 +1069,7 @@ impl ScenePlayer {
     }
 
     fn sound(&mut self, action: SoundAction) {
+        if self.silent { return; }
         if self.sounds.len() >= 256 { self.sounds.pop_front(); }
         self.sounds.push_back(SceneSound { run: self.run.id, action });
     }
@@ -827,6 +1096,24 @@ impl ScenePlayer {
         self.size.set((vw, vh));
         if let Some(panel) = &self.panel {
             panel.draw(vw, vh, t, spot, out);
+        }
+        if let Some(paused) = self.battle.as_ref().filter(|b| b.game_over) {
+            use crate::ui::text::{ellipsize, text_height, text_width};
+            use crate::ui::widgets::{BORDER, TEXT};
+            let scale = crate::ui::hud::hud_scale(vw, vh);
+            let hint = if paused.retry_sent { "Preparing retry... Back: disconnect" }
+                else if self.is_owner() { "Confirm: retry  Back: disconnect" }
+                else { "Waiting for owner. Back: disconnect" };
+            let cells = vw.saturating_sub(32) / (8 * scale);
+            let hint = ellipsize(hint, cells as usize);
+            let width = text_width(&hint, scale).max(text_width("GAME OVER", scale));
+            let height = text_height(scale);
+            let x = ((vw as i32 - width) / 2).max(0);
+            let y = ((vh as i32 - height * 4) / 2).max(0);
+            out.fill_rect(x - 12, y - 12, width + 24, height * 3 + 24, [8, 12, 36, 235]);
+            out.frame_rect(x - 12, y - 12, width + 24, height * 3 + 24, 1, BORDER);
+            out.draw_text(x + (width - text_width("GAME OVER", scale)) / 2, y, scale, TEXT, "GAME OVER");
+            out.draw_text(x, y + height * 2, scale, TEXT, &hint);
         }
     }
 }

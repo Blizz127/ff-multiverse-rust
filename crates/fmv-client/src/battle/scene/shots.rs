@@ -133,6 +133,8 @@ pub(super) struct Server {
 impl Server {
     pub(super) fn start(&self, setup: &BattleSetup, fingerprint: fmv_core::Fingerprint) -> ServerMsg {
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: self.id,
             formation_id: setup.formation_id,
             seed: setup.seed,
@@ -190,6 +192,8 @@ pub(super) fn canon(character: u8) -> BattleMember {
 /// with the formation's own placement and a camera to the side (made-up numbers), at `location`.
 pub(super) fn synthetic_scene(kit: &mut ModelKit, location: u16) -> BattleScene {
     let setup = BattleSetup {
+        initial_party: None,
+        escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: 1,
         seed: 3,
         party: vec![member(0, 0), member(1, 2), member(2, 1)],
@@ -444,6 +448,8 @@ fn offscreen_real_ff7_battle_formation() {
     let placement = real.rules.formation_scene(formation_id).expect("the formation has placement data");
     let setup = BattleSetup {
         formation_id,
+        initial_party: None,
+        escape_policy: fmv_protocol::EscapePolicy::Formation,
         seed: 0x5CE7E,
         party: vec![canon(0), canon(1), BattleMember::player(EntityId(1), ME, "Wedge", 2, 12, 0)],
         preemptive: true,
@@ -616,7 +622,7 @@ fn offscreen_real_battle_names() {
 
     let member = |entity: u64, account: AccountId, name: &str, character: u8| BattleMember::player(EntityId(entity), account, name, character, 6, 0);
     let party = vec![member(1, ME, "Blizz", 1), member(2, AccountId(2), "Wedge", 2)];
-    let setup = BattleSetup { formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
+    let setup = BattleSetup { initial_party: None, escape_policy: fmv_protocol::EscapePolicy::Formation, formation_id: 301, seed: 0xB11, party, preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000 };
     let server = Server { id: BattleId(1), state: real.rules.build(&setup).expect("the formation builds") };
     // The engine fights them as the canon characters of their slots: those are the names the engine knows.
     let engine_names: Vec<String> = server.state.party_ids().iter().filter_map(|id| server.state.actor(*id)).map(|c| c.name.clone()).collect();

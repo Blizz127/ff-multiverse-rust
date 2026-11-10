@@ -22,6 +22,8 @@ struct Server {
 impl Server {
     fn new() -> Self {
         let setup = BattleSetup {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             formation_id: FOE,
             seed: 5,
             party: vec![BattleMember::player(EntityId(100), ME, "P0", 0, 6, 0)],
@@ -42,6 +44,8 @@ impl Server {
 
     fn start(&self) -> ServerMsg {
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: self.id,
             formation_id: self.setup.formation_id,
             seed: self.setup.seed,

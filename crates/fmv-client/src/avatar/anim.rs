@@ -36,6 +36,12 @@ pub enum ClipFrame {
     HoldFull { elapsed: f32 },
     /// Play the loaded clip once; completion is resolved against a separate standing default.
     OnceFull { elapsed: f32 },
+    /// The same one-shot at two clip frames per scene frame. `elapsed` is clip time;
+    /// the standing default resumes at normal speed after the loaded clip completes.
+    OnceFullDoubled { elapsed: f32 },
+    /// A doubled full Once whose authored ASPED returned to normal at `doubled_until`
+    /// clip frames. This preserves both the current pose and the actual completion time.
+    OnceFullSlowed { elapsed: f32, doubled_until: f32 },
 }
 
 impl ClipFrame {
@@ -53,11 +59,28 @@ impl ClipFrame {
                 let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
                 Some(elapsed.min((frames - 1) as f32))
             }
-            Self::OnceFull { elapsed } => {
+            Self::OnceFull { elapsed } | Self::OnceFullDoubled { elapsed } | Self::OnceFullSlowed { elapsed, .. } => {
                 let elapsed = if elapsed.is_finite() { elapsed.max(0.0) } else { 0.0 };
                 (elapsed < frames as f32).then_some(elapsed.min((frames - 1) as f32))
             }
         }
+    }
+
+    /// Scene time since a full Once completed its actual loaded clip. A doubled gesture
+    /// must not carry its faster clip clock into the separately remembered standing loop.
+    pub fn return_elapsed(self, frames: usize) -> Option<f32> {
+        if let Self::OnceFullSlowed { elapsed, doubled_until } = self {
+            return (frames != 0 && elapsed.is_finite() && doubled_until.is_finite()
+                && doubled_until >= 0.0 && elapsed >= doubled_until && elapsed >= frames as f32)
+                .then_some(elapsed - frames as f32 - (doubled_until - frames as f32).max(0.0) / 2.0);
+        }
+        let (elapsed, rate) = match self {
+            Self::OnceFull { elapsed } => (elapsed, 1.0),
+            Self::OnceFullDoubled { elapsed } => (elapsed, 2.0),
+            _ => return None,
+        };
+        (frames != 0 && elapsed.is_finite() && elapsed >= frames as f32)
+            .then_some((elapsed - frames as f32) / rate)
     }
 }
 
@@ -207,6 +230,37 @@ mod tests {
         assert_eq!(ClipFrame::OnceFull { elapsed: 256.5 }.in_clip(300), Some(256.5));
         assert_eq!(ClipFrame::OnceFull { elapsed: 299.5 }.in_clip(300), Some(299.0));
         assert_eq!(ClipFrame::OnceFull { elapsed: f32::MAX }.in_clip(300), None);
+    }
+
+    #[test]
+    fn doubled_full_once_finishes_in_half_the_time_and_returns_on_the_scene_clock() {
+        let at = |scene_frames: f32| ClipFrame::OnceFullDoubled { elapsed: scene_frames * 2.0 };
+        assert_eq!(at(1.25).in_clip(4), Some(2.5));
+        assert_eq!(at(1.75).in_clip(4), Some(3.0), "the final pose occupies its shortened interval");
+        assert_eq!(at(1.75).return_elapsed(4), None);
+        assert_eq!(at(2.0).in_clip(4), None);
+        assert_eq!(at(2.0).return_elapsed(4), Some(0.0));
+        assert_eq!(at(2.5).return_elapsed(4), Some(0.5), "the standing default keeps its own normal rate");
+        assert_eq!(at(151.25).return_elapsed(300), Some(1.25), "the loaded length is not truncated to a byte");
+        for elapsed in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            let frame = ClipFrame::OnceFullDoubled { elapsed };
+            assert_eq!(frame.in_clip(4), Some(0.0));
+            assert_eq!(frame.return_elapsed(4), None);
+        }
+        assert_eq!(at(100.0).return_elapsed(0), None, "a missing clip gives no invented return time");
+        assert_eq!(ClipFrame::HoldFull { elapsed: 99.0 }.return_elapsed(4), None);
+    }
+
+    #[test]
+    fn a_doubled_once_slowed_by_the_script_preserves_its_final_frame_and_return_time() {
+        let at = |elapsed| ClipFrame::OnceFullSlowed { elapsed, doubled_until: 14.0 };
+        assert_eq!(at(14.0).in_clip(15), Some(14.0));
+        assert_eq!(at(14.5).in_clip(15), Some(14.0));
+        assert_eq!(at(14.5).return_elapsed(15), None);
+        assert_eq!(at(15.0).return_elapsed(15), Some(0.0));
+        assert_eq!(at(15.5).return_elapsed(15), Some(0.5));
+        assert_eq!(at(14.0).return_elapsed(12), Some(1.0), "a shorter clip completed on the earlier doubled clock");
+        assert_eq!(at(16.0).return_elapsed(12), Some(3.0));
     }
 
     #[test]

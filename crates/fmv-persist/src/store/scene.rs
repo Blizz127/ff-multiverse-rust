@@ -6,9 +6,11 @@
 //! both after images idempotently. An unrelated record, malformed intent or future schema
 //! stops opening. An uncertain write poisons this Store until it is dropped and reopened.
 //!
-//! Character receipts live in a private schema-2 envelope, preserved by ordinary character
-//! saves and account restoration. Old binaries cannot read these character records and must
-//! never be used against an outstanding intent. This module does not migrate live stores.
+//! Ordinary receipts live in a private schema-2 envelope. Co-op checkpoints, reservations
+//! and batch receipts require schema 3, plus a recognized index format fence written before
+//! the first batch intent. Ordinary character saves retain receipts; active continuations
+//! refuse ordinary writes and account rekeying. Schema-1 intents remain recoverable alongside
+//! the bounded schema-2 batch intents. Opening a store never opts it into these new writes.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,23 +24,28 @@ use crate::{CharacterProgress, PersistError, Progression, Result};
 use crate::fsio;
 use crate::model::{MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES, SCHEMA_VERSION};
 
+mod batch;
+pub use batch::{SceneBatchCommitted, SceneCheckpoint, SceneOperation, SceneOperationKind, ScenePhase, SceneReservation, SceneState,
+    MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
+
 pub(crate) const INTENT_FILE: &str = "pending-scene.json";
 const INTENT_VERSION: u32 = 1;
 const CHARACTER_RECEIPT_VERSION: u32 = 2;
+const CHARACTER_CONTINUATION_VERSION: u32 = 3;
 const MAX_INTENT_BYTES: u64 = 4 * 1024 * 1024;
 /// Receipts are never evicted: exceeding this limit refuses the next transaction.
 pub const MAX_SCENE_RECEIPTS: usize = 2048;
 
 /// A coherent view of both progress records. An absent character remains absent, and the
 /// story uses [`Progression::empty`] for an absent record, as the existing store API does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressPair {
     pub story: Progression,
     pub character: Option<CharacterProgress>,
 }
 
 /// Only an acknowledged `Applied` or `AlreadyApplied` authorizes gameplay to continue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SceneCommit {
     Applied,
     AlreadyApplied,
@@ -51,12 +58,23 @@ pub(crate) struct CharacterRecord {
     pub progress: CharacterProgress,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     scene_receipts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    batch_receipts: BTreeMap<String, batch::BatchReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<SceneCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation: Option<SceneReservation>,
+    /// The prepared scene's complete membership, copied to every reserved record so a
+    /// disconnected guest can find the owner without an account scan. Active records cannot be rekeyed by
+    /// trash restoration, so these ids never need to be guessed or partially rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scene_roster: Option<Vec<batch::RosterMember>>,
 }
 
 impl CharacterRecord {
     pub(crate) fn read(path: &Path) -> Result<Option<Self>> {
         let Some(bytes) = fsio::read_capped(path, MAX_CHARACTER_RECORD_BYTES)? else { return Ok(None) };
-        fsio::check_schema_version_upto(path, &bytes, CHARACTER_RECEIPT_VERSION)?;
+        fsio::check_schema_version_upto(path, &bytes, CHARACTER_CONTINUATION_VERSION)?;
         let record: Self = serde_json::from_slice(&bytes)
             .map_err(|e| PersistError::corrupt(path, format!("invalid character record: {e}")))?;
         record.validate().map_err(|e| PersistError::corrupt(path, e.to_string()))?;
@@ -65,21 +83,29 @@ impl CharacterRecord {
 
     fn validate(&self) -> Result<()> {
         self.progress.validate()?;
-        if self.progress.schema_version == 0 || self.progress.schema_version > CHARACTER_RECEIPT_VERSION {
+        if self.progress.schema_version == 0 || self.progress.schema_version > CHARACTER_CONTINUATION_VERSION {
             return Err(invalid("unsupported character schema"));
         }
-        if self.scene_receipts.is_empty() != (self.progress.schema_version == SCHEMA_VERSION) {
-            return Err(invalid("schema 1 must have no scene receipts; schema 2 must have durable receipts"));
+        let has_batch = !self.batch_receipts.is_empty() || self.has_continuation() || self.scene_roster.is_some();
+        let version = if has_batch { CHARACTER_CONTINUATION_VERSION }
+            else if self.scene_receipts.is_empty() { SCHEMA_VERSION } else { CHARACTER_RECEIPT_VERSION };
+        if self.progress.schema_version != version {
+            return Err(invalid("character schema does not match its durable metadata"));
         }
         if self.scene_receipts.len() > MAX_SCENE_RECEIPTS || self.scene_receipts.iter().any(|(k, v)| !is_digest(k) || !is_digest(v)) {
             return Err(invalid("invalid or oversized scene receipt set"));
         }
+        batch::validate_record(self)?;
         Ok(())
     }
 
     fn stamp(&mut self) {
-        self.progress.schema_version = if self.scene_receipts.is_empty() { SCHEMA_VERSION } else { CHARACTER_RECEIPT_VERSION };
+        self.progress.schema_version = if !self.batch_receipts.is_empty() || self.has_continuation() || self.scene_roster.is_some() {
+            CHARACTER_CONTINUATION_VERSION
+        } else if self.scene_receipts.is_empty() { SCHEMA_VERSION } else { CHARACTER_RECEIPT_VERSION };
     }
+
+    pub(crate) fn has_continuation(&self) -> bool { self.checkpoint.is_some() || self.reservation.is_some() }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +185,7 @@ impl ProgressPair {
             return Err(PersistError::BlobTooLarge { len: self.story.blob.len(), max: MAX_BLOB_BYTES });
         }
         if let Some(c) = &self.character {
-            if c.account_id != account || c.game != game || c.schema_version == 0 || c.schema_version > CHARACTER_RECEIPT_VERSION {
+            if c.account_id != account || c.game != game || c.schema_version == 0 || c.schema_version > CHARACTER_CONTINUATION_VERSION {
                 return Err(invalid("character belongs to a different account/game or schema"));
             }
             c.validate()?;
@@ -195,8 +221,11 @@ impl Store {
     /// Store ordinary character progress, retaining all existing scene receipts. The writer
     /// and progress write locks must already be held. A corrupt prior envelope is not replaced.
     pub(super) fn write_character_record(&self, path: &Path, progress: CharacterProgress) -> Result<CharacterProgress> {
-        let scene_receipts = CharacterRecord::read(path)?.map(|r| r.scene_receipts).unwrap_or_default();
-        let mut stored = CharacterRecord { progress, scene_receipts };
+        let mut stored = match CharacterRecord::read(path)? {
+            Some(record) if record.has_continuation() => return Err(PersistError::TransactionConflict("character has an active scene continuation".into())),
+            Some(mut record) => { record.progress = progress; record },
+            None => CharacterRecord { progress, scene_receipts: BTreeMap::new(), batch_receipts: BTreeMap::new(), checkpoint: None, reservation: None, scene_roster: None },
+        };
         stored.stamp();
         stored.validate()?;
         fsio::write_json(path, &stored, MAX_CHARACTER_RECORD_BYTES)?;
@@ -215,6 +244,9 @@ impl Store {
         let receipt = receipt_key(scene_key, expected_story)?;
         let result = result_key(selected_result)?;
         let current = self.read_images(account, game)?;
+        if current.character.as_ref().is_some_and(CharacterRecord::has_continuation) {
+            return Err(PersistError::TransactionConflict("account has an active scene continuation".into()));
+        }
         match current.character.as_ref().and_then(|c| c.scene_receipts.get(&receipt)) {
             None => Ok(false),
             Some(recorded) if recorded == &result => Ok(true),
@@ -268,6 +300,9 @@ impl Store {
         let _progress = self.progress_write();
         if !self.index().contains_account(account.0) { return Err(PersistError::UnknownAccount(account)) }
         let before = self.read_images(account, game)?;
+        if before.character.as_ref().is_some_and(CharacterRecord::has_continuation) {
+            return Err(PersistError::TransactionConflict("account has an active scene continuation".into()));
+        }
         if let Some(prior) = before.character.as_ref().and_then(|c| c.scene_receipts.get(&receipt)) {
             return if prior == &result { Ok(SceneCommit::AlreadyApplied) } else { Err(PersistError::TransactionConflict("receipt already records a different result".into())) };
         }
@@ -275,7 +310,7 @@ impl Store {
             return Err(PersistError::TransactionConflict("story or character precondition changed".into()));
         }
         let mut character = before.character.clone().ok_or_else(|| invalid("character progress is absent"))?;
-        if character.scene_receipts.len() >= MAX_SCENE_RECEIPTS { return Err(invalid("scene receipt capacity exhausted; receipts cannot be evicted")) }
+        if character.scene_receipts.len() + character.batch_receipts.len() >= MAX_SCENE_RECEIPTS { return Err(invalid("scene receipt capacity exhausted; receipts cannot be evicted")) }
         character.progress = next.character.clone().ok_or_else(|| invalid("character after-image is absent"))?;
         character.scene_receipts.insert(receipt.clone(), result.clone());
         character.stamp();
@@ -315,6 +350,9 @@ impl Store {
         if receipts.insert(intent.receipt.clone(), intent.result.clone()).is_some() || receipts != new.scene_receipts {
             return Err(invalid("intent must append exactly its one new receipt"));
         }
+        if old.has_continuation() || new.has_continuation() || old.batch_receipts != new.batch_receipts || old.scene_roster != new.scene_roster {
+            return Err(invalid("ordinary scene intent cannot change or bypass a continuation"));
+        }
         Ok(())
     }
 
@@ -335,8 +373,13 @@ impl Store {
 
     pub(super) fn recover_scene_progress(&self) -> Result<()> {
         let path = self.root.join(INTENT_FILE);
-        let Some(bytes) = fsio::read_capped(&path, MAX_INTENT_BYTES)? else { return Ok(()) };
-        fsio::check_schema_version_upto(&path, &bytes, INTENT_VERSION)?;
+        let Some(bytes) = fsio::read_capped(&path, batch::MAX_BATCH_INTENT_BYTES)? else { return Ok(()) };
+        fsio::check_schema_version_upto(&path, &bytes, batch::BATCH_INTENT_VERSION)?;
+        let schema: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| PersistError::corrupt(&path, format!("invalid scene intent: {e}")))?;
+        if schema.get("schema_version").and_then(serde_json::Value::as_u64) == Some(u64::from(batch::BATCH_INTENT_VERSION)) {
+            return self.recover_scene_batch(&path, &bytes);
+        }
+        if bytes.len() as u64 > MAX_INTENT_BYTES { return Err(PersistError::TooLarge { path, size: bytes.len() as u64, max: MAX_INTENT_BYTES }); }
         let file: IntentFile = serde_json::from_slice(&bytes).map_err(|e| PersistError::corrupt(&path, format!("invalid scene intent: {e}")))?;
         if file.kind != "fmv-scene-transaction" || file.checksum != digest(&file.intent)? { return Err(PersistError::corrupt(&path, "scene intent kind or checksum mismatch")) }
         let intent = &file.intent;
@@ -590,7 +633,7 @@ mod tests {
         assert!(store.commit_scene_progress("flower", &current, &after).is_err());
         assert_eq!(CharacterRecord::read(&path).unwrap().unwrap().scene_receipts.len(), MAX_SCENE_RECEIPTS);
         assert!(!store.root.join(INTENT_FILE).exists());
-        record.progress.schema_version = 3;
+        record.progress.schema_version = CHARACTER_CONTINUATION_VERSION + 1;
         fsio::write_json(&path, &record, MAX_CHARACTER_RECORD_BYTES).unwrap();
         assert!(matches!(store.get_character_progress(before.story.account_id, GameId::Ff7), Err(PersistError::FutureSchema { .. })));
     }

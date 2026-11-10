@@ -149,6 +149,7 @@ fn registration_progress_bytes(record: &CharacterProgress) -> Result<Vec<u8>> {
 #[cfg(test)]
 thread_local! {
     static FAIL_REGISTRATION_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_SCENE_FORMAT_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1073,7 +1074,8 @@ impl Store {
     }
 
     /// Store (replacing) the account's progression for `progression.game`. Other games are
-    /// untouched. The blob is capped at [`MAX_BLOB_BYTES`].
+    /// untouched. The blob is capped at [`MAX_BLOB_BYTES`]. An active durable scene
+    /// continuation or battle reservation refuses ordinary progress writes.
     pub fn put_progression(&self, progression: &Progression) -> Result<()> {
         if progression.blob.len() > MAX_BLOB_BYTES {
             return Err(PersistError::BlobTooLarge {
@@ -1088,6 +1090,7 @@ impl Store {
         if !self.index().contains_account(progression.account_id.0) {
             return Err(PersistError::UnknownAccount(progression.account_id));
         }
+        self.ensure_no_scene_continuation(progression.account_id, progression.game)?;
         fsio::ensure_dir(&self.progression_dir(progression.account_id.0))?;
         let mut stored = progression.clone();
         stored.schema_version = SCHEMA_VERSION;
@@ -1118,6 +1121,7 @@ impl Store {
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
+        self.ensure_no_scene_continuation(account, game)?;
         let mut next = change(self.read_progression(account, game)?);
         if next.account_id != account || next.game != game {
             return Err(PersistError::InvalidField {
@@ -1244,6 +1248,7 @@ impl Store {
         if !self.index().contains_account(record.account_id.0) {
             return Err(PersistError::UnknownAccount(record.account_id));
         }
+        self.ensure_no_scene_continuation(record.account_id, record.game)?;
         fsio::ensure_dir(&self.progression_dir(record.account_id.0))?;
         let mut stored = record.clone();
         stored.schema_version = SCHEMA_VERSION;
@@ -1279,6 +1284,7 @@ impl Store {
         if !self.index().contains_account(account.0) {
             return Err(PersistError::UnknownAccount(account));
         }
+        self.ensure_no_scene_continuation(account, game)?;
         let mut next = change(self.read_character_progress(account, game)?);
         if next.account_id != account || next.game != game {
             return Err(PersistError::InvalidField {
@@ -1297,6 +1303,40 @@ impl Store {
         next.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
         self.write_character_record(&path, next)
+    }
+
+    /// The caller already holds the writer and progress gates. Raise the recognized index
+    /// header before any batch intent or schema-3 progress is written: older binaries then
+    /// refuse the entire store, including their story-only setters. No account data changes.
+    fn ensure_scene_batch_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_transaction_healthy()?;
+        let mut log = self.log();
+        log.ensure_healthy()?;
+        if self.index().format_version() >= index::SCENE_BATCH_INDEX_VERSION { return Ok(()); }
+        let path = self.log_path();
+        // atomic_write can report a directory-sync failure after replacing the log. Until
+        // reopening decides which inode survived, no reader or writer may use this Store.
+        self.transaction_poisoned.store(true, Ordering::Release);
+        let upgraded = (|| {
+            let (len, _) = index::write_compacted_version(&path, &self.index(), counters.next_account_id,
+                counters.next_avatar_id, index::SCENE_BATCH_INDEX_VERSION)?;
+            #[cfg(test)]
+            if FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.replace(false)) {
+                return Err(PersistError::io("injected scene format fence failure", &path,
+                    std::io::Error::other("index replacement completed before writer reopen")));
+            }
+            let fresh = LogWriter::open(&path, len)?;
+            *log = fresh;
+            self.index_mut().require_scene_batch_format();
+            Ok(())
+        })();
+        match upgraded {
+            Ok(()) => { self.transaction_poisoned.store(false, Ordering::Release); Ok(()) }
+            Err(error) => {
+                log.poison(format!("the scene format fence needs reopen ({error})"));
+                Err(error)
+            }
+        }
     }
 
     // ---- maintenance -------------------------------------------------------------------
@@ -1680,4 +1720,63 @@ mod tests {
         drop(held);
         assert!(store.unclaimed_accounts().is_empty());
     }
+
+    #[test]
+    fn scene_batch_format_fence_preserves_records_and_survives_reopen_compaction_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("live");
+        let store = Store::open(&root).unwrap();
+        let (account, token) = store.create_account("Fence", 1).unwrap();
+        let mut character = CharacterProgress::new(account, GameId::Ff7, 0, 6, 2);
+        character.gil = 240;
+        character.inventory = Some(vec![]);
+        store.put_character_progress(&character).unwrap();
+        let bytes = std::fs::read(store.character_path(account.0, GameId::Ff7).unwrap()).unwrap();
+        assert_eq!(store.index().format_version(), crate::model::INDEX_LOG_VERSION);
+        {
+            let counters = store.writer().unwrap();
+            let _progress = store.progress_write();
+            store.ensure_scene_batch_format(&counters).unwrap();
+            store.ensure_scene_batch_format(&counters).unwrap();
+        }
+        assert_eq!(store.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(std::fs::read(store.character_path(account.0, GameId::Ff7).unwrap()).unwrap(), bytes);
+        // Authentication must append to the replaced log's new inode, not its old handle.
+        assert_eq!(store.authenticate(&token).unwrap(), account);
+        store.compact_index().unwrap();
+        let snapshot = dir.path().join("snapshot");
+        store.snapshot(&snapshot).unwrap();
+        drop(store);
+        let reopened = Store::open(&root).unwrap();
+        assert_eq!(reopened.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert!(reopened.unclaimed_accounts().is_empty(), "the post-fence claim was durable");
+        assert_eq!(reopened.get_character_progress(account, GameId::Ff7).unwrap(), Some(character.clone()));
+        let restored = dir.path().join("restored");
+        crate::restore_snapshot(&snapshot, &restored).unwrap();
+        let restored = Store::open(&restored).unwrap();
+        assert_eq!(restored.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(restored.get_character_progress(account, GameId::Ff7).unwrap(), Some(character));
+    }
+
+    #[test]
+    fn scene_batch_format_uncertain_replacement_fences_all_progress_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (account, _) = store.create_account("Fence Failure", 1).unwrap();
+        {
+            let counters = store.writer().unwrap();
+            let _progress = store.progress_write();
+            FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.set(true));
+            assert!(store.ensure_scene_batch_format(&counters).is_err());
+        }
+        assert!(matches!(store.get_progression(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+        assert!(matches!(store.put_progression(&Progression::empty(account, GameId::Ff7)), Err(PersistError::TransactionRecoveryRequired)));
+        assert!(matches!(store.create_account("Blocked", 2), Err(PersistError::TransactionRecoveryRequired)));
+        drop(store);
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(reopened.account_count(), 1);
+        assert!(reopened.get_progression(account, GameId::Ff7).unwrap().blob.is_empty());
+    }
+
 }

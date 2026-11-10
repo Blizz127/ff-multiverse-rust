@@ -37,6 +37,8 @@ struct Sim {
 impl Sim {
     fn new(formation: u16, accounts: &[AccountId]) -> Self {
         let setup = BattleSetup {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             formation_id: formation,
             seed: 99,
             party: members(accounts),
@@ -51,6 +53,8 @@ impl Sim {
 
     fn start(&self) -> ServerMsg {
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: self.id,
             formation_id: self.setup.formation_id,
             seed: self.setup.seed,

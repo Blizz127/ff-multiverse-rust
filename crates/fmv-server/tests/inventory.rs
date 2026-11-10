@@ -86,11 +86,11 @@ async fn fight_with(
     mut choose: impl FnMut(&BattleState, ActorId, u32) -> Command,
 ) -> Fought {
     let start = j.client.until("EncounterStart", |m| matches!(m, ServerMsg::EncounterStart { .. }).then(|| m.clone())).await;
-    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
+    let ServerMsg::EncounterStart { battle_id, formation_id, seed, party, initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second, .. } = start
     else {
         unreachable!()
     };
-    let setup = BattleSetup { formation_id, seed, party: party.clone(), preemptive, back_attack, battle_speed, ticks_per_second };
+    let setup = BattleSetup { formation_id, seed, party: party.clone(), initial_party, escape_policy, preemptive, back_attack, battle_speed, ticks_per_second };
     let mut replay = BattleReplay::start(rules, &setup).expect("the client builds the battle from its own data");
     let mine = ActorId(party.iter().position(|m| m.entity() == Some(j.entity)).expect("we are in the party") as u8);
     let (mut pending, mut turn) = (false, 0u32);

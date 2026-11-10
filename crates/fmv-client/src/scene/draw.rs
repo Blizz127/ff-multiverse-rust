@@ -28,7 +28,7 @@ use crate::backdrop::FieldView;
 use crate::render::view_to_window;
 use crate::state::NpcView;
 use crate::ui::hud::Subject;
-use fmv_core::{AnimState, Pos};
+use fmv_core::{AnimState, EntityId, Pos};
 use fmv_ff7::script::scene::Look;
 use fmv_protocol::SCENE_NPC_ID_BASE;
 use std::borrow::Cow;
@@ -72,6 +72,17 @@ fn hides_npc(scene: &ScenePlayer, npc: &NpcView) -> bool {
 pub fn label_hidden(scene: Option<&ScenePlayer>, subject: Subject, npcs: &[NpcView]) -> bool {
     let (Some(scene), Subject::Npc(id)) = (scene, subject) else { return false };
     is_trigger(id) || npcs.iter().find(|n| n.id == id).is_some_and(|n| hides_npc(scene, n))
+}
+
+/// A held participant can be absent from the picture during an authored entrance. Its name
+/// must be absent too: the ordinary HUD fallback would otherwise label its real world position.
+pub fn participant_label_hidden(scene: Option<&ScenePlayer>, own: EntityId, subject: Subject) -> bool {
+    let entity = match subject {
+        Subject::Own => own,
+        Subject::Remote(entity) => entity,
+        Subject::Npc(_) => return false,
+    };
+    scene.is_some_and(|scene| scene.hides_participant(entity))
 }
 
 /// The cast as avatars to draw.

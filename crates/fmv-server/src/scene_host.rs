@@ -18,6 +18,8 @@ use fmv_ff7::{field_direction_to_facing, Ff7Adapter, Ff7FieldArea};
 
 use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerInfo};
 
+mod continuation;
+
 fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     (match outcome.end {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
@@ -27,6 +29,12 @@ fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
 }
 
 fn safe_interpretation(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
+    complete_outcome(outcome) && safe_segment(outcome, true)
+}
+
+/// A continuation can stop at a window or battle rather than the end of the script. Its state
+/// still needs the same complete accounting before it can become a durable checkpoint.
+fn safe_segment(outcome: &fmv_ff7::script::scene::Outcome, full_restore_is_redundant: bool) -> bool {
     // These ignored instructions read or change the player's resources, inventory, clock or menu-owned state, or split
     // and join the party in ways nothing here models. Advancing past one without carrying it out can lose state or select
     // the wrong branch. They remain blocked until the server implements their effects.
@@ -36,14 +44,14 @@ fn safe_interpretation(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     // * `PRTYP`, `PRTYM`, `PRTYE` are not ignored any more: the interpreter records them (`Outcome::party`) and
     //   `finish_scene` accepts the scene only when the story's own party table has the party they leave
     //   (`Outcome::party_is_the_storys`), which is how this server carries a party.
-    // * `HMPMAX1`, `HMPMAX2`, `HMPMAX3` and `MHMMX` restore the party's HP and MP. This server keeps no HP or MP between
-    //   battles: a fighter is built from its level alone and starts every battle full (`fmv_protocol::BattleMember` has
-    //   no HP or MP input, and the stored progress is level, experience, AP, gil and the limit gauge). So a full
-    //   restore is what already holds, and skipping it loses nothing. (`HPu`, `HPd`, `MPu`, `MPd` change them by an
-    //   amount, which is not that, and stay refused.)
+    // * `HMPMAX1`, `HMPMAX2`, `HMPMAX3` and `MHMMX` restore the party's HP and MP. Ordinary battles still start full,
+    //   so those legacy scenes may treat a full restore as redundant. Consecutive continuation battles carry combat
+    //   resources instead: their caller passes false and refuses an unimplemented restore. Changes by an amount
+    //   (`HPu`, `HPd`, `MPu`, `MPd`) remain refused in either path.
     use fmv_ff7::script::scene::{FULL_RESTORE_OPS, SKIPPED_STATE_OPS};
-    let refused = |op: &&'static str| SKIPPED_STATE_OPS.contains(op) && !FULL_RESTORE_OPS.contains(op);
-    complete_outcome(outcome)
+    let refused = |op: &&'static str| SKIPPED_STATE_OPS.contains(op)
+        && !(full_restore_is_redundant && FULL_RESTORE_OPS.contains(op));
+    outcome.is_complete()
         && outcome.unknown_persistent_reads.is_empty()
         && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.ignored.keys().any(refused))
         // Every persistent selector must be accounted for, including aliases and the higher banks.
@@ -110,16 +118,22 @@ impl Ff7SceneHost {
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
         let run = if !preview && story.supports_extended() { run_to_end_with_resources_strict } else { run_to_end_with_resources };
         let outcome = run(area.field_file(), def, &story, seed, SceneResources { gil }, &answers).ok()?;
-        if !(if preview { complete_outcome(&outcome) } else if story.supports_extended() { safe_interpretation(&outcome) } else { safe_outcome(&outcome) }) { return None; }
+        self.scene_result(progress, &story, &outcome, preview, gil)
+    }
+
+    /// Build the final transition against the latest durable segment's input. A resumed scene
+    /// uses its post-battle resource snapshot here, so prefix writes cannot replace earned gil.
+    fn scene_result(&self, progress: &[u8], story: &StoryState, outcome: &fmv_ff7::script::scene::Outcome, preview: bool, gil: Option<u32>) -> Option<SceneResult> {
+        if !(if preview { complete_outcome(outcome) } else if story.supports_extended() { safe_interpretation(outcome) } else { safe_outcome(outcome) }) { return None; }
         let mut after = story.clone();
         let changed = if story.supports_extended() {
-            outcome.writes.apply_extended_to(&mut after, &story)?
+            outcome.writes.apply_extended_to(&mut after, story)?
         } else { outcome.writes.apply_to(&mut after) };
         if !preview {
             // The party the scripts leave must be the one the story has from now on (the party table carries it), and the
             // story may hold nothing new to save unless this server was told it may.
-            if !outcome.party_is_the_storys(&story, &after) { return None; }
-            if !self.extended_save && !saves_only_what_was_always_saved(&story, &after) { return None; }
+            if !outcome.party_is_the_storys(story, &after) { return None; }
+            if !self.extended_save && !saves_only_what_was_always_saved(story, &after) { return None; }
         }
         let transaction = if !preview && story.supports_extended() {
             let expected_gil = gil?;
@@ -142,12 +156,24 @@ impl Ff7SceneHost {
             let target = self.adapter.field_key_for_id(jump.field)?;
             // A scene sends its players only where the story goes on: a reviewed field (its own points and exits are
             // offered) or the field of another scene.
-            if !fmv_ff7::is_reviewed_field(&target) && !fmv_ff7::script::scene::is_scene_field(&target) { return None; }
+            if !fmv_ff7::is_reviewed_field(&target) && !self.defs.iter().any(|def| def.field.eq_ignore_ascii_case(&target)) { return None; }
+            // The bridge's zero MAPJUMP is an entry into a required arrival scene, not a
+            // grounded control position. Its director places hidden Cloud later. Keep the
+            // player held through that arrival and use its reviewed control handoff as the
+            // stored landing, including the real walkmesh triangle, for reconnect as well.
+            let landing = if jump.x == 0 && jump.y == 0 && jump.triangle == 0 {
+                self.defs.iter().find(|def| def.id == fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID
+                    && def.field == target && def.starts_on_arrival() && def.offered_to(&after)).map(|def| def.arrival)
+            } else { None };
+            let (x, y, direction, hint) = match landing {
+                Some(spot) => (spot.x, spot.y, spot.direction, Some(u32::from(spot.triangle))),
+                None => (jump.x, jump.y, jump.direction, u32::try_from(jump.triangle).ok()),
+            };
             Some(fmv_adapter_api::Exit {
                 line: (Pos::new(0.0, 0.0, 0.0), Pos::new(0.0, 0.0, 0.0)), target,
-                arrival: Pos::new(f32::from(jump.x), f32::from(jump.y), 0.0),
-                arrival_facing: Some(field_direction_to_facing(jump.direction)),
-                arrival_hint: u32::try_from(jump.triangle).ok(), kind: fmv_adapter_api::ExitKind::Gateway,
+                arrival: Pos::new(f32::from(x), f32::from(y), 0.0),
+                arrival_facing: Some(field_direction_to_facing(direction)),
+                arrival_hint: hint, kind: fmv_adapter_api::ExitKind::Gateway,
             })
         } else { None };
         Some(SceneResult { progress: after.encode(), changed, summary: summary.join(" "), travel, transaction })
@@ -177,6 +203,34 @@ impl SceneHost for Ff7SceneHost {
 
     fn automatic(&self, scene: &str) -> bool {
         self.def(scene).is_some_and(SceneDef::starts_on_arrival)
+    }
+
+    fn continuation(&self, scene: &str) -> bool {
+        self.extended_save && self.def(scene).is_some_and(|def| {
+            def.id == fmv_ff7::script::scene::BRIDGE_SCENE_ID || def.id == fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID
+        })
+    }
+
+    fn evaluate_continuation(&self, scene: &str, original_progress: &[u8], seed: u32, original_gil: u32,
+        replay: Option<&fmv_protocol::SceneReplay>) -> Option<crate::world::SceneBoundary> {
+        self.continuation_boundary(scene, original_progress, seed, original_gil, replay, None)
+    }
+
+    fn initial_continuation(&self, scene: &str, progress: &[u8], seed: u32, gil: u32,
+        origin: Option<fmv_protocol::SceneOrigin>) -> Option<crate::world::SceneBoundary> {
+        self.continuation_boundary(scene, progress, seed, gil, None, origin)
+    }
+
+    fn line_scene(&self, field: &str, progress: &[u8], from: Pos, to: Pos) -> Option<String> {
+        self.defs.iter().find(|def| {
+            if !def.field.eq_ignore_ascii_case(field) || !self.offered(&def.id, progress) || !self.continuation(&def.id) {
+                return false;
+            }
+            let Some(line) = def.line_trigger() else { return false };
+            let pos = |p: [i16; 3]| Pos::new(f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+            fmv_adapter_api::StoryPoint { id: 0, label: String::new(),
+                trigger: fmv_adapter_api::StoryTrigger::Line(pos(line.a), pos(line.b)) }.is_hit_by(from, to)
+        }).map(|def| def.id.clone())
     }
 
     fn point_scene(&self, field: &str, before: &[u8], after: &[u8]) -> Option<String> {
@@ -318,6 +372,25 @@ mod tests {
         }
         outcome.resources.unknown_gil = true;
         assert!(!complete_outcome(&outcome), "unknown gil cannot choose even a preview branch");
+    }
+
+    #[test]
+    fn battle_segments_require_known_state_and_cannot_discard_a_restore() {
+        let mut outcome = Outcome { end: End::Battle, windows: 2, writes: Writes::default(), jump: None,
+            setup_stats: Stats::default(), questions: 1, unknown_persistent_reads: Default::default(),
+            party: Vec::new(), resources: Default::default(), stats: Stats::default() };
+        assert!(!complete_outcome(&outcome), "a battle is not a completed scene");
+        assert!(safe_segment(&outcome, false), "a completely evaluated battle can be checkpointed");
+        outcome.unknown_persistent_reads.insert((3, 66));
+        assert!(!safe_segment(&outcome, false), "a guessed branch cannot start a durable fight");
+        outcome.unknown_persistent_reads.clear();
+        for op in ["HMPMAX1", "HPu", "STITM", "GOLDd"] {
+            outcome.stats.ignored.insert(op, 1);
+            assert!(!safe_segment(&outcome, false), "continuation cannot discard {op}");
+            outcome.stats.ignored.clear();
+        }
+        outcome.setup_stats.setup_incomplete = true;
+        assert!(!safe_segment(&outcome, false), "all stage setup must also finish");
     }
 
     #[test]

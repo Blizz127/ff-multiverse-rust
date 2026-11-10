@@ -130,6 +130,18 @@ impl Offscreen {
         out
     }
 
+    /// The window's follow-camera path, including its authored field-range mask before effects
+    /// and again before native UI. Overview shots use [`Offscreen::render_field`] instead.
+    pub fn render_field_clipped(
+        &mut self, w: u32, h: u32, scene: &Scene<'_>, avatars: Option<&crate::avatar::AvatarFrame>,
+        overlay: &DrawList, range: Option<fmv_adapter_api::Bounds>,
+    ) -> Vec<u8> {
+        self.render_with(w, h, |gpu, target, srgb| {
+            gpu.draw_field_clipped(target, (w, h), scene, avatars, srgb, range);
+            gpu.draw_overlay(target, &overlay.vertices(w, h, srgb));
+        })
+    }
+
     /// Draw with `draw` (given the GPU, a `w` x `h` target and whether it is sRGB) and read the
     /// target back: tightly packed RGBA8, top row first.
     pub fn render_with(&mut self, w: u32, h: u32, draw: impl FnOnce(&mut Gpu, &wgpu::TextureView, bool)) -> Vec<u8> {

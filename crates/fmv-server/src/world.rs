@@ -125,7 +125,7 @@ pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
-pub use scene::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
+pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -277,6 +277,10 @@ pub struct NewPlayer {
     /// The character it fights as (its combat slot) and what the store holds of its character progress (see
     /// `progress`; unrelated to `progression`).
     pub progress: ProgressSeed,
+    /// The exact paired record loaded with this account's authentication snapshot.
+    pub scene_state: Option<fmv_persist::SceneState>,
+    /// The coherent durable continuation cohort (owner first), or the account's inactive singleton.
+    pub scene_group: Vec<fmv_persist::SceneState>,
     pub tx: OutboundTx,
     pub close: CloseFlag,
 }
@@ -451,6 +455,12 @@ impl World {
         self.by_account.contains_key(&account) || self.scene_save_pending(account)
     }
 
+    /// Whether this account has a connected player. A durable reservation alone is recoverable
+    /// and must reach the final admission checks instead of being mistaken for a second session.
+    pub fn has_session(&self, account: AccountId) -> bool {
+        self.by_account.contains_key(&account)
+    }
+
     /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` and
     /// then the `InstancePlacement` to the joiner (always the first things in its queue after the
     /// handshake replies) and `PlayerJoined` to everyone else. The movement budget starts empty.
@@ -466,15 +476,29 @@ impl World {
         if self.scenes.storage_failed { return Err(JoinError::StorageUnavailable); }
         // Checked here, under the world lock, because two handshakes with the same token can both
         // pass authentication.
-        if self.is_online(new.account) {
+        let recovering = new.scene_state.as_ref().is_some_and(|state| state.checkpoint.is_some() || state.reservation.is_some());
+        if self.has_session(new.account) || (!recovering && self.scene_save_pending(new.account)) {
             return Err(JoinError::AlreadyOnline);
+        }
+        // Authentication supplies one coherent pair and its cohort. Do not admit a mixture of
+        // that pair and a separately loaded story/resource seed, or a detached reservation.
+        match &new.scene_state {
+            Some(state) if state.pair.story.account_id == new.account
+                && state.pair.story.game == self.home_game()
+                && (if recovering { state.pair.story.blob.clone() }
+                    else { crate::accounts::kept_progression(state.pair.story.blob.clone()) }) == new.progression
+                && state.pair.character.as_ref().map(Progress::from_record) == new.progress.stored
+                && state.pair.character.as_ref().and_then(|record| record.inventory.clone()) == new.progress.inventory
+                && new.scene_group.iter().filter(|member| member.pair.story.account_id == new.account).eq(std::iter::once(state)) => {}
+            None if new.scene_group.is_empty() => {}
+            _ => return Err(JoinError::ProgressChanged),
         }
         // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
         // one the server was told to give new accounts. Queue that baseline before admission so every later scene
         // transaction checks the same predecessor after this FIFO write. This is queued, not acknowledged durable at
         // join; if it cannot be saved, the later exact scene precondition fails without publishing its result.
         let mut new = new;
-        if new.progression.is_empty() {
+        if !recovering && new.progression.is_empty() {
             if let Some(story) = self.scenes.debug_new_story.clone() {
                 if self.saver.as_ref().is_some_and(|saver| !saver.save_story(new.account, story.clone())) {
                     return Err(JoinError::StorageUnavailable);
@@ -486,13 +510,14 @@ impl World {
         // Everyone joins the entry area, which is always loaded: on the spot it saved there (see `resume`), else on a
         // spawn point.
         let home = self.home.clone();
-        let saved_home = self.resume_home_spot(new.account, &new.progression);
+        let saved_home = if recovering { None } else { self.resume_home_spot(new.account, &new.progression) };
         let pos = match saved_home {
             Some((spot, _)) => spot,
             None => self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point),
         };
         let entity = new.entity;
         let account = new.account;
+        let recovery_group = new.scene_group;
         // Only a server that runs battles has characters to level and items to carry (see `progress`,
         // `inventory`).
         let progress = self.battle.as_ref().map(|bw| progress::resolve(bw.rules(), &new.progress));
@@ -528,6 +553,17 @@ impl World {
         );
         self.by_account.insert(account, entity);
 
+        // Validate and hold a restored continuation before any entry script can mutate its
+        // durable predecessor. Replay/travel messages wait until the initial area snapshot.
+        if recovering {
+            if let Err(error) = self.restore_continuation(entity, recovery_group, now) {
+                let mut failed = Vec::new();
+                self.remove_player(entity, &mut failed);
+                self.drop_failed(failed);
+                return Err(error);
+            }
+        }
+
         // The snapshot to the joiner (its instance's entities), `PlayerJoined` to the others of that
         // instance, then the joiner's first placement (a solo player is placed by its own phase),
         // third, where its character stands and, fourth, what it carries. An account whose story is not a
@@ -542,8 +578,9 @@ impl World {
         }
         self.drop_failed(failed);
         // Back to the spot it saved (see `resume`); else a story that a scene took somewhere no walk leads back from
-        // stands there again (`scene::SceneHost::entry`).
-        self.enter_at_saved_spot_or_story(entity, now);
+        // stands there again (`scene::SceneHost::entry`). A login that recovers an unfinished scene is placed by that
+        // scene's continuation instead, never by either.
+        if recovering { self.resume_track(entity) } else { self.enter_at_saved_spot_or_story(entity, now) }
         Ok(pos)
     }
 
@@ -627,23 +664,32 @@ impl World {
 
         match chord {
             Chord::Clear(accepted) => {
-                if let Some(exit) = self.open_exit(entity, crossed) {
-                    // `from` is where a refused transfer puts the player back (on the near side
-                    // of the line, so that crossing again is a new crossing).
-                    if self.start_travel(entity, &exit, from, facing, now) {
-                        return MoveOutcome::Applied;
-                    }
-                    // The target is unusable and its exit is now closed: the move is an ordinary one.
-                }
                 let Some(p) = self.players.get_mut(&entity) else {
                     return MoveOutcome::Gone;
                 };
+                let from_facing = p.snapshot.facing;
                 let changed = accepted != from || facing != p.snapshot.facing || anim != p.snapshot.anim;
                 p.snapshot.pos = accepted;
                 p.snapshot.facing = facing;
                 p.snapshot.anim = anim;
                 p.budget.tokens -= dist;
                 p.dirty |= changed;
+                // An original scripted line owns its accepted crossing before exits, story
+                // points, local links or random encounters can act on the same move.
+                if self.check_scene_line(entity, from, accepted, now) {
+                    return MoveOutcome::Applied;
+                }
+                if let Some(exit) = self.open_exit(entity, crossed) {
+                    // A refused transfer returns to the near side of the line, with the
+                    // facing from before this move, just as it did before scene line handling.
+                    if self.start_travel(entity, &exit, from, facing, now) {
+                        if let Some(transit) = self.players.get_mut(&entity).and_then(|p| p.transit.as_mut()) {
+                            transit.from_facing = from_facing;
+                        }
+                        return MoveOutcome::Applied;
+                    }
+                    // The target is unusable and its exit is now closed: the move is ordinary.
+                }
                 // Reaching a story point is what advances the story (a no-op in an area without any).
                 self.check_story(entity, from, accepted, now);
                 // Walking up to a line that no key fires may put the player somewhere else in the area.
@@ -944,7 +990,7 @@ mod tests {
         let close_rx = close.subscribe();
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now)
             .expect("a fresh account joins");
         Seat { entity, rx, close: close_rx }
     }
@@ -1441,6 +1487,8 @@ mod tests {
             avatar,
             progression: phase.to_vec(),
             progress: Default::default(),
+            scene_state: None,
+            scene_group: Vec::new(),
             tx,
             close,
         };
@@ -1508,7 +1556,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: "A again".into(), tint: [0; 3], appearance_ref: None };
-        let dup = NewPlayer { session, entity, account: acct(&a), avatar, progression: Vec::new(), progress: Default::default(), tx, close };
+        let dup = NewPlayer { session, entity, account: acct(&a), avatar, progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close };
         assert_eq!(w.join(dup, t0).unwrap_err(), JoinError::AlreadyOnline);
         assert_eq!(w.player_count(), 1);
         assert!(w.snapshot_of(entity).is_none());
@@ -1526,10 +1574,73 @@ mod tests {
             avatar: AvatarAppearance { display_name: "A".into(), tint: [0; 3], appearance_ref: None },
             progression: Vec::new(),
             progress: Default::default(),
+            scene_state: None,
+            scene_group: Vec::new(),
             tx,
             close,
         };
         assert!(w.join(again, t0).is_ok());
+    }
+
+    #[test]
+    fn admission_rejects_a_detached_or_mixed_storage_snapshot_before_publishing() {
+        for malformed in 0..5 {
+            let mut w = world();
+            let now = Instant::now();
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let state = fmv_persist::SceneState {
+                pair: fmv_persist::ProgressPair {
+                    story: fmv_persist::Progression::empty(account, w.home_game()), character: None,
+                },
+                checkpoint: None, reservation: None,
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let mut new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "snapshot".into(), tint: [0; 3], appearance_ref: None },
+                progression: Vec::new(), progress: Default::default(),
+                scene_state: Some(state.clone()), scene_group: vec![state],
+                tx, close: Arc::new(watch::channel(false).0),
+            };
+            match malformed {
+                0 => new.scene_group.clear(),
+                1 => new.scene_group.push(new.scene_group[0].clone()),
+                2 => new.progression.push(1),
+                3 => new.progress.inventory = Some(vec![]),
+                _ => new.scene_state = None,
+            }
+            assert_eq!(w.join(new, now), Err(JoinError::ProgressChanged));
+            assert_eq!(w.player_count(), 0);
+            assert!(!w.has_session(account));
+            assert!(rx.try_recv().is_err(), "no area state may escape before snapshot validation");
+        }
+    }
+
+    #[test]
+    fn a_coherent_inactive_storage_snapshot_uses_normal_admission() {
+        for stored_story in [Vec::new(), vec![7; crate::accounts::MAX_PROGRESSION_BYTES + 1]] {
+            let mut w = world();
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let state = fmv_persist::SceneState {
+                pair: fmv_persist::ProgressPair {
+                    story: fmv_persist::Progression::new(account, w.home_game(), stored_story.clone(), 0), character: None,
+                },
+                checkpoint: None, reservation: None,
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "snapshot".into(), tint: [0; 3], appearance_ref: None },
+                progression: crate::accounts::kept_progression(stored_story), progress: Default::default(),
+                scene_state: Some(state.clone()), scene_group: vec![state],
+                tx, close: Arc::new(watch::channel(false).0),
+            };
+            assert!(w.join(new, Instant::now()).is_ok());
+            assert!(w.has_session(account));
+            assert!(matches!(&*rx.try_recv().unwrap(), ServerMsg::AreaSnapshot { .. }));
+        }
     }
 
     #[test]

@@ -44,6 +44,125 @@ pub enum SceneError {
     InvalidAnswer { question: usize, answer: usize, first: usize, last: usize },
     #[error("the scene ended with {remaining} unused answers")]
     TrailingAnswers { remaining: usize },
+    #[error("the replay window acknowledgement does not match the pending window or its choices")]
+    WindowBoundary,
+    #[error("strict replay cannot follow unchecked preview advancement")]
+    UncheckedReplay,
+    #[error("the replay source or interpreter version differs")]
+    ReplayIdentity,
+    #[error("the transcript does not end at the expected boundary")]
+    ReplayBoundary,
+    #[error("the battle resume lacks an authoritative extended story or resource snapshot")]
+    BattleResources,
+    #[error("the authored battle mode is not supported for durable continuation")]
+    BattleMode,
+    #[error("the script defaulted a setup or malformed question instead of receiving an accepted answer")]
+    ImplicitAnswer,
+    #[error("a required scene window cannot be decoded")]
+    WindowData,
+    #[error("the accepted scene trigger position cannot be represented on this field's floor")]
+    SceneOrigin,
+}
+
+/// Replay semantics version. Change this when the interpreter's durable replay contract changes.
+pub const REPLAY_VERSION: u32 = 1;
+
+/// The exact authored instruction at which this run stopped for combat. Ordinals distinguish
+/// repeated executions of the same instruction, including repeated formations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BattleCheckpoint {
+    pub ordinal: u32,
+    pub entity: u8,
+    pub instruction_offset: u32,
+    pub formation: u16,
+    /// The last authored BTLMD flags; absent means no mode was established by this scene.
+    pub flags: Option<u16>,
+}
+
+impl BattleCheckpoint {
+    /// Canonical opaque key shared by host and client. No decoder is needed: compare with the
+    /// boundary reconstructed from trusted script data. Includes a kind and encoding version.
+    pub fn identity_bytes(&self) -> Vec<u8> {
+        let mut out = vec![1, 2];
+        out.extend(self.ordinal.to_le_bytes()); out.push(self.entity);
+        out.extend(self.instruction_offset.to_le_bytes()); out.extend(self.formation.to_le_bytes());
+        out.push(u8::from(self.flags.is_some()));
+        if let Some(flags) = self.flags { out.extend(flags.to_le_bytes()); }
+        out
+    }
+}
+
+/// Every presented window has an identity, including non-question windows and interpreter notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowCheckpoint {
+    pub ordinal: u32,
+    pub entity: u8,
+    pub instruction_offset: Option<u32>,
+    pub window: u8,
+    pub dialog: Option<u16>,
+    pub choices: Option<[u8; 2]>,
+}
+
+impl WindowCheckpoint {
+    pub fn identity_bytes(&self) -> Vec<u8> {
+        let mut out = vec![1, 1];
+        out.extend(self.ordinal.to_le_bytes()); out.push(self.entity);
+        out.push(u8::from(self.instruction_offset.is_some()));
+        if let Some(offset) = self.instruction_offset { out.extend(offset.to_le_bytes()); }
+        out.push(self.window); out.push(u8::from(self.dialog.is_some()));
+        if let Some(dialog) = self.dialog { out.extend(dialog.to_le_bytes()); }
+        out.push(u8::from(self.choices.is_some()));
+        if let Some(choices) = self.choices { out.extend(choices); }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowAck {
+    pub checkpoint: WindowCheckpoint,
+    /// Required for an ASK, forbidden for every other window. Absolute authored choice line.
+    pub answer: Option<u8>,
+}
+
+/// Only victorious continuation is currently supported. The host must establish the real result;
+/// an escaped or defeated battle cannot manufacture a successful continuation with this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BattleResolution { Victory }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BattleResume {
+    pub checkpoint: BattleCheckpoint,
+    pub resolution: BattleResolution,
+    /// Authoritative afterimage including the committed segment and the battle's rewards.
+    pub story: StoryState,
+    pub resources: SceneResources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SceneInput { Window(WindowAck), Battle(BattleResume) }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneBoundary { Window(WindowCheckpoint), Battle(BattleCheckpoint), End(End) }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayIdentity {
+    pub version: u32,
+    pub fingerprint: [u8; 32],
+    pub seed: u32,
+}
+
+/// A boundary's current segment effects. Stats and unknown reads remain cumulative so a later
+/// battle cannot erase an unsafe prefix. Persistent and economic writes rebase after each battle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneSnapshot {
+    pub boundary: SceneBoundary,
+    pub writes: Writes,
+    pub resources: ResourceOutcome,
+    pub party: Vec<PartyOp>,
+    pub jump: Option<super::vm::SceneJump>,
+    pub setup_stats: Stats,
+    pub stats: Stats,
+    pub unknown_persistent_reads: BTreeSet<(u8, u8)>,
 }
 
 /// What a scene's script wrote that the story can carry.
@@ -275,6 +394,10 @@ pub struct ScenePlay {
     off_cast: u32,
     story: StoryState,
     ended: Option<End>,
+    seed: u32,
+    unchecked: bool,
+    strict: bool,
+    transcript: Vec<SceneInput>,
 }
 
 impl std::fmt::Debug for ScenePlay {
@@ -355,7 +478,7 @@ impl ScenePlay {
         let heights = initial.iter().filter_map(|event| match *event {
             Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
         }).collect();
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None })
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None, seed, unchecked: false, strict: false, transcript: Vec::new() })
     }
 
     fn animation_clips(field: &FieldFile, script: &FieldScript<'_>, cast: &[CastMember]) -> BTreeMap<u8, Vec<String>> {
@@ -463,6 +586,11 @@ impl ScenePlay {
     /// absolute line number of the choice (the beat's `message.choice` has the range); anything else is clamped into the
     /// choices and `None` takes the cursor's starting line.
     pub fn next(&mut self, answer: Option<usize>) -> Beat {
+        self.unchecked = true;
+        self.advance(answer)
+    }
+
+    fn advance(&mut self, answer: Option<usize>) -> Beat {
         let Ok(script) = FieldScript::parse(&self.section) else {
             self.ended = Some(End::Broken);
             return Beat { stage: Vec::new(), then: Then::End { at: 0, how: End::Broken } };
@@ -474,6 +602,72 @@ impl ScenePlay {
             self.ended = Some(*how);
         }
         beat
+    }
+
+    /// Advance only after acknowledging the exact window previously handed out. At the start
+    /// or immediately after a checked battle resume, pass None. Validation never mutates the VM.
+    pub fn next_strict(&mut self, ack: Option<WindowAck>) -> Result<Beat, SceneError> {
+        if self.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
+        if self.vm.has_invalid_message() { return Err(SceneError::WindowData); }
+        if self.unchecked || self.def.resume_after_battle.is_some() { return Err(SceneError::UncheckedReplay); }
+        match (self.boundary(), ack) {
+            (Some(SceneBoundary::Window(expected)), Some(ack)) if expected == ack.checkpoint => {
+                match (expected.choices, ack.answer) {
+                    (Some([first, last]), Some(answer)) if (first..=last).contains(&answer) => {},
+                    (None, None) => {},
+                    _ => return Err(SceneError::WindowBoundary),
+                }
+                self.vm.accept_window(ack.answer);
+                self.transcript.push(SceneInput::Window(ack));
+            }
+            (None, None) => {},
+            _ => return Err(SceneError::WindowBoundary),
+        }
+        self.strict = true;
+        let beat = self.advance(None);
+        if self.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
+        if self.vm.has_invalid_message() { return Err(SceneError::WindowData); }
+        Ok(beat)
+    }
+
+    pub fn boundary(&self) -> Option<SceneBoundary> { self.vm.boundary() }
+
+    pub fn replay_identity(&self) -> ReplayIdentity {
+        ReplayIdentity { version: REPLAY_VERSION, fingerprint: super::replay_identity::fingerprint(&self.section, &self.def), seed: self.seed }
+    }
+
+    pub fn transcript(&self) -> &[SceneInput] { &self.transcript }
+
+    pub fn snapshot(&self) -> Option<SceneSnapshot> {
+        Some(SceneSnapshot {
+            boundary: self.boundary()?, writes: self.writes(), resources: self.resources().clone(),
+            party: self.vm.party_ops().to_vec(), jump: self.vm.destination(), setup_stats: self.setup.clone(),
+            stats: self.vm.stats().clone(), unknown_persistent_reads: self.vm.vars().unknown_persistent_reads(),
+        })
+    }
+
+    /// Resume once at the exact pending instruction. No scheduler, scratch, or RNG state is reset.
+    /// Only authored mode 8 (no escape, ordinary defeat is game over) is currently supported.
+    /// This policy follows the [original PSX battle setup] and [field return handler]; the owned
+    /// PC bridge's mode 8 is measured, but original PC battle-return byte parity is not claimed.
+    ///
+    /// [original PSX battle setup]: https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/battle/batini.c#L1083
+    /// [field return handler]: https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/main/110B8.c#L365
+    ///
+    /// The caller must first commit the segment and verify an actual victorious battle, then supply
+    /// its authoritative afterimage. This method itself performs no persistence or combat.
+    pub fn resume_battle_checked(&mut self, resume: BattleResume) -> Result<(), SceneError> {
+        if self.unchecked || !self.strict { return Err(SceneError::UncheckedReplay); }
+        if self.boundary() != Some(SceneBoundary::Battle(resume.checkpoint)) { return Err(SceneError::BattleBoundary); }
+        if resume.checkpoint.flags != Some(8) { return Err(SceneError::BattleMode); }
+        if !self.story.supports_extended() || !resume.story.supports_extended() || resume.resources.gil.is_none() {
+            return Err(SceneError::BattleResources);
+        }
+        self.vm.resume_battle(&resume.story, resume.resources);
+        self.story = resume.story.clone();
+        self.ended = None;
+        self.transcript.push(SceneInput::Battle(resume));
+        Ok(())
     }
 
     /// Keep what concerns the cast, give every place its height, name the speaker of a window.
@@ -558,6 +752,65 @@ impl ScenePlay {
     }
 }
 
+/// Bind the bridge's initially unplaced Cloud to the accepted crossing position. Both the
+/// host and client call this before constructing the VM and its source fingerprint. This does
+/// not verify that a crossing occurred: the authoritative world owns that movement test.
+/// An explicit triangle hint must be valid; without one the nearest containing floor is used.
+/// Other scenes do not accept a trigger-origin override.
+pub fn with_trigger_position(field: &FieldFile, def: &SceneDef, pos: fmv_core::Pos, facing: f32, triangle: Option<u32>) -> Result<SceneDef, SceneError> {
+    if def.id != super::data::BRIDGE_SCENE_ID || !pos.is_finite() || !facing.is_finite() { return Err(SceneError::SceneOrigin); }
+    let [x, y] = [pos.x.round(), pos.y.round()];
+    if [x, y].into_iter().any(|n| n < f32::from(i16::MIN) || n > f32::from(i16::MAX)) { return Err(SceneError::SceneOrigin); }
+    let (x, y) = (x as i16, y as i16);
+    let mesh = field.walkmesh().map_err(|e| SceneError::Walkmesh(e.to_string()))?;
+    let height = |tri: &[Vertex; 3]| triangle_contains_xy(tri, i32::from(x), i32::from(y))
+        .then(|| triangle_height_at(tri, i32::from(x), i32::from(y))).flatten();
+    let triangle = match triangle {
+        Some(index) => {
+            let index = u16::try_from(index).map_err(|_| SceneError::SceneOrigin)?;
+            mesh.triangles.get(usize::from(index)).and_then(height).ok_or(SceneError::SceneOrigin)?;
+            index
+        }
+        None => mesh.triangles.iter().enumerate().filter_map(|(index, tri)| {
+            Some((u16::try_from(index).ok()?, (height(tri)? - f64::from(pos.z)).abs()))
+        }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(index, _)| index).ok_or(SceneError::SceneOrigin)?,
+    };
+    let mut bound = def.clone();
+    let cloud = bound.cast.iter_mut().find(|member| member.entity == 1).ok_or(SceneError::SceneOrigin)?;
+    // Bound the angle before the older converter's float-to-integer step, including huge but
+    // finite protocol headings. Server and client use the same quantized turn.
+    let facing = facing.rem_euclid(std::f32::consts::TAU);
+    cloud.start = Some(Spot { x, y, triangle, direction: crate::facing_to_field_direction(facing) });
+    Ok(bound)
+}
+
+/// Reconstruct to the first unacknowledged window, combat instruction, or terminal boundary.
+/// Every supplied record must consume the exact next boundary. No choices are defaulted and no
+/// battle is skipped by formation alone. Callers bind initial story/resources and seed durably.
+pub fn replay_scene(field: &FieldFile, def: &SceneDef, story: &StoryState, resources: SceneResources, identity: ReplayIdentity, transcript: &[SceneInput]) -> Result<ScenePlay, SceneError> {
+    let mut play = ScenePlay::with_resources(field, def, story, identity.seed, resources)?;
+    if play.replay_identity() != identity { return Err(SceneError::ReplayIdentity); }
+    play.next_strict(None)?;
+    for input in transcript {
+        match input {
+            SceneInput::Window(ack) => { play.next_strict(Some(*ack))?; }
+            SceneInput::Battle(resume) => {
+                play.resume_battle_checked(resume.clone())?;
+                play.next_strict(None)?;
+            }
+        }
+    }
+    Ok(play)
+}
+
+/// As [`replay_scene`], additionally requiring the exact recorded endpoint. A truncated transcript
+/// cannot silently reconstruct an earlier valid window when a later boundary was committed.
+pub fn replay_scene_to(field: &FieldFile, def: &SceneDef, story: &StoryState, resources: SceneResources, identity: ReplayIdentity, transcript: &[SceneInput], target: SceneBoundary) -> Result<ScenePlay, SceneError> {
+    let play = replay_scene(field, def, story, resources, identity, transcript)?;
+    if play.boundary() != Some(target) { return Err(SceneError::ReplayBoundary); }
+    Ok(play)
+}
+
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
         Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
@@ -603,6 +856,8 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize], strict: bool) -> Result<Ou
     let (mut windows, mut questions) = (0usize, 0usize);
     let end = loop {
         let beat = play.next(given.take());
+        if strict && play.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
+        if strict && play.vm.has_invalid_message() { return Err(SceneError::WindowData); }
         match beat.then {
             Then::End { how, .. } => break how,
             Then::Window(w) => {

@@ -214,7 +214,7 @@ mod tests {
         let close = Arc::new(watch::channel(false).0);
         let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
         let account = AccountId(entity.0);
-        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), tx, close }, now).expect("joins");
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now).expect("joins");
         Seat { entity, rx }
     }
 

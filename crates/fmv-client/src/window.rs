@@ -420,6 +420,8 @@ enum KeyRoute {
     Camera,
     /// F3: optional scene edge smoothing.
     AntiAliasing,
+    /// F4: native resolution or optional 2x scene rendering.
+    RenderScale,
     Party(PartyKey),
     Audio(AudioKey),
     Battle(BattleKey),
@@ -447,6 +449,9 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     }
     if code == KeyCode::F3 {
         return if pressed && !repeat { KeyRoute::AntiAliasing } else { KeyRoute::Ignored };
+    }
+    if code == KeyCode::F4 {
+        return if pressed && !repeat { KeyRoute::RenderScale } else { KeyRoute::Ignored };
     }
     // In a battle a fresh press of Tab, or of Y (a controller's Y is FF7's Triangle), swaps the menu to the next ready member of
     // the party the player commands: FF7's own "switch". Outside a battle Y accepts an invite as ever and Tab is no key of the
@@ -566,7 +571,7 @@ pub(crate) struct App {
     /// Until when a first Escape press in the field keeps quitting armed (see [`escape_action`]).
     quit_armed_until: Option<Instant>,
     /// A short notice drawn over the frame, and when it goes away.
-    notice: Option<(&'static str, Instant)>,
+    notice: Option<(String, Instant)>,
     /// What the device asks of the window (full screen). The window is only created here on the
     /// command-line path; behind the character menu it was made by the menu, with the same value.
     device: DeviceMode,
@@ -660,7 +665,7 @@ impl App {
             }
             SceneRoute::Preview => {
                 eprintln!("scene: asking the server for a preview of the first scene");
-                self.notice = Some(("Asking the server for a scene preview", Instant::now() + NOTICE_TIME));
+                self.notice = Some(("Asking the server for a scene preview".to_string(), Instant::now() + NOTICE_TIME));
                 return;
             }
             SceneRoute::Press(npc) => {
@@ -693,11 +698,17 @@ impl App {
                     CameraMode::Follow => "Camera: follows you, as in FF7 (F2: the whole field)",
                     CameraMode::Whole => "Camera: the whole field (F2: follow you, as in FF7)",
                 };
-                self.notice = Some((text, Instant::now() + NOTICE_TIME));
+                self.notice = Some((text.to_string(), Instant::now() + NOTICE_TIME));
             }
             KeyRoute::AntiAliasing => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     let text = renderer.toggle_anti_aliasing();
+                    self.notice = Some((text.to_string(), Instant::now() + NOTICE_TIME));
+                }
+            }
+            KeyRoute::RenderScale => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let text = renderer.toggle_render_scale();
                     self.notice = Some((text, Instant::now() + NOTICE_TIME));
                 }
             }
@@ -737,19 +748,19 @@ impl App {
                     InputSource::Keyboard => eprintln!("battle: Esc does not quit during a battle (close the window to quit)"),
                     InputSource::Pad => eprintln!("battle: Start does not quit during a battle"),
                 }
-                self.notice = escape_notice(EscapeAction::IgnoreInBattle, source).map(|text| (text, now + NOTICE_TIME));
+                self.notice = escape_notice(EscapeAction::IgnoreInBattle, source).map(|text| (text.to_string(), now + NOTICE_TIME));
             }
             EscapeRoute::Action(EscapeAction::Arm) => {
                 self.quit_armed_until = Some(now + QUIT_CONFIRM);
-                self.notice = escape_notice(EscapeAction::Arm, source).map(|text| (text, now + QUIT_CONFIRM));
+                self.notice = escape_notice(EscapeAction::Arm, source).map(|text| (text.to_string(), now + QUIT_CONFIRM));
             }
             EscapeRoute::Action(EscapeAction::Quit) => self.quit(el),
         }
     }
 
     /// The notice to draw now, if one is up.
-    fn current_notice(&self) -> Option<&'static str> {
-        self.notice.filter(|(_, until)| Instant::now() < *until).map(|(text, _)| text)
+    fn current_notice(&self) -> Option<&str> {
+        self.notice.as_ref().filter(|(_, until)| Instant::now() < *until).map(|(text, _)| text.as_str())
     }
 
     /// Where the views of later areas come from: when the server moves the player to another
@@ -852,7 +863,7 @@ impl App {
             AudioKey::VolumeUp => self.audio.change_volume(true).map(|_| "Volume up"),
         };
         let text = said.unwrap_or("This run has no sound (see --help, SOUND)");
-        self.notice = Some((text, Instant::now() + NOTICE_TIME));
+        self.notice = Some((text.to_string(), Instant::now() + NOTICE_TIME));
     }
 
     /// A battle key was pressed: send the request it stands for, play the menu sound it made, and say what
@@ -913,7 +924,7 @@ impl App {
     fn scene_notice(&mut self) {
         if let Some(reason) = self.session.state.scene.take_refusal() {
             eprintln!("scene: the server refused it ({reason:?})");
-            self.notice = Some((refusal_notice(reason), Instant::now() + NOTICE_TIME));
+            self.notice = Some((refusal_notice(reason).to_string(), Instant::now() + NOTICE_TIME));
         }
     }
 
@@ -937,7 +948,8 @@ impl App {
         }
         // A story scene: its clock, what it owes the server, what it has to say. A new one lets go of the keys held when it
         // began (their releases may be swallowed) and closes a talk (the server holds the player).
-        self.session.state.scene.advance(dt);
+        let scene_visible = !self.session.state.battle.in_battle() && !self.session.state.battle.lingering(self.session.now());
+        self.session.state.scene.advance_visible(dt, scene_visible);
         self.session.flush_scene();
         self.session.log_scene_notes();
         self.scene_notice();
@@ -981,7 +993,7 @@ impl App {
     }
 
     fn redraw(&mut self, el: &ActiveEventLoop) {
-        let notice = self.current_notice();
+        let notice = self.current_notice().map(str::to_owned);
         let Some(renderer) = self.renderer.as_mut() else { return };
         let now = self.session.now();
         let render_t = render_time(now);
@@ -1004,7 +1016,7 @@ impl App {
             if drawn.is_none() {
                 draw_battle_text(&battle, vw, vh, &mut overlay);
             }
-            if let Some(text) = notice {
+            if let Some(text) = notice.as_deref() {
                 draw_notice(text, vw, vh, &mut overlay);
             }
             let result = match drawn {
@@ -1046,7 +1058,8 @@ impl App {
         // (a scene's trigger is not drawn while its scene runs, and is not named either)
         let story = state.scene.player();
         let anchor = |subject: Subject, at: Pos| {
-            if scene::label_hidden(story, subject, state.npc_views()) {
+            if scene::label_hidden(story, subject, state.npc_views())
+                || scene::participant_label_hidden(story, state.self_entity(), subject) {
                 None
             } else {
                 label_anchor(built.as_ref(), view, draw.own_who, subject, at)
@@ -1061,10 +1074,10 @@ impl App {
             let spot = scene::speaker_spot(story, built.as_ref(), view, vw, vh);
             story.draw(vw, vh, now, spot.as_ref(), &mut overlay);
         }
-        if let Some(text) = notice {
+        if let Some(text) = notice.as_deref() {
             draw_notice(text, vw, vh, &mut overlay);
         }
-        let result = renderer.render_layers(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay));
+        let result = renderer.render_layers_clipped(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay), self.camera.clip_range(view.range));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {
             (FrameResult::Fatal(msg), _) => self.fail(el, msg),
@@ -1177,6 +1190,9 @@ pub(crate) fn field_draw(
     });
     if let Some(story) = story {
         scene::place_witnesses(&mut players, story);
+        // Apply visibility before both model and fallback-marker construction. Cast ids occupy
+        // their own namespace; only actual participants named by the scene can be hidden.
+        players.retain(|p| !story.hides_participant(fmv_core::EntityId(p.who.0)));
     }
     let own_at = players.iter().find(|p| p.own).and_then(|p| view.to_view(p.pos));
     let built = match (avatars, view.stage.as_ref()) {
@@ -1546,6 +1562,11 @@ mod tests {
         assert_eq!(route_key(KeyCode::F3, true, false, true), KeyRoute::AntiAliasing);
         assert_eq!(route_key(KeyCode::F3, true, true, false), KeyRoute::Ignored);
         assert_eq!(route_key(KeyCode::F3, false, false, false), KeyRoute::Ignored);
+        for in_battle in [false, true] {
+            assert_eq!(route_key(KeyCode::F4, true, false, in_battle), KeyRoute::RenderScale);
+            assert_eq!(route_key(KeyCode::F4, true, true, in_battle), KeyRoute::Ignored, "holding F4 toggles only once");
+            assert_eq!(route_key(KeyCode::F4, false, false, in_battle), KeyRoute::Ignored);
+        }
         assert_eq!(route_key(KeyCode::KeyP, true, false, true), KeyRoute::Party(PartyKey::Invite));
         assert_eq!(route_key(KeyCode::Space, true, false, false), KeyRoute::Battle(BattleKey::Confirm));
         assert_eq!(route_key(KeyCode::ShiftLeft, true, false, true), KeyRoute::Movement, "Shift is still tracked");
@@ -1569,6 +1590,8 @@ mod tests {
                 back_attack: false,
                 battle_speed: 0,
                 ticks_per_second: 1000,
+                escape_policy: fmv_protocol::EscapePolicy::Formation,
+                initial_party: None,
                 data_fingerprint: SyntheticRules::FINGERPRINT,
             },
         );

@@ -14,7 +14,7 @@ offered the director scene, whose five answer paths finish at moment 39. Without
 the server does not offer the flower encounter. The original script's purchase path executes
 `GOLDd 1` with saturating subtraction; a zero balance stays zero, as the instruction specifies.
 
-Only this scene's stable identity enables preparation of a legacy story as an extended v3
+The flower's stable identity enables preparation of a legacy story as an extended v3
 snapshot for interpretation. Preparation is temporary: it preserves unknown bits and does not
 write the save. On accepted completion, the server commits the exact story and gil result in
 one durable, once-only transaction against the original stored story and balance. Every path
@@ -50,22 +50,66 @@ entrance, a reviewed depth occlusion. The existing route-camera regression also 
 flower scene. These are offscreen checks on the original owned models; original PC frame timing
 and every mod/body combination are not established.
 
-Validation at this checkpoint: 1,387 client tests, 607 FF7 library tests, 504 server tests,
+Validation at the flower checkpoint: 1,387 client tests, 607 FF7 library tests, 504 server tests,
 231 persistence tests, all 37 owned-data scene tests, the owned flower host checks and the two
 existing owned server preview/gateway regressions passed. All-target clippy completes with two
 previously existing warnings. The implementation status here records no deployment or bulk
 migration of existing saves.
 
-**Still unregistered:** the bridge confrontation and the surveyed cargo train, train,
-Sector 7 station, pillar, Sector 7 intro and early bar continuations. The flower transaction
-does not establish their missing flags, inventory/affection effects, battle continuations or
-presentation. The continuous-route audit below identifies their concrete dependencies.
+**Bridge and cargo arrival are now registered behind `--story-extended-save`.** The stable IDs
+are `ff7/md8brdg/confrontation` and `ff7/cargoin/train-survey` (the cargo name is retained for
+compatibility), appended at registry indices 14 and 15. The bridge starts at its original
+entity-4 line, using the player's accepted crossing position and facing. Strict replay checks
+every window and all three questions against the script fingerprint; all eight answer paths
+select the original subset of formations 328, 329 and 330. The bridge keeps moment 39, then its
+scripted jump starts cargo's 26-window arrival and commits moment 48. Cargo's authored arrival
+`(-24,16)`, triangle 20, replaces the bridge jump's zero placeholder. Moment-48 relogin uses
+that same position with direction 0.
+
+Each battle preparation, settlement and pending landing is durable. The saved replay binds
+the source, accepted dialogue, battle identities, exact setup/seed and frozen participant
+roster. One atomic batch applies costs, rewards and checkpoint changes for the roster before
+play resumes. Guests keep their own story. Recovery handles a prepared fight, a settled
+victory, and the bridge-to-cargo landing independently of the moment-based entry table.
+Defeat retains a Game Over checkpoint and rolls back that attempt's staged costs; Confirm
+retries, while Back disconnects and preserves the checkpoint. Held cohorts cannot mutate
+their party until release. The first batch raises the account-store header fence to 3;
+older binaries refuse to open it. Both ends of the connection require protocol 20.
+
+Consecutive fights carry HP, MP, limits, knockout and persistent Sadness/Fury. Mode 8 forbids
+escape. The actual MP formations and their reachable AI were checked against owned data;
+no unsupported AI instructions were needed. Current HP/MP is preserved through a player
+level-up and companion levels stay fixed for the chain: these are explicit port policies,
+not proven original active-party leveling behavior. Ordinary field health persistence is
+still absent.
+
+All eight bridge paths and the cargo arrival pass owned-data interpreter and offscreen
+presentation checks, with no skipped actor animations or camera misses. The cargo hides
+participant bodies/labels until durable completion, and field geometry is clipped to the
+camera range so guards do not appear in side bars. These checks do not establish movie,
+fade, background-opcode or all audio parity: bridge movie 23/fades and some cargo background
+and sound behavior remain unfinished. No live-store migration or deployment was performed.
+
+Bridge acceptance now includes the real TCP route in `tests/bridge_real.rs`: both the no-fight
+path `[3,1,1]` and all-three-fight path `[2,0,0]` pass, with one actual Potion consumed on the
+latter. It checks carried resources through 328/329/330, the pincer opening, escape refusal,
+restarts before combat, after a victory and at the cargo landing, then all 26 cargo windows
+and byte-identical final relogin without repeated rewards. Separate lifecycle tests cover
+co-op reservations, defeat, acknowledgment races and dropped sessions; persistence recovery
+passes 42 injected crash cases. Final suites pass 552 server tests, 254 persistence tests,
+1,417 client tests and 89 protocol tests (including the owned battle chain). All workspace
+targets compile; clippy retains only the previously existing FF7/client warnings.
+
+**Next route gap:** the cargo door sequence into `tin_1` is separate from the arrival and is
+not yet registered. Passenger-train, Sector 7 station, pillar, Sector 7 intro and early bar
+continuations remain unregistered. Their missing flags, inventory/affection effects and
+presentation still need review. The continuous-route audit below records the authored triggers.
 
 ## Historical survey notes
 
 The following notes preserve earlier checkpoints and their evidence limits. Statements that
-the flower was unregistered, its debit was unimplemented, or the story model could not carry
-these bits describe those checkpoints, not the current implementation above. Older notes on
+the flower, bridge or cargo arrival was unregistered, their continuations were missing, or the
+story model could not carry these bits describe those checkpoints, not the current implementation above. Older notes on
 `md8_4`/`md8_1` likewise predate their registration. The later scenes' unresolved work remains
 open unless explicitly updated in the current status or the dated continuous-route audit.
 

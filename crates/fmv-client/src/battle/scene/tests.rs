@@ -27,6 +27,8 @@ fn member(i: u64, character: u8) -> BattleMember {
 
 fn setup_for(formation: u16, party: usize) -> BattleSetup {
     BattleSetup {
+        initial_party: None,
+        escape_policy: fmv_protocol::EscapePolicy::Formation,
         formation_id: formation,
         seed: 7,
         party: (0..party as u64).map(|i| member(i, i as u8)).collect(),
@@ -615,6 +617,8 @@ fn state_in_battle() -> ClientState {
     s.apply(
         0.0,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(4),
             formation_id: 1,
             seed: 5,
@@ -676,6 +680,8 @@ fn a_solo_player_is_its_own_body_beside_the_canon_pair_whatever_its_stat_curve()
         s.apply(
             0.0,
             ServerMsg::EncounterStart {
+                initial_party: None,
+                escape_policy: fmv_protocol::EscapePolicy::Formation,
                 battle_id: BattleId(9),
                 formation_id: 0,
                 seed: 3,
@@ -716,6 +722,8 @@ fn the_canon_companions_are_the_canon_characters_and_the_players_are_their_own_b
     s.apply(
         0.0,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(4),
             formation_id: 1,
             seed: 5,
@@ -768,6 +776,8 @@ fn a_scene_is_made_for_a_battle_kept_while_it_is_seen_and_rebuilt_for_the_next()
     s.apply(
         4.0,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(5),
             formation_id: 0,
             seed: 1,
@@ -793,6 +803,8 @@ fn a_battle_that_cannot_be_replayed_here_is_drawn_flat() {
     s.apply(
         5.0,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(9),
             formation_id: 1,
             seed: 5,
@@ -1034,6 +1046,8 @@ fn events_are_kept_without_a_replay_and_for_the_battle_that_is_on_only() {
     s.apply(
         2.0,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(6),
             formation_id: 1,
             seed: 5,
@@ -1056,6 +1070,8 @@ fn events_are_kept_without_a_replay_and_for_the_battle_that_is_on_only() {
     s.apply(
         3.5,
         ServerMsg::EncounterStart {
+            initial_party: None,
+            escape_policy: fmv_protocol::EscapePolicy::Formation,
             battle_id: BattleId(7),
             formation_id: 0,
             seed: 1,

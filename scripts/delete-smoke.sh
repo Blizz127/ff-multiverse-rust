@@ -482,7 +482,12 @@ main() {
     case "$rel" in
       accounts/* | avatars/* | characters/* | progression/*)
         after_hash=$(hash_of "$WORK/after-delete.txt" "$rel")
-        if [[ -z $after_hash ]]; then
+        if [[ -z $after_hash && $rel == progression/*.location.json ]]; then
+          # where the character last stood (MMO-style saving) is forgotten by a delete, not kept in the trash
+          if [[ -n $(hash_of "$WORK/after-delete.txt" "trash/${entry_dir##*/}/$rel") ]]; then
+            problem "$rel (a saved spot) was moved into the trash; a delete forgets it"
+          fi
+        elif [[ -z $after_hash ]]; then
           # gone from the live directories: it must be in the trash with the same bytes
           if [[ $(hash_of "$WORK/after-delete.txt" "trash/${entry_dir##*/}/$rel") == "$before_hash" ]]; then
             moved=$((moved + 1))

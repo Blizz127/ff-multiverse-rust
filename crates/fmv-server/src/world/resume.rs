@@ -222,6 +222,12 @@ impl World {
         }
     }
 
+    /// The end of a `join` that a recovering scene places (`continuation`): its spots are saved from now on, but its saved
+    /// spot is not used.
+    pub(super) fn resume_track(&mut self, entity: EntityId) {
+        self.resume.tracked.entry(entity).or_default();
+    }
+
     /// After a travel (`join_area`): the player stands somewhere new; save it now (unless it is the spot already saved,
     /// as at the end of a resume).
     pub(super) fn location_arrived(&mut self, entity: EntityId, now: Instant) {
@@ -239,11 +245,11 @@ impl World {
         }
     }
 
-    /// `player` (already out of `players`) leaves the world: save where it stood.
+    /// `player` (already out of `players`) leaves the world: save where it stood. A player whose `join` never finished
+    /// (it has no tracker: a scene recovery that failed) saves nothing: it stood on a spawn point, not on its spot.
     pub(super) fn location_left(&mut self, entity: EntityId, player: &Player) {
-        let tracker = self.resume.tracked.remove(&entity);
         self.resume.pending.remove(&player.account);
-        let mut tracker = tracker.unwrap_or_default();
+        let Some(mut tracker) = self.resume.tracked.remove(&entity) else { return };
         if let Some(spot) = self.spot_of(player, &mut tracker) {
             if let Some(saver) = &self.resume.saver {
                 saver.save(spot);
@@ -341,7 +347,7 @@ mod tests {
         let account = AccountId(account);
         let avatar = AvatarAppearance { display_name: format!("P{}", account.0), tint: [1, 2, 3], appearance_ref: None };
         w.prepare_resume(account, spot);
-        w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), tx, close }, now)
+        w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now)
             .expect("joins");
         Seat { entity, rx }
     }
@@ -482,6 +488,17 @@ mod tests {
         w.save_locations(now + SAVE_EVERY);
         let saved = spots(&mut rx);
         assert_eq!((saved.len(), saved[0].resumable), (1, false), "{saved:?}");
+    }
+
+    #[test]
+    fn a_player_whose_join_never_finished_saves_nothing_when_removed() {
+        let (mut w, mut rx) = world();
+        let t0 = Instant::now();
+        let s = join(&mut w, 16, &[], None, t0);
+        // As a failed scene recovery removes it: before the end of `join` gave it a tracker.
+        w.resume.tracked.remove(&s.entity);
+        assert!(w.leave(s.entity));
+        assert!(spots(&mut rx).is_empty(), "a spawn point never replaces the spot the account saved");
     }
 
     #[test]

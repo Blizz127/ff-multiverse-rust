@@ -93,7 +93,8 @@ pub struct CastMember {
     pub start: Option<Spot>,
 }
 
-/// The character whose talk starts the scene.
+/// The field-script entity and slot that start the scene. A talk supplies a radius; an
+/// authored crossing is identified separately by [`SceneDef::line_trigger`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trigger {
     /// The script entity talked to.
@@ -106,6 +107,15 @@ pub struct Trigger {
     pub talk_radius: u16,
     /// The story moments (`Var[2][0]`) the scene is offered at.
     pub moments: RangeInclusive<u16>,
+}
+
+/// An authored line that starts a scene when the player crosses it, in field coordinates.
+/// This is separate from a talk radius and from an arrival scene; entering the field alone
+/// does not cross the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneLineTrigger {
+    pub a: [i16; 3],
+    pub b: [i16; 3],
 }
 
 /// A story scene (see the module docs).
@@ -150,7 +160,7 @@ impl SceneDef {
     /// Keep this capability attached to the stable scene identity: another scene in the same field
     /// does not inherit permission to promote a save or publish economic effects.
     pub fn requires_exact_transaction(&self) -> bool {
-        self.id == FLOWER_STATION_SCENE_ID
+        self.id == FLOWER_STATION_SCENE_ID || self.id == BRIDGE_SCENE_ID || self.id == CARGO_TRAIN_SCENE_ID
     }
 
     /// The snapshot used to interpret this scene. Promotion is local and preserves unknown bits;
@@ -195,6 +205,16 @@ impl SceneDef {
         self.trigger.moments.contains(&moment)
     }
 
+    /// The field's authored crossing for a scene that begins on a line. The bridge's entity
+    /// 4 initializer defines this line and disables it outside moment 39; slot 5 starts the
+    /// confrontation. The host preserves its actual crossing position, choices and battle
+    /// boundaries in the durable continuation transcript.
+    pub fn line_trigger(&self) -> Option<SceneLineTrigger> {
+        (self.id == BRIDGE_SCENE_ID).then_some(SceneLineTrigger {
+            a: [-614, 835, 518], b: [-238, 835, 518],
+        })
+    }
+
     /// Whether the scene starts by itself when a player whose story it is offered to comes to stand in its field (an
     /// ARRIVAL scene: what the field's own director does from the first frame on), instead of on a press next to a
     /// character. That is what a trigger nobody can talk to means: its talk radius is 0, so no press can ever reach it and
@@ -204,7 +224,7 @@ impl SceneDef {
     /// offered, and the world runs the ones that fire on entry BEFORE it judges the scene, so a point that writes the
     /// scene's moment (as `md8_1`'s does) would leave the scene never offered (`tests/scene_real.rs` holds the list to it).
     pub fn starts_on_arrival(&self) -> bool {
-        self.trigger.talk_radius == 0 && !self.is_point_cutscene()
+        self.trigger.talk_radius == 0 && self.line_trigger().is_none() && !self.is_point_cutscene()
     }
 
     /// Whether this scene is the cutscene of the step of field `field` that takes a story from `before` to `after` (see
@@ -291,13 +311,15 @@ pub const SECTOR7_STATION_SCENE_ID: &str = "ff7/mds7st3/station-arrival-survey";
 pub const SECTOR7_INTRO_SCENE_ID: &str = "ff7/mds7/intro-survey";
 /// The flower seller's arrival scene, committed through an exact story-and-gil transaction.
 pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower";
+/// The bridge confrontation, continued through durable choices and battle boundaries.
+pub const BRIDGE_SCENE_ID: &str = "ff7/md8brdg/confrontation";
 /// Survey-only Sector 7 pillar-field entry; not registered for play.
 pub const SECTOR7_PILLAR_SCENE_ID: &str = "ff7/mds7plr1/entry-survey";
 
 /// Survey-only Reactor opening; never offered for live play.
 pub const REACTOR_OPENING_SCENE_ID: &str = "ff7/md1stin/opening-survey";
 
-/// Survey-only cargo train director; not registered for play.
+/// The cargo train arrival director. The established id is retained for saved continuation identity.
 pub const CARGO_TRAIN_SCENE_ID: &str = "ff7/cargoin/train-survey";
 
 /// **After the escape: the team at the tunnel mouth** (field `md8_4`, story moment 33). An arrival scene
@@ -724,6 +746,40 @@ pub fn flower_station_scene() -> SceneDef {
     }
 }
 
+/// The bridge's moment-39 line confrontation. Entity 4's slot 5
+/// requests the director's slot 3. Its three answers independently select battles 328,
+/// 329 and 330; after returning from those battles the director plays movie 23 and jumps
+/// to the cargo train without advancing the moment. The director's main also sets BTLMD 8.
+/// The host preserves the actual answer and battle transcript across each continuation.
+///
+/// Cloud's initializer does not place him: the original uses his position at the crossing.
+/// The midpoint below is a fallback on triangle 12, not an authored placement. Live playback
+/// must replace it with the validated actual crossing origin through `with_trigger_position`;
+/// the host refuses a bridge continuation without that origin.
+/// The eight guards use their own initializers; Tifa's entity is only a window-close timer
+/// on this path, and Cid's entity does no work, so neither is a visible cast member.
+/// Movie playback, background-effect parity and original-engine timing remain presentation limits.
+pub fn bridge_scene() -> SceneDef {
+    let cast = [
+        (1, "cloud"), (7, "hei1"), (8, "hei2"), (9, "hei3"), (10, "hei4"),
+        (11, "hei8"), (12, "hei5"), (13, "hei6"), (14, "hei7"),
+    ].into_iter().map(|(entity, name)| CastMember {
+        entity, name: name.into(),
+        look: Look::Model { hrc: if entity == 1 { "aaaa" } else { "bwab" }.into(), idle: "aafe".into() },
+        start: (entity == 1).then_some(Spot { x: -426, y: 835, triangle: 12, direction: 0 }),
+    }).collect();
+    SceneDef {
+        id: BRIDGE_SCENE_ID.into(), game: "ff7".into(), field: "md8brdg".into(),
+        trigger: Trigger { entity: 4, name: "ev".into(), slot: 5, talk_radius: 0, moments: 39..=39 },
+        setup: [0, 1, 4, 7, 8, 9, 10, 11, 12, 13, 14].into_iter().map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: vec![Step::StartMain(0), Step::Await(ScriptRef::new(4, 5))], cast,
+        speakers: vec![("Cloud".into(), 1)], witness: vec![],
+        // The gateway from md8_3. It is before the triggering line, not the crossing itself.
+        arrival: Spot { x: -422, y: 1387, triangle: 3, direction: 0 },
+        presents: None, resume_after_battle: None, presents_bit: None,
+    }
+}
+
 /// Offline opening director survey. It includes initialization, an unimplemented movie and a
 /// subsequent battle trigger; never register it as a live or preview scene in this form.
 pub fn reactor_opening_scene() -> SceneDef {
@@ -744,8 +800,11 @@ pub fn reactor_opening_scene() -> SceneDef {
     }
 }
 
-/// Offline cargo-train director survey at moment 39. The incoming transition, audiovisual
-/// effects and witnesses have not been validated; this is not registered for live play.
+/// The cargo-train arrival director at moment 39, reached by the bridge's durable landing.
+/// The arrival uses Cloud's authored floor placement rather than the bridge's placeholder
+/// `(0, 0, triangle 0)` jump. Reaching that placement still requires the moment-39 arrival
+/// scene; only its durable completion at moment 48 supplies a normal story return entry.
+/// Background-effect parity and original-engine timing remain presentation limits.
 pub fn cargo_train_scene() -> SceneDef {
     let cast = [
         (11, "cloud", "aaaa", "acfe"), (12, "ballet", "acgd", "adcb"),
@@ -760,7 +819,8 @@ pub fn cargo_train_scene() -> SceneDef {
         setup: (11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
         root: vec![Step::StartMain(6)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
-        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
+        // Cloud's XYZI at 0x0750, with the final TURNGEN at 0x0863 after the introduction.
+        witness: vec![], arrival: Spot { x: -24, y: 16, triangle: 20, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
 }
 
@@ -856,9 +916,9 @@ pub fn proof_scene() -> SceneDef {
 
 /// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
-/// reactor's own story points, followed by the flower encounter.
+/// reactor's own story points, followed by the flower encounter, bridge confrontation and cargo arrival.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene(), bridge_scene(), cargo_train_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a
@@ -889,6 +949,9 @@ pub struct StoryEntry {
 ///   would join in `md1stin` and could never reach the story again. The spot is the arrival that jump names.
 /// * **From moment 39** the flower scene has finished in `md8_2`. Return at Cloud's authored final MOVE and TURNGEN
 ///   position, on the connected floor leading to both ways out. The scene is no longer offered at that moment.
+/// * **From moment 48** the cargo introduction has finished. Return at Cloud's authored placement and final heading
+///   in `cargoin`. Before that durable completion, a bridge landing must retain its separate pending destination:
+///   the unchanged moment 39 alone does not authorize bypassing the introduction.
 ///
 /// A row names a place the game's own data puts the player at (never an invented one). Rows ascend by moment.
 /// `tests/scene_real.rs` holds every row to
@@ -898,6 +961,7 @@ pub const STORY_ENTRIES: &[StoryEntry] = &[
     StoryEntry { from_moment: 33, field: "md8_4", spot: Spot { x: 82, y: 267, triangle: 3, direction: 0 } },
     StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1629, y: -5357, triangle: 15, direction: 192 } },
     StoryEntry { from_moment: 39, field: "md8_2", spot: Spot { x: -3989, y: 21138, triangle: 19, direction: 150 } },
+    StoryEntry { from_moment: 48, field: "cargoin", spot: Spot { x: -24, y: 16, triangle: 20, direction: 0 } },
 ];
 
 /// The entry of a story at `moment` ([`STORY_ENTRIES`]): the row with the greatest `from_moment` that is not past it.

@@ -462,7 +462,7 @@ fn seat(w: &mut World, name: &str, progression: &[u8], now: Instant) -> Seat {
     let close = Arc::new(watch::channel(false).0);
     let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
     let account = AccountId(entity.0);
-    w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), tx, close }, now).expect("joins");
+    w.join(NewPlayer { session, entity, account, avatar, progression: progression.to_vec(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now).expect("joins");
     Seat { entity, account, rx }
 }
 
@@ -672,7 +672,7 @@ fn reconnect(w: &mut World, account: AccountId, story: &[u8]) -> (NewPlayer, mps
     let (session, entity) = w.allocate_ids();
     let (tx, rx) = mpsc::channel(256);
     (NewPlayer { session, entity, account, avatar: AvatarAppearance { display_name: "reconnected".into(), tint: [1, 2, 3], appearance_ref: None },
-        progression: story.to_vec(), progress: Default::default(), tx, close: Arc::new(watch::channel(false).0) }, rx)
+        progression: story.to_vec(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close: Arc::new(watch::channel(false).0) }, rx)
 }
 
 #[test]
@@ -725,6 +725,7 @@ fn a_disconnected_pending_owner_is_reserved_and_stale_admission_is_fenced_even_a
     assert_ne!(before, during);
     assert!(w.leave(a.entity));
     assert!(w.is_online(a.account), "queued persistence reserves the account after disconnect");
+    assert!(!w.has_session(a.account), "reservation-only recovery is distinct from a connected duplicate");
     let (new, _rx) = reconnect(&mut w, a.account, &[]);
     assert_eq!(w.join(new, now), Err(crate::world::JoinError::AlreadyOnline));
     let acknowledged = scene_ack(&w, a.account, &[5], 0);

@@ -902,15 +902,16 @@ fn future_and_zero_schema_versions_are_rejected_for_every_record_kind() {
     drop(kinds);
     let store = Arc::try_unwrap(store).expect("kinds were dropped, store is unique");
     drop(store);
-    // The index version lives in the header of index.log.
+    // The index version lives in the header of index.log. Fresh stores use v2;
+    // checkpoint stores use supported v3, so v4 is the first future format.
     let log_original = fs::read(index_log(&root)).unwrap();
-    let newer = u64::from(INDEX_LOG_VERSION) + 1;
+    let newer = 4u64;
     for future in [newer, u64::from(u32::MAX)] {
         set_log_schema(&root, Some(json!(future)));
         match Store::open(&root) {
             Err(PersistError::FutureSchema {
                 found, supported, ..
-            }) => assert_eq!((u64::from(found), supported), (future, INDEX_LOG_VERSION)),
+            }) => assert_eq!((u64::from(found), supported), (future, 3)),
             other => panic!("index.log v{future}: expected FutureSchema, got {other:?}"),
         }
         assert!(
@@ -1323,7 +1324,7 @@ fn snapshot_destination_rules() {
         restore_snapshot(&good, &busy),
         Err(PersistError::Snapshot(_))
     ));
-    set_log_schema(&good, Some(json!(u64::from(INDEX_LOG_VERSION) + 1)));
+    set_log_schema(&good, Some(json!(4)));
     assert!(matches!(
         restore_snapshot(&good, guard.path().join("from-good")),
         Err(PersistError::FutureSchema { .. })

@@ -20,14 +20,15 @@
 //! * `SceneEnded` for a scene that is on show ends it at once, in either role; a repeated one, or one for another run, is
 //!   ignored.
 //!
-//! The keys of a scene are the talk window's (see [`SceneKey::from_event`]); while a scene is on show EVERY key is the
-//! scene's ([`SceneClient::key`] says so), so nothing reaches the field: no walking, no talking, no battle key, no `Interact`.
+//! The keys of a scene are the talk window's (see [`SceneKey::from_event`]). A scene holds field
+//! movement throughout a durable battle, while [`super::keys::route_key`] gives combat and its
+//! result panel their input. A defeated continuation stays held until its owner explicitly retries.
 
 use super::player::{Run, SceneCmd, SceneEvent, SceneKey, ScenePlayer, SceneSound, SoundAction};
 use super::source::{NoScenes, SceneBuilder};
 use fmv_ff7::story::StoryState;
 use fmv_ff7::script::scene::SceneResources;
-use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
+use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
 use std::collections::VecDeque;
 use winit::keyboard::KeyCode;
 
@@ -55,6 +56,9 @@ pub struct SceneClient {
     /// opens, and those repeats belong to the walk, not to a pointer that spins through the answers).
     armed: Vec<KeyCode>,
     armed_epoch: u32,
+    visible: bool,
+    /// A reserved continuation cannot be released locally. The session closes on this error.
+    failure: Option<String>,
 }
 
 impl std::fmt::Debug for SceneClient {
@@ -91,6 +95,8 @@ impl SceneClient {
             instant: false,
             armed: Vec::new(),
             armed_epoch: 0,
+            visible: true,
+            failure: None,
         }
     }
 
@@ -105,11 +111,12 @@ impl SceneClient {
         self.instant = instant;
     }
 
-    /// Whether a scene is on show: every key is the scene's, the player is held, the trigger's character is hidden and the
-    /// cast stands in its place.
+    /// Whether a scene holds the field, including a suspended battle or a defeated attempt.
     pub fn is_active(&self) -> bool {
-        self.player.is_some()
+        self.player.is_some() || self.failure.is_some()
     }
+
+    pub fn failure(&self) -> Option<&str> { self.failure.as_deref() }
 
     pub fn player(&self) -> Option<&ScenePlayer> {
         self.player.as_ref()
@@ -137,8 +144,8 @@ impl SceneClient {
     /// One of the server's scene messages (anything else is not ours). `area` is the key of the field this player stands in.
     pub fn on_message(&mut self, area: &str, msg: ServerMsg) {
         match msg {
-            ServerMsg::SceneStart { run, scene, seed, progress, gil, participants, you, .. } => {
-                self.start(Start { run, scene, seed, progress, gil, participants, you }, area);
+            ServerMsg::SceneStart { run, scene, seed, progress, gil, replay, participants, you, .. } => {
+                self.start(Start { run, scene, seed, progress, gil, replay, participants, you }, area);
             }
             ServerMsg::SceneStep { run, step, answer } => {
                 if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
@@ -147,6 +154,25 @@ impl SceneClient {
                 }
             }
             ServerMsg::SceneEnded { run, outcome } => self.ended(run, outcome),
+            ServerMsg::SceneBattleStarted { run, ordinal, battle_id } => {
+                if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
+                    player.on_battle_started(ordinal, battle_id);
+                    self.armed.clear();
+                    self.reap();
+                }
+            }
+            ServerMsg::SceneBattleResumed { run, ordinal, battle_id, progress, gil } => {
+                if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
+                    player.on_battle_resumed(ordinal, battle_id, &progress, gil);
+                    self.reap();
+                }
+            }
+            ServerMsg::SceneGameOver { run, ordinal, battle_id } => {
+                if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
+                    player.on_game_over(ordinal, battle_id);
+                    self.reap();
+                }
+            }
             ServerMsg::SceneRefused { reason } => {
                 self.refusal = Some(reason);
                 self.event(SceneEvent::Refused(reason));
@@ -156,21 +182,25 @@ impl SceneClient {
     }
 
     fn start(&mut self, start: Start, area: &str) {
-        let Start { run, scene, seed, progress, gil, participants, you } = start;
+        let Start { run, scene, seed, progress, gil, replay, participants, you } = start;
+        let durable = replay.is_some();
         // A run still on show is a stale one (the server holds a player in one run at a time): it is replaced.
         self.end_local();
         self.finished = None;
+        self.failure = None;
         self.armed.clear();
+        self.visible = true;
         self.started += 1;
         self.event(SceneEvent::Started { run, scene: clean_id(&scene), role: you, participants: participants.len() });
         if scene == fmv_ff7::script::scene::PROOF_SCENE_ID && participants.len() > 1 && crate::mods::script_source().is_some() {
             self.note("scene: Echo-S bar dialogue is unavailable with watchers; using the original script".into());
         }
         // The scene belongs to its owner. A watcher's local wallet may be different, and a
-        // missing snapshot must never be reconstructed as zero (protocol 19 requires the field).
+        // missing snapshot must never be reconstructed as zero (the protocol requires the field).
         let resources = SceneResources { gil: Some(gil) };
         let built = match StoryState::decode(&progress) {
-            Some(story) if you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed, resources),
+            Some(story) if durable => self.builder.build_with_origin(&scene, &story, seed, resources, replay.as_ref().and_then(|r| r.origin.as_ref())),
+            Some(story) if replay.is_none() && you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed, resources),
             Some(story) => self.builder.build(&scene, &story, seed, resources),
             None => Err("the story the scene plays against cannot be read here".to_string()),
         };
@@ -186,19 +216,29 @@ impl SceneClient {
                     participants.len(),
                     if built.source.echo_voice() { "echo-s" } else { "original" }
                 ));
-                let run = Run { id: run, participants, role: you };
-                self.player = Some(ScenePlayer::new(run, built.def, built.source, self.instant));
-                self.reap();
+                let identity = Run { id: run, participants, role: you };
+                let player = match replay {
+                    Some(replay) => ScenePlayer::with_replay(identity, built.def, built.source, self.instant, &replay),
+                    None => Ok(ScenePlayer::new(identity, built.def, built.source, self.instant)),
+                };
+                match player {
+                    Ok(player) => { self.player = Some(player); self.reap(); }
+                    Err(why) => self.unavailable(run, you, &scene, &why, durable),
+                }
             }
-            Ok(built) => self.unavailable(run, you, &scene, &format!("the scene plays in another field ({}), this is {}", clean_id(&built.def.field), clean_id(area))),
-            Err(why) => self.unavailable(run, you, &scene, &why),
+            Ok(built) => self.unavailable(run, you, &scene, &format!("the scene plays in another field ({}), this is {}", clean_id(&built.def.field), clean_id(area)), durable),
+            Err(why) => self.unavailable(run, you, &scene, &why, durable),
         }
     }
 
-    /// This machine cannot play the run: ask to leave without advancing the owner's story;
-    /// the server's `SceneEnded` is what lets the player go.
-    fn unavailable(&mut self, run: SceneRunId, _role: SceneRole, scene: &str, why: &str) {
-        self.note(format!("scene: cannot play {} here: {why}; releasing the player", clean_id(scene)));
+    /// An ordinary scene can be left without advancing the owner's story. A reserved durable
+    /// scene instead closes the session and stays locally held until that close takes effect.
+    fn unavailable(&mut self, run: SceneRunId, _role: SceneRole, scene: &str, why: &str, durable: bool) {
+        if durable {
+            self.failure = Some(format!("Saved scene cannot be resumed safely: {why}. Reconnect with matching game data."));
+        }
+        let action = if durable { "closing the session" } else { "releasing the player" };
+        self.note(format!("scene: cannot play {} here: {why}; {action}", clean_id(scene)));
         self.event(SceneEvent::Unavailable);
         self.outbox.push(SceneCmd::Leave { run });
         self.finished = Some((run, 0));
@@ -227,17 +267,29 @@ impl SceneClient {
     // ---- time and keys -------------------------------------------------------------------------------------------
 
     /// Let `seconds` go by: the stage moves on and what is due happens.
+    #[cfg(test)]
     pub fn advance(&mut self, seconds: f32) {
+        self.advance_visible(seconds, true);
+    }
+
+    /// Battle rendering includes its lingering result panel. Neither script time nor a durable
+    /// resume acknowledgement advances the scene until that presentation has left the screen.
+    pub fn advance_visible(&mut self, seconds: f32, visible: bool) {
+        self.visible = visible;
         if let Some(player) = self.player.as_mut() {
-            player.advance(seconds);
+            player.advance_visible(seconds, visible);
             self.reap();
         }
     }
 
+    pub fn battle_input(&self) -> bool { self.player.as_ref().is_some_and(ScenePlayer::battle_input) }
+
     /// A key event. Returns whether the scene took it: while one is on show it takes every key (the field gets none), and
     /// only the talk window's keys do anything.
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> bool {
+        if self.failure.is_some() { return true; }
         let Some(player) = self.player.as_mut() else { return false };
+        if !self.visible { return true; }
         if player.epoch() != self.armed_epoch {
             self.armed.clear();
             self.armed_epoch = player.epoch();
@@ -265,6 +317,7 @@ impl SceneClient {
     /// `answer` (the pointer's line when `None`); a watcher's windows are moved past by the owner's steps. (Meant for a
     /// client set [`instant`](SceneClient::set_instant), where moving past a window opens the next at once.)
     pub fn autoplay(&mut self, answer: Option<usize>) {
+        if !self.visible { return; }
         for _ in 0..=MAX_SCENE_STEPS {
             let Some(player) = self.player.as_mut() else { break };
             if !player.pass_window(answer) {
@@ -287,6 +340,9 @@ impl SceneClient {
     /// Collect what the player has to say, and drop it when it is over.
     fn reap(&mut self) {
         let Some(player) = self.player.as_mut() else { return };
+        if let Some(reason) = player.continuation_failure() {
+            self.failure = Some(reason.to_string());
+        }
         self.outbox.extend(player.take_commands());
         let events: Vec<SceneEvent> = player.take_events();
         let sounds = player.take_sounds();
@@ -358,6 +414,7 @@ struct Start {
     seed: u32,
     progress: Vec<u8>,
     gil: u32,
+    replay: Option<SceneReplay>,
     participants: Vec<SceneParticipant>,
     you: SceneRole,
 }

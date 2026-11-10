@@ -55,7 +55,8 @@
 //!   says which), so a limit that ends the battle still ends on its `Victory`.
 //! * **Escape.** [`Command::Escape`] spends the actor's turn running. Whether and how hard a battle is to
 //!   run from comes from the peer's own `scene.bin` ([`BattleRules::build`] gives the engine its
-//!   `EscapeRule`; nothing travels). When the party gets away the battle ends with
+//!   `EscapeRule`). The shared [`EscapePolicy`] can additionally forbid escape when a field script does
+//!   (`BTLMD 8`); it never makes an inescapable formation escapable. When the party gets away the battle ends with
 //!   [`Outcome::Escaped`]: the message that carries the command has `Action { Escape }` and no
 //!   terminal event, and `BattleEnd` follows it with no rewards; a failed attempt adds
 //!   `EscapeFailed { actor }` and the battle goes on. The server saves the limit gauges of an escaped
@@ -202,6 +203,7 @@ impl fmt::Display for BattleId {
 /// players' own characters, each commanded by its player: nobody takes a canon member's place. A canon member is
 /// commanded by the SERVER, or by one player the roster names ([`BattleMember::commander`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Controller {
     /// A player's own original character: only that account's session may command it, and its entity is frozen
     /// in the field while the battle runs. The entity is what a peer finds the player's look by (the snapshot of
@@ -245,6 +247,7 @@ impl Controller {
 /// One fighter of a battle's party: a player's character or a canon companion. Ids, numbers and a name: the
 /// stats follow from the peer's own kernel data. `party[i]` of `EncounterStart` fights as `ActorId(i)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BattleMember {
     /// Who commands this fighter (protocol v9; v8 had the player's `entity` and `account` here).
     pub controller: Controller,
@@ -512,12 +515,19 @@ impl fmt::Display for BattleRejection {
 // ---------------------------------------------------------------------------------------------
 
 /// Everything a peer needs to build the engine of a battle: the content of `EncounterStart`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BattleSetup {
     /// Formation id, `scene * 4 + slot`.
     pub formation_id: u16,
     pub seed: u64,
     pub party: Vec<BattleMember>,
+    /// Authoritative carry from an earlier fight, in the same order as `party` (actor index).
+    /// `None` retains the ordinary full-health start. A supplied snapshot must be complete.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub initial_party: Option<Vec<BattleInitialState>>,
+    /// A field script may forbid escape even when the formation permits it (`BTLMD 8`).
+    pub escape_policy: EscapePolicy,
     /// The party gets the first move (full gauges); the enemies start empty.
     pub preemptive: bool,
     /// The enemies get the first move; the party starts empty.
@@ -526,6 +536,53 @@ pub struct BattleSetup {
     pub battle_speed: u8,
     /// Engine ticks per second of simulated time (the engine clamps it to `1..=1000`).
     pub ticks_per_second: u32,
+}
+
+/// A field-level restriction on a formation's escape rule. It can forbid escape, never grant it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EscapePolicy {
+    #[default]
+    Formation,
+    Forbidden,
+}
+
+impl EscapePolicy {
+    fn apply(self, formation: Option<EscapeRule>) -> Option<EscapeRule> {
+        match self { Self::Formation => formation, Self::Forbidden => None }
+    }
+}
+
+/// Resources retained between authored fights. Index `i` belongs to `party[i]`, actor `i`; the
+/// server must match account/companion identities before assembling a different roster.
+/// Death and Near-death derive from HP. Only Sadness/Fury survive FF7's battle-result commit
+/// (`CommitBattleResults` writes `status & 0x30`); timers and other battle-local state restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BattleInitialState {
+    pub hp: u32,
+    pub mp: u32,
+    pub status: StatusSet,
+    pub limit: u16,
+}
+
+/// Capture the party's result in canonical actor order, before dropping its engine. This is a
+/// battle-boundary snapshot, not a midfight checkpoint: temporary statuses and turn timers end.
+/// For a completed fight, FF7's result commit also changes exactly 7777 current HP to 1 (the
+/// all-sevens aftermath). Capturing a fresh setup leaves 7777 HP intact.
+/// Source: <https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/battle/batres.c>.
+/// Reward level growth is separate: this does not add max-HP/MP growth to current resources.
+/// Keeping those amounts through active-party level gains is the port's explicit policy; the
+/// original active-party result routine remains undecoded, so this part is not fidelity-verified.
+pub fn battle_party_snapshot(state: &BattleState) -> Vec<BattleInitialState> {
+    state.party_ids().into_iter().map(|id| {
+        let c = state.actor(id).expect("a party actor belongs to the engine");
+        BattleInitialState {
+            hp: if state.outcome().is_some() && c.hp == 7777 { 1 } else { c.hp },
+            mp: c.mp,
+            status: c.status.set().intersection(fmv_ff7_battle::status::PERSISTENT),
+            limit: c.limit,
+        }
+    }).collect()
 }
 
 impl BattleSetup {
@@ -546,6 +603,36 @@ impl BattleSetup {
             ticks_per_second: self.ticks_per_second,
             start: self.start_mode(),
         }
+    }
+
+    /// Apply a complete, checked carry before engine initialization draws RNG or starts timers.
+    fn apply_initial_party(&self, party: &mut [Combatant]) -> Result<(), BattleBuildError> {
+        let Some(initial) = &self.initial_party else { return Ok(()) };
+        if initial.len() != party.len() {
+            return Err(BattleBuildError::InitialPartySize { expected: party.len(), actual: initial.len() });
+        }
+        for (index, ((c, member), initial)) in party.iter_mut().zip(&self.party).zip(initial).enumerate() {
+            let actor = ActorId(index as u8);
+            if initial.hp > c.max_hp || initial.mp > c.max_mp {
+                return Err(BattleBuildError::InvalidInitialResources { actor, hp: initial.hp, max_hp: c.max_hp, mp: initial.mp, max_mp: c.max_mp });
+            }
+            if !initial.status.is_valid_start() || initial.status.intersection(fmv_ff7_battle::status::PERSISTENT) != initial.status
+                || (initial.hp == 0 && !initial.status.is_empty()) {
+                return Err(BattleBuildError::InvalidInitialStatus { actor, bits: initial.status.bits() });
+            }
+            if initial.limit > LIMIT_MAX || initial.status != member.status || initial.limit != member.limit {
+                return Err(BattleBuildError::InitialMemberMismatch { actor });
+            }
+            // The engine has no limit gauge for a player without a limit break, nor a fallen actor.
+            if initial.limit != 0 && (c.limit_break.is_none() || initial.hp == 0) {
+                return Err(BattleBuildError::InitialMemberMismatch { actor });
+            }
+            c.hp = initial.hp;
+            c.mp = initial.mp;
+            c.status = StatusState::starting(initial.status);
+            c.limit = initial.limit;
+        }
+        Ok(())
     }
 }
 
@@ -570,6 +657,14 @@ pub enum BattleBuildError {
     /// A starting status set the engine does not play, or one that has both Haste and Slow or both Sadness and Fury.
     #[error("character id {character} starts with the status set {bits:#x}, which is not one the battle plays")]
     InvalidStatus { character: u8, bits: u32 },
+    #[error("initial party has {actual} actors, expected {expected}")]
+    InitialPartySize { expected: usize, actual: usize },
+    #[error("actor {actor:?} has invalid initial resources HP {hp}/{max_hp}, MP {mp}/{max_mp}")]
+    InvalidInitialResources { actor: ActorId, hp: u32, max_hp: u32, mp: u32, max_mp: u32 },
+    #[error("actor {actor:?} has nonpersistent initial statuses {bits:#x}")]
+    InvalidInitialStatus { actor: ActorId, bits: u32 },
+    #[error("actor {actor:?}'s initial snapshot disagrees with its roster or limit capability")]
+    InitialMemberMismatch { actor: ActorId },
 }
 
 /// The statuses a member begins a battle with, checked: only ones the engine plays, and never both of a pair that
@@ -1130,7 +1225,8 @@ impl BattleRules for Ff7BattleData {
         if enemies.is_empty() {
             return Err(BattleBuildError::NoEnemies(setup.formation_id));
         }
-        let party = self.party(setup)?;
+        let mut party = self.party(setup)?;
+        setup.apply_initial_party(&mut party)?;
         // How hard the fight is to run from is the scene's own: its escape counter and flags, and the
         // arrival that makes every Run Check succeed (a preemptive strike, a side attack).
         let scene_setup = formation.setup();
@@ -1139,7 +1235,7 @@ impl BattleRules for Ff7BattleData {
             .map(|difficulty| EscapeRule { difficulty, sure: scene_setup.layout.makes_running_sure() });
         Ok(BattleState::with_config(setup.seed, party, enemies, setup.config())
             .with_items(Arc::clone(&self.items))
-            .with_escape(escape))
+            .with_escape(setup.escape_policy.apply(escape)))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -1152,10 +1248,10 @@ impl BattleRules for Ff7BattleData {
         if enemies == 0 {
             return None;
         }
-        let layout = formation.setup().layout;
+        let start = StartMode::from_layout(formation.setup().layout);
         Some(FormationInfo {
-            preemptive: layout == BattleLayout::Preemptive,
-            back_attack: layout == BattleLayout::BackAttack,
+            preemptive: start == StartMode::Preemptive,
+            back_attack: start == StartMode::BackAttack,
             enemies,
         })
     }
@@ -1364,7 +1460,7 @@ impl BattleRules for SyntheticRules {
         if setup.party.len() > MAX_BATTLE_PARTY.min(MAX_PER_SIDE) {
             return Err(BattleBuildError::PartyTooLarge(setup.party.len()));
         }
-        let party = setup
+        let mut party = setup
             .party
             .iter()
             .map(|m| {
@@ -1393,9 +1489,10 @@ impl BattleRules for SyntheticRules {
                 Ok(c)
             })
             .collect::<Result<Vec<_>, BattleBuildError>>()?;
+        setup.apply_initial_party(&mut party)?;
         Ok(BattleState::with_config(setup.seed, party, enemies, setup.config())
             .with_items(Self::item_table())
-            .with_escape(Self::escape_rule(setup.formation_id)))
+            .with_escape(setup.escape_policy.apply(Self::escape_rule(setup.formation_id))))
     }
 
     fn data_fingerprint(&self) -> Fingerprint {
@@ -1464,6 +1561,8 @@ mod tests {
             formation_id,
             seed: 0x00BA_771E,
             party: (0..members as u64).map(|i| member(i, i as u8)).collect(),
+            initial_party: None,
+            escape_policy: EscapePolicy::Formation,
             preemptive: false,
             back_attack: false,
             battle_speed: 0,
@@ -1506,6 +1605,236 @@ mod tests {
         // A different seed is a different battle (initial gauges are random).
         let other = rules.build(&BattleSetup { seed: 7, ..setup.clone() }).unwrap();
         assert_ne!(other, rules.build(&setup).unwrap());
+    }
+
+    #[test]
+    fn a_complete_carry_rebuilds_exact_resources_on_both_peers_without_healing() {
+        let rules = SyntheticRules { player_limits: true, ..SyntheticRules::default() };
+        let mut setup = setup(1, 3);
+        let status = StatusSet::EMPTY.with(Status::Sadness);
+        let carry = vec![
+            BattleInitialState { hp: 121, mp: 17, status, limit: 53 },
+            BattleInitialState { hp: 0, mp: 5, status: StatusSet::EMPTY, limit: 0 },
+            BattleInitialState { hp: 201, mp: 23, status: StatusSet::EMPTY, limit: 7 },
+        ];
+        for (member, initial) in setup.party.iter_mut().zip(&carry) {
+            member.status = initial.status;
+            member.limit = initial.limit;
+        }
+        setup.initial_party = Some(carry.clone());
+        setup.escape_policy = EscapePolicy::Forbidden;
+        let mut server = rules.build(&setup).unwrap();
+        assert_eq!(battle_party_snapshot(&server), carry);
+        assert!(server.has_status(ActorId(1), Status::Death));
+        assert!(!server.can_act(ActorId(1)));
+        let wire = serde_json::to_vec(&setup).unwrap();
+        let decoded: BattleSetup = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, setup);
+        let mut damaged = serde_json::to_value(&setup).unwrap();
+        damaged.as_object_mut().unwrap().remove("initial_party");
+        assert!(serde_json::from_value::<BattleSetup>(damaged).is_err(), "missing carry is not an ordinary full-health start");
+        let mut future = serde_json::to_value(&setup).unwrap();
+        future["initial_party"][0]["future_resource"] = 9.into();
+        assert!(serde_json::from_value::<BattleSetup>(future).is_err(), "an unknown carried resource cannot disappear on recovery");
+        let mut future = serde_json::to_value(&setup).unwrap();
+        future["future_battle_rule"] = true.into();
+        assert!(serde_json::from_value::<BattleSetup>(future).is_err(), "an unknown battle rule cannot be ignored");
+        let mut future = serde_json::to_value(&setup).unwrap();
+        future["party"][0]["future_equipment"] = 1.into();
+        assert!(serde_json::from_value::<BattleSetup>(future).is_err(), "an unknown roster rule cannot disappear");
+        let mut future = serde_json::to_value(&setup).unwrap();
+        future["party"][0]["controller"]["Player"]["future_authority"] = true.into();
+        assert!(serde_json::from_value::<BattleSetup>(future).is_err(), "an unknown controller rule cannot disappear");
+        let log = serve(&mut server, 7);
+        let replay = replay_all(&rules, &decoded, &log).unwrap();
+        assert_eq!(replay.state(), &server);
+        assert_eq!(battle_party_snapshot(replay.state()), battle_party_snapshot(&server));
+    }
+
+    #[test]
+    fn a_carry_with_missing_actors_impossible_values_or_conflicting_roster_is_refused() {
+        let rules = SyntheticRules { player_limits: true, ..SyntheticRules::default() };
+        let mut setup = setup(0, 1);
+        let original = rules.build(&setup).unwrap();
+        let good = battle_party_snapshot(&original);
+        setup.initial_party = Some(Vec::new());
+        assert!(matches!(rules.build(&setup), Err(BattleBuildError::InitialPartySize { .. })));
+        for change in [0, 1, 2, 3, 4, 5, 6, 7] {
+            let mut changed = good.clone();
+            match change {
+                0 => changed[0].hp = u32::MAX,
+                1 => changed[0].mp = u32::MAX,
+                2 => changed[0].limit = LIMIT_MAX + 1,
+                3 => changed[0].status = StatusSet::EMPTY.with(Status::Poison),
+                4 => changed[0].status = StatusSet::EMPTY.with(Status::Death),
+                5 => changed[0].status = StatusSet::EMPTY.with(Status::Sadness).with(Status::Fury),
+                6 => changed[0].status = StatusSet::EMPTY.with(Status::Fury), // contradicts roster
+                _ => changed[0].limit = 1, // contradicts roster
+            }
+            setup.initial_party = Some(changed);
+            assert!(rules.build(&setup).is_err(), "bad carry {change} must not be repaired");
+        }
+        setup.initial_party = Some(good);
+        assert_eq!(rules.build(&setup).unwrap(), original, "an explicit full start preserves the ordinary setup");
+        setup.party[0].limit = 1;
+        setup.initial_party.as_mut().unwrap()[0].limit = 1;
+        assert!(matches!(SyntheticRules::default().build(&setup), Err(BattleBuildError::InitialMemberMismatch { .. })), "a character without a limit break cannot silently lose its supplied gauge");
+        setup.party[0].limit = 0;
+        setup.party[0].status = StatusSet::EMPTY.with(Status::Sadness);
+        setup.initial_party = Some(vec![BattleInitialState { hp: 0, mp: 0, status: setup.party[0].status, limit: 0 }]);
+        assert!(matches!(rules.build(&setup), Err(BattleBuildError::InvalidInitialStatus { .. })), "equipment-protected statuses on a fallen actor are not implemented");
+    }
+
+    #[test]
+    fn a_boundary_snapshot_keeps_only_persistent_statuses_and_applies_the_all_sevens_rule() {
+        let mut hero = Combatant::new("Hero", 10, 9000);
+        hero.hp = 7777;
+        hero.mp = 19;
+        hero.max_mp = 100;
+        hero.status = StatusState::starting(StatusSet::EMPTY.with(Status::Sadness).with(Status::Poison).with(Status::Haste));
+        let live = BattleState::with_config(1, vec![hero.clone()], vec![Combatant::new("Foe", 1, 10)], BattleConfig::default());
+        assert_eq!(battle_party_snapshot(&live)[0].hp, 7777, "a freshly assembled start is not a battle result");
+        let engine = BattleState::with_config(1, vec![hero], vec![Combatant::new("Foe", 1, 0)], BattleConfig::default());
+        assert_eq!(engine.outcome(), Some(Outcome::Victory));
+        assert_eq!(battle_party_snapshot(&engine), vec![BattleInitialState {
+            hp: 1, mp: 19, status: StatusSet::EMPTY.with(Status::Sadness), limit: 0,
+        }]);
+        assert_eq!(engine.actor(ActorId(0)).unwrap().hp, 7777, "capture never mutates the ending fight");
+    }
+
+    #[test]
+    fn a_field_escape_restriction_overrides_the_formation_on_both_peers() {
+        let rules = SyntheticRules::default();
+        let mut setup = setup(3, 1);
+        setup.preemptive = true;
+        assert!(rules.build(&setup).unwrap().can_escape());
+        setup.escape_policy = EscapePolicy::Forbidden;
+        let mut server = rules.build(&setup).unwrap();
+        let mut client = rules.build(&setup).unwrap();
+        assert!(!server.can_escape() && !client.can_escape());
+        assert_eq!(server.submit_command(ActorId(0), Command::Escape), client.submit_command(ActorId(0), Command::Escape));
+        assert_eq!(server.outcome(), None);
+        assert_eq!(play(&mut server), play(&mut client));
+        assert_eq!(server, client);
+        assert_ne!(server.outcome(), Some(Outcome::Escaped));
+    }
+
+    #[test]
+    #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA), opened read-only"]
+    fn owned_bridge_formations_use_the_engine_layout_and_script_escape_override() {
+        let root = std::path::PathBuf::from(std::env::var_os("FMV_FF7_DATA").expect("FMV_FF7_DATA"));
+        let root = if root.join("battle/scene.bin").is_file() { root } else { root.join("lang-en") };
+        let rules = Ff7BattleData::open(&root.join("battle/scene.bin"), &root.join("kernel/kernel.bin")).unwrap();
+        for formation in [328, 329, 330] {
+            let info = rules.formation(formation).unwrap();
+            let mut setup = setup(formation, 1);
+            setup.party = vec![BattleMember::companion("Cloud", 0, 5, 0)];
+            setup.preemptive = info.preemptive;
+            setup.back_attack = info.back_attack;
+            let layout = rules.scenes().formation(usize::from(formation)).unwrap().setup().layout;
+            assert_eq!(setup.start_mode(), StartMode::from_layout(layout));
+            assert_eq!(info.back_attack, formation == 330, "Pincer takes the engine's back-attack gauge start");
+            assert!(rules.build(&setup).unwrap().can_escape(), "the raw formation permits running");
+            setup.escape_policy = EscapePolicy::Forbidden;
+            let server = rules.build(&setup).unwrap();
+            let client = BattleReplay::start(&rules, &setup).unwrap();
+            assert!(!server.can_escape() && !client.state().can_escape());
+            assert_eq!(&server, client.state());
+        }
+    }
+
+    /// The three authored bridge fights form one resource chain. This exercises the real setup,
+    /// capture and replay APIs; durable account settlement is covered by the server's tests.
+    #[test]
+    #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA), opened read-only"]
+    fn owned_bridge_fights_carry_resources_through_328_329_and_330() {
+        let root = std::path::PathBuf::from(std::env::var_os("FMV_FF7_DATA").expect("FMV_FF7_DATA"));
+        let root = if root.join("battle/scene.bin").is_file() { root } else { root.join("lang-en") };
+        let rules = Ff7BattleData::open(&root.join("battle/scene.bin"), &root.join("kernel/kernel.bin")).unwrap();
+        let account = AccountId(77);
+        let mut party = vec![
+            BattleMember::companion("Cloud", 0, 5, 0),
+            BattleMember::player(EntityId(77), account, "Player", 1, 5, 0),
+        ];
+        // Force a genuine reward-driven level boundary while keeping the engine's initial level 5.
+        let initial_exp = rules.exp_for_level(1, 6).unwrap() - 1;
+        let mut progress = BattleReward::new(account, initial_exp, 600, 0);
+        let mut carry: Option<Vec<BattleInitialState>> = None;
+        let mut magic_casts = 0;
+        let mut enemy_turns = 0;
+        for (ordinal, formation) in [328, 329, 330].into_iter().enumerate() {
+            let info = rules.formation(formation).unwrap();
+            let mut setup = BattleSetup {
+                formation_id: formation, seed: 17 + ordinal as u64, party: party.clone(),
+                initial_party: None, escape_policy: EscapePolicy::Forbidden,
+                preemptive: info.preemptive, back_attack: info.back_attack,
+                battle_speed: 0, ticks_per_second: 240,
+            };
+            let incoming = carry.take().unwrap_or_else(|| {
+                let mut first = battle_party_snapshot(&rules.build(&setup).unwrap());
+                first[0].hp -= 7;
+                first[0].mp -= 5;
+                first[0].status = StatusSet::EMPTY.with(Status::Sadness);
+                first[1].hp -= 11;
+                first[1].mp -= 3;
+                first
+            });
+            for (member, state) in setup.party.iter_mut().zip(&incoming) {
+                member.status = state.status;
+                member.limit = state.limit;
+            }
+            setup.initial_party = Some(incoming.clone());
+            let mut engine = rules.build(&setup).unwrap();
+            let mut replay = BattleReplay::start(&rules, &setup).unwrap();
+            assert_eq!(battle_party_snapshot(&engine), incoming, "formation {formation}: no resource resets, including after a level gain");
+            assert!(!engine.can_escape() && !replay.state().can_escape());
+            let mut cast_this_fight = false;
+            for _ in 0..20_000 {
+                if engine.outcome().is_some() { break; }
+                let events = engine.step_ticks(5);
+                replay.apply(engine.tick(), &events, None).unwrap();
+                for actor in engine.ready_actors() {
+                    let Some(target) = engine.enemy_ids().into_iter().find(|id| engine.actor(*id).unwrap().is_alive()) else { break };
+                    assert!(matches!(engine.submit_command(actor, Command::Escape), Err(fmv_ff7_battle::rules::CommandError::CannotEscape)));
+                    let magic = (!cast_this_fight && actor == ActorId(0)).then(|| engine.spells_for(actor).into_iter()
+                        .filter(|spell| spell.mp_cost > 0)
+                        .map(|spell| Command::Magic { spell: spell.spell, target: Target::One(target) })
+                        .find(|command| engine.check_command(actor, command).is_ok())).flatten();
+                    let command = magic.unwrap_or(Command::Attack { target });
+                    let events = engine.submit_command(actor, command).unwrap();
+                    replay.apply(engine.tick(), &events, Some(&AppliedCommand { actor, command })).unwrap();
+                    if magic.is_some() { cast_this_fight = true; magic_casts += 1; }
+                }
+            }
+            assert_eq!(engine.outcome(), Some(Outcome::Victory), "formation {formation}: bounded deterministic commands finish the fight");
+            assert_eq!(replay.state(), &engine);
+            let outgoing = battle_party_snapshot(&engine);
+            assert_eq!(outgoing[0].status, StatusSet::EMPTY.with(Status::Sadness));
+            assert!(outgoing[0].mp <= incoming[0].mp && outgoing[1].mp == incoming[1].mp);
+            for enemy in engine.enemy_ids() {
+                let stats = engine.actor(enemy).unwrap().ai.as_ref().expect("the MP has its original AI").stats();
+                assert_eq!((stats.fallbacks, stats.counters_skipped), (0, 0), "formation {formation}: unsupported AI is not hidden");
+                enemy_turns += stats.turns;
+            }
+            let rewards = replay.expected_rewards();
+            replay.check_end(Outcome::Victory, &rewards).unwrap();
+            assert_eq!(rewards.len(), 1);
+            let earned = &rewards[0];
+            assert_eq!(earned.account, account);
+            progress.exp += earned.exp;
+            progress.gil += earned.gil;
+            progress.ap += earned.ap;
+            party = setup.party;
+            while party[1].level < rules.progress_limits().max_level
+                && rules.exp_for_level(1, party[1].level + 1).is_some_and(|next| progress.exp >= next) {
+                party[1].level += 1;
+            }
+            eprintln!("formation {formation}: resources {outgoing:?}, player level {}, experience {}, gil {}, AP {}", party[1].level, progress.exp, progress.gil, progress.ap);
+            carry = Some(outgoing);
+        }
+        assert!(magic_casts > 0 && enemy_turns > 0, "the chain spends real MP and executes original enemy AI");
+        assert!(party[1].level >= 6, "earned resources update the next roster's level");
+        assert_eq!((progress.exp - initial_exp, progress.gil - 600, progress.ap), (128, 80, 16));
     }
 
     #[test]

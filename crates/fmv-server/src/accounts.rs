@@ -41,6 +41,9 @@
 //! With battle rules available, registration stores the game's starting resources once. Login of an older
 //! account with no progress stores its historical zero-gil defaults before it enters the world. Existing
 //! records, including a missing inventory (`None`) or an explicitly empty one, are read unchanged.
+//! Token login then reads story, resources and any reserved scene group in one coherent snapshot.
+//! The world receives that same snapshot for continuation recovery; connection admission fences it
+//! against scene saves completed while the handshake was in progress.
 //!
 //! # Appearance
 //!
@@ -50,7 +53,9 @@
 //! cannot put an arbitrary string in front of other players either.
 
 use fmv_core::{AccountId, AvatarAppearance, GameId, NameError, PhaseKey};
-use fmv_persist::{CharacterProgress, NewCharacterProgress, NewPlayerCharacter, PersistError, Store};
+use fmv_persist::{NewCharacterProgress, NewPlayerCharacter, PersistError, SceneState, Store};
+#[cfg(test)]
+use fmv_persist::CharacterProgress;
 use fmv_protocol::{BattleRules, CharacterCard, NewCharacter, RejectCode, Secret};
 
 use crate::character::{self, Creation, Refusal};
@@ -87,6 +92,12 @@ pub struct Login {
     /// The character it fights as (its combat slot) and what the store holds of its character progress
     /// (initialized during registration when the server has rules). Separate from `progression`: see `progress`.
     pub progress: ProgressSeed,
+    /// The same coherent stored snapshot that supplied `progression` and `progress`, including
+    /// any durable continuation or battle reservation. New registrations have no continuation.
+    pub scene_state: Option<SceneState>,
+    /// The complete reserved cohort, owner first, or the token login's singleton state when
+    /// unreserved. Read with `scene_state` under one store gate so a settlement cannot split them.
+    pub scene_group: Vec<SceneState>,
     /// What the player is told about its own character in `Welcome` (identity, binding, slot).
     pub card: CharacterCard,
     /// Where its player last stood in the hosted game (MMO-style saving: see `world::resume`). `None` for a new
@@ -256,7 +267,6 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
         // An account without an avatar (made by other tooling): give it one now.
         store.create_avatar(account, tint, DEFAULT_ARCHETYPE, now).map_err(map_store_error)?;
     }
-    let progression = store.get_progression(account, game).map_err(map_store_error)?;
     let (record, added) =
         store.ensure_player_character(account, game, now, |view| character::legacy_entry(game, view)).map_err(map_store_error)?;
     if added {
@@ -268,37 +278,34 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
             "player character added to an account that predates it (nothing the account had was changed)"
         );
     }
-    // Follow the pointer to the progress record. A game without a pointer reads the record of (account, game) all
-    // the same: that is where it always was.
-    let mut stored: Option<CharacterProgress> = match store.follow_character_progress(&record, game).map_err(map_store_error)? {
-        Some(linked) => {
-            if !linked.in_sync() {
-                tracing::warn!(
-                    account = account.0,
-                    slot = linked.expected_character,
-                    stored_character = linked.record.character,
-                    "the stored progress names another character than the player's slot (a rolled-back build saved it by look); the slot wins and the next save writes it back"
-                );
-            }
-            Some(linked.record)
-        }
-        None => store.get_character_progress(account, game).map_err(map_store_error)?,
-    };
     let slot = record.slot(game).unwrap_or(progress::DEFAULT_CHARACTER);
-    if stored.is_none() {
-        if let Some(rules) = rules {
-            stored = Some(store.ensure_character_progress(account, game, || {
-                let mut initial = progress::fresh(rules, slot).to_record(account, game, now);
-                initial.inventory = Some(crate::inventory::Inventory::resolve(rules, None).entries().to_vec());
-                initial
-            }).map_err(map_store_error)?);
-        }
+    if let Some(rules) = rules {
+        store.ensure_character_progress(account, game, || {
+            let mut initial = progress::fresh(rules, slot).to_record(account, game, now);
+            initial.inventory = Some(crate::inventory::Inventory::resolve(rules, None).entries().to_vec());
+            initial
+        }).map_err(map_store_error)?;
+    }
+    // A reservation can belong to another account's continuation. Read the entire group once
+    // after legacy initialization, then derive every progress field from this same snapshot.
+    // Reading story, character and owner checkpoint separately could straddle a settlement.
+    let scene_group = store.get_scene_group(account, game).map_err(map_store_error)?;
+    let scene_state = scene_group.iter().find(|state| state.pair.story.account_id == account && state.pair.story.game == game)
+        .cloned().ok_or_else(|| LoginError::Internal("the scene recovery snapshot omitted the authenticated account".into()))?;
+    let stored = scene_state.pair.character.as_ref();
+    if let Some(stored) = stored.filter(|stored| record.slot(game).is_some_and(|slot| slot != stored.character)) {
+        tracing::warn!(
+            account = account.0,
+            slot,
+            stored_character = stored.character,
+            "the stored progress names another character than the player's slot (a rolled-back build saved it by look); the slot wins and the next save writes it back"
+        );
     }
     let progress = ProgressSeed {
         character: slot,
-        stored: stored.as_ref().map(Progress::from_record),
+        stored: stored.map(Progress::from_record),
         // `None` (a record of an older build, or no record) is "never stored": the starting stock.
-        inventory: stored.as_ref().and_then(|record| record.inventory.clone()),
+        inventory: stored.and_then(|record| record.inventory.clone()),
     };
     let location = store.get_location(account, game).unwrap_or_else(|e| {
         tracing::warn!(account = account.0, error = %e, "the saved spot cannot be read; the account joins where everyone joins");
@@ -307,9 +314,11 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
     Ok(Login {
         account,
         avatar: character::shown(game, &record),
-        progression: kept_progression(progression.blob),
+        progression: kept_progression(scene_state.pair.story.blob.clone()),
         issued_token: None,
         progress,
+        scene_state: Some(scene_state),
+        scene_group,
         card: character::card(game, &record),
         location,
     })
@@ -357,6 +366,8 @@ fn register_inner(store: &Store, game: GameId, registration: Registration, now: 
         issued_token: Some(registered.token),
         progress: ProgressSeed { character: slot.unwrap_or(progress::DEFAULT_CHARACTER), stored: initial.as_ref().map(Progress::from_record),
             inventory: initial.and_then(|record| record.inventory) },
+        scene_state: None,
+        scene_group: Vec::new(),
         card,
         location: None,
     })
@@ -443,3 +454,6 @@ pub fn release_unclaimed(store: &Store, account: AccountId) -> Release {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod scene_recovery_tests;

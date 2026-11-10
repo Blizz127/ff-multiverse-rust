@@ -788,7 +788,7 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         assert_eq!(&fs::read(&path).unwrap(), bytes, "{what}");
     }
 
-    // Schema versions: 0 never existed, a newer one is from a newer build.
+    // Schema versions: 0 never existed; checkpoint envelopes use v3, so v4 is future.
     put_raw(&root, a, "Ff7", &doc(|v| v["schema_version"] = json!(0)));
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
@@ -798,12 +798,12 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         &root,
         a,
         "Ff7",
-        &doc(|v| v["schema_version"] = json!(3)),
+        &doc(|v| v["schema_version"] = json!(4)),
     );
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
         Err(PersistError::FutureSchema { found, supported, .. })
-            if found == 3 && supported == 2
+            if found == 4 && supported == 3
     ));
     // ... and an update refuses to build on such a record rather than overwrite it.
     let mut called = false;

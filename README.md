@@ -324,20 +324,32 @@ follows), else you. A scroll to field-screen `(x, y)` centres the view on `(-x, 
 (`mds7pb_1`'s `SCR2D 64,-83` centres it on Cloud at `(-64, 84)`; the team talk's `SCR2DC -96,60` brings the team at the
 reactor's gate into view). Changing whom it follows eases over half a second; a new field puts the view in place at once.
 Names of players the view leaves out are not drawn, and a scene's window whose speaker is out of view takes its usual
-place at the bottom. **F2** shows the whole field instead (the overview the window showed before) and back; a FIXTURE
-room is always shown whole. Checked by unit tests (`camera::tests`, the scene's camera clock) and, on the owner's data
+place at the bottom. Follow mode clips the scene to its camera range before image effects and keeps the sidebars
+clear afterward; actors beyond that range stay out of view, while the native HUD can still use the full window.
+**F2** shows the whole field instead (the overview the window showed before) and back; a FIXTURE room is always shown whole. Checked by unit tests (`camera::tests`, the scene's camera clock) and, on the owner's data
 with a GPU or lavapipe, by `scene::shots::offscreen_real_ff7_the_field_camera` (`camera-*.png`: the player in `md1_1`,
 the player at the range's corner, the team talk's scroll).
 
-*Optional edge smoothing.* **F3** switches FXAA on or off in a field or battle. Off is the default and keeps
+*Optional graphics.* **F3** switches FXAA on or off in a field or battle. Off is the default and keeps
 exactly the existing render path. FXAA smooths contrasting edges in the completed field or battle image, including
 fallback battles; the HUD, dialogue and menus are drawn afterward so their text stays sharp. This is a spatial
-filter: it may soften background detail and does not reconstruct missing detail or use previous frames. The choice
-is saved atomically as `{"anti_aliasing":"fxaa"}` (or `"off"`) in `graphics.json` under the client state directory
-(`--state-dir`, else the usual library state directory's `client/`). Invalid settings are left untouched; a failure
-to save still changes the current session and displays a notice. A GPU regression checks edge coverage, unchanged
-UI pixels, resize and exact restoration when disabled in plain and sRGB output:
-`cargo test -p fmv-client offscreen_fxaa -- --ignored`.
+filter: it may soften background detail and does not reconstruct missing detail or use previous frames.
+
+**F4** switches between native scene resolution (the default) and **2x scene rendering**: twice the width and height,
+four samples per output pixel, averaged before FXAA and the native-resolution UI. It improves model edge coverage;
+it also smooths background pixel boundaries and costs more GPU time and memory. Camera framing, model size, text
+and HUD stay at their original window positions. FXAA and 2x can be selected independently. If a doubled target
+exceeds the GPU's texture dimension limit or 16,777,216 internal pixels, the scene uses native resolution while
+retaining the requested setting and FXAA choice. The F4 notice distinguishes that fallback; the client log records
+it for each affected window size. This allocation bound allows 2x at 2560x1440, but falls back at 3840x2160.
+
+Both choices are saved atomically in `graphics.json` under the client state directory (`--state-dir`, else the usual
+library state directory's `client/`), for example `{"anti_aliasing":"fxaa","render_scale":"2x"}`. The defaults are
+`"off"` and `"native"`; older settings without `render_scale` stay native. Invalid settings are left untouched;
+a failure to save still changes the current session and displays a notice. GPU regressions check edge coverage,
+unchanged UI pixels and model framing, foreground depth, resizing, fallback, and exact restoration when disabled:
+`cargo test -p fmv-client offscreen_fxaa -- --ignored` and
+`cargo test -p fmv-client offscreen_supersample -- --ignored` (the real-field comparisons also need owned FF7 data).
 
 *Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
 it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the
@@ -1408,8 +1420,8 @@ Cloud (18) three times (33, 36 and 38); answering line 1, or nothing, gives six,
 
 ### After the escape: the scenes that start by themselves
 
-Two more scenes are offered, and they are the first that a player reaches by playing: the story of the first reactor ends
-at moment 33, and the game's own next two fields carry it on.
+The story of the first reactor ends at moment 33. Its next fields carry it through the street, bridge and cargo-car
+arrival; the flower, bridge and cargo continuations require `--story-extended-save`.
 
 * **`ff7/md8_4/post-escape`** (the tunnel mouth, moment 33): the field's director has the team talk (four windows) and then
   jumps to the street. It changes nothing that is saved; the scene ends in the field's own `MAPJUMP`, which the server
@@ -1423,11 +1435,30 @@ at moment 33, and the game's own next two fields carry it on.
   story and gil snapshot and commits the flags, moment and balance together before releasing the player.
   Repeating the completion cannot charge twice. A failed save does not advance the scene. Missing, invalid or extra
   choice answers cannot commit; pressing Back before all choices are answered cancels without spending gil.
+* **`ff7/md8brdg/confrontation`** (the bridge, moment 39): the authored line crossing starts the confrontation from
+  the player's accepted position and facing. Its three questions select among battles **328, 329 and 330**, including
+  paths that avoid every fight. Every dialogue acknowledgment and battle boundary is checked against the original
+  script. Consecutive fights carry HP, MP, limits, knockout and persistent Sadness/Fury status; this scene forbids escape.
+* **`ff7/cargoin/train-survey`** (the cargo car; the historical ID is retained): the bridge's scripted jump starts
+  the 26-window arrival, which saves **moment 48**. The bridge's placeholder destination is resolved to the arrival
+  script's authored position `(-24,16)`, triangle 20. Participant bodies and name labels stay hidden through this narrow
+  cutscene until the server acknowledges completion; the original cast performs it.
+
+**Saving between fights.** Bridge and cargo use durable continuations. The server records a source-bound replay,
+the frozen participant roster, the exact battle setup and seed, and each pending landing. Battle costs and rewards are
+committed for the whole roster before the next scene segment is released. Retrying a save cannot award them twice.
+Restarting before a fight, after a victory or between bridge and cargo restores that checkpoint. A defeat rolls back
+that attempt's staged costs and offers **Confirm** to retry the saved fight; **Back** disconnects while preserving the
+checkpoint. Party changes involving a held participant are refused until release. Guest story progression remains their own.
+
+The first continuation transaction raises the account-store format fence to version 3, so an older server refuses to
+open that store. Use matching protocol-20 client and server builds. The extended-save switch is off by default; these
+implementation checks use temporary stores and do not change the live preview store.
 
 The flower encounter prepares a known-bit v3 story in memory when reading a supported legacy save. Unknown bits remain
 unknown; the original stored bytes remain the transaction's expected predecessor. Only successful completion stores the
-new format. Other scene definitions do not automatically promote their saves, and the flower is not offered when the
-extended-save switch is off. The route and rendering checks use temporary saves and read the owned game files without
+new format. Bridge and cargo also prepare a known-bit snapshot against their original saved predecessor; unrelated
+scene definitions do not automatically promote saves. The route and rendering checks use temporary saves and read the owned game files without
 changing them; these changes do not deploy or convert the live preview store.
 
 **They start by themselves.** A scene whose trigger nobody can talk to (`SceneDef::starts_on_arrival`: a talk radius of 0)
@@ -1439,7 +1470,8 @@ that player alone (no watchers; a party member plays its own). The server announ
 
 * it skipped no instruction that touches the player's state (`fmv_ff7::script::scene::SKIPPED_STATE_OPS`: items, HP and
   MP by an amount, the menus, materia, who belongs to the team). The full restores (`FULL_RESTORE_OPS`: `HMPMAX1/2/3`, `MHMMX`)
-  are the exception: this server keeps no HP or MP between battles, so every battle already starts full. Gil operations
+  are the exception only for the older, independent battle path, which starts each fight full. Continuations retain
+  battle resources and refuse unsupported restore effects. Gil operations
   execute against the server snapshot and require an exact durable transaction; unknown persistent inputs refuse a real save;
 * **the party it leaves is the story's own.** `PRTYP`, `PRTYM` and `PRTYE` are recorded by the interpreter
   (`Outcome::party`), a later test of the party in the same scene sees them, and the scene is accepted only when the
@@ -1459,13 +1491,16 @@ watcher, the original is shown.
 **Coming back.** Everyone joins in `md1stin`. A story that a scene took somewhere no walk leads back from stands there
 again at the next login (`fmv_ff7::script::scene::STORY_ENTRIES`, `SceneHost::entry`, `World::enter_at_story`): from moment
 33 outside the reactor in `md8_4`, from 36 on the street of `md8_1`, and from 39 at Cloud's authored final flower-scene
-position in `md8_2`, each at a place the game's own data names. The
+position in `md8_2`, and from 48 in `cargoin` at `(-24,16)`, triangle 20, direction 0. A durable continuation takes
+precedence over these moment-based entries, including the bridge's pending cargo landing while the moment is still 39. The
 player joins like everyone and is sent on through the ordinary area handshake. Without it an account at 36 could never
 reach the story again (`md8_1` has no way back and only the scene jumps there).
 
-**Not done here:** the opening movie of the street scene is skipped. The bridge confrontation after `md8_2` needs
-choice-dependent battles and continuation before its cargo-train exit can open. Later train, Sector 7 and bar scenes
-remain outside the verified playable route; see `docs/POST-REACTOR.md`. This is not a claim of complete Disc 1 accuracy.
+**Not done here:** the street and bridge movies, bridge fades and some cargo background/audio effects are skipped.
+The cargo door sequence into the passenger train, later train, Sector 7 and bar scenes remain outside the verified
+playable route; see `docs/POST-REACTOR.md`. HP/MP carry currently covers consecutive continuation battles, not ordinary
+field health. Keeping current HP/MP through a level-up and keeping companion levels fixed during the chain are port
+policies, not established original-game parity. This is not a claim of complete Disc 1 accuracy.
 
 ```
 scripts/story-smoke.sh --debug --build                    # one real headless player: both scenes, 33 -> 36 saved once, restart, re-login on the street
@@ -1760,7 +1795,7 @@ on a real store (the whole state directory is byte for byte what it was before t
 `scripts/scene-smoke.sh` over real processes. `mds7pb_1` is not one of `REVIEWED_FIELDS` either, so its story points are
 withheld anyway: that is a second layer, not the first.
 
-### The wire (protocol v19)
+### The wire (protocol v20)
 
 New in `fmv_protocol::scene`: `ClientMsg::{SceneStep, SceneEnd, SceneLeave, SceneDebugPreview}`,
 `ServerMsg::{SceneStart, SceneStep, SceneEnded, SceneRefused}`, `SceneRunId`, `SceneRole`, `SceneParticipant`,
@@ -1769,12 +1804,19 @@ cross the wire; every client builds the scene from its own files. Protocol 19 ma
 watcher follows the same resource-dependent branch as the owner. Original and replacement-script equivalence checks use
 that same snapshot. Older peers are refused at the handshake; a missing gil field is never guessed as zero.
 
+Protocol 20 adds bounded scene replay and battle continuation messages: `SceneBattleReady`, `SceneBattleStarted`,
+`SceneBattleResumed`, `SceneGameOver` and `SceneRetry`. `SceneStart.replay` is required and nullable: an ordinary scene
+uses `null`, while a continuation carries its source fingerprint, accepted origin and acknowledged window/battle history.
+Encounter messages also require the escape policy and nullable initial party resources, so server and clients reconstruct
+the same carried battle state. Missing fields, oversized transcripts and mismatched boundary identities are refused.
+
 ### Checking it
 
 ```
 FMV_FF7_DATA=<.../data> cargo test --offline -p fmv-ff7 --test scene_real -- --ignored       # the interpreter on the real field
 FMV_FF7_FLEVEL=<.../flevel.lgp> cargo test --offline -p fmv-server --test scene_real -- --ignored   # a real server and socket
 cargo test --offline -p fmv-server --test scene_preview   # a real store and sockets: preview never saves, a real write is saved once, restart
+FMV_FF7_LIBRARY=<state dir> cargo test --offline -p fmv-server --test bridge_real -- --ignored --nocapture # bridge battles, checkpoint restarts, cargo to 48
 scripts/scene-smoke.sh --debug --build                 # two real headless players, the scene, a server restart (real data)
 FMV_FF7_LIBRARY=<state dir> FMV_SHOT_DIR=<dir> cargo test --offline -p fmv-client --bin fmv-client -- --ignored \
     --exact scene::shots::offscreen_real_ff7_the_proof_scene --test-threads=1 --nocapture   # the pictures and what the camera shows
@@ -1790,7 +1832,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
 
 ### Known gaps of the proof
 
-* **The proof scene is had once per story, and only a debug preview can reach it today.** The world ends at the first reactor, so
+* **The proof scene is had once per story, and only a debug preview can reach it today.** The playable route ends at the cargo arrival, so
   no real account is ever at moment 72 in the bar: the save-and-reload path is proved with a stand-in scene on a real account and
   store (`crates/fmv-server/tests/scene_preview.rs`: the scene's write is saved once, the server restarts on the same store, the
   account is told its saved story and no scene is on offer, an OK starts nothing, nothing holds the player) and, on the real
