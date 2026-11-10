@@ -1483,6 +1483,16 @@ How it works (`World::start_point_scene`, `SceneHost::point_scene`):
   joins); a name entry or a display setting one edition has and the other has not does not count (Echo-S's `md1_1` names one
   character where the original names two).
 
+**Scene sound effects.** Literal `SOUND` commands in a scene now follow its stage clock, including waits and pauses
+at dialogue windows. Each participant reads and decodes the sounds from their own local library. A new sound replaces
+channel 1; sound 0 stops it. Clips with authored loop regions repeat until stopped; other clips finish naturally.
+Finishing, skipping, leaving or replacing a scene cancels its channel and any pending decode. Other ambient channels,
+menu effects and voices keep their own handles. Missing or late clips are skipped without delaying dialogue.
+`FMV_FIELD_SOUNDS=off` disables this path too. Setup sounds and a victory continuation's discarded prelude are not replayed.
+Banked `SOUND` operands remain unresolved, and scene `AKAO` commands remain unsupported. Timing follows the scene
+interpreter's existing movement estimates; the change has not been checked with audible device output or rendered frames.
+Headless checks can use `--scene-realtime` to preserve that clock while automatically advancing dialogue windows.
+
 **Where the player stands.** A scene that names no witness spots (the cutscenes) gets them from its own data
 (`fmv_ff7::script::scene::auto_witnesses`): the owner and up to two watchers stand on the floor the scene's arrival is on, clear
 of every place the cast takes in the scene by two body rings and a margin and of the floor's edge by one and a half, as near the

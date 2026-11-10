@@ -994,3 +994,41 @@ fn the_window_is_anchored_to_its_speakers_head_and_feet_and_knows_who_else_is_in
     assert!(a.y + a.h <= want_head[1] as i32, "the window stands above the head ({} <= {})", a.y + a.h, want_head[1]);
     assert!(b.y > a.y, "the one without a speaker is lower, at the bottom of the screen");
 }
+
+#[test]
+fn scene_sound_clock_prefetch_pause_stop_and_cancel_follow_both_roles() {
+    use super::SoundAction;
+    let beats = vec![
+        Beat { stage: vec![timed(15, Stage::Sound { id: 61, pan: 63 })], then: say(30, 18, 18, 1).then },
+        Beat { stage: vec![timed(15, Stage::Sound { id: 0, pan: 63 }), timed(30, Stage::Sound { id: 59, pan: 127 })], then: end(60).then },
+    ];
+    for role in [SceneRole::Owner, SceneRole::Watcher] {
+        let mut rig = rig_with(beats.clone(), false);
+        begin(&mut rig, role);
+        let actions = |client: &mut SceneClient| client.take_sounds().into_iter().map(|c| c.action).collect::<Vec<_>>();
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Begin, SoundAction::Prepare(61)]);
+        rig.client.advance(0.25);
+        assert!(actions(&mut rig.client).is_empty());
+        rig.client.advance(0.25);
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 61, pan: 63 }]);
+        rig.client.advance(0.5);
+        rig.client.advance(10.0); // the open window pauses the clock, including the sound stop
+        assert!(actions(&mut rig.client).is_empty());
+        if role == SceneRole::Owner { rig.client.autoplay(None); }
+        else { rig.client.on_message(AREA, ServerMsg::SceneStep { run: RUN, step: 0, answer: None }); }
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Prepare(59)]);
+        rig.client.advance(0.5);
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::Play { id: 0, pan: 63 }]);
+        rig.client.end_local(); // area change/disconnect cancels the unplayed tail
+        assert_eq!(actions(&mut rig.client), vec![SoundAction::End]);
+        rig.client.advance(60.0);
+        assert!(actions(&mut rig.client).is_empty());
+    }
+    for outcome in [SceneOutcome::Skipped, SceneOutcome::TimedOut] {
+        let mut rig = rig_with(beats.clone(), false);
+        begin(&mut rig, SceneRole::Watcher);
+        rig.client.take_sounds();
+        rig.client.on_message(AREA, ServerMsg::SceneEnded { run: RUN, outcome });
+        assert_eq!(rig.client.take_sounds().iter().map(|c| c.action).collect::<Vec<_>>(), [SoundAction::End]);
+    }
+}

@@ -55,8 +55,8 @@ pub struct SfxClip {
     rate: u32,
     /// Interleaved stereo.
     samples: Arc<[f32]>,
-    /// The part that repeats when the clip is played as a loop ([`crate::AudioEngine::play_sfx_loop`]), in frames of
-    /// the clip: `start < end <= frames`. A one-shot ([`crate::AudioEngine::play_sfx`]) ignores it.
+    /// The part that repeats with [`crate::AudioEngine::play_sfx_loop`] or [`crate::AudioEngine::play_sfx_controlled`],
+    /// in frames of the clip: `start < end <= frames`. [`crate::AudioEngine::play_sfx`] ignores it.
     loop_region: Option<(usize, usize)>,
 }
 

@@ -259,7 +259,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
     });
     // A headless run has no picture to wait for and no keys: a scene that starts for it (one it asked for with `--scene-*`,
     // or one the server starts by itself when the player arrives somewhere) is played through at once.
-    session.state.scene.set_instant(true);
+    session.state.scene.set_instant(!args.scene_realtime);
     eprintln!(
         "headless: joined {} as `{}` (entity {}), bot={:?} for {:.1} s",
         session.info.area_id,
@@ -325,6 +325,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
 
     let start = Instant::now();
     let mut last = start;
+    let mut scene_tick = start;
     let mut ended: Option<String> = None;
     let mut own_walk = Odometer::default();
     let mut peer_walks: BTreeMap<EntityId, Odometer> = BTreeMap::new();
@@ -426,7 +427,11 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         // around it (the preview, the press, the control check) is stepped here. What it printed goes to stdout, flushed.
         // (every headless run moves past the windows of a scene it is in: without it a scene the server started for a route
         // bot would hold the bot until the server's own timeout, and the story the scene carries would never move)
+        let scene_now = Instant::now();
+        session.state.scene.advance(scene_now.duration_since(scene_tick).as_secs_f32());
+        scene_tick = scene_now;
         session.state.scene.autoplay(if scene_bot.is_active() { scene_bot.answer() } else { args.scene_answer.map(usize::from) });
+        audio.follow_scene(&mut session.state.scene, now);
         for event in session.state.scene.take_events() {
             if scene_bot.is_active() {
                 scene_bot.on_event(&event, now);

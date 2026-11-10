@@ -23,7 +23,7 @@
 //! The keys of a scene are the talk window's (see [`SceneKey::from_event`]); while a scene is on show EVERY key is the
 //! scene's ([`SceneClient::key`] says so), so nothing reaches the field: no walking, no talking, no battle key, no `Interact`.
 
-use super::player::{Run, SceneCmd, SceneEvent, SceneKey, ScenePlayer};
+use super::player::{Run, SceneCmd, SceneEvent, SceneKey, ScenePlayer, SceneSound, SoundAction};
 use super::source::{NoScenes, SceneBuilder};
 use fmv_ff7::story::StoryState;
 use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
@@ -40,6 +40,7 @@ pub struct SceneClient {
     outbox: Vec<SceneCmd>,
     events: VecDeque<SceneEvent>,
     notes: VecDeque<String>,
+    sounds: VecDeque<SceneSound>,
     /// The run this client finished by itself (or could not play) and has not yet heard the server end, with the windows
     /// it moved past: its `SceneEnded` is still to be reported.
     finished: Option<(SceneRunId, u32)>,
@@ -82,6 +83,7 @@ impl SceneClient {
             outbox: Vec::new(),
             events: VecDeque::new(),
             notes: VecDeque::new(),
+            sounds: VecDeque::new(),
             finished: None,
             refusal: None,
             started: 0,
@@ -155,7 +157,7 @@ impl SceneClient {
     fn start(&mut self, start: Start, area: &str) {
         let Start { run, scene, seed, progress, participants, you } = start;
         // A run still on show is a stale one (the server holds a player in one run at a time): it is replaced.
-        self.player = None;
+        self.end_local();
         self.finished = None;
         self.armed.clear();
         self.started += 1;
@@ -202,6 +204,7 @@ impl SceneClient {
         let lines = if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
             player.on_ended();
             let lines = player.lines();
+            self.sound(SceneSound { run, action: SoundAction::End });
             self.player = None;
             self.finished = None;
             lines
@@ -270,6 +273,7 @@ impl SceneClient {
     /// The scene cannot go on here (the area changed under it): drop it without a word.
     pub fn end_local(&mut self) {
         if let Some(player) = self.player.take() {
+            self.sound(SceneSound { run: player.run_id(), action: SoundAction::End });
             self.finished = Some((player.run_id(), player.lines()));
         }
     }
@@ -281,7 +285,9 @@ impl SceneClient {
         let Some(player) = self.player.as_mut() else { return };
         self.outbox.extend(player.take_commands());
         let events: Vec<SceneEvent> = player.take_events();
+        let sounds = player.take_sounds();
         let over = player.is_over().then(|| (player.run_id(), player.lines()));
+        for sound in sounds { self.sound(sound); }
         for event in events {
             self.event(event);
         }
@@ -300,6 +306,15 @@ impl SceneClient {
     /// `--debug-scene-preview`). It goes out with the rest of the commands.
     pub fn request_preview(&mut self, scene: &str) {
         self.outbox.push(SceneCmd::Preview { scene: scene.to_string() });
+    }
+
+    fn sound(&mut self, sound: SceneSound) {
+        if self.sounds.len() >= MAX_PENDING { self.sounds.pop_front(); }
+        self.sounds.push_back(sound);
+    }
+
+    pub fn take_sounds(&mut self) -> Vec<SceneSound> {
+        self.sounds.drain(..).collect()
     }
 
     /// What happened since the last call, oldest first.

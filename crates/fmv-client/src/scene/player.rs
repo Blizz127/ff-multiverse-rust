@@ -88,6 +88,21 @@ pub enum SceneEvent {
     Unavailable,
 }
 
+/// Local audio commands; no sound bytes or new messages cross the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneSound {
+    pub run: SceneRunId,
+    pub action: SoundAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundAction {
+    Begin,
+    Prepare(u16),
+    Play { id: u16, pan: u8 },
+    End,
+}
+
 /// What a key means to a scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneKey {
@@ -184,6 +199,7 @@ pub struct ScenePlayer {
     instant: bool,
     outbox: Vec<SceneCmd>,
     events: Vec<SceneEvent>,
+    sounds: VecDeque<SceneSound>,
     /// Changes whenever a window opens or closes.
     epoch: u32,
     /// The screen the window was last drawn for (keys lay the text out for the same one).
@@ -246,9 +262,11 @@ impl ScenePlayer {
             instant,
             outbox: Vec::new(),
             events: Vec::new(),
+            sounds: VecDeque::new(),
             epoch: 0,
             size: Cell::new((960, 540)),
         };
+        player.sound(SoundAction::Begin);
         player.settle();
         player
     }
@@ -406,6 +424,12 @@ impl ScenePlayer {
             }
             let Some(event) = self.due.pop_front() else { break };
             let late = self.clock - event.at as f32;
+            if let Stage::Sound { id, pan } = event.what {
+                // A stalled frame must not dump a burst of old effects. Stops still cancel a loop.
+                if id == 0 || self.instant || late <= FRAMES_PER_SECOND as f32 / 2.0 {
+                    self.sound(SoundAction::Play { id, pan });
+                }
+            }
             let source = &self.source;
             self.cast.apply(&event.what, late, &|x, y, triangle| source.height_at(x, y, triangle));
         }
@@ -427,6 +451,11 @@ impl ScenePlayer {
                     }
                     let beat = self.source.next(answer);
                     self.clock = if self.instant { f32::INFINITY } else { 0.0 };
+                    for event in &beat.stage {
+                        if let Stage::Sound { id, .. } = event.what {
+                            if id != 0 { self.sound(SoundAction::Prepare(id)); }
+                        }
+                    }
                     self.due = beat.stage.into();
                     self.next = match beat.then {
                         Then::Window(w) => Next::Window(w),
@@ -621,6 +650,8 @@ impl ScenePlayer {
 
     /// Over: no window, no actors, the field's camera.
     fn finish(&mut self) {
+        if self.over { return; }
+        self.sound(SoundAction::End);
         if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         self.over = true;
         self.panel = None;
@@ -629,6 +660,15 @@ impl ScenePlayer {
         self.due.clear();
         self.cast.clear();
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn sound(&mut self, action: SoundAction) {
+        if self.sounds.len() >= 256 { self.sounds.pop_front(); }
+        self.sounds.push_back(SceneSound { run: self.run.id, action });
+    }
+
+    pub fn take_sounds(&mut self) -> Vec<SceneSound> {
+        self.sounds.drain(..).collect()
     }
 
     /// What is owed to the server since the last call.

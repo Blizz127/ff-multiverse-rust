@@ -12,6 +12,7 @@
 //! * `Show` hides or shows it.
 //! * `Anim` is **not played**: the cast are the playable models, which have a standing, a walking and a running clip and
 //!   none of the scripts' clips. The event is counted ([`Counts::anims_skipped`]), never guessed at.
+//! * `Sound` is routed separately by the scene player to its cancellable audio channel.
 //! * `Camera` is **recorded** ([`CameraState`]) and not shown: the field's own camera stays where it is.
 //!
 //! Time is in field frames (30 a second), the interpreter's clock. A walk or a turn only moves while the scene runs: a
@@ -241,6 +242,7 @@ impl Cast {
     pub fn apply(&mut self, event: &Stage, overshoot: f32, height: Height<'_>) {
         let overshoot = if overshoot.is_nan() { 0.0 } else { overshoot.max(0.0) };
         match event {
+            Stage::Sound { .. } => {},
             Stage::Camera(op) => {
                 self.counts.camera_ops = self.counts.camera_ops.saturating_add(1);
                 self.camera = match *op {

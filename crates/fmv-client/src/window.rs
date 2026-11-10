@@ -916,6 +916,8 @@ impl App {
         // The music follows the area and the battle (before the battle's early return below: a fight is
         // exactly when it changes).
         self.audio.update_from(&self.session);
+        let now = self.session.now();
+        self.audio.follow_scene(&mut self.session.state.scene, now);
         self.session.log_party_notes();
         self.session.log_battle_notes();
         self.session.flush_party_sync();

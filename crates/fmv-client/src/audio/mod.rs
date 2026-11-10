@@ -26,6 +26,8 @@
 //!   them with the effects' volume path: they share the master volume, the mute key and `--mute`/`FMV_AUDIO` with the rest.
 //!   `FMV_BATTLE_SOUNDS` says which ones are played: `off` none, `data` (the default) what the data names, `all` also
 //!   the two that only a hand-made list of the sound bank names (an enemy's death, an escape; see [`BattleSounds`]).
+//! * **Scene sounds.** Literal SOUND commands follow the local scene clock on cancellable channel 1.
+//!   Stops, replacement and scene end cancel pending decodes; other channels keep playing.
 //! * **Field sounds.** What the field's own scripts play for the player's story ([`field`]): ambient loops (the hum of
 //!   the reactor before the boss, its alarm after it), and the sounds of the ladders, jumps, lift and doors the player uses.
 //!   When the player is in an FF7 field [`GameAudio::follow_field`] (every frame, from [`GameAudio::update_from`]) asks the
@@ -36,7 +38,7 @@
 //!
 //! What the log says (it is the evidence of a headless run, which has no ears): one `audio: field
 //! <area>:` line per area with the tracks its script names, `audio: decoded <track>` as each
-//! finishes, `audio: playing <track> (<why>)` at the moment a track really starts, `audio: battle sounds: N loaded`
+//! finishes, `audio: playing <track> (<why>)` at the moment a track really starts, `audio: effect sounds: N loaded`
 //! when a fight's clips were read, `audio: battle sound <id> (<hit|critical|miss|impact|...>)` at the moment each one
 //! plays and, when the run ends, `audio: battle sounds played: N (<id>x<times> ...)`. For the field's sounds: `audio: field
 //! <area> sounds (moment <m>): ambient ch3:38; ...` when a plan is read, `audio: field loop start ch3 38` and `... stop ...
@@ -46,6 +48,7 @@ mod cues;
 mod director;
 pub mod ff7;
 pub mod field;
+mod scene;
 mod worker;
 
 pub use cues::{battle_cue, menu_cue, Cue};
@@ -258,6 +261,7 @@ struct Live {
     unheard: HashSet<u16>,
     /// What the field plays (see [`field`]).
     field: field::FieldState,
+    scene_audio: scene::SceneAudio,
     /// The area whose links the field state holds.
     links_for: Option<String>,
     /// The voice layer (see [`VoiceState`]).
@@ -391,9 +395,9 @@ impl Live {
                         }
                     }
                     for (id, why) in &read.missing {
-                        self.say(&format!("no clip for battle sound {id} ({why}); going on without it"));
+                        self.say(&format!("no clip for effect sound {id} ({why}); going on without it"));
                     }
-                    self.say(&format!("battle sounds: {loaded} loaded in {} ms", took.as_millis()));
+                    self.say(&format!("effect sounds: {loaded} loaded in {} ms", took.as_millis()));
                 }
                 Done::Field { key, story, read, took } => self.field.on_read(&self.log, &key, &story, read, took),
                 Done::Voice { seq, result } => self.on_voice(seq, result),
@@ -548,6 +552,7 @@ impl GameAudio {
                 battle_played: BTreeMap::new(),
                 unheard: HashSet::new(),
                 field: field::FieldState::new(FieldSounds::default()),
+                scene_audio: scene::SceneAudio::default(),
                 links_for: None,
                 voice: VoiceState::default(),
                 takes_global_voices: false,
@@ -676,6 +681,13 @@ impl GameAudio {
         live.pump_worker();
         let Live { engine, worker, log, field, .. } = &mut **live;
         field.follow(engine, worker.as_mut(), log, frame);
+    }
+
+    /// Drain this client's local scene cues, including on silent runs, without blocking the scene.
+    pub fn follow_scene(&mut self, scene: &mut crate::scene::SceneClient, now: f64) {
+        let commands = scene.take_sounds();
+        let Some(live) = self.live.as_mut() else { return };
+        live.scene_sounds(commands, now);
     }
 
     /// The loops the field has playing, as `(channel, sound id)` (tests).
@@ -1405,7 +1417,7 @@ mod tests {
         assert_eq!(asked, ["sounds [5, 15, 18, 27, 292, 350]"], "{asked:?}");
         look(&mut rig, &client, 0.1);
         assert_eq!(rig.state.borrow().asked.iter().filter(|a| a.starts_with("sounds")).count(), 1, "not asked for again");
-        assert!(rig.lines().iter().any(|l| l == "battle sounds: 6 loaded in 3 ms"), "{:?}", rig.lines());
+        assert!(rig.lines().iter().any(|l| l == "effect sounds: 6 loaded in 3 ms"), "{:?}", rig.lines());
         // A blow of player A's arrives at 10.0; it lands half a second later and not before.
         send(&mut client, 10.0, blow(0, 2, false));
         look(&mut rig, &client, 10.0);
@@ -1526,7 +1538,7 @@ mod tests {
         let mut client = battle();
         look(&mut rig, &client, 0.0);
         look(&mut rig, &client, 0.1);
-        assert!(rig.lines().iter().any(|l| l.starts_with("no clip for battle sound 18 (an empty slot)")), "{:?}", rig.lines());
+        assert!(rig.lines().iter().any(|l| l.starts_with("no clip for effect sound 18 (an empty slot)")), "{:?}", rig.lines());
         for round in 0..3 {
             send(&mut client, 10.0 + f64::from(round) * 3.0, blow(0, 2, false));
             for step in 0..=100 {
@@ -2193,4 +2205,33 @@ mod tests {
         assert!(!off.is_on());
     }
 
+
+    use crate::scene::{SceneSound, SoundAction};
+    use fmv_protocol::SceneRunId;
+    #[test]
+    fn scene_sound_replacement_stop_delayed_decode_and_off_are_bounded_to_the_run() {
+        // Shared test rig supplies a manual sink and delayed worker; no sound device.
+        let mut rig = Rig::new(&[], &[]);
+        let call = |action| SceneSound { run: SceneRunId(7), action };
+        let feed = |rig: &mut Rig, actions: Vec<SceneSound>, at| rig.audio.live.as_mut().unwrap().scene_sounds(actions, at);
+        feed(&mut rig, vec![call(SoundAction::Begin), call(SoundAction::Prepare(61))], 0.0);
+        feed(&mut rig, vec![call(SoundAction::Play { id: 61, pan: 63 })], 0.5);
+        assert!(rig.audio.pump(64).iter().any(|s| s.abs() > 0.01));
+        feed(&mut rig, vec![call(SoundAction::Play { id: 0, pan: 63 })], 0.6);
+        rig.audio.pump(64); // stop ramp
+        assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001));
+        rig.state.borrow_mut().hold = true;
+        feed(&mut rig, vec![call(SoundAction::Play { id: 59, pan: 0 })], 1.0);
+        feed(&mut rig, vec![call(SoundAction::End)], 1.1);
+        let held = std::mem::take(&mut rig.state.borrow_mut().held);
+        rig.state.borrow_mut().inbox.extend(held);
+        feed(&mut rig, vec![], 1.2);
+        assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001), "late clip cannot restart an ended run");
+        feed(&mut rig, vec![call(SoundAction::Play { id: 61, pan: 63 })], 1.3);
+        assert!(rig.audio.pump(64).iter().all(|s| s.abs() < 0.001), "stale run ignored");
+        rig.audio = rig.audio.with_field_sounds(FieldSounds::Off);
+        let asks = rig.state.borrow().asked.len();
+        feed(&mut rig, vec![call(SoundAction::Begin), call(SoundAction::Prepare(236)), call(SoundAction::Play { id: 236, pan: 63 })], 2.0);
+        assert_eq!(rig.state.borrow().asked.len(), asks, "off neither loads nor plays");
+    }
 }

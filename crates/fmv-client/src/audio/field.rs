@@ -284,6 +284,17 @@ impl FieldState {
         self.links = links;
     }
 
+    /// A scene's SOUND owns channel 1 until its run ends. Other ambient channels keep playing.
+    pub fn scene_channel(&mut self, engine: &AudioEngine, log: &Logger, active: bool) {
+        if active {
+            if let Some(old) = self.loops[0].take() {
+                engine.stop_sfx_loop(old.handle, Duration::ZERO);
+                log(&format!("field loop stop ch1 {} (a scene sound replaces it)", old.id));
+            }
+        }
+        self.replaced[0] = active;
+    }
+
     /// The loops playing now, as `(channel, sound id)` (tests).
     #[cfg(test)]
     pub fn playing(&self) -> Vec<(u8, u16)> {

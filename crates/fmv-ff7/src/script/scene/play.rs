@@ -432,7 +432,7 @@ impl ScenePlay {
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
         Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
-        Stage::Camera(_) => None,
+        Stage::Sound { .. } | Stage::Camera(_) => None,
     }
 }
 

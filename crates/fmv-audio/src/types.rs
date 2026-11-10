@@ -68,9 +68,9 @@ impl Backend {
     }
 }
 
-/// A looping sound effect that is playing, to stop it by ([`crate::AudioEngine::play_sfx_loop`] gives one,
-/// [`crate::AudioEngine::stop_sfx_loop`] takes it). Opaque; a handle whose loop has ended is stale and stopping it again
-/// does nothing.
+/// An effect's stop handle, returned by [`crate::AudioEngine::play_sfx_loop`] or
+/// [`crate::AudioEngine::play_sfx_controlled`] and accepted by [`crate::AudioEngine::stop_sfx_loop`].
+/// Opaque; a handle whose effect has ended is stale and stopping it again does nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SfxHandle(pub(crate) u64);
 

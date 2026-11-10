@@ -14,7 +14,7 @@
 //!
 //! # What it produces
 //!
-//! [`Beat`]s: the stage events up to the next window (placements, walks, turns, animations, visibility, camera
+//! [`Beat`]s: the stage events up to the next window (placements, walks, turns, animations, visibility, sound, camera
 //! moves, each stamped with the frame it happens at, counted from the previous window's opening), then the window
 //! (a `MESSAGE` or an `ASK`, with the field's own text exactly as written) or the end of the scene. A window pauses
 //! the whole scene until the caller resumes the VM (the engine pauses only the script that opened it; the others'
@@ -24,7 +24,7 @@
 //!
 //! * It never touches the world: the variables it writes are its own ([`Vm::writes`]), the caller decides what to
 //!   keep ([`super::Writes`]).
-//! * It never guesses. An opcode it does not know (or one that changes nothing a scene shows: palettes, sound,
+//! * It never guesses. An opcode it does not know (or one that changes nothing a scene shows: palettes, music,
 //!   background layers) is skipped and COUNTED by mnemonic ([`Stats::unknown`], [`Stats::ignored`]); an operand it
 //!   cannot read is not made up.
 //! * It never runs away: [`Limits`] bound instructions, windows, threads and virtual time, a script that cannot be
@@ -151,6 +151,8 @@ pub enum Stage {
     Anim { entity: u8, animation: u8, how: AnimHow, first: Option<u8>, last: Option<u8>, speed: u8 },
     /// Show or hide (`VISI`).
     Show { entity: u8, visible: bool },
+    /// Play a literal `SOUND` on effect channel 1; id 0 stops that channel. Pan is the script's byte.
+    Sound { id: u16, pan: u8 },
     Camera(CameraOp),
 }
 
@@ -196,7 +198,7 @@ pub struct Stats {
     pub threads: usize,
     /// Opcodes the VM carries out.
     pub handled: BTreeMap<&'static str, u32>,
-    /// Opcodes it knows change nothing a scene shows (sound, palettes, background layers, field logic): skipped.
+    /// Opcodes not presented (music, other sound commands, palettes, background layers, field logic): skipped.
     pub ignored: BTreeMap<&'static str, u32>,
     /// Opcodes it does not know: skipped, never guessed.
     pub unknown: BTreeMap<&'static str, u32>,
@@ -1391,6 +1393,17 @@ impl Vm {
                 self.wait_until(idx, self.camera_end);
                 Flow::Yield
             }
+            0xF1 => {
+                match crate::field_sound::Call::of(ins) {
+                    Ok(Some(call)) => self.emit(self.thread_time(idx), Stage::Sound { id: call.id, pan: call.pan }),
+                    _ => {
+                        // This presentation slice supports literal SOUND operands only. Do not turn an
+                        // unreviewed variable read into a guessed sound or a stop of the current channel.
+                        *class = Class::Ignored;
+                    }
+                }
+                Flow::Next
+            }
             // ---- the party: nothing changes here, what was asked is kept for the caller -----------------------
             0xC8 | 0xC9 => {
                 // (an operand that is not a literal is not made up: the op stays unknown)
@@ -1596,7 +1609,7 @@ impl Vm {
 }
 
 /// Opcodes a scene can skip without changing a line, a place, a turn, an animation, a visibility or the camera: the
-/// sound and music, the picture's own effects (palettes, fades, background layers, shakes), and the field's logic
+/// other sound commands and music, the picture's own effects (palettes, fades, background layers, shakes), and the field's logic
 /// that is about the player (controls, menus, party, talk and solid radii, triggers).
 fn is_ignored(op: u8) -> bool {
     matches!(
@@ -1608,8 +1621,8 @@ fn is_ignored(op: u8) -> bool {
         | 0x2E | 0x2F | 0x36 | 0x37 | 0x41..=0x43 | 0x51..=0x55 | 0x56 | 0x57 | 0x45 | 0x47 | 0x4D | 0x4F
         // the picture: fades, shakes, background layers, palettes, scrolls of a layer
         | 0x25 | 0x2C | 0x2D | 0x5E | 0x69 | 0x6A | 0x6B | 0x6C | 0x61 | 0x62 | 0x6F | 0xDF | 0xE0..=0xEF
-        // sound and music
-        | 0xDA | 0xF0..=0xF7 | 0xF8..=0xFE
+        // sound commands other than SOUND, and music
+        | 0xDA | 0xF0 | 0xF2..=0xF7 | 0xF8..=0xFE
         // items and materia: not given here
         | 0x59 | 0x5A | 0x5C | 0x5D | 0x3A | 0x3C..=0x3F
         // SPECIAL and KAWAI families

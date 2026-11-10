@@ -56,7 +56,7 @@ pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};
 pub use client::{clean_id, SceneClient};
 pub use draw::{cast_players, label_hidden, place_witnesses, speaker_spot, visible_npcs};
 pub use keys::{route_key, SceneRoute};
-pub use player::SceneCmd;
+pub use player::{SceneCmd, SceneSound, SoundAction};
 pub use source::Ff7Scenes;
 #[cfg(test)]
 pub(crate) use source::{Built, SceneBuilder};

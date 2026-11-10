@@ -43,7 +43,7 @@ pub(crate) enum Command {
     PlaySfx(SfxVoice),
     /// A looping voice (built with [`SfxVoice::looping`]), fading in over `fade_in`.
     PlayLoop { voice: SfxVoice, fade_in: Duration },
-    /// Stop the loop `id`, fading out over `fade` (zero: cut). An id that is not playing is ignored.
+    /// Stop the handle-controlled effect `id`, fading out over `fade` (zero: cut). An id that is not playing is ignored.
     StopLoop { id: u64, fade: Duration },
     /// Stop every sound effect, one-shots and loops alike.
     StopSfx,
@@ -320,8 +320,9 @@ enum LoopEnv {
     Out { from: f32, done: u64, total: u64 },
 }
 
-/// The part of a [`SfxVoice`] that makes it a loop: where it repeats, the handle it is stopped by, and its envelope.
-struct LoopState {
+/// A voice's stop handle and fade envelope, and whether its region repeats or ends naturally.
+struct SfxControl {
+    repeat: bool,
     /// The region `[start, end)` that repeats, in clip frames; the frames before `start` are the intro.
     start: usize,
     end: usize,
@@ -331,7 +332,7 @@ struct LoopState {
     level: f32,
 }
 
-impl LoopState {
+impl SfxControl {
     /// Step the envelope over `n` frames: the level at the start of the block, at its end, and whether a fade out is over.
     fn advance(&mut self, n: usize) -> (f32, f32, bool) {
         let g0 = self.level;
@@ -364,8 +365,8 @@ pub(crate) struct SfxVoice {
     pos: f64,
     gain_left: f32,
     gain_right: f32,
-    /// `Some` for a loop.
-    looped: Option<LoopState>,
+    /// `Some` for an effect that can be stopped by its handle, looping or finite.
+    control: Option<SfxControl>,
 }
 
 impl SfxVoice {
@@ -374,7 +375,7 @@ impl SfxVoice {
     pub(crate) fn new(clip: SfxClip, gain: f32, pan: f32) -> Self {
         let gain = if gain.is_nan() { 1.0 } else { gain.clamp(0.0, 1.0) };
         let pan = if pan.is_nan() { 0.0 } else { pan.clamp(-1.0, 1.0) };
-        Self { clip, pos: 0.0, gain_left: gain * (1.0 - pan).min(1.0), gain_right: gain * (1.0 + pan).min(1.0), looped: None }
+        Self { clip, pos: 0.0, gain_left: gain * (1.0 - pan).min(1.0), gain_right: gain * (1.0 + pan).min(1.0), control: None }
     }
 
     /// A voice that plays the clip's intro and then repeats its loop region (the whole clip when it has none) until it
@@ -383,34 +384,43 @@ impl SfxVoice {
         let frames = clip.frames();
         let (start, end) = clip.loop_frames().unwrap_or((0, frames));
         let mut voice = Self::new(clip, gain, pan);
-        voice.looped = Some(LoopState { start, end, id, env: LoopEnv::Steady, level: 1.0 });
+        voice.control = Some(SfxControl { repeat: true, start, end, id, env: LoopEnv::Steady, level: 1.0 });
         voice
     }
 
-    /// The handle a loop is stopped by (`None` for a one-shot).
-    fn loop_id(&self) -> Option<u64> {
-        self.looped.as_ref().map(|l| l.id)
+    /// A stoppable voice that repeats only when the clip names a loop region.
+    pub(crate) fn controlled(clip: SfxClip, gain: f32, pan: f32, id: u64) -> Self {
+        let repeat = clip.loop_frames().is_some();
+        let mut voice = Self::looping(clip, gain, pan, id);
+        if let Some(control) = &mut voice.control {
+            control.repeat = repeat;
+        }
+        voice
+    }
+
+    /// The stop handle (`None` for an ordinary one-shot).
+    fn handle_id(&self) -> Option<u64> {
+        self.control.as_ref().map(|l| l.id)
     }
 
     fn fade_in(&mut self, total: u64) {
-        if let Some(l) = self.looped.as_mut().filter(|_| total > 0) {
+        if let Some(l) = self.control.as_mut().filter(|_| total > 0) {
             l.env = LoopEnv::In { done: 0, total };
             l.level = 0.0;
         }
     }
 
-    /// Start the loop's fade out (a loop already fading is left alone: stopping it twice does nothing more).
+    /// Start a controlled effect's fade out; stopping it twice does nothing more.
     fn fade_out(&mut self, total: u64) {
-        if let Some(l) = self.looped.as_mut().filter(|l| !matches!(l.env, LoopEnv::Out { .. })) {
+        if let Some(l) = self.control.as_mut().filter(|l| !matches!(l.env, LoopEnv::Out { .. })) {
             l.env = LoopEnv::Out { from: l.level, done: 0, total: total.max(1) };
         }
     }
 
-    /// Add `n` frames of a looping voice into `acc`, wrapping from the loop's end back to its start without a gap (the
-    /// interpolation between the last frame of the loop and the first one wraps too, so the seam has no step); `true`
-    /// once a fade out is over (a one-shot voice never gets here).
-    fn render_loop_block(&mut self, out_rate: u32, n: usize, acc: &mut [f32]) -> bool {
-        let Some(state) = self.looped.as_mut() else { return true };
+    /// Add a controlled effect, wrapping a loop's seam or interpolating a finite clip's end toward silence.
+    /// Returns `true` when the clip or its fade out ends.
+    fn render_controlled_block(&mut self, out_rate: u32, n: usize, acc: &mut [f32]) -> bool {
+        let Some(state) = self.control.as_mut() else { return true };
         let (g0, g1, faded_out) = state.advance(n);
         let (start, end) = (state.start, state.end);
         let step = f64::from(self.clip.rate()) / f64::from(out_rate.max(1));
@@ -419,7 +429,7 @@ impl SfxVoice {
         let length = (end - start).max(1) as f64;
         let ramp = (g1 - g0) / n.max(1) as f32;
         for i in 0..n {
-            if self.pos >= end as f64 {
+            if state.repeat && self.pos >= end as f64 {
                 self.pos = start as f64 + (self.pos - start as f64) % length;
             }
             let at = self.pos as usize;
@@ -427,19 +437,22 @@ impl SfxVoice {
                 return true;
             }
             let frac = (self.pos - at as f64) as f32;
-            let next = if at + 1 >= end { start } else { at + 1 };
+            let next = if state.repeat && at + 1 >= end { start } else { at + 1 };
             let (l0, r0) = (samples[at * 2], samples[at * 2 + 1]);
-            let (l1, r1) = (samples[next * 2], samples[next * 2 + 1]);
+            let (l1, r1) = if next < frames { (samples[next * 2], samples[next * 2 + 1]) } else { (0.0, 0.0) };
             let level = g0 + ramp * (i + 1) as f32;
             acc[i * 2] += (l0 + (l1 - l0) * frac) * self.gain_left * level;
             acc[i * 2 + 1] += (r0 + (r1 - r0) * frac) * self.gain_right * level;
             self.pos += step;
         }
-        faded_out
+        faded_out || (!state.repeat && self.pos as usize >= frames)
     }
 
     /// Add `n` frames into `acc`; `true` once the clip is over.
     fn render_block(&mut self, out_rate: u32, n: usize, acc: &mut [f32]) -> bool {
+        if self.control.is_some() {
+            return self.render_controlled_block(out_rate, n, acc);
+        }
         let step = f64::from(self.clip.rate()) / f64::from(out_rate.max(1));
         let samples = self.clip.samples();
         let frames = samples.len() / 2;
@@ -581,13 +594,15 @@ impl Mixer {
             Command::StopLoop { id, fade } => {
                 let frames = self.fade_frames(fade);
                 if frames == 0 {
-                    self.loops.retain(|voice| voice.loop_id() != Some(id));
+                    self.loops.retain(|voice| voice.handle_id() != Some(id));
+                    self.sfx.retain(|voice| voice.handle_id() != Some(id));
                 } else {
-                    for voice in self.loops.iter_mut().filter(|voice| voice.loop_id() == Some(id)) {
+                    for voice in self.loops.iter_mut().chain(&mut self.sfx).filter(|voice| voice.handle_id() == Some(id)) {
                         voice.fade_out(frames);
                     }
                 }
                 self.shared.set_loops(self.loops.len());
+                self.shared.set_sfx(self.sfx.len());
             }
             Command::StopSfx => {
                 self.sfx.clear();
@@ -646,7 +661,7 @@ impl Mixer {
             self.shared.set_sfx(self.sfx.len());
         }
         let before = self.loops.len();
-        self.loops.retain_mut(|voice| !voice.render_loop_block(rate, n, sfx_acc));
+        self.loops.retain_mut(|voice| !voice.render_controlled_block(rate, n, sfx_acc));
         if self.loops.len() != before {
             self.shared.set_loops(self.loops.len());
         }

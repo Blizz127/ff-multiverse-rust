@@ -124,7 +124,7 @@ pub struct AudioEngine {
     manual: Option<MixerHandle>,
     stop: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<()>>,
-    /// The id the next looping effect is given (see [`AudioEngine::play_sfx_loop`]).
+    /// The id the next handle-controlled effect is given.
     next_loop: AtomicU64,
 }
 
@@ -209,6 +209,24 @@ impl AudioEngine {
         }
     }
 
+    /// Play an effect that can be stopped with [`AudioEngine::stop_sfx_loop`]. A clip with a loop region plays its
+    /// intro and repeats that region; a clip without one plays once and ends naturally. `gain` and `pan` are those
+    /// of [`AudioEngine::play_sfx`]. Finite effects share the sixteen one-shot slots, looping effects the eight loop
+    /// slots; a new voice cuts the oldest in its own pool when full. An engine that is off returns a handle too.
+    pub fn play_sfx_controlled(&self, clip: &SfxClip, gain: f32, pan: f32) -> SfxHandle {
+        let id = self.next_loop.fetch_add(1, Relaxed);
+        if let Some(commands) = &self.commands {
+            let voice = SfxVoice::controlled(clip.clone(), gain, pan, id);
+            let command = if clip.loop_frames().is_some() {
+                Command::PlayLoop { voice, fade_in: Duration::ZERO }
+            } else {
+                Command::PlaySfx(voice)
+            };
+            let _ = commands.send(command);
+        }
+        SfxHandle(id)
+    }
+
     /// Stop every sound effect at once, **loops included** (a loop that has to be kept while the one-shots go has to be
     /// stopped by its own handle instead, [`AudioEngine::stop_sfx_loop`]).
     pub fn stop_sfx(&self) {
@@ -231,9 +249,9 @@ impl AudioEngine {
         SfxHandle(id)
     }
 
-    /// Stop the loop `handle` names, fading it out over `fade` (zero: cut it). A handle that is stale (its loop was stopped,
-    /// cut by a ninth loop, or ended with [`AudioEngine::stop_sfx`]) or was never given is ignored, and so is a second stop of
-    /// a loop that is already fading out.
+    /// Stop the effect `handle` names, fading it out over `fade` (zero: cut it). Handles from both
+    /// [`AudioEngine::play_sfx_loop`] and [`AudioEngine::play_sfx_controlled`] work here. A stale handle (its effect
+    /// ended, was stopped or was cut by a full pool) or one never given is ignored, as is a second stop during a fade.
     pub fn stop_sfx_loop(&self, handle: SfxHandle, fade: Duration) {
         if let Some(commands) = &self.commands {
             let _ = commands.send(Command::StopLoop { id: handle.0, fade });
@@ -862,6 +880,40 @@ mod tests {
         // a new loop is a new handle, not a recycled one
         let again = engine.play_sfx_loop(&steady(0.3, 20), 1.0, 0.0, Duration::ZERO);
         assert!(again != hum && again != alarm);
+    }
+
+    #[test]
+    fn controlled_effects_follow_clip_loops_end_naturally_and_stop_only_their_own_handle() {
+        let full = Volumes { master: 1.0, music: 1.0, sfx: 1.0 };
+        let engine = AudioEngine::start_manual(AudioConfig { sample_rate: 1_000, volumes: full, ..AudioConfig::default() });
+        let clip = |frames: &[f32]| SfxClip::from_mono(1_000, frames).expect("clip");
+        let heard = |frames| engine.pump(frames).chunks_exact(2).map(|f| f[0]).collect::<Vec<_>>();
+        let close = |actual: &[f32], expected: &[f32]| {
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-5), "{actual:?} != {expected:?}");
+        };
+        engine.play_sfx(&clip(&[0.05; 100]), 1.0, 0.0);
+        let ambience = engine.play_sfx_loop(&clip(&[0.025]), 1.0, 0.0, Duration::ZERO);
+        let short = engine.play_sfx_controlled(&clip(&[0.1; 3]), 1.0, 0.0);
+        let looping = engine.play_sfx_controlled(&clip(&[0.2, 0.3, 0.4, 0.5]).with_loop(1, 3), 1.0, 0.0);
+        assert!(short != looping && short != ambience && looping != ambience);
+        close(&heard(3), &[0.375, 0.475, 0.575]);
+        assert_eq!((engine.status().sfx_playing, engine.status().loops_playing), (1, 2), "finite voice gone on its final frame");
+        close(&heard(5), &[0.375, 0.475, 0.375, 0.475, 0.375]);
+
+        // Replacing one channel stops its previous handle, while unrelated effects remain.
+        engine.stop_sfx_loop(looping, Duration::ZERO);
+        let replacement = engine.play_sfx_controlled(&clip(&[0.2; 50]), 1.0, 0.0);
+        assert!(replacement != short && replacement != looping && replacement != ambience);
+        engine.stop_sfx_loop(short, Duration::ZERO);
+        engine.stop_sfx_loop(looping, Duration::ZERO);
+        close(&heard(2), &[0.275; 2]);
+        assert_eq!((engine.status().sfx_playing, engine.status().loops_playing), (2, 1));
+        engine.stop_sfx_loop(replacement, Duration::from_millis(2));
+        close(&heard(2), &[0.175, 0.075]);
+        engine.stop_sfx_loop(replacement, Duration::ZERO);
+        close(&heard(4), &[0.075; 4]);
+        assert_eq!((engine.status().sfx_playing, engine.status().loops_playing), (1, 1), "ordinary effect and ambience survive");
     }
 
     #[test]

@@ -591,6 +591,10 @@ pub struct Args {
     #[arg(long, value_name = "LINE", requires = "headless")]
     pub scene_answer: Option<u8>,
 
+    /// Keep the scene clock running at normal speed in a headless smoke (windows still advance automatically).
+    #[arg(long, requires = "headless")]
+    pub scene_realtime: bool,
+
     /// How long a scene bot waits for the scene to start, and then for it to end, in seconds (headless only).
     #[arg(long, value_name = "SECS", default_value = "60", value_parser = parse_duration_secs, requires = "headless")]
     pub scene_wait_secs: Duration,
@@ -612,7 +616,7 @@ const DEFAULT_SERVER: &str = "127.0.0.1:47770";
 /// game files and runs no bot; the bot's flags need `--headless`, a requirement clap waives next to an argument that
 /// conflicts with it, so they have to be named here or they would be accepted and ignored. A unit test checks that every
 /// flag of [`Args`] is either here or one of those three, so a flag added later has to be decided about.
-const DELETE_CONFLICTS: [&str; 43] = [
+const DELETE_CONFLICTS: [&str; 44] = [
     // who it is
     "name",
     "register",
@@ -649,6 +653,7 @@ const DELETE_CONFLICTS: [&str; 43] = [
     "scene_preview",
     "scene_watch",
     "scene_answer",
+    "scene_realtime",
     "scene_wait_secs",
     "scene_watchers",
     // the mod layers (a delete shows no text and plays no sound; the ids are the fields of `mods::ModFlags`)

@@ -62,6 +62,11 @@ fn wait(frames: u16) -> Vec<u8> {
     vec![0x24, lo, hi]
 }
 
+fn sound(id: u16, pan: u8) -> Vec<u8> {
+    let [lo, hi] = id.to_le_bytes();
+    vec![0xF1, 0, lo, hi, pan]
+}
+
 fn words(values: &[i16]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -423,6 +428,58 @@ fn camera_moves_are_recorded_and_the_script_can_wait_for_a_scroll() {
     assert_eq!(cam[1].1, CameraOp::Reset);
 }
 
+#[test]
+fn literal_sounds_and_stops_follow_waits_and_window_boundaries() {
+    let section = script(vec![("a", vec![(1, vec![
+        sound(61, 0), wait(12), sound(59, 127), message(0, 0), wait(7), sound(0, 64), message(0, 1),
+    ])])], texts(2));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(stage(&beats), [
+        (0, Stage::Sound { id: 61, pan: 0 }),
+        (12, Stage::Sound { id: 59, pan: 127 }),
+        (7, Stage::Sound { id: 0, pan: 64 }),
+    ]);
+    assert_eq!(windows(&beats).iter().map(|w| w.at).collect::<Vec<_>>(), [12, 7]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(vm.stats().handled.get("SOUND"), Some(&3));
+    assert!(!vm.stats().ignored.contains_key("SOUND"));
+    assert_eq!(vm.stats().unresolved, 0);
+    assert!(vm.writes().is_empty());
+}
+
+#[test]
+fn banked_sound_operands_are_reported_and_never_guessed() {
+    let section = script(vec![("a", vec![(1, vec![
+        vec![0xF1, 0x10, 7, 0, 64], // id is Var[1][7]
+        vec![0xF1, 0x01, 61, 0, 7], // pan is Var[1][7]
+        sound(59, 64), message(0, 0),
+    ])])], texts(1));
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(stage(&beats), [(0, Stage::Sound { id: 59, pan: 64 })]);
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert_eq!(vm.stats().ignored.get("SOUND"), Some(&2));
+    assert_eq!(vm.stats().handled.get("SOUND"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 0, "optional unsupported audio does not make the story incomplete");
+    assert!(vm.stats().unknown.is_empty());
+    let outcome = run_to_end(&field_of(section), &demo_def(vec![], start(0, 1)), &StoryState::new_game(), 1, &[]).unwrap();
+    assert!(outcome.is_complete(), "banked SOUND remains a skipped presentation command");
+}
+
+#[test]
+fn setup_sounds_do_not_replay_and_sounds_need_no_cast_member() {
+    let field = field_of(script(vec![("a", vec![
+        (0, vec![sound(236, 64)]),
+        (1, vec![sound(61, 64), message(0, 0)]),
+    ])], texts(1)));
+    let mut def = demo_def(vec![], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 0)];
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    assert!(play.initial_stage_events().is_empty());
+    let beat = play.next(None);
+    assert_eq!(stage(&[beat]), [(0, Stage::Sound { id: 61, pan: 64 })]);
+    assert_eq!(play.off_cast(), 0);
+}
+
 // ---- what the VM does not do ------------------------------------------------------------------
 
 #[test]
@@ -629,6 +686,8 @@ fn two_editions_tell_the_same_story_only_when_what_is_kept_is_the_same() {
     let reworded = run([message(0, 0), message(0, 1), setword(2, 0, 9), vec![0x3F]].concat(), lines());
     assert_ne!(original.windows, reworded.windows);
     assert!(original.same_story_as(&reworded) && reworded.same_story_as(&original));
+    // Sound presentation differs without changing the story or the provenance comparison.
+    assert!(original.same_story_as(&run([sound(61, 64), message(0, 0), setword(2, 0, 9), vec![0x3F]].concat(), lines())));
     // a different moment
     assert!(!original.same_story_as(&run([message(0, 0), setword(2, 0, 10), vec![0x3F]].concat(), lines())));
     // no moment at all
@@ -960,8 +1019,8 @@ fn a_scene_reads_the_bits_the_story_carries_from_the_story_and_the_rest_from_wha
 #[test]
 fn victory_continuation_resumes_the_waiting_parent_after_the_matching_battle() {
     let bytes = script(vec![
-        ("parent", vec![(1, vec![message(0, 0), reqew(1, 1), message(0, 3)])]),
-        ("child", vec![(1, vec![message(0, 1), vec![0x70, 0, 0x44, 1], message(0, 2)])]),
+        ("parent", vec![(1, vec![sound(236, 64), message(0, 0), reqew(1, 1), message(0, 3)])]),
+        ("child", vec![(1, vec![message(0, 1), sound(0, 64), vec![0x70, 0, 0x44, 1], sound(61, 64), message(0, 2)])]),
     ], texts(4));
     let field = FieldScript::parse(&bytes).unwrap();
     let mut vm = vm_for(StoryState::new_game(), &[]);
@@ -969,6 +1028,7 @@ fn victory_continuation_resumes_the_waiting_parent_after_the_matching_battle() {
     assert!(vm.seek_after_battle(&field, 324));
     let beats = vec![vm.resume(&field, None), vm.resume(&field, None), vm.resume(&field, None)];
     assert_eq!(dialogs_of(&beats), [2, 3]);
+    assert_eq!(stage(&beats), [(0, Stage::Sound { id: 61, pan: 64 })], "seeking past the battle never replays prelude sounds");
     assert!(matches!(beats[2].then, Then::End { how: End::Finished, .. }));
     assert_eq!(vm.stats().handled.get("BATTLE"), Some(&1));
 }

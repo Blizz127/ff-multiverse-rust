@@ -334,13 +334,23 @@ fn the_guard_scorpion_talk_is_the_cutscene_of_the_point_that_starts_the_boss_bat
     assert_eq!(run_to_end(&f, &unseeded, &before, 1, &[]).unwrap().windows, 0);
     let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
     let mut openers = Vec::new();
+    let mut sounds = Vec::new();
     loop {
-        match play.next(None).then {
+        let beat = play.next(None);
+        sounds.extend(beat.stage.into_iter().filter_map(|event| match event.what {
+            Stage::Sound { id, pan } => Some((event.at, id, pan)),
+            _ => None,
+        }));
+        match beat.then {
             Then::End { .. } => break,
             Then::Window(w) => openers.push(w.opener),
         }
     }
     assert_eq!(openers, [4, 4, 3, 4, 3, 3, 3, 3, 4, 3, 3]);
+    assert_eq!(sounds.iter().map(|(_, id, pan)| (*id, *pan)).collect::<Vec<_>>(),
+        [(236, 64), (0, 64), (61, 64), (59, 64), (60, 64), (0, 64)]);
+    assert_eq!(sounds[3].0 - sounds[2].0, 60, "the bomb's two sounds are separated by WAIT 60");
+    assert_eq!(sounds[4].0 - sounds[3].0, 30, "WAIT 10 and WAIT 20 precede the alarm");
     assert_eq!(play.off_cast(), 0);
 }
 
@@ -567,7 +577,7 @@ fn sector7_station_survey_runs_the_authored_arrival_chain() {
     assert!(outcome.unknown_persistent_reads.is_empty());
     assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
     assert!(outcome.stats.unknown.is_empty());
-    assert!(outcome.stats.ignored.contains_key("SOUND"), "the survey does not claim audio parity");
+    assert!(outcome.stats.handled.contains_key("SOUND"), "literal sound events are reported; this survey does not render audio");
     let mut play = ScenePlay::new(&f, &def, &story, 1).unwrap();
     loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
     assert_eq!(play.off_cast(), 0);
@@ -592,7 +602,7 @@ fn sector7_intro_survey_reports_its_assumed_flags_and_cast() {
     assert!(outcome.unknown_persistent_reads.contains(&(3, 209)));
     assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
     assert!(outcome.stats.unknown.is_empty());
-    assert!(outcome.stats.ignored.contains_key("SOUND"));
+    assert!(outcome.stats.handled.contains_key("SOUND"));
     let mut play = ScenePlay::new(&f, &def, &story, 1).unwrap();
     loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
     assert_eq!(play.off_cast(), 0);
@@ -691,7 +701,8 @@ fn reactor_opening_survey_exposes_unsafe_director_tail() {
     assert_eq!((result.end, result.windows), (End::Battle, 1));
     assert!(result.stats.handled.contains_key("GETAI"));
     assert!(result.stats.unresolved > 0);
-    for op in ["MMBLK", "MOVIE", "PMVIE", "SOUND"] {
+    assert!(result.stats.handled.contains_key("SOUND"));
+    for op in ["MMBLK", "MOVIE", "PMVIE"] {
         assert!(result.stats.ignored.contains_key(op), "{op}");
     }
     // The opening sets a cutscene's party (`PRTYE 0, 254, 254`: Cloud and two empty slots): recorded, not skipped.
@@ -970,9 +981,9 @@ fn the_scene_finishes_within_budget_and_every_op_it_meets_is_handled_or_known_to
     // The ops the VM carries out, and the ones it knows change nothing a scene shows.
     let handled = [
         "ANIM!2", "ANIME1", "ANIME2", "ANIMW", "ASK", "BITON", "CANM!2", "DFANM", "DIR", "DIRA", "IFUB", "IFUBL", "JMPF", "JMPFL", "MESSAGE", "MOVE", "PLUS!",
-        "REQEW", "REQSW", "RET", "SCR2D", "SCR2DC", "SCRCC", "SCRLW", "SETBYTE", "TURA", "WAIT", "WINDOW", "XYZI",
+        "REQEW", "REQSW", "RET", "SCR2D", "SCR2DC", "SCRCC", "SCRLW", "SETBYTE", "SOUND", "TURA", "WAIT", "WINDOW", "XYZI",
     ];
-    let ignored = ["MENU2", "SOUND", "TALKR", "UC", "WREST"];
+    let ignored = ["MENU2", "TALKR", "UC", "WREST"];
     let mut seen_handled = std::collections::BTreeSet::new();
     for answers in [vec![2usize], vec![1usize], vec![]] {
         let p = play(&f, 72, &answers);
