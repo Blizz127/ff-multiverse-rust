@@ -66,7 +66,9 @@ watcher always use the original until mixed-layer window synchronization is impl
 a preview milestone, not proof that the Reactor-to-bar route or all Echo-S scenes are playable;
 the real bar write remains guarded until its persistent effects are carried safely.
 Echo-S's bar windows in the measured archive do not identify speakers with the original's
-first-line convention; the preview leaves their speaker anchors unset rather than guessing.
+first-line convention. For the exact measured replacement-section fingerprint, the preview uses
+the speaker mapping established from the original windows and the two scripts' actor-action
+traces. Other replacement sections leave unmatched speaker anchors unset rather than guessing.
 
 The owned-data exit graph also gives the unreviewed continuation `cargoin` → `tin_1` →
 `mds7st3` → `mds7plr1` → `mds7` → `mds7pb_1`. `tin_1` → `mds7st3` is a

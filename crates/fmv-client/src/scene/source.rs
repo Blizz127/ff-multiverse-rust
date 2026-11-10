@@ -55,12 +55,39 @@ impl SceneSource for ScenePlay {
     }
 }
 
-struct PrivateEcho(ScenePlay);
+/// The measured Echo-S 1.24 bar script section; a different section gets no guessed speakers.
+const ECHO_BAR_SECTION: &str = "6b0735a74596a337761e711c1bd048b5073c3ee53d1523bcf4f2fa9e3911329e";
+
+fn known_echo_bar(section: &[u8]) -> bool { blake3::hash(section).to_hex().as_str() == ECHO_BAR_SECTION }
+
+fn echo_bar_speaker(dialog: usize) -> Option<&'static str> {
+    match dialog {
+        30..=35 | 37 | 38 | 40 | 42 => Some("tifa"),
+        36 | 39 | 41 => Some("cloud"),
+        _ => None,
+    }
+}
+
+struct PrivateEcho { play: ScenePlay, known_bar: bool }
 
 impl SceneSource for PrivateEcho {
-    fn initial(&self) -> Vec<Stage> { self.0.initial_stage_events().to_vec() }
-    fn next(&mut self, answer: Option<usize>) -> Beat { self.0.next(answer) }
-    fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.0.ground().height(x, y, triangle, None) }
+    fn initial(&self) -> Vec<Stage> { self.play.initial_stage_events().to_vec() }
+    fn next(&mut self, answer: Option<usize>) -> Beat {
+        let mut beat = self.play.next(answer);
+        if self.known_bar {
+            if let fmv_ff7::script::scene::Then::Window(w) = &mut beat.then {
+                if w.speaker.is_none() {
+                    if let fmv_ff7::script::dialogue::MessageOrigin::Canon { dialog, .. } = &w.message.origin {
+                        if let Some(name) = echo_bar_speaker(*dialog) {
+                            w.speaker = self.play.def().cast.iter().find(|m| m.name.eq_ignore_ascii_case(name)).map(|m| m.entity);
+                        }
+                    }
+                }
+            }
+        }
+        beat
+    }
+    fn height_at(&self, x: i16, y: i16, triangle: Option<u16>) -> Option<f32> { self.play.ground().height(x, y, triangle, None) }
     fn echo_voice(&self) -> bool { true }
     fn bot_answer(&self, window: &fmv_ff7::script::scene::Window, answer: Option<usize>) -> Option<usize> {
         if window.message.choice.is_some() { answer.map(|line| line.saturating_sub(1)) } else { answer }
@@ -175,7 +202,8 @@ impl SceneBuilder for Ff7Scenes {
         let Ok(field) = adapter.load_field(&fallback.def.field) else { return Ok(fallback) };
         if !compatible_bar(field.field_file(), &fallback.def, story, seed, &section) { return Ok(fallback); }
         let Ok(play) = ScenePlay::with_script_section(field.field_file(), &fallback.def, story, seed, &section) else { return Ok(fallback) };
-        Ok(Built { def: play.def().clone(), source: Box::new(PrivateEcho(play)) })
+        let known_bar = known_echo_bar(&section);
+        Ok(Built { def: play.def().clone(), source: Box::new(PrivateEcho { play, known_bar }) })
     }
 
     fn reach(&mut self, index: usize, area: &str) -> Option<f32> {
@@ -210,6 +238,10 @@ mod tests {
 
     #[test]
     fn a_client_without_data_builds_nothing_and_knows_no_reach() {
+        assert!(!known_echo_bar(b"another script"));
+        assert_eq!(echo_bar_speaker(36), Some("cloud"));
+        assert_eq!(echo_bar_speaker(35), Some("tifa"));
+        assert_eq!(echo_bar_speaker(43), None);
         let mut none = NoScenes;
         assert!(none.build("ff7/mds7pb_1/tifa-bar", &StoryState::at(72), 1).is_err());
         assert_eq!(none.reach(0, "mds7pb_1"), None);
@@ -241,6 +273,7 @@ mod tests {
             let mut pending = None;
             let mut count = 0;
             let mut voices = 0;
+            let mut speakers = Vec::new();
             let mut mapped = None;
             loop {
                 match built.source.next(pending.take()).then {
@@ -249,6 +282,7 @@ mod tests {
                         count += 1;
                         if let fmv_ff7::script::dialogue::MessageOrigin::Canon { dialog, .. } = &w.message.origin {
                             voices += usize::from(mods.voice_path("mds7pb_1", w.id, *dialog, 0).is_some());
+                            speakers.push(w.speaker);
                         }
                         if w.message.choice.is_some() {
                             assert!(mapped.is_none());
@@ -262,6 +296,8 @@ mod tests {
             }
             assert_eq!(mapped, Some(selected + 1));
             assert_eq!(count, if selected == 0 { 7 } else { 12 });
+            let expected = if selected == 0 { vec![9, 9, 9, 9, 9, 7, 9] } else { vec![9, 9, 9, 9, 9, 7, 9, 9, 7, 9, 7, 9] };
+            assert_eq!(speakers, expected.into_iter().map(Some).collect::<Vec<_>>());
             assert!(voices >= if selected == 0 { 6 } else { 11 });
             let shared = builder.build(fmv_ff7::script::scene::PROOF_SCENE_ID, &StoryState::at(72), 1).unwrap();
             assert!(!shared.source.echo_voice(), "watchers use original window numbering");

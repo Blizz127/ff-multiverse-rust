@@ -25,6 +25,7 @@ fmv-audio = { path = "../fmv-audio" }
 fmv-mods = { path = "../fmv-mods" }
 # The mods' settings file (a small JSON object of booleans).
 serde_json.workspace = true
+blake3.workspace = true
 tokio.workspace = true
 clap.workspace = true
 thiserror.workspace = true
