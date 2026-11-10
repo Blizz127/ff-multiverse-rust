@@ -573,7 +573,8 @@ fn authored_loops_start_at_events_pause_and_restart_without_changing_the_base_mo
     let looping = |slot| Stage::Anim { entity: 20, animation: slot, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 };
     let mut unsupported = vec![
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Once, first: Some(0), last: None, speed: 16, divisor: 1 },
-        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 32, divisor: 1 },
+        // (A full Hold at twice the rate, 32, is shown since the doubled Holds of the post-escape scene; 48 is not.)
+        Stage::Anim { entity: 20, animation: 3, how: AnimHow::Hold, first: None, last: None, speed: 48, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: Some(0), last: Some(1), speed: 16, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 32, divisor: 1 },
         Stage::Anim { entity: 20, animation: 3, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 2 },
