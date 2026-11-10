@@ -113,6 +113,12 @@ moment 69. Later Tifa slot 10 requests Barret slot 5, which sets moment 72 and r
 actors. These links are static script references, not proof of complete scheduling, reachability,
 effects, or dialogue equivalence. The untracked flag and party/menu operations must be handled
 before this sequence can safely advance a player's saved story.
+An exploratory headless run starting director slot 1 at moment 63, with no stage setup and the
+proof scene's limited cast, returned six windows and moment 69 for each answer. The first path
+set both `Var[3][211]` bits 0 and 2; the second set bit 2 only. Each run also skipped `MMBud`
+and `MENU`, had one unresolved position read and dropped 28 or 30 off-cast stage events. This
+helps identify the missing work; it does not establish safe playback, cast, state, or completion
+in the real engine.
 
 An exploratory real-data run of `tin_1` director main at moment 48 produced two windows and a
 moment-51 write, but ended at the VM frame budget with one unresolved read. It also ran looping
