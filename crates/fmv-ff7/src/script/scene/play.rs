@@ -384,13 +384,12 @@ impl ScenePlay {
                     }
                     if let Some(z) = *z { self.heights.insert(*entity, z); }
                 }
-                Stage::Move { entity, x, y, z, how, .. } => {
-                    // MOVE gives no height. On stacked floors use the actor's preceding surface,
-                    // not the surface nearest world zero. Keep jump resolution unchanged: its
-                    // authored destination triangle is not yet carried by Stage::Move.
+                Stage::Move { entity, x, y, z, triangle, how, .. } => {
+                    // The authored landing triangle selects a jump's floor. Walking has no
+                    // triangle: prefer its preceding surface where several floors overlap.
                     if z.is_none() {
                         let hint = (*how == MoveHow::Walk).then(|| self.heights.get(entity).copied()).flatten();
-                        *z = self.ground.height(*x, *y, None, hint).map(|h| h.round() as i16);
+                        *z = self.ground.height(*x, *y, *triangle, hint).map(|h| h.round() as i16);
                     }
                     if let Some(z) = *z { self.heights.insert(*entity, z); }
                 }

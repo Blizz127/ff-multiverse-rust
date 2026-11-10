@@ -258,7 +258,7 @@ impl Cast {
                 actor.pos = Some([f32::from(*x), f32::from(*y), z]);
                 actor.triangle = *triangle;
             }
-            Stage::Move { entity, from, x, y, z, frames, how } => {
+            Stage::Move { entity, from, x, y, z, triangle, frames, how } => {
                 let Some(actor) = self.actors.get_mut(entity) else { return self.off_cast() };
                 // A second move of the same actor starts where the first one was going.
                 if let Some(walk) = actor.walk.take() {
@@ -273,7 +273,7 @@ impl Cast {
                     (None, Some(here)) => here,
                     (None, None) => [target_xy.0, target_xy.1, 0.0],
                 };
-                let z = z.map(f32::from).or_else(|| height(*x, *y, None)).unwrap_or(start[2]);
+                let z = z.map(f32::from).or_else(|| height(*x, *y, *triangle)).unwrap_or(start[2]);
                 let to = [target_xy.0, target_xy.1, z];
                 let (dx, dy) = (to[0] - start[0], to[1] - start[1]);
                 if *how == MoveHow::Walk && dx.hypot(dy) > 0.5 {
@@ -329,7 +329,7 @@ mod tests {
     }
 
     fn walk(entity: u8, x: i16, y: i16, frames: u32) -> Stage {
-        Stage::Move { entity, from: None, x, y, z: None, frames, how: MoveHow::Walk }
+        Stage::Move { entity, from: None, x, y, z: None, triangle: None, frames, how: MoveHow::Walk }
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
         cast.apply(&walk(1, 40, 0, 100), 0.0, &flat);
         cast.advance(10.0);
         // The script's next walk was planned from where the first one ends.
-        cast.apply(&Stage::Move { entity: 1, from: Some((40, 0)), x: 40, y: 60, z: None, frames: 20, how: MoveHow::Walk }, 0.0, &flat);
+        cast.apply(&Stage::Move { entity: 1, from: Some((40, 0)), x: 40, y: 60, z: None, triangle: None, frames: 20, how: MoveHow::Walk }, 0.0, &flat);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 0.0, 7.0]));
         cast.advance(10.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 30.0, 7.0]));
@@ -407,8 +407,26 @@ mod tests {
         cast.advance(50.0);
         assert_eq!(cast.actor(1).unwrap().pos(), Some([-5.0, -5.0, 7.0]), "the walk was cancelled");
         // A jump and a ladder are not walks: the model does not walk for them.
-        cast.apply(&Stage::Move { entity: 1, from: None, x: 0, y: 0, z: Some(50), frames: 30, how: MoveHow::Ladder }, 0.0, &flat);
+        cast.apply(&Stage::Move { entity: 1, from: None, x: 0, y: 0, z: Some(50), triangle: None, frames: 30, how: MoveHow::Ladder }, 0.0, &flat);
         assert!(!cast.actor(1).unwrap().moving());
+    }
+
+    #[test]
+    fn a_jump_uses_its_landing_triangle_unless_it_has_an_explicit_height() {
+        let mut cast = Cast::new([1]);
+        cast.apply(&Stage::Place { entity: 1, x: 0, y: 0, z: Some(0), triangle: Some(0) }, 0.0, &flat);
+        let target = |_, _, triangle| match triangle { Some(1) => Some(100.0), _ => Some(0.0) };
+        let mut jump = Stage::Move { entity: 1, from: Some((0, 0)), x: 40, y: 20, z: None, triangle: Some(1), frames: 30, how: MoveHow::Jump };
+        cast.apply(&jump, 0.0, &target);
+        cast.advance(15.0);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([20.0, 10.0, 50.0]));
+        assert!(!cast.actor(1).unwrap().moving(), "a jump does not use the walking animation");
+        cast.advance(15.0);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 20.0, 100.0]));
+        assert!(!cast.busy());
+        if let Stage::Move { z, .. } = &mut jump { *z = Some(75); }
+        cast.apply(&jump, 30.0, &target);
+        assert_eq!(cast.actor(1).unwrap().pos(), Some([40.0, 20.0, 75.0]), "explicit script height wins over the triangle");
     }
 
     #[test]

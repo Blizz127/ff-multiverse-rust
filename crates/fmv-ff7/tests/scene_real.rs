@@ -1318,8 +1318,13 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
         assert_eq!(interpreted, after, "only the existing point's writes");
         let mut play = ScenePlay::new(&f, &def, &before, 1).unwrap();
         let mut lines = Vec::new();
+        let mut jumps = Vec::new();
         loop {
-            match play.next(None).then {
+            let beat = play.next(None);
+            jumps.extend(beat.stage.iter().filter_map(|event| match event.what {
+                Stage::Move { entity: 4, x, y, z, triangle, how: MoveHow::Jump, .. } => Some((x, y, z, triangle)), _ => None,
+            }));
+            match beat.then {
                 Then::Window(w) => {
                     let MessageOrigin::Canon { dialog, .. } = w.message.origin else { panic!("unexpected added line") };
                     lines.push((w.opener, dialog));
@@ -1328,6 +1333,8 @@ fn jessie_ladder_plays_one_window_and_matches_only_the_existing_moment_step() {
             }
         }
         assert_eq!(lines, [(4, 72)]);
+        let landing_height = Ground::new(mesh.clone()).height(242, 1850, Some(37), None).unwrap().round() as i16;
+        assert_eq!(jumps, [(242, 1850, Some(landing_height), Some(37))], "owned JUMP preserves its landing triangle and floor");
         assert_eq!(play.off_cast(), 0);
         let cast = cast_places(&f, &def, &before, 1).unwrap();
         for spot in def.witness.iter().chain(std::iter::once(&def.arrival)) {

@@ -1469,6 +1469,8 @@ point moves the story to, or `SceneDef::presents_bit` for an existing saved flag
   point advances the story to 14. Nearby party members share the scene. Jessie and the potion use their own scripts;
   Cloud has no scripted action in this branch. The upper platform uses one measured witness spot clear of her path;
   other watchers keep their actual positions. It adds no saved fields and cannot start again after moment 14.
+  Scripted jumps retain their destination triangle so overlapping walkways select the authored landing floor;
+  Jessie's jump to triangle 37 is checked against the owned field.
   Floor clearance is checked against the owned walkmesh; camera visibility has not been checked on a rendered frame.
 
 `python3 scripts/ladder-smoke.py <package-bin-dir> [--echo-s <archive>]` checks this last scene with two headless party

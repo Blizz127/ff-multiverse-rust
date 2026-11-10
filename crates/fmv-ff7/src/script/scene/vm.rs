@@ -144,7 +144,8 @@ pub enum Stage {
     Place { entity: u8, x: i16, y: i16, z: Option<i16>, triangle: Option<u16> },
     /// Walk to a place over `frames`, from where the entity stood (`from`, when the scene knows it). `z` is the
     /// script's height (a ladder's), else the ground's at the place ([`super::ScenePlay`] fills it in).
-    Move { entity: u8, from: Option<(i16, i16)>, x: i16, y: i16, z: Option<i16>, frames: u32, how: MoveHow },
+    /// `triangle` preserves the authored landing floor of a jump or ladder when one is supplied.
+    Move { entity: u8, from: Option<(i16, i16)>, x: i16, y: i16, z: Option<i16>, triangle: Option<u16>, frames: u32, how: MoveHow },
     /// Turn to face a heading (radians, counter-clockwise from the field's +x axis seen from above) over `frames`.
     Face { entity: u8, heading: f32, frames: u32 },
     /// Play a clip of the entity's model (`animation` is the index in the model-loader's list).
@@ -925,7 +926,7 @@ impl Vm {
             self.move_frames(entity, distance)
         });
         self.places.insert(entity, Where { x, y, z, triangle });
-        self.emit(time, Stage::Move { entity, from, x, y, z, frames, how });
+        self.emit(time, Stage::Move { entity, from, x, y, z, triangle, frames, how });
         // The script waits until the walk is over.
         self.add_time(idx, frames);
     }

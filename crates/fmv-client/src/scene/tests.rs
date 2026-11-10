@@ -481,7 +481,7 @@ fn a_run_of_empty_windows_without_end_is_cut_off_by_the_scenes_own_limit() {
 
 #[test]
 fn the_stage_is_where_the_scene_puts_it_when_it_begins_and_moves_with_the_clock_and_a_window_pauses_it() {
-    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, frames: 30, how: MoveHow::Walk };
+    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 30, how: MoveHow::Walk };
     let beats = vec![
         // Beat 0: she starts to walk at frame 10 (30 frames, 100 units); the first window opens at frame 20.
         Beat { stage: vec![timed(10, walk)], then: Then::Window(window(20, 18, Some(18), message(1, 18, "one"))) },
@@ -860,7 +860,7 @@ fn every_participant_is_drawn_on_its_witness_spot_and_nobody_else_is_moved() {
 
 #[test]
 fn the_cast_is_drawn_as_avatars_under_keys_that_meet_nobody_walking_only_while_a_move_is_on() {
-    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, frames: 60, how: MoveHow::Walk };
+    let walk = Stage::Move { entity: 20, from: None, x: 50, y: 110, z: None, triangle: None, frames: 60, how: MoveHow::Walk };
     let beats = vec![
         Beat { stage: vec![timed(0, walk), timed(0, Stage::Show { entity: 18, visible: false })], then: Then::Window(window(30, 20, Some(20), message(1, 20, "x"))) },
         say(60, 20, 20, 2),

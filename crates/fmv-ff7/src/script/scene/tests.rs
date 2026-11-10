@@ -881,9 +881,45 @@ fn walks_keep_the_actors_floor_across_windows_and_explicit_moves_reset_it() {
     assert_eq!(moves(&second), [
         (Some(100), MoveHow::Walk), // The previous window did not lose the floor.
         (Some(0), MoveHow::Walk),   // Explicit placement resets the floor.
-        (Some(0), MoveHow::Jump),   // Preserve existing jump resolution, without a walk-height hint.
+        (Some(0), MoveHow::Jump),   // The authored lower-floor jump resets the walking height.
         (Some(0), MoveHow::Walk),   // The resolved landing resets subsequent walking.
     ]);
+}
+
+#[test]
+fn jumps_land_on_the_authored_floor_and_following_walks_keep_it() {
+    let jump = |x, y, triangle| cat(&[vec![0xC0, 0, 0], words(&[x, y, triangle, 20])]);
+    let section = script(vec![("a", vec![
+        (3, vec![xyzi(10, 10, 0, 0)]),
+        (1, vec![jump(20, 10, 1), message(0, 0), mov(30, 10), jump(40, 20, 0),
+                 mov(30, 20), jump(20, 20, 1), jump(10, 10, 99), jump(200, 200, 1)]),
+    ])], vec![dialog("Aya")]);
+    let mut spec = FieldSpec::with_mesh(vec![
+        [(0, 0, 0), (100, 0, 0), (0, 100, 0)],
+        [(0, 0, 100), (100, 0, 100), (0, 100, 100)],
+    ], vec![[u16::MAX; 3]; 2]);
+    spec.overrides.push((0, section));
+    let field = FieldFile::parse(spec.build()).unwrap();
+    let mut def = demo_def(vec![member(0, "aya")], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 3)];
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    let moves = |beat: &Beat| beat.stage.iter().filter_map(|event| match event.what {
+        Stage::Move { z, triangle, how, .. } => Some((z, triangle, how)), _ => None,
+    }).collect::<Vec<_>>();
+    let first = play.next(None);
+    assert!(matches!(first.then, Then::Window(_)));
+    assert_eq!(moves(&first), [(Some(100), Some(1), MoveHow::Jump)], "landing on the upper floor overrides the lower takeoff height");
+    let second = play.next(None);
+    assert!(matches!(second.then, Then::End { how: End::Finished, .. }));
+    assert_eq!(moves(&second), [
+        (Some(100), None, MoveHow::Walk),
+        (Some(0), Some(0), MoveHow::Jump),
+        (Some(0), None, MoveHow::Walk),
+        (Some(100), Some(1), MoveHow::Jump),
+        (Some(0), Some(99), MoveHow::Jump), // Invalid triangle retains the old geometric fallback.
+        (None, Some(1), MoveHow::Jump),    // No floor is invented for an off-mesh destination.
+    ]);
+    assert!(play.writes().is_story_neutral());
 }
 
 #[test]
