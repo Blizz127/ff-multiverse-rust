@@ -124,7 +124,9 @@ stage director as setup. With the same two answers in owned data, it reaches six
 moment 69 without unresolved positions or off-cast events. Its test verifies model/idle stems
 against the field loader. It still skips party/menu effects and assumes unsaved state; neither
 its witness nor the real route has been validated. A private floor-plan survey drew 23 actor
-walks across the bar with no witness; no safe player position has been established.
+walks across the bar with no witness. A candidate `(218, 292, triangle 37)` was visible and
+clear of the cast in the inspected offscreen samples, but the harness did not check every
+frame or assert a successful scene outcome. No safe player position has yet been established.
 An isolated interpreter comparison used the original director/setup slots and the corresponding
 manually surveyed Echo-S slots (the replacement renames several entities, so automatic rebind
 rejects this definition). At moment 63 each original answer produced six windows and each Echo-S
