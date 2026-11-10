@@ -23,8 +23,9 @@
 //!   59 `u32`, palette at 0xEC, pixel data after it, colour-key array last; the field offsets used
 //!   here (width 0x3C, height 0x40, palette flag 0x4C, palette entries 0x58, pixel bytes 0x68,
 //!   colour-key flag 0x08, key-array flag 0xBC, reference alpha 0xC4, pixel-format block 0x6C to
-//!   0xB8). Direct-colour decoding follows the page's bit-count / mask / shift description and
-//!   **no owned file uses it, so it is unverified**.
+//!   0xB8). Direct-colour decoding uses each channel's declared bit count, mask and shift.
+//!   The owner's Ninostyle battle archive contains 24-bit textures with an over-wide green mask;
+//!   the declared eight-bit width limits that mask so green is decoded correctly.
 //!
 //! # Layout (all integers little-endian)
 //!
@@ -188,20 +189,26 @@ pub fn parse_tex(bytes: &[u8]) -> Result<RgbaImage, ModelError> {
         }
     } else {
         // Direct colour: pack of `bpp` little-endian bytes decoded through the pixel-format block.
-        let channel = |mask_at: usize, shift_at: usize| -> Result<(u32, u32), ModelError> {
-            Ok((word(mask_at)?, word(shift_at)?))
+        let channel = |bits_at: usize, mask_at: usize, shift_at: usize| -> Result<(u32, u32, u32), ModelError> {
+            Ok((word(bits_at)?, word(mask_at)?, word(shift_at)?))
         };
-        let (red, green, blue, alpha) =
-            (channel(0x7C, 0x8C)?, channel(0x80, 0x90)?, channel(0x84, 0x94)?, channel(0x88, 0x98)?);
-        let extract = |pixel: u32, (mask, shift): (u32, u32)| -> Option<u8> {
-            if mask == 0 || shift >= 32 {
+        let (red, green, blue, alpha) = (
+            channel(0x6C, 0x7C, 0x8C)?, channel(0x70, 0x80, 0x90)?,
+            channel(0x74, 0x84, 0x94)?, channel(0x78, 0x88, 0x98)?,
+        );
+        let extract = |pixel: u32, (bits, mask, shift): (u32, u32, u32)| -> Option<u8> {
+            if mask == 0 || shift >= 32 || bits > 32 {
                 return None;
             }
-            let max = mask >> shift;
+            // Some mod textures have a mask wider than the channel (e.g. 0xFFFFFF00
+            // for 8-bit green). Bits outside the declared channel are not colour bits.
+            // A zero bit count retains the legacy mask-only interpretation.
+            let width_mask = if bits == 0 || bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            let max = (mask >> shift) & width_mask;
             if max == 0 {
                 return None;
             }
-            let value = (pixel & mask) >> shift;
+            let value = (pixel >> shift) & max;
             u8::try_from(u64::from(value) * 255 / u64::from(max)).ok()
         };
         for chunk in data.chunks_exact(bpp) {
@@ -249,6 +256,7 @@ pub(crate) mod tests {
         /// (red, green, blue, alpha) masks for direct colour
         pub masks: [u32; 4],
         pub shifts: [u32; 4],
+        pub bits: [u32; 4],
         pub trailing: usize,
     }
 
@@ -264,6 +272,7 @@ pub(crate) mod tests {
                 bytes_per_pixel: 1,
                 masks: [0; 4],
                 shifts: [0; 4],
+                bits: [0; 4],
                 trailing: 0,
             }
         }
@@ -282,6 +291,7 @@ pub(crate) mod tests {
             h[20] = if self.palette.is_empty() { 0 } else { 8 };
             h[22] = self.palette.len() as u32;
             h[26] = self.bytes_per_pixel;
+            h[27..31].copy_from_slice(&self.bits); // 0x6C..: channel widths
             h[31..35].copy_from_slice(&self.masks); // 0x7C..: masks
             h[35..39].copy_from_slice(&self.shifts); // 0x8C..: shifts
             h[47] = u32::from(self.key_array.is_some());
@@ -364,6 +374,20 @@ pub(crate) mod tests {
             ..TexSpec::default()
         };
         assert_eq!(parse_tex(&spec.build()).unwrap().pixel(0, 0), Some([255, 0, 16, 128]));
+    }
+
+    #[test]
+    fn direct_colour_uses_declared_width_for_an_overwide_mask() {
+        // The owned Ninostyle battle textures use 24-bit BGR pixels and this green mask.
+        let spec = TexSpec {
+            width: 2, height: 1, palette: vec![], bytes_per_pixel: 3, key_flag: false,
+            bits: [8, 8, 8, 0], masks: [0x00FF_0000, 0xFFFF_FF00, 0x0000_00FF, 0],
+            shifts: [16, 8, 0, 0], pixels: vec![0x20, 0x60, 0xA0, 0x10, 0xE0, 0x50],
+            ..TexSpec::default()
+        };
+        let img = parse_tex(&spec.build()).unwrap();
+        assert_eq!(img.pixel(0, 0), Some([0xA0, 0x60, 0x20, 255]));
+        assert_eq!(img.pixel(1, 0), Some([0x50, 0xE0, 0x10, 255]));
     }
 
     #[test]

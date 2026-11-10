@@ -145,4 +145,24 @@ mod tests {
             models.load_character(character).unwrap_or_else(|e| panic!("{character:?}: {e}"));
         }
     }
+    #[test]
+    #[ignore = "requires the owner's Ninostyle battle IRO (FMV_NINO_TEST)"]
+    fn owned_battle_enemy_textures_decode_direct_colour_channels() {
+        let dir = std::env::var("FMV_NINO_TEST").expect("FMV_NINO_TEST");
+        let layer = Layer::open(&Path::new(&dir).join("Ninostyle Battle.iro"), BATTLE_ID, BATTLE_FOLDERS).unwrap();
+        for name in ["aqac", "arac"] {
+            let bytes = layer.read(name).expect("enemy texture").unwrap();
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!((word(0x4c), word(0x68), word(0x70), word(0x80), word(0x90)), (0, 3, 8, 0xffff_ff00, 8));
+            let image = fmv_ff7::tex::parse_tex(&bytes).unwrap();
+            let raw = &bytes[fmv_ff7::tex::TEX_HEADER_LEN..];
+            let mut green = 0;
+            for (bgr, rgba) in raw.chunks_exact(3).zip(image.rgba.chunks_exact(4)) {
+                assert_eq!(&rgba[..3], &[bgr[2], bgr[1], bgr[0]], "{name}");
+                green += usize::from(bgr[1] != 0);
+            }
+            assert!(green > 100, "{name} contains green pixels");
+        }
+    }
+
 }
