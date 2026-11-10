@@ -156,7 +156,7 @@ impl World {
         // The story: each point is judged on the story as it was before the press, and the first that applies is the
         // press's (the lift's ride down and ride up exclude each other).
         for point in points {
-            if self.reach_story_point(entity, point, Some(now)) {
+            if self.reach_story_point(entity, point, Some(now), now, false) != super::story::Reached::Nothing {
                 return PressOutcome::Nothing;
             }
         }

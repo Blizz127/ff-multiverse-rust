@@ -63,8 +63,20 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
     // The host over the real field, asked directly first.
     let host = Ff7SceneHost::new(opened.adapter.clone());
     let scenes = host.scenes();
-    assert_eq!(scenes.len(), 1);
-    assert_eq!((scenes[0].id.as_str(), scenes[0].field.as_str()), (PROOF_SCENE_ID, "mds7pb_1"));
+    let listed: Vec<(&str, &str)> = scenes.iter().map(|s| (s.id.as_str(), s.field.as_str())).collect();
+    assert_eq!(
+        listed,
+        [(PROOF_SCENE_ID, "mds7pb_1"), ("ff7/md8_4/post-escape", "md8_4"), ("ff7/md8_1/post-escape-station", "md8_1"), ("ff7/md1_1/team-talk", "md1_1")],
+        "the proof first (its trigger keeps its number), then the scenes after the escape and the reactor's cutscenes"
+    );
+    // The two scenes after the escape start by themselves; the cutscene is never offered or started by itself, only played
+    // for the step of md1_1's story point that it presents.
+    assert!(host.automatic("ff7/md8_4/post-escape") && host.automatic("ff7/md8_1/post-escape-station") && !host.automatic(PROOF_SCENE_ID));
+    assert!(!host.automatic("ff7/md1_1/team-talk") && !host.offered("ff7/md1_1/team-talk", &[1, 6, 0]));
+    assert_eq!(host.point_scene("md1_1", &[1, 6, 0], &[1, 7, 0]).as_deref(), Some("ff7/md1_1/team-talk"));
+    assert_eq!(host.point_scene("md1_1", &[], &[1, 7, 0]).as_deref(), Some("ff7/md1_1/team-talk"), "a new account's story (moment 1)");
+    assert_eq!(host.point_scene("md1_2", &[1, 6, 0], &[1, 7, 0]), None);
+    assert_eq!(host.point_scene("md1_1", &[1, 7, 0], &[1, 8, 0]), None);
     let moment_72 = host.preview_progress(PROOF_SCENE_ID).expect("a made-up story");
     let field = opened.adapter.load_field("mds7pb_1").unwrap();
     let story = fmv_ff7::story::StoryState::at(72);

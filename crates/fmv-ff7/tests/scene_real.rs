@@ -178,6 +178,73 @@ fn the_post_escape_scene_changes_nothing_that_is_saved() {
     }
 }
 
+/// The team's talk at the reactor's gate is the cutscene of `md1_1`'s story point to 7: played against the story before
+/// the step, the field's own director runs the twelve windows, writes exactly the moment the story point writes, and ends
+/// in its jump on (which a cutscene does not make). Its cast are the field's own models, Cloud seeded on the triangle the
+/// director watches (without him there, nothing happens), and it touches no party and nothing else that is saved.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step() {
+    use fmv_adapter_api::AreaRuntime;
+    use fmv_core::{EditionProvenance, GameId, Platform};
+    use fmv_ff7::script::scene::{scene, team_talk_scene, TEAM_TALK_SCENE_ID};
+    let f = field("md1_1").expect("FMV_FF7_DATA and md1_1");
+    let def = team_talk_scene();
+    assert_eq!(scene(TEAM_TALK_SCENE_ID).as_ref(), Some(&def), "registered");
+    assert!(!def.starts_on_arrival() && !def.offered_to(&StoryState::at(6)), "a cutscene is never offered by itself");
+    // The story point of the field, as the server serves it.
+    let dir = data_dir().unwrap();
+    let provenance = EditionProvenance { game: GameId::Ff7, platform: Platform::Pc, edition: "steam".into(), region: "any".into(), language: "en".into(), revision: "test".into(), sources: vec![], modded: false };
+    let adapter = fmv_ff7::Ff7Adapter::from_flevel_path(flevel_path(&dir), provenance).unwrap();
+    let area = adapter.load_field("md1_1").unwrap();
+    let points = area.story_points();
+    assert_eq!(points.len(), 1, "{points:?}");
+    for moment in [1u16, 6] {
+        let before = StoryState::at(moment);
+        let step = area.story_advance(&before.encode(), points[0].id).expect("the point applies before 7");
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert_eq!(after.moment, 7);
+        assert!(def.presents_step("md1_1", &before, &after), "moment {moment}");
+        assert!(!def.presents_step("md1_2", &before, &after) && !def.presents_step("md1_1", &after, &after));
+        let outcome = run_to_end(&f, &def, &before, 1, &[]).unwrap();
+        assert_eq!((outcome.end, outcome.windows, outcome.questions), (End::MapJump { field: 118 }, 12, 0), "moment {moment}");
+        assert_eq!(outcome.writes.moment, Some(after.moment), "the scene's own write is the point's step");
+        assert!(outcome.writes.tracked.is_empty() && !outcome.writes.untracked.keys().any(|(bank, _)| (1..=4).contains(bank)), "{:?}", outcome.writes);
+        assert!(outcome.party.is_empty());
+        assert!(outcome.is_complete(), "setup {:?} / scene {:?}", outcome.setup_stats.unknown, outcome.stats.unknown);
+    }
+    assert!(def.presents_step("md1_1", &StoryState::at(1), &StoryState::at(7)));
+    assert!(!def.presents_step("md1_1", &StoryState::at(7), &StoryState::at(8)), "a step that is not this point's");
+    // Without Cloud on the triangle the director waits: the seed is what starts it.
+    let mut unseeded = def.clone();
+    for member in &mut unseeded.cast {
+        member.start = None;
+    }
+    assert_eq!(run_to_end(&f, &unseeded, &StoryState::at(6), 1, &[]).unwrap().windows, 0);
+    // The cast are the field's own models.
+    let script = FieldScript::from_field(&f).unwrap();
+    let models = fmv_ff7::script::parse_model_list(f.section(fmv_ff7::field::section::MODEL_LOADER).unwrap()).unwrap();
+    let loader = f.model_loader().unwrap();
+    for member in &def.cast {
+        let init = script.entity_inits(Some(&models)).into_iter().find(|i| i.entity == usize::from(member.entity)).unwrap();
+        let model = &loader.models[init.model_index.expect("a model")];
+        let Look::Model { hrc, idle } = &member.look else { panic!("a field model") };
+        assert_eq!((model.hrc_stem(), model.animations.first().map(|a| a.stem())), (hrc.clone(), Some(idle.clone())), "{}", member.name);
+        assert_eq!(init.name, member.name);
+    }
+    // Who speaks: the windows' openers are the team (the survey: av_m, av_l, cl, ba).
+    let mut play = ScenePlay::new(&f, &def, &StoryState::at(6), 1).unwrap();
+    let mut openers = Vec::new();
+    loop {
+        match play.next(None).then {
+            Then::End { .. } => break,
+            Then::Window(w) => openers.push(w.opener),
+        }
+    }
+    assert_eq!(openers, [3, 4, 4, 3, 3, 1, 3, 1, 2, 2, 2, 2]);
+    assert_eq!(play.off_cast(), 0, "every stage event is about the cast");
+}
+
 /// The parts of a walkmesh that a walk can reach from each other (triangles joined by an edge that can be crossed, either way).
 fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
     let n = mesh.triangles.len();
@@ -259,7 +326,14 @@ fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
     let all = scenes();
     for (i, a) in all.iter().enumerate() {
         assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
-        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0);
+        assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && a.presents.is_none());
+        if let Some(moment) = a.presents {
+            // A cutscene: no reach, offered at moments before the one its point moves to, and in a field whose story points
+            // are served (a reviewed field), or it would never play.
+            assert_eq!(a.trigger.talk_radius, 0, "{}", a.id);
+            assert!(*a.trigger.moments.end() < moment, "{}", a.id);
+            assert!(fmv_ff7::is_reviewed_field(&a.field), "{}: a cutscene's point must be served", a.id);
+        }
         if a.starts_on_arrival() {
             for b in all.iter().skip(i + 1).filter(|b| b.starts_on_arrival() && b.field.eq_ignore_ascii_case(&a.field)) {
                 assert!(a.trigger.moments.end() < b.trigger.moments.start() || b.trigger.moments.end() < a.trigger.moments.start(), "{} and {}", a.id, b.id);
@@ -445,8 +519,9 @@ fn cargo_train_survey_runs_director_and_field_staging() {
     assert!(outcome.unknown_persistent_reads.is_empty());
     assert_eq!((outcome.stats.unresolved, outcome.stats.dropped_requests), (0, 0));
     assert!(outcome.stats.unknown.is_empty());
-    assert!(outcome.setup_stats.unknown.contains_key("CHAR"));
-    assert!(outcome.setup_stats.unknown.contains_key("PC"));
+    // The field's own staging declares each actor's model and binding (CHAR, PC): known declarations, skipped.
+    assert!(outcome.setup_stats.ignored.contains_key("CHAR") && outcome.setup_stats.ignored.contains_key("PC"));
+    assert!(outcome.setup_stats.unknown.is_empty(), "{:?}", outcome.setup_stats.unknown);
     let mut play = ScenePlay::new(&f, &def, &story, 1).unwrap();
     loop { if let Then::End { how, .. } = play.next(None).then { assert_eq!(how, End::Finished); break; } }
     assert_eq!(play.off_cast(), 0);
@@ -837,7 +912,7 @@ fn the_proof_scene_writes_only_its_mark_once_and_a_scene_that_moves_the_moment_r
         ],
         speakers: vec![("Cloud".into(), CLOUD), ("Tifa".into(), TIFA)],
         witness: Vec::new(),
-        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 },
+        arrival: fmv_ff7::script::scene::Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None,
     };
     let out = run_to_end(&f, &leaving, &StoryState::at(81), 1, &[]).unwrap();
     assert_eq!(out.end, End::MapJump { field: 294 }, "the scene ends where the script leaves the field");

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use fmv_adapter_api::GameAdapter;
 use fmv_core::{AccountId, AnimState, AvatarAppearance};
-use fmv_fixture::rooms::{RoomsAdapter, HALL, YARD};
+use fmv_fixture::rooms::{RoomsAdapter, HALL, STORY_ADVANCED, YARD};
 use fmv_party::PartyConfig;
 use fmv_protocol::SyntheticRules;
 use tokio::sync::{mpsc, watch};
@@ -25,6 +25,8 @@ type Finish = (String, Vec<u8>, u32, Vec<u8>);
 
 /// The story the fake host has an entry for (see [`FakeHost::entry`]).
 const FAR_ALONG: &[u8] = &[7, 7];
+/// The fake host's cutscene: of the hall's story region (the fixture's point 0, a new account to `STORY_ADVANCED`).
+const POINT_SCENE: &str = "test/hall-cutscene";
 
 #[derive(Default)]
 struct FakeHost {
@@ -33,11 +35,19 @@ struct FakeHost {
     automatic: Mutex<bool>,
     /// Where a story of [`FAR_ALONG`] comes into the world, when the test sets one.
     entry: Mutex<Option<fmv_adapter_api::Exit>>,
+    /// Whether the hall's story step has its cutscene ([`POINT_SCENE`]).
+    cutscene: Mutex<bool>,
 }
 
 impl SceneHost for FakeHost {
     fn scenes(&self) -> Vec<SceneInfo> {
-        vec![SceneInfo { id: SCENE.to_string(), field: YARD.to_string(), arrival: Pos::new(150.0, -100.0, 0.0), arrival_facing: 0.0, arrival_hint: None }]
+        vec![
+            SceneInfo { id: SCENE.to_string(), field: YARD.to_string(), arrival: Pos::new(150.0, -100.0, 0.0), arrival_facing: 0.0, arrival_hint: None },
+            SceneInfo { id: POINT_SCENE.to_string(), field: HALL.to_string(), arrival: Pos::new(200.0, 0.0, 0.0), arrival_facing: 0.0, arrival_hint: None },
+        ]
+    }
+    fn point_scene(&self, field: &str, before: &[u8], after: &[u8]) -> Option<String> {
+        (*self.cutscene.lock().unwrap() && field == HALL && before.is_empty() && after == STORY_ADVANCED).then(|| POINT_SCENE.to_string())
     }
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         scene == SCENE && (progress.is_empty() || progress == MADE_UP)
@@ -96,6 +106,106 @@ fn automatic_scene_uses_and_saves_only_the_members_own_story() {
     let Some(Msg::Story(job)) = saved_rx.try_recv().ok() else { panic!("the member's story was not saved") };
     assert_eq!((job.account, job.progress), (b.account, vec![5]));
     assert!(saved_rx.try_recv().is_err());
+}
+
+/// A world over the fixture rooms WITH their synthetic story (the hall's story region takes a new account to
+/// `STORY_ADVANCED`), the fake host with its cutscene for that step on.
+fn cutscene_world() -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>) {
+    let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_story());
+    let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+    w.set_area_source(adapter);
+    let (handle, rx) = SaverHandle::channel();
+    w.set_progress_saver(handle);
+    let host = Arc::new(FakeHost::default());
+    *host.cutscene.lock().unwrap() = true;
+    w.configure_scenes(Some(SceneSettings { host: host.clone(), debug_preview: false, debug_new_story: None }));
+    (w, rx, host)
+}
+
+/// Walk `s` from the hall's spawn into its story region (x 150..250, y -50..50).
+fn into_the_region(w: &mut World, s: &Seat, now: &mut Instant) {
+    assert_eq!(go(w, s, 100.0, 0.0, now), MoveOutcome::Applied);
+    assert_eq!(go(w, s, 200.0, 0.0, now), MoveOutcome::Applied);
+}
+
+/// A story point with a cutscene plays it FIRST: the player is held in a run of the cutscene, built against its story before
+/// the step, and nothing of the story moves until the run ends; then the point's own step is applied, once (the saver gets
+/// it once, after the `SceneEnded`). The cutscene writes nothing of its own: the host is never asked to run it.
+#[test]
+fn a_point_with_a_cutscene_plays_it_first_and_its_step_follows_when_it_ends() {
+    let mut now = Instant::now();
+    let (mut w, mut saved_rx, host) = cutscene_world();
+    let mut a = seat(&mut w, "A", &[], now);
+    a.drain();
+    into_the_region(&mut w, &a, &mut now);
+    let msgs = a.drain();
+    let started: Vec<_> = msgs.iter().filter_map(|m| match m { ServerMsg::SceneStart { run, scene, progress, .. } => Some((*run, scene.clone(), progress.clone())), _ => None }).collect();
+    let [(run, scene, progress)] = &started[..] else { panic!("one cutscene run: {msgs:?}") };
+    assert_eq!((scene.as_str(), progress.as_slice()), (POINT_SCENE, &[][..]), "built against the story before the step");
+    assert!(w.in_scene(a.entity));
+    assert!(w.players.get(&a.entity).unwrap().progression.is_empty(), "the step waits for the run");
+    assert!(saved(&mut saved_rx).is_empty());
+    assert!(!msgs.iter().any(|m| matches!(m, ServerMsg::StoryUpdate { .. })));
+    // held: a move is ignored, so the region is not reached again
+    w.scene_message(a.entity, ClientMsg::SceneEnd { run: *run, skipped: false }, now);
+    let msgs = a.drain();
+    let ended = msgs.iter().position(|m| matches!(m, ServerMsg::SceneEnded { .. })).expect("released");
+    let story = msgs.iter().position(|m| matches!(m, ServerMsg::StoryUpdate { advance: Some(_), .. })).expect("then the step");
+    assert!(ended < story);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED);
+    assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()], "saved once");
+    assert!(host.finished.lock().unwrap().is_empty(), "a cutscene's own run writes nothing");
+    let log = logs_of(&mut w);
+    assert!(log.iter().any(|l| l.contains(&format!("scene={POINT_SCENE} outcome=Finished answers=0 story=the point's step"))), "{log:?}");
+    assert!(log.iter().any(|l| l.starts_with("story advanced account=") && l.contains("point=0")), "{log:?}");
+    // walking on in the region reaches the point again, which no longer applies: no second run
+    assert_eq!(go(&mut w, &a, 210.0, 0.0, &mut now), MoveOutcome::Applied);
+    assert!(starts(&a.drain()).is_empty() && !w.in_scene(a.entity));
+}
+
+/// However the cutscene ends (the owner's client leaves it, or it goes quiet and times out), the step is applied: the story
+/// never waits on a presentation. An owner that leaves the world takes nothing with it: no step, no save.
+#[test]
+fn a_cutscene_that_is_left_or_times_out_still_gives_the_step_and_one_whose_owner_left_gives_nothing() {
+    let mut now = Instant::now();
+    let (mut w, mut saved_rx, _host) = cutscene_world();
+    let mut a = seat(&mut w, "A", &[], now);
+    a.drain();
+    into_the_region(&mut w, &a, &mut now);
+    let run = starts(&a.drain())[0].0;
+    w.scene_message(a.entity, ClientMsg::SceneLeave { run }, now);
+    assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED, "left: the step all the same");
+    assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()]);
+
+    let mut b = seat(&mut w, "B", &[], now);
+    b.drain();
+    into_the_region(&mut w, &b, &mut now);
+    assert_eq!(starts(&b.drain()).len(), 1);
+    w.advance_scenes(now + SCENE_IDLE_TIMEOUT + Duration::from_secs(1));
+    assert_eq!(w.players.get(&b.entity).unwrap().progression, STORY_ADVANCED, "timed out: the step all the same");
+    assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()]);
+
+    let mut c = seat(&mut w, "C", &[], now);
+    c.drain();
+    into_the_region(&mut w, &c, &mut now);
+    assert_eq!(starts(&c.drain()).len(), 1);
+    assert!(w.leave(c.entity));
+    assert!(saved(&mut saved_rx).is_empty(), "the owner left: nothing applied, nothing saved");
+}
+
+/// Without a cutscene for the step (the host has none) the step is applied at once, exactly as before cutscenes.
+#[test]
+fn a_point_without_a_cutscene_applies_its_step_at_once() {
+    let mut now = Instant::now();
+    let (mut w, mut saved_rx, host) = cutscene_world();
+    *host.cutscene.lock().unwrap() = false;
+    let mut a = seat(&mut w, "A", &[], now);
+    a.drain();
+    into_the_region(&mut w, &a, &mut now);
+    let msgs = a.drain();
+    assert!(starts(&msgs).is_empty());
+    assert!(msgs.iter().any(|m| matches!(m, ServerMsg::StoryUpdate { advance: Some(_), .. })));
+    assert_eq!(saved(&mut saved_rx), [STORY_ADVANCED.to_vec()]);
 }
 
 fn logs_of(w: &mut World) -> Vec<String> {

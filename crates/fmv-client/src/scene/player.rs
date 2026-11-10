@@ -322,6 +322,11 @@ impl ScenePlayer {
     // ---- the stage -----------------------------------------------------------------------------------------------
 
     /// The cast members to draw: placed, not hidden, with the look the scene gives them.
+    /// The scene's data (its cast, witness spots and the rest).
+    pub fn def(&self) -> &SceneDef {
+        &self.def
+    }
+
     pub fn cast_draws(&self) -> Vec<CastDraw<'_>> {
         self.cast
             .actors()

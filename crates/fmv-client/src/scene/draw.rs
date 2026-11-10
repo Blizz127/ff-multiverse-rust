@@ -47,10 +47,15 @@ pub fn is_trigger(id: u32) -> bool {
     id >= SCENE_NPC_ID_BASE
 }
 
-/// The area's characters as a frame draws them: all of them, except the scenes' triggers while a scene is on show.
+/// The area's characters as a frame draws them: all of them, except, while a scene is on show, the scenes' triggers and the
+/// characters the scene's cast plays (an area character whose name is a cast member's: the cast stands for it, where the scene
+/// puts it, so it is not drawn twice).
 pub fn visible_npcs<'a>(npcs: &'a [NpcView], scene: Option<&ScenePlayer>) -> Cow<'a, [NpcView]> {
-    if scene.is_some() && npcs.iter().any(|n| is_trigger(n.id)) {
-        Cow::Owned(npcs.iter().filter(|n| !is_trigger(n.id)).cloned().collect())
+    let Some(scene) = scene else { return Cow::Borrowed(npcs) };
+    let cast = &scene.def().cast;
+    let played = |n: &NpcView| !n.name.is_empty() && cast.iter().any(|m| m.name.eq_ignore_ascii_case(&n.name));
+    if npcs.iter().any(|n| is_trigger(n.id) || played(n)) {
+        Cow::Owned(npcs.iter().filter(|n| !is_trigger(n.id) && !played(n)).cloned().collect())
     } else {
         Cow::Borrowed(npcs)
     }

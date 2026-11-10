@@ -1419,6 +1419,32 @@ scripts/story-smoke.sh --debug --echo-s <Echo-s.iro>      # the same in Echo-S's
 The smoke's server runs with `--debug-start-moment 33` (a new account starts where the escape ends; refused on the default
 state directory, like the other debug flags that make up stored numbers), so it takes seconds instead of the whole mission.
 
+### Cutscenes of the reactor's own story points
+
+The first reactor's story moves at story points (README "Walking between fields": a triangle, a line, entering a field, a
+talk), and the server applies each point's step, read statically from the field's script. Where the game plays a scripted
+conversation at a point, that conversation is now played too, as a **cutscene** (`SceneDef::presents`: the moment the
+point moves the story to):
+
+* **`ff7/md1_1/team-talk`** (the reactor's gate, the point to 7): Biggs, Jessie, Cloud and Barret, twelve windows.
+
+How it works (`World::start_point_scene`, `SceneHost::point_scene`):
+
+* When a player reaches a point whose step has a cutscene, the server starts a run of it for that player (party members in
+  range watch, as for any scene), built against the player's story BEFORE the step, and holds the step.
+* The cutscene writes nothing of its own and sends nobody anywhere (the field's own jump at its end is not made). When the run
+  ends, however it ends (finished, skipped, left, timed out), the point's own step is applied, judged again on the player's
+  story then, exactly as a story battle's step is after the win. Only an owner that left the world gets nothing.
+* A point whose cutscene holds the player is the last one judged in that move (or on that entry); the field's other entry
+  points are judged again after the step.
+* The scene's own interpreted write is held to the point's step by a real-data test (`tests/scene_real.rs`,
+  `the_team_talk_is_the_cutscene_of_md1_1s_story_point_and_writes_its_step`), so a cutscene never shows a story the server
+  did not apply.
+* A player alone sees Echo-S's edition when both editions tell the same story (as for the scenes after the escape).
+
+Known gap: the player's own character stands where it reached the point, which is where the cast's Cloud starts too, until a
+witness spot is measured for the field.
+
 ### Scene data (`fmv_ff7::script::scene::SceneDef`)
 
 A scene is DATA: ids, names and numbers, never game text or bytes. The script and the lines are read from the owner's
@@ -1567,7 +1593,7 @@ ranks the floor for them. The pictures contain game art: they stay out of the re
   numbers in about 700 fields; entity names are kept, so resolving by name is the way when such a layer is wired in.
 * **After a scene that changes the story the area's NPC list is not re-sent** unless the player changes instance, so a trigger
   that should be gone can still be drawn; the server refuses the press.
-* Scenes are Rust data (three today), not files.
+* Scenes are Rust data (four today), not files.
 **Protocol v17 (the commander of the canon pair)** adds one optional field to the battle roster, `BattleMember::commander`
 (an account, for a canon companion only; absent from the JSON when the server commands the companion, so that a roster
 without it is byte for byte what v16 sent and reads as "the server's"), and changes who may send a `BattleCommand`:

@@ -47,6 +47,17 @@ pub(super) struct StoryThen {
     pub point: u32,
 }
 
+/// What reaching a story point did (`World::reach_story_point`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reached {
+    /// The point does not apply (or its battle could not start).
+    Nothing,
+    /// The step was applied, or the point's battle started.
+    Applied,
+    /// The step's cutscene holds the player; the step follows when the run ends.
+    Held,
+}
+
 impl World {
     /// The accepted move `from -> to` of `entity`: reach every story point of its area that it touches
     /// and advance its story where that applies (module docs). Does nothing for a player that is in a
@@ -67,7 +78,10 @@ impl World {
                 .collect()
         };
         for point in touched {
-            self.reach_story_point(entity, point, Some(now));
+            // (a point whose cutscene now holds the player is the move's last: the others are judged on the story it leaves)
+            if self.reach_story_point(entity, point, Some(now), now, false) == Reached::Held {
+                break;
+            }
         }
     }
 
@@ -75,7 +89,10 @@ impl World {
     /// story point of the area that fires on entry, in the order the area lists them, each judged on the story the
     /// ones before it left. Does nothing for a player whose placement does not let it advance the story (a party
     /// member in the leader's phase), or in an area without such points.
-    pub(super) fn enter_story(&mut self, entity: EntityId) {
+    ///
+    /// A point whose cutscene holds the player is the last judged here: the run's end applies its step and judges the
+    /// area's entry points again (`point_step_after_scene`).
+    pub(super) fn enter_story(&mut self, entity: EntityId, now: Instant) {
         let entering: Vec<u32> = {
             let Some(player) = self.players.get(&entity).filter(|p| p.battle.is_none() && p.transit.is_none()) else { return };
             if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
@@ -85,8 +102,10 @@ impl World {
             area.story_points().iter().filter(|point| point.is_on_entry()).map(|point| point.id).collect()
         };
         for point in entering {
-            // (no clock here: a point that needs a battle is not one that fires by coming to stand somewhere)
-            self.reach_story_point(entity, point, None);
+            // (no battle clock here: a point that needs a battle is not one that fires by coming to stand somewhere)
+            if self.reach_story_point(entity, point, None, now, true) == Reached::Held {
+                break;
+            }
         }
     }
 
@@ -101,21 +120,26 @@ impl World {
     }
 
     /// `entity` reached story point `point` of its area: advance its story if the point applies to it, or start the
-    /// battle the point starts first (`AreaRuntime::story_battle`: the step then waits for the win; `now` is the
-    /// clock of that battle, and without one such a point does nothing). Returns whether anything was done.
-    pub(super) fn reach_story_point(&mut self, entity: EntityId, point: u32, now: Option<Instant>) -> bool {
+    /// battle the point starts first (`AreaRuntime::story_battle`: the step then waits for the win; `battle_clock` is the
+    /// clock of that battle, and without one such a point does nothing), or play the step's cutscene first (the game's
+    /// `SceneHost::point_scene`: the step then waits for the run's end; `now` is the run's clock, `on_entry` whether the point
+    /// was reached by coming to stand in the area).
+    pub(super) fn reach_story_point(&mut self, entity: EntityId, point: u32, battle_clock: Option<Instant>, now: Instant, on_entry: bool) -> Reached {
         let (step, battle) = {
-            let Some(player) = self.players.get(&entity) else { return false };
-            let Some(area) = self.areas.get(&player.area) else { return false };
+            let Some(player) = self.players.get(&entity) else { return Reached::Nothing };
+            let Some(area) = self.areas.get(&player.area) else { return Reached::Nothing };
             (area.runtime().story_advance(&player.progression, point), area.runtime().story_battle(point))
         };
-        let Some(step) = step else { return false };
+        let Some(step) = step else { return Reached::Nothing };
         if let Some(formation) = battle {
-            let Some(now) = now else { return false };
-            return self.start_story_battle(entity, point, formation, now);
+            let Some(clock) = battle_clock else { return Reached::Nothing };
+            return if self.start_story_battle(entity, point, formation, clock) { Reached::Applied } else { Reached::Nothing };
+        }
+        if self.start_point_scene(entity, point, &step, now, on_entry) {
+            return Reached::Held;
         }
         self.apply_story_step(entity, point, step);
-        true
+        Reached::Applied
     }
 
     /// The battle that a story point started has been WON: the player's step, if it still applies (the player is where

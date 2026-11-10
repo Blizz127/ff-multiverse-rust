@@ -130,6 +130,12 @@ pub struct SceneDef {
     pub witness: Vec<Spot>,
     /// Where a player that is put in the scene's field (the debug preview) arrives: on the floor, within the trigger's reach.
     pub arrival: Spot,
+    /// For the CUTSCENE of one of the field's own story points: the story moment that point moves the story to. Such a scene
+    /// is never offered by itself (no trigger character, no start on arrival, see [`SceneDef::offered_to`]): the server plays
+    /// it when a player reaches that point, built against the story the player has before the step, and applies the point's
+    /// own step (read from the script by the story model, not from this run) when it ends. It writes nothing of its own and
+    /// sends nobody anywhere. `None` for every other scene.
+    pub presents: Option<u16>,
 }
 
 impl SceneDef {
@@ -177,7 +183,14 @@ impl SceneDef {
     /// offered, and the world runs the ones that fire on entry BEFORE it judges the scene, so a point that writes the
     /// scene's moment (as `md8_1`'s does) would leave the scene never offered (`tests/scene_real.rs` holds the list to it).
     pub fn starts_on_arrival(&self) -> bool {
-        self.trigger.talk_radius == 0
+        self.trigger.talk_radius == 0 && self.presents.is_none()
+    }
+
+    /// Whether this scene is the cutscene of the step of field `field` that takes a story from `before` to `after` (see
+    /// [`SceneDef::presents`]): the field is the scene's, the step moves the moment up to the one the scene presents, and the
+    /// scene applies at the story the step starts from.
+    pub fn presents_step(&self, field: &str, before: &StoryState, after: &StoryState) -> bool {
+        self.field.eq_ignore_ascii_case(field) && self.presents == Some(after.moment) && after.moment > before.moment && self.applies_at(before.moment)
     }
 
     /// Whether the scene has already begun for `story`: every mark its own root turns on first (the field's way of saying that
@@ -196,7 +209,7 @@ impl SceneDef {
     /// Whether the scene is on offer for `story`: at its moment and not begun yet (module docs: a story scene plays once per
     /// story, as far as the story carries its mark).
     pub fn offered_to(&self, story: &StoryState) -> bool {
-        self.applies_at(story.moment) && !self.begun_in(story)
+        self.presents.is_none() && self.applies_at(story.moment) && !self.begun_in(story)
     }
 
     /// The same scene with another cast (the entities the script drives stay; the actors that play them change).
@@ -273,7 +286,7 @@ pub fn post_escape_scene() -> SceneDef {
         // walkmesh rule (71 units from the cast, 76 from the edge) and stays out of the way, behind the rock: the body is
         // barely visible.
         witness: vec![Spot { x: -133, y: 144, triangle: 0, direction: 0 }],
-        arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 },
+        arrival: Spot { x: 82, y: 267, triangle: 3, direction: 0 }, presents: None,
     }
 }
 
@@ -323,7 +336,7 @@ pub fn train_scene() -> SceneDef {
         setup: vec![ScriptRef::new(40, 0)], given: vec![], root: vec![Step::StartMain(17)], cast,
         speakers: vec![("Cloud".into(), 30), ("Barret".into(), 31), ("Biggs".into(), 33), ("Jessie".into(), 34), ("Wedge".into(), 35)],
         // Deliberately absent until a visible walkmesh location has been checked.
-        witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 },
+        witness: vec![], arrival: Spot { x: -2, y: 608, triangle: 29, direction: 252 }, presents: None,
     }
 }
 
@@ -347,6 +360,47 @@ pub fn early_bar_scene() -> SceneDef {
     def
 }
 
+/// The id of the team's talk at the reactor's gate (the cutscene of `md1_1`'s story point to 7).
+pub const TEAM_TALK_SCENE_ID: &str = "ff7/md1_1/team-talk";
+
+/// **The team at the reactor's gate** (field `md1_1`): the cutscene of the field's story point that moves the story to 7
+/// ([`SceneDef::presents`]). The field's director (`dir`, entity 0) watches the triangle the player's character stands on;
+/// when Cloud reaches triangle 62 with the story before 7 it locks the controls, writes 7 and plays the team's talk: twelve
+/// windows (Biggs, Jessie, Cloud and Barret), the door, and its own jump on to the next field. As a cutscene the scene is
+/// played for the player who reaches the point, built against its story before the step: the stage scripts are the init
+/// part of every entity's script 0 (what the field does when it loads), the root starts the director's main loop, and Cloud
+/// starts on triangle 62 (its centre), where the director's `GETAI` finds him. The step itself is the story point's,
+/// applied when the scene ends (`tests/scene_real.rs` holds the scene's own write to it); the jump is not made.
+pub fn team_talk_scene() -> SceneDef {
+    let cast = [
+        (1, "cl", "aaaa", "acfe"), (2, "ba", "acgd", "adcb"), (3, "av_m", "bwfd", "acfe"), (4, "av_l", "axdc", "acfe"),
+        (5, "av_s", "bxbe", "acfe"), (6, "drL", "bxjb", "bxjf"), (7, "drR", "bxjb", "bxjf"),
+    ]
+    .into_iter()
+    .map(|(entity, name, hrc, idle)| CastMember {
+        entity,
+        name: name.into(),
+        look: Look::Model { hrc: hrc.into(), idle: idle.into() },
+        start: (entity == 1).then_some(Spot { x: 1120, y: 1468, triangle: 62, direction: 0 }),
+    })
+    .collect();
+    SceneDef {
+        id: TEAM_TALK_SCENE_ID.into(),
+        game: "ff7".into(),
+        field: "md1_1".into(),
+        trigger: Trigger { entity: 0, name: "dir".into(), slot: 0, talk_radius: 0, moments: 0..=6 },
+        setup: (0..12).map(|e| ScriptRef::new(e, 0)).collect(),
+        given: vec![],
+        root: vec![Step::StartMain(0)],
+        cast,
+        speakers: vec![("Cloud".into(), 1), ("Barret".into(), 2), ("Biggs".into(), 3), ("Jessie".into(), 4), ("Wedge".into(), 5)],
+        // Known gap until a spot is measured: the player stands where it reached the point.
+        witness: vec![],
+        arrival: Spot { x: 1120, y: 1468, triangle: 62, direction: 0 },
+        presents: Some(7),
+    }
+}
+
 /// Offline director survey at moment 51. The route, witness, field effects and party state
 /// have not been verified for live play, so this definition is deliberately unregistered.
 pub fn sector7_station_scene() -> SceneDef {
@@ -364,7 +418,7 @@ pub fn sector7_station_scene() -> SceneDef {
         trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 51..=51 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
-        witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 },
+        witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 }, presents: None,
     }
 }
 
@@ -384,7 +438,7 @@ pub fn sector7_intro_scene() -> SceneDef {
         id: SECTOR7_INTRO_SCENE_ID.into(), game: "ff7".into(), field: "mds7".into(),
         trigger: Trigger { entity: 7, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(7)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 },
+        witness: vec![], arrival: Spot { x: 1641, y: -328, triangle: 109, direction: 0 }, presents: None,
     }
 }
 
@@ -403,7 +457,7 @@ pub fn flower_station_scene() -> SceneDef {
         trigger: Trigger { entity: 0, name: "dic".into(), slot: 0, talk_radius: 0, moments: 36..=36 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
         speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
-        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 },
+        witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 }, presents: None,
     }
 }
 
@@ -423,7 +477,7 @@ pub fn reactor_opening_scene() -> SceneDef {
         id: REACTOR_OPENING_SCENE_ID.into(), game: "ff7".into(), field: "md1stin".into(),
         trigger: Trigger { entity: 0, name: "dir".into(), slot: 0, talk_radius: 0, moments: 0..=0 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 3655, y: 27432, triangle: 25, direction: 128 },
+        witness: vec![], arrival: Spot { x: 3655, y: 27432, triangle: 25, direction: 128 }, presents: None,
     }
 }
 
@@ -443,7 +497,7 @@ pub fn cargo_train_scene() -> SceneDef {
         setup: (11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
         root: vec![Step::StartMain(6)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
-        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 },
+        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 }, presents: None,
     }
 }
 
@@ -461,7 +515,7 @@ pub fn sector7_pillar_scene() -> SceneDef {
         id: SECTOR7_PILLAR_SCENE_ID.into(), game: "ff7".into(), field: "mds7plr1".into(),
         trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 63..=63 },
         setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast, speakers: vec![],
-        witness: vec![], arrival: Spot { x: 378, y: -264, triangle: 65, direction: 0 },
+        witness: vec![], arrival: Spot { x: 378, y: -264, triangle: 65, direction: 0 }, presents: None,
     }
 }
 
@@ -533,14 +587,15 @@ pub fn proof_scene() -> SceneDef {
             Spot { x: -100, y: 60, triangle: 68, direction: 1 },
         ],
         // At the counter's edge, facing Tifa across it (she stands at (-268, -105); her talk radius is 150).
-        arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 },
+        arrival: Spot { x: -124, y: -112, triangle: 27, direction: 192 }, presents: None,
     }
 }
 
 /// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
-/// ones before it keep their numbers): the proof, then the two the escape from the first reactor ends in.
+/// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
+/// reactor's own story points.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

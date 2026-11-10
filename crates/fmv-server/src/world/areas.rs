@@ -408,7 +408,7 @@ impl World {
         self.scene_entered(entity, failed);
         // What the area's own scripts do by themselves from the first frame on moves the story of whoever stands
         // there (the points that fire on entry; a no-op in an area without any).
-        self.enter_story(entity);
+        self.enter_story(entity, now);
         self.automatic_scene_entered(entity, now);
     }
 

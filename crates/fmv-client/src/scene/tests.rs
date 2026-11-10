@@ -52,7 +52,7 @@ pub(crate) fn def_in(field: &str) -> SceneDef {
             Spot { x: -100, y: -216, triangle: 40, direction: 128 },
             Spot { x: -30, y: -72, triangle: 25, direction: 226 },
         ],
-        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 },
+        arrival: Spot { x: -125, y: -100, triangle: 27, direction: 192 }, presents: None,
     }
 }
 
@@ -625,7 +625,8 @@ fn an_arrow_held_while_walking_up_does_not_spin_the_pointer_but_one_pressed_in_t
 
 #[test]
 fn the_trigger_is_hidden_while_its_scene_runs_and_is_back_when_it_is_over() {
-    let npcs = vec![trigger(3, 0.0), trigger(SCENE_NPC_ID_BASE, 10.0), trigger(SCENE_NPC_ID_BASE + 1, 20.0)];
+    // (the area's own character has a name of its own: one the cast plays is hidden too, see the next test)
+    let npcs = vec![NpcView { name: "gamma".into(), ..trigger(3, 0.0) }, trigger(SCENE_NPC_ID_BASE, 10.0), trigger(SCENE_NPC_ID_BASE + 1, 20.0)];
     let mut rig = rig_with(talk(), false);
     assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "no scene: everybody is drawn");
     assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE)));
@@ -637,6 +638,21 @@ fn the_trigger_is_hidden_while_its_scene_runs_and_is_back_when_it_is_over() {
     ended(&mut rig, RUN, SceneOutcome::Finished);
     assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "back again");
     assert!(!label_hidden(rig.client.player(), Subject::Npc(SCENE_NPC_ID_BASE)));
+}
+
+/// An area character the scene's cast plays (the same script entity name, any case) is not drawn while the scene is on
+/// show: the cast member stands for it where the scene puts it. Characters the cast does not play stay.
+#[test]
+fn an_area_character_the_cast_plays_is_drawn_once_while_the_scene_runs() {
+    let named = |id: u32, name: &str| NpcView { name: name.to_string(), ..trigger(id, 0.0) };
+    let npcs = vec![named(1, "ALPHA"), named(2, "gamma"), named(3, "")];
+    let mut rig = rig_with(talk(), false);
+    assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3);
+    begin(&mut rig, SceneRole::Owner);
+    let shown: Vec<u32> = visible_npcs(&npcs, rig.client.player()).iter().map(|n| n.id).collect();
+    assert_eq!(shown, [2, 3], "alpha is the cast's (entity 18); gamma and the unnamed one are not");
+    ended(&mut rig, RUN, SceneOutcome::Finished);
+    assert_eq!(visible_npcs(&npcs, rig.client.player()).len(), 3, "back again when it is over");
 }
 
 #[test]

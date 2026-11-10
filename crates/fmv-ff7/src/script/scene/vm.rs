@@ -1590,6 +1590,9 @@ fn is_ignored(op: u8) -> bool {
         | 0x59 | 0x5A | 0x5C | 0x5D | 0x3A | 0x3C..=0x3F
         // SPECIAL and KAWAI families
         | 0x0F | 0x28 | 0x29
+        // an entity's declarations: its model (CHAR) and the playable character it is bound to (PC). A scene's cast names
+        // the models it draws, and nothing the VM does reads the binding (`GETAI` and the rest name their entity).
+        | 0xA0 | 0xA1
     )
 }
 

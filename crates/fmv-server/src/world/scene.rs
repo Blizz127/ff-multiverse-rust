@@ -121,6 +121,10 @@ pub trait SceneHost: Send + Sync {
     fn offered(&self, scene: &str, progress: &[u8]) -> bool;
     /// Whether the scene starts automatically on entering its field.
     fn automatic(&self, _scene: &str) -> bool { false }
+    /// The CUTSCENE of a story point, if the game has one: the scene to play for a player whose step in area `field` takes its
+    /// story from `before` to `after` (the point's own step, which the world applies when the scene ends: see
+    /// `World::start_point_scene`). `None`: the step is applied at once, as it always was.
+    fn point_scene(&self, _field: &str, _before: &[u8], _after: &[u8]) -> Option<String> { None }
     /// Where an account whose story is `progress` comes into the world, when that is not where everyone joins: a story that
     /// a scene took somewhere no walk leads back from stands there again on its next login (`World::join` sends the player
     /// on from the entry area through the ordinary area handshake). `None`: it joins like everyone.
@@ -191,6 +195,19 @@ struct SceneRun {
     /// Whether the owner may write the story here (its own phase chose the instance).
     writes_story: bool,
     preview: bool,
+    /// A cutscene's story point, whose step is applied when the run ends (`World::start_point_scene`). `None` for every other run.
+    then: Option<PointThen>,
+}
+
+/// What a cutscene run holds back until it ends: the story point whose step it presents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PointThen {
+    point: u32,
+    /// The area the point is in (the step applies only to a player still standing there).
+    area: AreaKey,
+    /// Whether the point was reached by coming to stand in the area (`World::enter_story` stopped at it and judges the
+    /// area's other entry points again after the step).
+    on_entry: bool,
 }
 
 /// The scenes of a world.
@@ -340,8 +357,73 @@ impl World {
             last_activity: now,
             writes_story,
             preview,
+            then: None,
         };
         self.start_run(run, record, &mut Vec::new());
+    }
+
+    /// `entity` reached story point `point` of its area, whose step is `step`: if the game has a cutscene for that step
+    /// (`SceneHost::point_scene`), play it first. The run is the player's (party members in range watch, as for any scene),
+    /// built against the story it has BEFORE the step; it writes nothing of its own and sends nobody anywhere, and when it
+    /// ends, however it ends, the point's own step is applied (judged again then: `point_step_after_scene`), unless the player
+    /// has left the world. Returns whether a run was started (the step then waits for it); `false` leaves the step to the
+    /// caller, as before cutscenes. A previewing player, or one that is held, in a battle or in transit, gets none.
+    pub(super) fn start_point_scene(&mut self, entity: EntityId, point: u32, step: &StoryStep, now: Instant, on_entry: bool) -> bool {
+        let Some(host) = self.scenes.host.clone() else { return false };
+        let (area, account, pos, before) = {
+            let Some(p) = self.players.get(&entity) else { return false };
+            if p.preview.is_some() || p.scene.is_some() || p.battle.is_some() || p.transit.is_some() {
+                return false;
+            }
+            (p.area.clone(), p.account, p.snapshot.pos, p.progression.clone())
+        };
+        let Some(scene) = host.point_scene(&area, &before, &step.progress) else { return false };
+        if !self.scenes.list.iter().any(|s| s.id == scene) {
+            return false;
+        }
+        let watchers = self.watchers_for(entity, account, pos);
+        let run = SceneRunId(self.scenes.next_run.max(1));
+        self.scenes.next_run = run.0.saturating_add(1);
+        let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
+        let record = SceneRun {
+            scene,
+            owner: entity,
+            watchers,
+            seed,
+            progress: before,
+            answers: Vec::new(),
+            steps: 0,
+            started: now,
+            last_activity: now,
+            writes_story: false,
+            preview: false,
+            then: Some(PointThen { point, area, on_entry }),
+        };
+        self.start_run(run, record, &mut Vec::new());
+        true
+    }
+
+    /// A cutscene run has ended: apply its point's step to its owner, judged on the owner's story NOW (as a battle's step is
+    /// after the win), if the owner is still in the world, in that area, free, and allowed to move the story there; then, for a
+    /// point reached on entry, the area's other entry points the run held back.
+    fn point_step_after_scene(&mut self, owner: EntityId, then: PointThen, now: Instant) {
+        let step = {
+            let Some(player) = self.players.get(&owner) else { return };
+            if player.area != then.area || player.battle.is_some() || player.transit.is_some() || player.scene.is_some() {
+                return;
+            }
+            if player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) {
+                return;
+            }
+            let Some(area) = self.areas.get(&player.area) else { return };
+            area.runtime().story_advance(&player.progression, then.point)
+        };
+        if let Some(step) = step {
+            self.apply_story_step(owner, then.point, step);
+        }
+        if then.on_entry {
+            self.enter_story(owner, now);
+        }
     }
 
     /// The party members of `owner` that may watch: same instance, same area, in range, free (not in a battle, in transit or in a
@@ -514,7 +596,7 @@ impl World {
                 }
             }
         }
-        let story = if !apply { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
+        let story = if record.then.is_some() { "the point's step" } else if !apply { "dropped" } else if !record.writes_story { "none (not the owner's phase)" } else if let Some(result) = &result {
             self.apply_scene_story(&record, result)
         } else { "none (the scene could not be run)" };
         // A debug preview never changes the real world. A real scene's destination is resolved and
@@ -530,6 +612,10 @@ impl World {
         }
         self.logs.info(format!("scene ended run={} scene={} outcome={outcome:?} answers={} story={story}", run.0, record.scene, record.answers.len()));
         self.drop_failed(failed);
+        // A cutscene's point: its step, now that the run is over (however it ended; nothing if the owner is gone).
+        if let Some(then) = record.then {
+            self.point_step_after_scene(record.owner, then, now);
+        }
     }
 
     /// What the scene's script wrote, applied to the owner's story once (see the module docs). Returns a word for the log.
@@ -697,7 +783,7 @@ impl World {
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
         let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress, answers: vec![], steps: 0,
-            started: now, last_activity: now, writes_story: true, preview: false };
+            started: now, last_activity: now, writes_story: true, preview: false, then: None };
         self.start_run(run, record, &mut Vec::new());
     }
 }
