@@ -227,6 +227,9 @@ pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower-survey";
 /// Survey-only Sector 7 pillar-field entry; not registered for play.
 pub const SECTOR7_PILLAR_SCENE_ID: &str = "ff7/mds7plr1/entry-survey";
 
+/// Survey-only Reactor opening; never offered for live play.
+pub const REACTOR_OPENING_SCENE_ID: &str = "ff7/md1stin/opening-survey";
+
 /// Survey-only cargo train director; not registered for play.
 pub const CARGO_TRAIN_SCENE_ID: &str = "ff7/cargoin/train-survey";
 
@@ -371,6 +374,26 @@ pub fn flower_station_scene() -> SceneDef {
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
         speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
         witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 },
+    }
+}
+
+/// Offline opening director survey. It includes initialization, an unimplemented movie and a
+/// subsequent battle trigger; never register it as a live or preview scene in this form.
+pub fn reactor_opening_scene() -> SceneDef {
+    let cast = [
+        (1, "cl", "aaaa", "acfe"), (2, "ba", "acgd", "adcb"),
+        (4, "hei0", "bwab", "acfe"), (5, "hei1", "bwab", "acfe"),
+        (6, "av_m", "bwfd", "acfe"), (7, "av_l", "axdc", "acfe"),
+        (8, "av_s", "bxbe", "acfe"), (9, "gu0", "azhe", "aafe"),
+        (10, "gu1", "azhe", "aafe"), (11, "guadd", "azhe", "aafe"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: REACTOR_OPENING_SCENE_ID.into(), game: "ff7".into(), field: "md1stin".into(),
+        trigger: Trigger { entity: 0, name: "dir".into(), slot: 0, talk_radius: 0, moments: 0..=0 },
+        setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast, speakers: vec![],
+        witness: vec![], arrival: Spot { x: 3655, y: 27432, triangle: 25, direction: 128 },
     }
 }
 

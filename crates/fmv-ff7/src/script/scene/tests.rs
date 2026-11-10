@@ -217,6 +217,20 @@ fn texts(n: usize) -> Vec<Vec<u8>> {
     (0..n).map(|i| dialog(&format!("Line {i}"))).collect()
 }
 
+#[test]
+fn getai_reads_known_triangles_and_refuses_unresolved_positions() {
+    let getai = |entity, dest| vec![0xB9, 0x06, entity, dest];
+    let section = script(vec![("actor", vec![(1, vec![xyzi(10, 20, 0, 42), getai(0, 4), mov(11, 22), getai(0, 6), getai(1, 8)])])], vec![]);
+    let (beats, vm) = run_root(&section, start(0, 1), &[]);
+    assert_eq!(end_of(&beats), End::Finished);
+    assert_eq!(vm.writes().get(&(6, 4)), Some(&42));
+    assert_eq!(vm.writes().get(&(6, 5)), Some(&0));
+    assert!(!vm.writes().contains_key(&(6, 6)), "a move without a triangle cannot supply one");
+    assert!(!vm.writes().contains_key(&(6, 8)), "an unknown actor cannot supply one");
+    assert_eq!(vm.stats().unresolved, 2);
+    assert!(vm.stats().unknown.is_empty());
+}
+
 // ---- windows and asks ------------------------------------------------------------------------
 
 #[test]
@@ -677,6 +691,7 @@ fn route_survey_definitions_are_not_registered_for_play() {
     assert!(scene(FLOWER_STATION_SCENE_ID).is_none());
     assert!(scene(SECTOR7_PILLAR_SCENE_ID).is_none());
     assert!(scene(CARGO_TRAIN_SCENE_ID).is_none());
+    assert!(scene(REACTOR_OPENING_SCENE_ID).is_none());
 }
 
 #[test]

@@ -323,3 +323,45 @@ fn music_and_sound_layers_cover_these_names_and_ids() {
     println!("sound ids 1..=750: {with_clips} have clips from the sound layer ({clip_total} clips in all), {} play the original", 750 - with_clips);
     assert!(with_clips > 600, "Cosmo's config names clips for the vast majority of the ids");
 }
+
+#[test]
+#[ignore = "needs the owner's Echo-S archive (FMV_ECHO_S_IRO); opening is not enabled"]
+fn reactor_opening_echo_s_changes_entry_moment_and_has_unsafe_tail() {
+    use fmv_ff7::script::dialogue::{End, MessageOrigin};
+    use fmv_ff7::script::scene::{Limits, SceneVars, Step, Then, Vm};
+    use fmv_ff7::story::StoryState;
+    let m = mods().expect("FMV_ECHO_S_IRO");
+    let bytes = m.script_section("md1stin").expect("Echo-S md1stin section");
+    let script = FieldScript::parse(&bytes).unwrap();
+    assert!(script.disassemble_partial(0, 0).unwrap().instructions.iter().any(|i|
+        i.mnemonic == "SETWORD" && i.operand("var").is_some_and(|v| (v.bank, v.value) == (2, 0)) && i.literal("value") == Some(2)
+    ));
+    let run = |moment| {
+        let mut vm = Vm::new(SceneVars::new(StoryState::at(moment), &[]), 1, Limits::default());
+        vm.begin(vec![Step::StartMain(0)]);
+        let mut lines = Vec::new();
+        let end = loop {
+            match vm.resume(&script, None).then {
+                Then::Window(window) => lines.push((window.id, window.opener, window.message.origin)),
+                Then::End { how, .. } => break how,
+            }
+            assert!(lines.len() <= 16);
+        };
+        (end, lines, vm)
+    };
+    let (end, lines, _) = run(0);
+    assert_eq!(end, End::MapJump { field: 109 });
+    assert!(lines.is_empty());
+    let (end, lines, vm) = run(1);
+    assert_eq!(end, End::Battle);
+    assert_eq!(lines.len(), 1);
+    assert!(matches!(&lines[0], (3, 2, MessageOrigin::Canon { entity: 2, dialog: 6 })));
+    assert!(m.voice_path("md1stin", 3, 6, 0).is_some());
+    assert!(vm.stats().handled.contains_key("GETAI"));
+    assert!(vm.stats().unresolved > 0);
+    for op in ["PRTYE", "MMBLK", "HMPMAX1", "MOVIE", "PMVIE", "SOUND"] {
+        assert!(vm.stats().ignored.contains_key(op), "{op}");
+    }
+    assert_eq!(vm.writes().get(&(1, 4)), Some(&30));
+    assert!(vm.vars().unknown_persistent_reads().contains(&(1, 4)));
+}

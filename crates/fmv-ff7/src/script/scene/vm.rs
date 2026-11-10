@@ -1222,6 +1222,20 @@ impl Vm {
                 let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| if op == 0xCB { self.vars.in_party(c) } else { self.vars.is_member(c) });
                 self.branch(idx, ins, holds)
             }
+            // GETAI reads an entity's current walkmesh triangle. A MOVE without an explicit
+            // triangle does not establish one; never invent it from a stale position.
+            0xB9 => {
+                if let Some((bank, address)) = Self::dest(ins, "var_triangle") {
+                    let triangle = ins.literal("entity").and_then(|e| u8::try_from(e).ok())
+                        .and_then(|e| self.places.get(&e)).and_then(|place| place.triangle);
+                    if let Some(triangle) = triangle {
+                        self.set_word(bank, address, triangle);
+                    } else {
+                        self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    }
+                }
+                Flow::Next
+            }
             // ---- the stage -----------------------------------------------------------------------------------
             0xA5..=0xA7 => {
                 self.do_place(idx, me, ins);

@@ -316,6 +316,32 @@ fn cargo_train_survey_runs_director_and_field_staging() {
     }
 }
 
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA); opening is not enabled"]
+fn reactor_opening_survey_exposes_unsafe_director_tail() {
+    let f = field("md1stin").expect("FMV_FF7_DATA and md1stin");
+    let def = fmv_ff7::script::scene::reactor_opening_scene();
+    let script = FieldScript::from_field(&f).unwrap();
+    assert!(script.disassemble_partial(0, 0).unwrap().instructions.iter().any(|i|
+        i.mnemonic == "SETWORD" && i.operand("var").is_some_and(|v| (v.bank, v.value) == (2, 0)) && i.literal("value") == Some(1)
+    ));
+    let result = run_to_end(&f, &def, &StoryState::at(0), 1, &[]).unwrap();
+    assert_eq!((result.end, result.windows), (End::Battle, 1));
+    assert!(result.stats.handled.contains_key("GETAI"));
+    assert!(result.stats.unresolved > 0);
+    for op in ["PRTYE", "MMBLK", "MOVIE", "PMVIE", "SOUND"] {
+        assert!(result.stats.ignored.contains_key(op), "{op}");
+    }
+    assert_eq!(result.writes.untracked.get(&(1, 4)), Some(&30));
+    assert!(result.unknown_persistent_reads.contains(&(1, 4)));
+    let loader = f.model_loader().unwrap();
+    for (member, model) in def.cast.iter().zip(&loader.models) {
+        let Look::Model { hrc, idle } = &member.look else { panic!("expected a field model") };
+        assert_eq!(model.hrc_stem(), *hrc);
+        assert_eq!(model.animations.first().map(|a| a.stem()).as_deref(), Some(idle.as_str()));
+    }
+}
+
 // ---- 1. the trigger is found -----------------------------------------------------------------
 
 #[test]
