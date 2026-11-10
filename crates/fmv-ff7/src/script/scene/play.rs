@@ -326,7 +326,15 @@ impl ScenePlay {
             }
             let Ok(entity) = u8::try_from(init.entity) else { continue };
             let Some(member) = cast.iter().find(|m| m.entity == entity) else { continue };
-            let Look::Model { hrc, .. } = &member.look else { continue };
+            let hrc = match &member.look {
+                Look::Model { hrc, .. } => hrc.as_str(),
+                // A canonical look may keep its own asset when it is the very same field rig.
+                // Unknown ids and generic bodies must not borrow a fallback character's clips.
+                Look::Appearance(id) => match crate::playable::resolve_appearance(id) {
+                    Some(model) => model.hrc,
+                    None => continue,
+                },
+            };
             let Some(record) = init.model_index.and_then(|index| loader.models.get(index)) else { continue };
             if !hrc.eq_ignore_ascii_case(&record.hrc_stem()) {
                 continue;

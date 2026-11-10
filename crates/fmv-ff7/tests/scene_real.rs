@@ -1058,7 +1058,51 @@ fn the_trigger_npc_is_tifa_where_her_stage_script_puts_her() {
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn the_scene_plays_its_real_lines_in_order_with_their_speakers() {
+    use fmv_ff7::script::scene::AnimHow;
     let Some(f) = field(PROOF_FIELD) else { return };
+    let def = proof_scene();
+    let script = FieldScript::from_field(&f).unwrap();
+    let inits = script.entity_inits(None);
+    let loader = f.model_loader().unwrap();
+    let mut characters = LgpArchive::open_path(data_dir().unwrap().join("field/char.lgp")).unwrap();
+    let poses = [
+        (CLOUD, "ff7/cloud", 0, "aaaa", 15u8, "cxdc", 21),
+        (TIFA, "ff7/tifa", 2, "aagb", 19u8, "cxia", 24),
+    ];
+    for &(entity, appearance, model_index, hrc, slot, stem, bones) in &poses {
+        assert_eq!(def.member(entity).unwrap().look, Look::Appearance(appearance.to_string()), "the proof keeps its canonical appearance identity");
+        let canonical = fmv_ff7::playable::resolve_appearance(appearance).unwrap();
+        let init = inits.iter().find(|init| init.entity == usize::from(entity)).unwrap();
+        assert_eq!(init.model_index, Some(model_index));
+        let record = &loader.models[model_index];
+        assert_eq!((canonical.hrc, record.hrc_stem()), (hrc, hrc.to_string()), "the canonical skeleton is the original loader's exact HRC");
+        assert_eq!(record.animations[usize::from(slot)].stem(), stem);
+        let clip = fmv_ff7::load_field_animation(&mut characters, stem).unwrap();
+        let model = fmv_ff7::load_field_model(&mut characters, canonical.hrc).unwrap();
+        assert_eq!((clip.frame_count(), clip.bone_count(), model.bones.len()), (15, bones, bones));
+        assert!(model.fits(&clip));
+        for frame in [0, 14] {
+            assert!(clip.frame(frame).is_some() && model.pose(&clip, frame).is_some(), "{appearance}'s original Hold endpoint {frame} fits");
+        }
+    }
+    for answer in [1usize, 2] {
+        let mut source = ScenePlay::new(&f, &def, &StoryState::at(72), 1).unwrap();
+        assert_eq!(source.animation_clip(CLOUD, 15), Some("cxdc"));
+        assert_eq!(source.animation_clip(TIFA, 19), Some("cxia"));
+        let Then::Window(opening) = source.next(None).then else { panic!("the proof opens its first window") };
+        assert!(matches!(opening.message.origin, MessageOrigin::Canon { dialog: 28, .. }));
+        let question = source.next(None);
+        let Then::Window(window) = &question.then else { panic!("the proof asks its drink question") };
+        assert!(window.message.choice.is_some() && matches!(window.message.origin, MessageOrigin::Canon { dialog: 29, .. }));
+        for &(entity, _, _, _, slot, _, _) in &poses {
+            assert!(question.stage.iter().any(|event| event.at < window.at && matches!(event.what, Stage::Anim {
+                entity: actor, animation, how: AnimHow::Hold, first: None, last: None, speed: 16, divisor: 1,
+            } if actor == entity && animation == slot)), "answer {answer}: entity {entity}'s original full Hold is emitted before the question");
+        }
+        let Then::Window(next) = source.next(Some(answer)).then else { panic!("the selected answer has its own next line") };
+        let MessageOrigin::Canon { dialog, .. } = next.message.origin else { panic!("a canon answer branch") };
+        assert_eq!(dialog, if answer == 1 { 30 } else { 31 });
+    }
     // Answering the drink "something hard" (line 2): eleven windows, Tifa's and Cloud's, the question among them.
     let hard = play(&f, 72, &[2]);
     assert_eq!(

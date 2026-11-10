@@ -1442,6 +1442,82 @@ fn animation_slots_use_the_actual_script_binding_and_only_the_matching_cast_mode
 }
 
 #[test]
+fn canonical_animation_slots_require_a_known_matching_source_model() {
+    let section = script(vec![
+        ("cloud", vec![(0, vec![vec![0xA1, 99]]), (1, vec![
+            vec![0xA2, 1, 1], message(0, 0), vec![0xBD, 0, 32, 0], message(0, 1),
+        ])]),
+        ("tifa", vec![(0, vec![vec![0xA1, 0]])]),
+        ("unbound", vec![]), ("missing", vec![(0, vec![vec![0xA1, 0]])]),
+    ], texts(2));
+    let field_with_cloud = |hrc: &str| FieldFile::parse(FieldSpec {
+        overrides: vec![(0, section.clone())],
+        models: vec![
+            LoaderModelSpec::new("cloud.char", hrc, &["ACFE.aki", "CLOD.aki"]),
+            LoaderModelSpec::new("tifa.char", "AAGB.HRC", &["ABCD.aki", "TIFA.yos"]),
+        ], ..FieldSpec::default()
+    }.build()).unwrap();
+    let field = field_with_cloud("AAAA.HRC");
+    let canonical = |entity, name, id: &str| CastMember {
+        look: Look::Appearance(id.into()), ..member(entity, name)
+    };
+    let def = demo_def(vec![
+        canonical(0, "cloud", "ff7/cloud"), canonical(1, "tifa", "FF7/TIFA"),
+        canonical(2, "unbound", "ff7/cloud"), canonical(3, "missing", "ff7/cloud"),
+    ], start(0, 1));
+    let mut play = ScenePlay::new(&field, &def, &StoryState::at(4), 1).unwrap();
+    assert_eq!(play.animation_clip(0, 1), Some("clod"), "CHAR 99 uses original loader record 0, whose HRC is Cloud's");
+    assert_eq!(play.animation_clip(1, 1), Some("tifa"), "the canonical appearance resolves case-insensitively to Tifa's matching HRC");
+    assert_eq!(play.initial_default_animation_clip(0), Some((0, "acfe")));
+    assert_eq!(play.initial_default_animation_clip(1), Some((0, "abcd")));
+    assert_eq!(play.animation_clip(0, 2), None, "slots still require an actual loader animation");
+    for entity in [2, 3, u8::MAX] {
+        assert_eq!(play.animation_clip(entity, 0), None, "absent declaration, absent record or off-cast entity: {entity}");
+        assert_eq!(play.initial_default_animation_clip(entity), None);
+    }
+    assert_eq!(play.def().cast, def.cast, "binding clips does not replace the cast's canonical appearances");
+    let initial = play.initial_stage_events().to_vec();
+    for expected in [
+        Stage::Anim { entity: 0, animation: 1, how: AnimHow::Loop, first: None, last: None, speed: 16, divisor: 1 },
+        Stage::AnimSpeed { entity: 0, speed: 32 },
+    ] {
+        let beat = play.next(None);
+        assert!(matches!(beat.then, Then::Window(_)));
+        assert_eq!(beat.stage.iter().map(|event| &event.what).collect::<Vec<_>>(), [&expected]);
+        assert_eq!(play.initial_default_animation_clip(0), Some((0, "acfe")), "runtime changes cannot mutate the canonical default snapshot");
+        assert_eq!(play.initial_stage_events(), initial.as_slice());
+        assert!(play.writes().is_story_neutral());
+    }
+    assert!(matches!(play.next(None).then, Then::End { how: End::Finished, .. }));
+
+    for (appearance, hrc) in [
+        ("ff7/not-a-character", "AAAA.HRC"), // A default-Cloud fallback would incorrectly match.
+        ("ff7/body/lean", "AWCB.HRC"), // Even a matching body rig is not a canonical appearance.
+        ("ff7/cloud", "AAGB.HRC"), // Recognized character, wrong original field rig.
+    ] {
+        let mut rejected_def = def.clone();
+        rejected_def.cast[0].look = Look::Appearance(appearance.into());
+        let rejected = ScenePlay::new(&field_with_cloud(hrc), &rejected_def, &StoryState::at(4), 1).unwrap();
+        assert_eq!(rejected.animation_clip(0, 0), None, "{appearance} must not claim {hrc}'s clips");
+        assert_eq!(rejected.initial_default_animation_clip(0), None);
+        assert_eq!(rejected.def().cast, rejected_def.cast);
+        assert!(rejected.writes().is_story_neutral());
+    }
+
+    let uncertain_section = script(vec![
+        ("cloud", vec![(0, vec![if_ub(3, 9, 0, 0, &[0xA1, 99])])]),
+        ("tifa", vec![(0, vec![vec![0xA1, 0]])]),
+        ("unbound", vec![]), ("missing", vec![(0, vec![vec![0xA1, 0]])]),
+    ], vec![]);
+    let uncertain = ScenePlay::with_script_section(&field, &def, &StoryState::at(4), 1, &uncertain_section).unwrap();
+    for entity in [0, 1] {
+        assert_eq!(uncertain.animation_clip(entity, 0), None, "an uncertain declaration also invalidates later canonical loader bindings");
+        assert_eq!(uncertain.initial_default_animation_clip(entity), None);
+    }
+    assert!(uncertain.writes().is_story_neutral());
+}
+
+#[test]
 fn headless_outcome_includes_setup_interpreter_observations() {
     let section = script(vec![("a", vec![(1, vec![message(0, 0)]), (3, vec![unknown_op()])])], vec![dialog("Hello.")]);
     let field = field_of(section);

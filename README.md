@@ -1597,9 +1597,12 @@ its position. Resuming keeps the walking phase. Moves, turns and placements run 
 stale sound effects remain suppressed. Ordinary field players and NPCs keep their normal animation clocks. Focused CPU
 pose checks cover this path; rendered playback is untested.
 Field-model cast members can also use their script's full-length default loops (`DFANM`, ASPED 16 and literal speed 1),
-including Wedge's loop after the `nrthmk` approach. The clip slot must belong to that entity's exact model-loader skeleton;
-canonical appearance substitutions keep their existing clips. A separate bounded clip cache preserves the base mesh and
-checks skeleton compatibility, falling back to the usual pose if the clip cannot load. Standing loops yield during movement,
+including Wedge's loop after the `nrthmk` approach. The clip slot must belong to that entity's exact model-loader skeleton.
+A recognized canonical appearance can also use these clips when its HRC matches the field's proven loader record;
+unknown appearances, generic bodies, different rigs and uncertain bindings keep their existing fallback. The bar preview
+retains Cloud's and Tifa's canonical appearances while using their shared pre-choice full Holds: Cloud's slot 15 `cxdc`
+and Tifa's slot 19 `cxia`, both 15 frames. The preview still saves no progression. A separate bounded clip cache preserves
+the base mesh and checks skeleton compatibility, falling back to the usual pose if the clip cannot load. Standing loops yield during movement,
 restart after arrival, and freeze with dialogue. Normal-speed Holds support explicit forward ranges: they start at the
 requested first frame, advance with scene time and remain on the requested last frame. Jessie uses `btce` frames 0–39
 in the ladder scene; her authored jump interrupts the range after its existing 15-frame wait. A single-frame Hold stays
