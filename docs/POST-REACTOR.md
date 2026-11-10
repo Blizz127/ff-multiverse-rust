@@ -33,6 +33,24 @@ Tifa's affection (`Var[1][4]`). The current story model carries neither effect. 
 refuse those writes instead of silently discarding them; debug
 preview can still show it on made-up state. Safely carrying affection needs its own reviewed
 persistence design and owner decision under the existing data gate.
+There is a separate read-side gap: `SceneVars` supplies `Given` values or zero for bytes
+the saved story does not carry. The VM can branch on those assumed values, yet the server's
+current completeness check records unknown opcodes and unresolved positions, not unknown
+persistent variable reads. A run with no discarded writes can therefore still choose the wrong
+branch. In particular, the bar preview assumes bits in `Var[3][211]` and `Var[3][212]`;
+those assumptions are useful for a preview but are not evidence of an individual player's
+state. Keep the post-reactor scenes unregistered until their decision inputs and effects are
+modeled and verified against saved state.
+
+A read guard needs more than checking whether a byte was written in the VM. A bit operation
+can preserve unknown bits, arithmetic can propagate an assumed value into another byte, and a
+bit-test may depend on only one known bit of a partially tracked byte. Track knownness through
+the operations that produce values and reject a real run whenever an unknown persistent input
+can affect a branch, a persistent effect, or a scene result. Treat `Given` as preview context,
+not authoritative saved data; retain the separate preview path. Exercise partial-byte tests,
+word reads, overwrites versus bit operations, and propagation through scratch variables before
+using this as a safety check. This is an implementation requirement, not a proposed change to
+the live story format or authorization to migrate player data.
 The existing story merge unions tracked bits and is not a numeric affection merge. The correct
 initial affection and the behavior of later increases/decreases must be established from owned
 game data before proposing a durable numeric representation; treating the observed `+5` as a
