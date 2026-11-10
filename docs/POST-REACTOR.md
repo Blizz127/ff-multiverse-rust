@@ -52,3 +52,5 @@ turn of entity 40 toward entity 31; running entity 40's initialization as setup 
 authored position and removes that unresolved read. With that setup, the remaining live loop at
 the frame limit is entity 35's slot 6 animation loop; entities 40 and 41 are parked. These are
 exploratory runs, not proof that cutting those threads off preserves the full scene.
+Stopping at Cloud's slot-3 return is not a valid shortcut: the trace still has other actors running
+at later virtual times, including Jessie, Biggs and Wedge.
