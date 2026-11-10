@@ -67,6 +67,7 @@ pub struct Launch {
     pub server: String,
     pub store: TokenStore,
     pub looks: LookCache,
+    pub graphics: crate::graphics::Settings,
     /// `client_build` for `Hello`.
     pub client_build: String,
     /// The game whose content this machine holds (it decides the bodies and slots on offer and the labels).
@@ -567,7 +568,8 @@ impl ApplicationHandler for Shell {
             Err(e) => return self.fail(el, format!("cannot create the window: {e}")),
         };
         match Renderer::new(Arc::clone(&window), el.owned_display_handle()) {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.set_graphics(std::mem::take(&mut self.launch.graphics));
                 eprintln!("renderer: {}", r.describe());
                 self.renderer = Some(r);
             }
@@ -666,6 +668,7 @@ mod tests {
             server: server.to_string(),
             store: TokenStore::new(dir),
             looks: LookCache::new(dir),
+            graphics: crate::graphics::Settings::load(dir),
             client_build: "test-build".to_string(),
             game: GameId::Ff7,
             tint: None,

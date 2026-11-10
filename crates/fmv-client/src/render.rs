@@ -470,6 +470,8 @@ pub struct Gpu {
     ui: crate::ui::gpu::UiGpu,
     /// The players as models, drawn over the scene by [`Gpu::draw_field`] (see [`crate::avatar`]).
     avatars: crate::avatar::gpu::AvatarGpu,
+    /// Allocated only while optional edge smoothing is selected.
+    fxaa: Option<crate::graphics::fxaa::Fxaa>,
 }
 
 const MIN_VERTEX_BYTES: u64 = 64 * 1024;
@@ -571,6 +573,17 @@ impl Gpu {
             backdrop: None,
             ui,
             avatars,
+            fxaa: None,
+        }
+    }
+
+    pub fn set_anti_aliasing(&mut self, mode: crate::graphics::AntiAliasing) {
+        match mode {
+            crate::graphics::AntiAliasing::Off => self.fxaa = None,
+            crate::graphics::AntiAliasing::Fxaa if self.fxaa.is_none() => {
+                self.fxaa = Some(crate::graphics::fxaa::Fxaa::new(&self.device, self.format));
+            }
+            _ => {}
         }
     }
 
@@ -599,6 +612,15 @@ impl Gpu {
         scene: &Scene<'_>,
         avatars: Option<&crate::avatar::AvatarFrame>,
         srgb: bool,
+    ) {
+        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
+        self.draw_field_raw(filtered.as_ref().unwrap_or(target), size, scene, avatars, srgb);
+        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+    }
+
+    fn draw_field_raw(
+        &mut self, target: &wgpu::TextureView, size: (u32, u32), scene: &Scene<'_>,
+        avatars: Option<&crate::avatar::AvatarFrame>, srgb: bool,
     ) {
         let (w, h) = size;
         // The one fitted camera everything of the frame is placed by.
@@ -829,11 +851,24 @@ impl Gpu {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// A flat fallback battle gets the same optional filter as the 3D scene.
+    pub fn draw_flat(&mut self, target: &wgpu::TextureView, size: (u32, u32), vertices: &[Vertex], srgb: bool) {
+        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
+        self.draw_scene(filtered.as_ref().unwrap_or(target), vertices, None, CLEAR_RGB, srgb);
+        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+    }
+
     /// Draw one frame of a battle ([`crate::battle::scene`]) into `target` (`size` pixels): clear it,
     /// the stage (flat triangles in NDC, painter's order), the location's model if there is one, then
     /// the models and the marks on the ground under them through the avatar renderer, depth-tested
     /// with a fresh depth buffer. The UI overlay is the caller's to draw after.
     pub fn draw_battle(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::battle::scene::BattleFrame, srgb: bool) {
+        let filtered = self.fxaa.as_mut().map(|fxaa| fxaa.target(&self.device, size));
+        self.draw_battle_raw(filtered.as_ref().unwrap_or(target), size, frame, srgb);
+        if let Some(fxaa) = &self.fxaa { fxaa.resolve(&self.device, &self.queue, target); }
+    }
+
+    fn draw_battle_raw(&mut self, target: &wgpu::TextureView, size: (u32, u32), frame: &crate::battle::scene::BattleFrame, srgb: bool) {
         self.draw_scene(target, &frame.stage, None, frame.clear_rgb, srgb);
         // The location, when there is one, in a pass of its own: the actors' pass then starts with a
         // fresh depth buffer, so the marks under the actors are not covered by the location's floor.
@@ -869,6 +904,7 @@ pub struct Renderer {
     needs_reconfigure: bool,
     description: String,
     gpu_errors: Arc<Mutex<Vec<String>>>,
+    graphics: crate::graphics::Settings,
 }
 
 impl Renderer {
@@ -953,7 +989,24 @@ impl Renderer {
             needs_reconfigure: false,
             description,
             gpu_errors,
+            graphics: crate::graphics::Settings::default(),
         })
+    }
+
+    pub fn set_graphics(&mut self, settings: crate::graphics::Settings) {
+        self.gpu.set_anti_aliasing(settings.anti_aliasing);
+        self.graphics = settings;
+    }
+
+    /// The choice applies immediately even if the local settings file cannot be written.
+    pub fn toggle_anti_aliasing(&mut self) -> &'static str {
+        let saved = self.graphics.toggle();
+        self.gpu.set_anti_aliasing(self.graphics.anti_aliasing);
+        if let Err(e) = saved {
+            eprintln!("graphics: {e}");
+            return "Graphics changed for this session; settings could not be saved";
+        }
+        self.graphics.anti_aliasing.notice()
     }
 
     /// "adapter name (backend, device type)" for logs.
@@ -1118,7 +1171,7 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let vertices = build(w, h, self.srgb);
-        self.gpu.draw_scene(&view, &vertices, None, CLEAR_RGB, self.srgb);
+        self.gpu.draw_flat(&view, (w, h), &vertices, self.srgb);
         if let Some(overlay) = overlay {
             self.gpu.draw_overlay(&view, &overlay.vertices(w, h, self.srgb));
         }

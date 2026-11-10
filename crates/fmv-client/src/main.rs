@@ -34,6 +34,7 @@ mod delete;
 mod ff7;
 mod gamemode;
 mod gamepad;
+mod graphics;
 mod headless;
 mod interp;
 mod login;
@@ -285,6 +286,7 @@ fn run_menu(args: &Args, state_dir: &Path, store: TokenStore) -> u8 {
             server: args.server.clone(),
             store,
             looks: ui::looks::LookCache::new(state_dir),
+            graphics: graphics::Settings::load(state_dir),
             client_build,
             game,
             tint: args.tint,
@@ -421,7 +423,7 @@ fn run(args: Args) -> u8 {
         None => headless::run(&args, session, ff7, audio),
         Some(el) => {
             let view = field_view(ff7.as_deref(), &session);
-            window::run(el, session, view, ff7, device, audio)
+            window::run(el, session, view, ff7, device, audio, graphics::Settings::load(&state_dir))
         }
     }
 }

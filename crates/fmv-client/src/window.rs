@@ -207,8 +207,10 @@ pub fn window_attributes(title: String, device: DeviceMode) -> winit::window::Wi
 
 /// `ff7` is where the views of the areas the server moves us to are read from (see
 /// [`App::with_ff7`]); `device` is what the device asks of the window (full screen).
-pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>, device: DeviceMode, audio: GameAudio) -> u8 {
+#[allow(clippy::too_many_arguments)] // Entry point shares the menu path's presentation settings.
+pub fn run(event_loop: EventLoop<()>, session: Session, view: FieldView, ff7: Option<Arc<Ff7Adapter>>, device: DeviceMode, audio: GameAudio, graphics: crate::graphics::Settings) -> u8 {
     let mut app = App::new(session, view).with_ff7(ff7).with_device(device).with_audio(audio);
+    app.graphics = graphics;
     // A panic inside the windowing or GPU stack must not skip the goodbye or end as a raw abort.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app)));
     app.finish(result)
@@ -416,6 +418,8 @@ enum KeyRoute {
     WalkMesh,
     /// F2: FF7's scrolling screen or the whole field.
     Camera,
+    /// F3: optional scene edge smoothing.
+    AntiAliasing,
     Party(PartyKey),
     Audio(AudioKey),
     Battle(BattleKey),
@@ -440,6 +444,9 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
     }
     if code == KeyCode::F2 {
         return if pressed && !repeat { KeyRoute::Camera } else { KeyRoute::Ignored };
+    }
+    if code == KeyCode::F3 {
+        return if pressed && !repeat { KeyRoute::AntiAliasing } else { KeyRoute::Ignored };
     }
     // In a battle a fresh press of Tab, or of Y (a controller's Y is FF7's Triangle), swaps the menu to the next ready member of
     // the party the player commands: FF7's own "switch". Outside a battle Y accepts an invite as ever and Tab is no key of the
@@ -573,6 +580,7 @@ pub(crate) struct App {
     audio: GameAudio,
     /// How many story scenes had begun when the window last looked (a new one lets go of the keys held and closes a talk).
     scene_started: u64,
+    graphics: crate::graphics::Settings,
 }
 
 impl App {
@@ -613,6 +621,7 @@ impl App {
             talk: Talk::ff7(None),
             audio: GameAudio::off(),
             scene_started: 0,
+            graphics: crate::graphics::Settings::default(),
         }
     }
 
@@ -685,6 +694,12 @@ impl App {
                     CameraMode::Whole => "Camera: the whole field (F2: follow you, as in FF7)",
                 };
                 self.notice = Some((text, Instant::now() + NOTICE_TIME));
+            }
+            KeyRoute::AntiAliasing => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let text = renderer.toggle_anti_aliasing();
+                    self.notice = Some((text, Instant::now() + NOTICE_TIME));
+                }
             }
             KeyRoute::Party(key) => self.party_key(key),
             KeyRoute::Audio(key) => self.audio_key(key),
@@ -1205,7 +1220,8 @@ impl ApplicationHandler for App {
             Err(e) => return self.fail(el, format!("cannot create the window: {e}")),
         };
         match Renderer::new(Arc::clone(&window), el.owned_display_handle()) {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.set_graphics(std::mem::take(&mut self.graphics));
                 eprintln!("renderer: {}", r.describe());
                 self.renderer = Some(r);
             }
@@ -1526,6 +1542,10 @@ mod tests {
         assert_eq!(route_key(KeyCode::F2, true, false, true), KeyRoute::Camera, "in a battle too (it changes nothing there)");
         assert_eq!(route_key(KeyCode::F2, true, true, false), KeyRoute::Ignored, "a held F2 does not flicker");
         assert_eq!(route_key(KeyCode::F2, false, false, false), KeyRoute::Ignored);
+        assert_eq!(route_key(KeyCode::F3, true, false, false), KeyRoute::AntiAliasing);
+        assert_eq!(route_key(KeyCode::F3, true, false, true), KeyRoute::AntiAliasing);
+        assert_eq!(route_key(KeyCode::F3, true, true, false), KeyRoute::Ignored);
+        assert_eq!(route_key(KeyCode::F3, false, false, false), KeyRoute::Ignored);
         assert_eq!(route_key(KeyCode::KeyP, true, false, true), KeyRoute::Party(PartyKey::Invite));
         assert_eq!(route_key(KeyCode::Space, true, false, false), KeyRoute::Battle(BattleKey::Confirm));
         assert_eq!(route_key(KeyCode::ShiftLeft, true, false, true), KeyRoute::Movement, "Shift is still tracked");

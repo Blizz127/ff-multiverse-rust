@@ -329,6 +329,16 @@ room is always shown whole. Checked by unit tests (`camera::tests`, the scene's 
 with a GPU or lavapipe, by `scene::shots::offscreen_real_ff7_the_field_camera` (`camera-*.png`: the player in `md1_1`,
 the player at the range's corner, the team talk's scroll).
 
+*Optional edge smoothing.* **F3** switches FXAA on or off in a field or battle. Off is the default and keeps
+exactly the existing render path. FXAA smooths contrasting edges in the completed field or battle image, including
+fallback battles; the HUD, dialogue and menus are drawn afterward so their text stays sharp. This is a spatial
+filter: it may soften background detail and does not reconstruct missing detail or use previous frames. The choice
+is saved atomically as `{"anti_aliasing":"fxaa"}` (or `"off"`) in `graphics.json` under the client state directory
+(`--state-dir`, else the usual library state directory's `client/`). Invalid settings are left untouched; a failure
+to save still changes the current session and displays a notice. A GPU regression checks edge coverage, unchanged
+UI pixels, resize and exact restoration when disabled in plain and sRGB output:
+`cargo test -p fmv-client offscreen_fxaa -- --ignored`.
+
 *Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
 it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the
 game's, read by your client from your own copy of the field's script and shown exactly as written (the
