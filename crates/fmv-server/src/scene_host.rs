@@ -23,7 +23,7 @@ fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
         fmv_ff7::script::dialogue::End::MapJump { field } => outcome.jump.is_some_and(|jump| jump.field == field),
         _ => false,
-    }) && [&outcome.setup_stats, &outcome.stats].iter().all(|s| s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+    }) && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
 }
 
 fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
@@ -178,6 +178,9 @@ mod tests {
         outcome.setup_stats.unresolved = 1;
         assert!(!complete_outcome(&outcome));
         outcome.setup_stats.unresolved = 0;
+        outcome.setup_stats.setup_incomplete = true;
+        assert!(!complete_outcome(&outcome), "budget-exhausted setup cannot be accepted");
+        outcome.setup_stats.setup_incomplete = false;
         outcome.setup_stats.ignored.insert("GOLDd", 1);
         assert!(complete_outcome(&outcome), "preview may show a complete simulated run");
         assert!(!safe_outcome(&outcome), "setup must not discard economic effects");

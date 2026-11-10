@@ -631,6 +631,15 @@ fn headless_outcome_includes_setup_interpreter_observations() {
 }
 
 #[test]
+fn setup_reports_when_a_script_exceeds_its_budget() {
+    let section = script(vec![("a", vec![(3, vec![xyzi(10, 20, 0, 0), dir(128)])])], vec![]);
+    let parsed = FieldScript::parse(&section).unwrap();
+    let mut vm = Vm::new(SceneVars::new(StoryState::at(4), &[]), 1, Limits { steps: 1, ..Limits::default() });
+    vm.setup(&parsed, &[ScriptRef::new(0, 3)]);
+    assert!(vm.stats().setup_incomplete);
+}
+
+#[test]
 fn what_the_scene_writes_is_reported_by_kind_and_applied_forward_only() {
     // the script sets the moment to 80, a tracked bit (the reactor lift) and a field flag of its own
     let a = vec![setword(2, 0, 80), biton(1, 225, 0), biton(3, 213, 2), message(0, 0)];

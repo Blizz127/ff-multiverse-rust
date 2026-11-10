@@ -58,9 +58,9 @@ complete value or simply OR-ing bytes would be incorrect.
 An owner whose client cannot build or finish the interpreter run aborts without saving; a timed-out
 run also leaves progress untouched rather than silently choosing any remaining answers.
 The server also checks the setup interpreter's unknown instructions, unresolved positions,
-dropped requests and ignored stateful operations before accepting an outcome. Setup itself can
-still stop at its budget and discard running threads without recording a completion reason, so
-these checks do not establish that every setup finished correctly.
+dropped requests and ignored stateful operations before accepting an outcome. Setup reports
+when it stops at a budget or an unexpected scene end rather than silently accepting partial state.
+These checks do not resolve the separate unknown-variable-read gap above.
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that all scene dialogue and voices use it.

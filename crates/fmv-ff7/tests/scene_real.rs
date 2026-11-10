@@ -141,6 +141,7 @@ fn train_director_finishes_after_its_authored_actor_work() {
     let f = field("tin_1").expect("FMV_FF7_DATA and tin_1");
     let def = fmv_ff7::script::scene::train_scene();
     let outcome = run_to_end(&f, &def, &StoryState::at(48), 1, &[]).unwrap();
+    assert!(!outcome.setup_stats.setup_incomplete, "train setup must not stop on a budget or scene end");
     assert_eq!(outcome.end, End::Finished);
     assert_eq!(outcome.windows, 2);
     assert_eq!(outcome.writes.moment, Some(51));

@@ -210,6 +210,8 @@ pub struct Stats {
     pub dropped_requests: u32,
     /// Reads the VM could not answer (a read-back of a place it does not know).
     pub unresolved: u32,
+    /// Setup stopped at a budget or at an unexpected window/scene end while scripts were still running.
+    pub setup_incomplete: bool,
 }
 
 /// The destination of the MAPJUMP that ended a scene, as authored in the field script.
@@ -1429,12 +1431,16 @@ impl Vm {
         }
         while let Some(idx) = self.pick() {
             if self.steps >= self.limits.steps.min(20_000) || self.thread_time(idx) > self.limits.frames {
+                self.stats.setup_incomplete = true;
                 break;
             }
             self.steps = self.steps.saturating_add(1);
             match self.step_script(script, idx) {
                 Flow::Next | Flow::Yield => {}
-                Flow::Window(_) | Flow::Scene(_) => break,
+                Flow::Window(_) | Flow::Scene(_) => {
+                    self.stats.setup_incomplete = true;
+                    break;
+                }
             }
         }
         self.threads.clear();
