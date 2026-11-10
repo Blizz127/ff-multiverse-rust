@@ -109,6 +109,15 @@ def main():
             assert sl.count("story saved account=1 bytes=7 progress=021b000101e121") == 1, "one stored rescue step"
             assert sl.index(f"scene={rescue} ") < sl.index("var1.225=1->33"), "step follows scene"
             print(f"PASS: 3 Jessie rescue windows ({layer}), one saved rescue flag, return through ladders to nmkin_2")
+            cast_line = r"headless: npc area=Ff7/nmkin_3 id=(\d+) name=(\S+) model=(\S+)"
+            rescue_start = cl.index(f"{rescue} as owner")
+            before_cast = {int(i): (name, model) for i, name, model in re.findall(cast_line, cl[:rescue_start])}
+            after_cast = {int(i): (name, model) for i, name, model in re.findall(cast_line, cl[rescue_start:])}
+            assert any(name == "av_j" for name, _ in before_cast.values()), "Jessie visible before rescue"
+            assert after_cast == {i: actor for i, actor in before_cast.items() if actor[0] != "av_j"}, "only Jessie leaves; other IDs stay"
+            assert len(after_cast) == 1, "potion remains"
+            assert "player moved to another instance of its area entity=1 area=Ff7/nmkin_3" in sl, "rescue refreshes the field phase"
+            print("PASS: saved rescue hides Jessie immediately; the potion keeps its NPC ID")
         for line in cl.splitlines():
             if line.startswith("scene:"):
                 print(line)

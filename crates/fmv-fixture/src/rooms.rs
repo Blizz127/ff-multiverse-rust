@@ -525,8 +525,15 @@ impl AreaRuntime for Room {
         })
     }
 
-    /// The yard's guard stands only in the advanced phase.
+    /// The interactive guard can be talked to before the step and leaves afterward. The ordinary story
+    /// fixture introduces the guard in the advanced phase instead.
     fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
+        if self.interactive {
+            return self.npcs().into_iter().map(|mut npc| {
+                npc.unconditional = phase.0 != STORY_ADVANCED_PHASE;
+                npc
+            }).collect();
+        }
         if self.story && phase.0 != STORY_ADVANCED_PHASE {
             return Vec::new();
         }

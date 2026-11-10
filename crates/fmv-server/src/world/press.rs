@@ -126,13 +126,13 @@ impl World {
 
     /// `ClientMsg::Interact`: the player pressed OK (module docs).
     pub fn press(&mut self, entity: EntityId, npc: Option<u32>, now: Instant) -> PressOutcome {
-        let (pos, area_key) = {
+        let (pos, area_key, phase) = {
             let Some(p) = self.players.get(&entity) else { return PressOutcome::Gone };
             // (a player held in a story scene presses nothing: see `scene`)
             if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.fence.is_some_and(|f| now < f.until) {
                 return PressOutcome::Nothing;
             }
-            (p.snapshot.pos, p.area.clone())
+            (p.snapshot.pos, p.area.clone(), p.placement.as_ref().map(|p| p.key.phase.clone()).unwrap_or_default())
         };
         // OK next to a scene's trigger starts the scene (see `scene`): the trigger is no character of the area's own.
         if let Some(npc) = npc.filter(|n| super::scene::scene_index(*n).is_some()) {
@@ -142,7 +142,7 @@ impl World {
         let (points, link) = {
             let Some(area) = self.areas.get(&area_key) else { return PressOutcome::Gone };
             // A character the area does not have is no character addressed: the press is where the player stands.
-            let addressed = npc.and_then(|id| area.npc_position(id));
+            let addressed = npc.and_then(|id| area.npc_position(id, &phase));
             let talking = addressed.is_some();
             let points: Vec<u32> = area
                 .story_points()
@@ -420,11 +420,18 @@ mod tests {
         // a press naming a character the area does not have is a press where the player stands: nothing there
         assert_eq!(w.press(a.entity, Some(7), now), PressOutcome::Nothing);
         assert!(progression(&w, &a).is_empty());
+        // Address what this player's effective phase shows, not the base cast or personal story.
+        let phase = w.players[&a.entity].placement.as_ref().unwrap().key.phase.clone();
+        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().key.phase = fmv_core::PhaseKey(fmv_fixture::rooms::STORY_ADVANCED_PHASE.to_vec());
+        assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
+        assert!(progression(&w, &a).is_empty(), "a hidden character cannot be addressed");
+        w.players.get_mut(&a.entity).unwrap().placement.as_mut().unwrap().key.phase = phase;
         // next to it, naming it, is the talk: the story's step
         assert_eq!(w.press(a.entity, Some(0), now), PressOutcome::Nothing);
         assert_eq!(progression(&w, &a), STORY_ADVANCED);
         let log = log_text(&mut w);
         assert!(log.contains("area=Fixture/yard point=0 moment=0->1"), "{log}");
+        assert!(a.drain().iter().any(|msg| matches!(msg, ServerMsg::AreaSnapshot { npcs, .. } if npcs.is_empty())), "the guard leaves immediately in the new phase");
     }
 
     #[test]

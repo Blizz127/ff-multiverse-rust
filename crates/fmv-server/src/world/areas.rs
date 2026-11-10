@@ -141,9 +141,10 @@ fn clip(text: &str, max: usize) -> String {
 fn npc_snapshots(spawns: Vec<NpcSpawn>) -> Vec<NpcSnapshot> {
     spawns
         .into_iter()
-        .filter(|n| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
         .take(MAX_NPCS_PER_AREA)
         .enumerate()
+        // A hidden slot must not renumber the following characters: clicks use these IDs.
+        .filter(|(_, n)| n.unconditional && n.pos.is_finite() && n.facing.is_finite())
         .map(|(i, n)| NpcSnapshot {
             id: u32::try_from(i).unwrap_or(u32::MAX),
             name: clip(&n.entity_name, NPC_NAME_CHARS),
@@ -153,6 +154,22 @@ fn npc_snapshots(spawns: Vec<NpcSpawn>) -> Vec<NpcSnapshot> {
             facing: normalize_facing(n.facing),
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn hidden_npc_slots_do_not_renumber_other_characters() {
+    use fmv_adapter_api::NpcAppearance;
+    let npc = |name: &str, x: f32| NpcSpawn {
+        entity_name: name.into(), appearance: NpcAppearance { model: "fixture".into(), idle_animation: None, label: name.into() },
+        pos: Pos::new(x, 0.0, 0.0), facing: 0.0, unconditional: true,
+    };
+    let mut cast = vec![npc("Jessie", 10.0), npc("Potion", 100.0)];
+    let before = npc_snapshots(cast.clone());
+    cast[0].unconditional = false;
+    let after = npc_snapshots(cast);
+    assert_eq!(before.iter().map(|n| n.id).collect::<Vec<_>>(), [0, 1]);
+    assert_eq!(after, [before[1].clone()], "a stale ID 0 cannot name the potion");
 }
 
 impl AreaState {
@@ -268,9 +285,9 @@ impl AreaState {
         &self.links
     }
 
-    /// Where the non-player character `id` of this area's own list (`AreaSnapshot::npcs`) stands.
-    pub(super) fn npc_position(&self, id: u32) -> Option<Pos> {
-        self.npcs.iter().find(|n| n.id == id).map(|n| n.pos)
+    /// Where NPC `id` stands in the player's effective phase (`AreaSnapshot::npcs`); absent slots cannot be addressed.
+    pub(super) fn npc_position(&self, id: u32, phase: &PhaseKey) -> Option<Pos> {
+        self.cast(phase).into_iter().find(|n| n.id == id).map(|n| n.pos)
     }
 
     pub(super) fn encounters(&self) -> Option<&AreaEncounters> {

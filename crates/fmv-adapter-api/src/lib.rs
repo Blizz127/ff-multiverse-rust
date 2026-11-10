@@ -715,6 +715,9 @@ pub trait AreaRuntime: Send + Sync {
     /// where a phase decides which of the game's cast (and so which events) a player's instance holds.
     /// The default is every NPC the area places ([`AreaRuntime::npcs`]) whatever the phase; the
     /// server shows only those with `unconditional` set, as it always has.
+    /// Keep the same vector slot for an existing character when changing its visibility: set
+    /// `unconditional` to false for an absent slot. Server NPC IDs are these bounded slot indices,
+    /// so removing an entry would redirect old clicks to a different character.
     fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
         let _ = phase;
         self.npcs()

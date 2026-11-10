@@ -645,8 +645,9 @@ party can do of it. Everything below is pinned against the real data in `crates/
   the panel again. In `nmkin_3` the woman who is stuck on the way out is freed by a talk (her talk script, from moment 27 on,
   turns bit 5 of the reactor byte on, which is carried for it: a talk that moves the story, once, `var1.225=1->33` with the
   lift down; no exit or point waits for the bit, which only decides where she and her namesake of `nmkin_1` stand and
-  whether the second door of `nmkin_1` opens, neither of which a server models: the walkmesh has no locks and the cast does
-  not change with the moment, so she stays on the field after she is freed). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
+  whether the second door of `nmkin_1` opens. Saving the rescue now changes the `nmkin_3` phase and hides Jessie immediately,
+  including after re-login; other NPC slots retain their IDs. Her pre-rescue position and the `nmkin_1` cast/door remain as
+  before, and the walkmesh has no door locks). A bot that also travels (`--story-advance --travel`) pursues a story step that OPENS the exit its route
   goes to (the ride back, which is not a step forward) and never one that would CLOSE it (the ride down, forward again once
   the lift is up), so the lift is ridden once each way and never flaps (`StoryBot::set_wanted_exit`). The way out of the reactor is the
   gateway from `nmkin_1` to `nrthmk`. **A member that is behind its leader at the lift still goes up:** the finale moves the
@@ -689,7 +690,8 @@ account that never advanced has none, which is a new account) and the world keep
 field per story phase, so players only see the players of their own instance. Solo, a player is in
 the instance of its own phase; in a party, in its leader's, keeping its own progression. For FF7 the
 progression is the main story counter `Var[2][0]` (`crates/fmv-ff7/src/story.rs`): each field's
-phases are the intervals of the values its own scripts compare it against, every new account is the
+phases are the intervals of the values its own scripts compare it against. In `nmkin_3` from moment 27,
+the existing rescue flag additionally selects a cast without Jessie; it adds no saved fields. Every new account is the
 empty phase of every field, and the story advances where the field's own script says it does and the
 server can see it: in `md1stin` a player's character stepping onto walkmesh triangle 12 while the counter
 is 1 sets it to 6 (the server logs `story advanced account=<n> entity=<n> area=Ff7/md1stin point=0
@@ -705,8 +707,8 @@ version was bumped and a server refuses a v3 client at the handshake with a clea
 built from this version or later.
 
 Not done: exits a talk or a director decides (the finale's jump from `nrthmk` to `md8_4` among them), the script exits, story
-points and links of every field but the first mission's ten (they are left off until reviewed), conditional NPCs (the cast
-does not change with the moment), NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
+points and links of every field but the first mission's ten (they are left off until reviewed), general conditional NPC
+placement (only rescued Jessie's visibility currently follows her flag), NPC animation, cutscenes (`md8_4`, where the first mission's evidence ends, is one).
 
 ## Accounts, avatars and parties
 

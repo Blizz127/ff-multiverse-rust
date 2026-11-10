@@ -206,6 +206,9 @@ use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+// Distinct from AreaStory's moment tag (0x4D); never stored in a progression blob.
+const JESSIE_RESCUED_PHASE: u8 = b'J';
+
 /// Cap on a decompressed field file (16 MiB). The largest part of a PC field is its
 /// background (at most 42 texture pages of at most 128 KiB, about 5 MiB) and the largest
 /// real fields are a few MiB, so this is generous without letting a hostile entry cost much.
@@ -1015,7 +1018,29 @@ impl AreaRuntime for Ff7FieldArea {
     /// story counter that this field's own scripts distinguish. The empty progression (a new account)
     /// is the empty key in every field. `None` for a blob that is not FF7's.
     fn phase_key(&self, progress: &[u8]) -> Option<PhaseKey> {
-        self.story.phase_key(progress)
+        let mut phase = self.story.phase_key(progress)?;
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
+            let story = story::StoryState::decode(progress)?;
+            if story.moment >= 27 && story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) == Some(true) {
+                // A runtime phase only: the existing rescue flag now changes the cast. Prefixing the moment
+                // interval keeps its distinctions and causes an immediate snapshot after the rescue step.
+                phase.0.insert(0, JESSIE_RESCUED_PHASE);
+            }
+        }
+        Some(phase)
+    }
+
+    fn npcs_in_phase(&self, phase: &PhaseKey) -> Vec<NpcSpawn> {
+        let mut npcs = self.npcs();
+        if self.info.id.key.eq_ignore_ascii_case("nmkin_3") && phase.0.first() == Some(&JESSIE_RESCUED_PHASE) {
+            for npc in &mut npcs {
+                if npc.entity_name.eq_ignore_ascii_case("av_j") {
+                    // Retain the slot so the other characters keep their server IDs.
+                    npc.unconditional = false;
+                }
+            }
+        }
+        npcs
     }
 
     fn story_points(&self) -> Vec<StoryPoint> {
@@ -1059,8 +1084,7 @@ impl AreaRuntime for Ff7FieldArea {
         crate::story::canon_party_of(progress)
     }
 
-    // `npcs_in_phase` keeps its default: every account sees the NPCs it has always seen. The canon party is
-    // in the battle, not in the field (see `crate::story`, "What this does not do").
+    // The canon party is in the battle, not in the field (see `crate::story`, "What this does not do").
 
     /// The hint is the index of a triangle of this walkmesh (an exit's `arrival_hint`): when it
     /// names one that holds the arrival point, the point stands on that triangle, at its height

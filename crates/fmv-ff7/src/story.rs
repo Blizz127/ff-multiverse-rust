@@ -23,8 +23,8 @@
 //!   answer the same, so the field looks the same to both players; the key of an interval is its
 //!   first moment. **The interval that holds [`NEW_GAME_MOMENT`] is the empty key in every field**,
 //!   which is what makes all existing accounts one phase and keeps their placements byte for byte
-//!   what they were. (The variables beyond the moment do not take part in phases: the one the model
-//!   carries only ever changes together with a moment the field distinguishes.)
+//!   what they were. The field runtime additionally distinguishes `nmkin_3` after Jessie's existing rescue
+//!   bit is set from moment 27 on, so her disappearance is sent immediately. That phase key is not saved.
 //! * **Story points** ([`AreaStory::points`]): where a field's own scripts advance the story on
 //!   something the server can see. See below.
 //!
@@ -208,9 +208,9 @@ pub const TIMEOUT_BIT: u8 = 7;
 /// * **Bit 5, the woman of `nmkin_3` is freed.** On the way out, at moment 27 or later, her talk script (slot 1 of `av_j`) turns
 ///   it on, with the bit clear, and she walks off. It is a talk that moves the story (the model's own definition: a tracked
 ///   bit turned on), so it is a talk point like the ones of the way down. The bit only decides where she and her
-///   namesake of `nmkin_1` stand and whether the second door of `nmkin_1` opens, none of which a server models (it has no
-///   locks and its cast does not change with the moment), so no exit or point waits for it: it is carried because the
-///   party takes the step, and the saved story keeps it.
+///   namesake of `nmkin_1` stand and whether the second door of `nmkin_1` opens. The field runtime now hides her in
+///   `nmkin_3` once rescued; the other placements and door locks remain unmodeled. No exit or point waits for it:
+///   the party takes the step, and the saved story keeps it.
 /// * **Bit 7, the countdown ran out.** Each reactor field's `timeo` entity sets it when the timer that the Guard
 ///   Scorpion step starts reaches zero (then a `MAPJUMP` to `nrthmk`), and `nrthmk`'s finale reads it: with it clear the
 ///   party has escaped (moment 33), with it set the finale ends in `GAMEOVER`. It is carried ONLY so that the finale's

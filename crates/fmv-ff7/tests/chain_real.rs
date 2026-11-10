@@ -1080,10 +1080,14 @@ fn each_reviewed_field_is_one_phase_at_27_of_its_own_and_one_from_28_on() {
         assert_ne!(before, bomb, "{field}: 27 is not 26");
         assert_ne!(bomb, out, "{field}: 27 is not 28");
         assert!([28, 30, 32].iter().all(|&m| phase(area.as_ref(), m) == out), "{field}: 28 on is one phase (up to the next comparison: the lift's own, at 33)");
-        // the phase does not depend on the lift's bit or on the woman's, which are not part of the phases
+        // The lift never changes the cast; rescuing Jessie changes only her own field phase.
         let mut variant = StoryState::at(27);
         assert!(variant.set_bit(1, 225, 0, true) && variant.set_bit(1, 225, 5, true));
-        assert_eq!(area.phase_key(&variant.encode()), Some(bomb.clone()), "{field}");
+        if field == "nmkin_3" {
+            assert_ne!(area.phase_key(&variant.encode()), Some(bomb.clone()), "Jessie has left");
+        } else {
+            assert_eq!(area.phase_key(&variant.encode()), Some(bomb.clone()), "{field}");
+        }
     }
 }
 
@@ -1130,4 +1134,40 @@ fn the_woman_of_nmkin_3_is_freed_on_the_way_out_once_and_it_changes_nothing_else
     assert_eq!((finale.summary.as_str(), finale.progress.as_slice()), ("moment=27->33 var1.225=32->33", &[2, 33, 0, 1, 1, 225, 0x21][..]));
     // and the story the smoke ends with
     assert_eq!(adapter.merge_progression(&[2, 27, 0, 1, 1, 225, 0x21], &finale.progress), finale.progress);
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn jessies_saved_rescue_changes_only_her_visibility_and_field_phase() {
+    use fmv_ff7::script::scene::{jessie_rescue_scene, ScenePlay, Stage};
+    let adapter = adapter().expect("FMV_FF7_DATA");
+    let area = adapter.load_field("nmkin_3").unwrap();
+    let base = area.npcs();
+    let jessie = base.iter().position(|n| n.entity_name == "av_j").expect("Jessie");
+    assert!(base.len() > 1 && base[jessie].unconditional);
+    let mut archive = fmv_ff7::lgp::LgpArchive::open_path(flevel_path(&data_dir().unwrap())).unwrap();
+    let field = script_common::load_field(&mut archive, "nmkin_3").unwrap();
+    for moment in [1, 13, 14, 26, 27, 28, 33, 40] {
+        let before = StoryState::at(moment);
+        let phase = area.phase_key(&before.encode()).unwrap();
+        assert_eq!(area.npcs_in_phase(&phase), base);
+        let mut after = before.clone();
+        after.set_bit(1, 225, 5, true);
+        let rescued_phase = area.phase_key(&after.encode()).unwrap();
+        let mut expected = base.clone();
+        if moment >= 27 {
+            assert_ne!(phase, rescued_phase, "same moment, changed cast");
+            expected[jessie].unconditional = false;
+            // The owned setup hides Jessie at exactly these story states.
+            let scene = ScenePlay::new(&field, &jessie_rescue_scene(), &after, 1).unwrap();
+            assert!(scene.initial_stage_events().iter().any(|e| matches!(e, Stage::Show { entity: 4, visible: false })));
+        } else {
+            assert_eq!(phase, rescued_phase, "rescue flag is irrelevant before escape");
+        }
+        assert_eq!(area.npcs_in_phase(&rescued_phase), expected, "slots, other NPCs and coordinates preserved");
+        assert_eq!(area.phase_key(&StoryState::decode(&after.encode()).unwrap().encode()), Some(rescued_phase.clone()), "same after re-login");
+        after.set_bit(1, 225, 0, true);
+        assert_eq!(area.phase_key(&after.encode()), Some(rescued_phase), "lift does not change this cast");
+    }
+    assert_eq!(area.phase_key(&[255, 1, 2]), None, "unreadable progression is not guessed");
 }
