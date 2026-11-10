@@ -227,6 +227,9 @@ pub const FLOWER_STATION_SCENE_ID: &str = "ff7/md8_2/flower-survey";
 /// Survey-only Sector 7 pillar-field entry; not registered for play.
 pub const SECTOR7_PILLAR_SCENE_ID: &str = "ff7/mds7plr1/entry-survey";
 
+/// Survey-only cargo train director; not registered for play.
+pub const CARGO_TRAIN_SCENE_ID: &str = "ff7/cargoin/train-survey";
+
 /// Field-authored cast and director scripts at moment 33. Not registered until the arrival
 /// trigger and subsequent field transition are ready to serve together.
 pub fn post_escape_scene() -> SceneDef {
@@ -368,6 +371,26 @@ pub fn flower_station_scene() -> SceneDef {
         setup: vec![], given: vec![], root: vec![Step::StartMain(0)], cast,
         speakers: vec![("Cloud".into(), 1), ("Aerith".into(), 2)],
         witness: vec![], arrival: Spot { x: -3445, y: 21419, triangle: 34, direction: 0 },
+    }
+}
+
+/// Offline cargo-train director survey at moment 39. The incoming transition, audiovisual
+/// effects and witnesses have not been validated; this is not registered for live play.
+pub fn cargo_train_scene() -> SceneDef {
+    let cast = [
+        (11, "cloud", "aaaa", "acfe"), (12, "ballet", "acgd", "adcb"),
+        (13, "aval", "bwfd", "acfe"), (14, "avaf", "bxbe", "acfe"),
+        (15, "avaw", "axdc", "acfe"),
+    ].into_iter().map(|(entity, name, hrc, idle)| CastMember {
+        entity, name: name.into(), look: Look::Model { hrc: hrc.into(), idle: idle.into() }, start: None,
+    }).collect();
+    SceneDef {
+        id: CARGO_TRAIN_SCENE_ID.into(), game: "ff7".into(), field: "cargoin".into(),
+        trigger: Trigger { entity: 6, name: "direct".into(), slot: 0, talk_radius: 0, moments: 39..=39 },
+        setup: (11..=15).map(|e| ScriptRef::new(e, 0)).collect(), given: vec![],
+        root: vec![Step::StartMain(6)], cast,
+        speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
+        witness: vec![], arrival: Spot { x: 0, y: 0, triangle: 0, direction: 0 },
     }
 }
 

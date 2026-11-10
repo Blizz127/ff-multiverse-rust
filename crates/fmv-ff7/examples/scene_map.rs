@@ -84,6 +84,7 @@ fn main() {
         fmv_ff7::script::scene::SECTOR7_STATION_SCENE_ID => Some(fmv_ff7::script::scene::sector7_station_scene()),
         fmv_ff7::script::scene::SECTOR7_INTRO_SCENE_ID => Some(fmv_ff7::script::scene::sector7_intro_scene()),
         fmv_ff7::script::scene::FLOWER_STATION_SCENE_ID => Some(fmv_ff7::script::scene::flower_station_scene()),
+        fmv_ff7::script::scene::CARGO_TRAIN_SCENE_ID => Some(fmv_ff7::script::scene::cargo_train_scene()),
         fmv_ff7::script::scene::SECTOR7_PILLAR_SCENE_ID => Some(fmv_ff7::script::scene::sector7_pillar_scene()),
         _ => scene(&id),
     };

@@ -134,6 +134,18 @@ In `mds7`, the early director checks and sets `Var[3][209]` bit 0; the script-dr
 entrance to the bar requests Cloud's slot 11, which sets bit 1 before jumping to `mds7pb_1`.
 Neither bit is carried by the current story model. These are static findings, not evidence that
 either sequence can be skipped or that a moment alone reconstructs the player's flags.
+The unregistered `cargo_train_scene()` surveys `cargoin` at moment 39: staging the five
+field actors through their own initial scripts resolves a facing target that was absent in a
+bare director run. The sampled original director finishes at moment 48 with 26 windows, no
+unknown persistent reads, untracked writes, unresolved actions or off-cast actors. Setup still
+reports unimplemented `CHAR` and `PC`; scene playback skips background, sound and control
+operations, and the witness and incoming transition are not validated. It must not be enabled
+for live progress on this evidence. The `md8brdg` field jump supplies the survey's arrival
+coordinates (0, 0, triangle 0), but that is not a verified witness location.
+A sampled Echo-S replacement reaches moment 48 with 27 windows and no untracked writes;
+three of those window/dialog lookups did not match a voice file, and voice playback and
+semantic equivalence have not been checked. This comparison uses local owned data only.
+
 The intermediate `mds7plr1` producer also tests `Var[3][208]` bits 0, 1 and 3 and can turn
 bits 0 and 3 on; a stage script can turn bit 1 off. These field-entry paths must be evaluated
 against actual player state, and the current monotonic union cannot represent the clear. Static
