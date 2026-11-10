@@ -249,16 +249,24 @@ enum Class {
 pub struct SceneVars {
     pub story: StoryState,
     pub given: Vec<Given>,
+    unknown_persistent_reads: std::cell::RefCell<std::collections::BTreeSet<(u8, u8)>>,
 }
 
 impl SceneVars {
     pub fn new(story: StoryState, given: &[Given]) -> Self {
-        Self { story, given: given.to_vec() }
+        Self { story, given: given.to_vec(), unknown_persistent_reads: Default::default() }
+    }
+
+    pub fn unknown_persistent_reads(&self) -> std::collections::BTreeSet<(u8, u8)> {
+        self.unknown_persistent_reads.borrow().clone()
     }
 }
 
 impl StoryVars for SceneVars {
     fn byte(&self, bank: u8, address: u8) -> u8 {
+        if (1..=4).contains(&bank) && self.story.known_byte(bank, address).is_none() {
+            self.unknown_persistent_reads.borrow_mut().insert((bank, address));
+        }
         let moment = bank == MOMENT_BANK && address <= MOMENT_ADDRESS.wrapping_add(1);
         if !moment {
             if let Some(g) = self.given.iter().find(|g| g.bank == bank && g.address == address) {

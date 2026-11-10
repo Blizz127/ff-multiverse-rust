@@ -523,6 +523,45 @@ fn a_branch_on_a_given_flag_is_taken_as_the_scene_was_found() {
     assert_eq!(dialogs_of(&beats), [1], "without the flag the first window is not opened");
 }
 
+#[test]
+fn unknown_persistent_reads_are_reported_even_without_a_persistent_write() {
+    let branch = if_ub(3, 5, 9, 1, &message(0, 0));
+    let field = field_of(script(vec![("a", vec![(1, vec![branch])])], vec![dialog("Hello.")]));
+    let mut def = demo_def(vec![member(0, "aya")], start(0, 1));
+    def.given = vec![Given { bank: 3, address: 5, value: 2 }];
+    let result = run_to_end(&field, &def, &StoryState::at(4), 1, &[]).unwrap();
+    assert!(result.writes.untracked.is_empty());
+    assert!(result.unknown_persistent_reads.contains(&(3, 5)));
+}
+
+#[test]
+fn read_audit_accepts_the_moment_and_field_scratch_but_refuses_a_partial_story_byte() {
+    use crate::script::dialogue::StoryVars;
+    let vars = SceneVars::new(StoryState::at(33), &[]);
+    let _ = (vars.byte(2, 0), vars.byte(2, 1), vars.byte(5, 4));
+    assert!(vars.unknown_persistent_reads().is_empty());
+    let _ = vars.byte(REACTOR_STATE.bank, REACTOR_STATE.address);
+    assert!(vars.unknown_persistent_reads().contains(&(REACTOR_STATE.bank, REACTOR_STATE.address)));
+}
+
+#[test]
+fn read_audit_follows_persistent_inputs_copied_to_field_scratch() {
+    // SETBYTE Var[5][7] <- Var[3][5], then test the scratch value.
+    let copy = vec![0x80, 0x53, 7, 5];
+    let field = field_of(script(vec![("a", vec![(1, vec![copy, if_ub(5, 7, 0, 1, &message(0, 0))])])], vec![dialog("Hello.")]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let result = run_to_end(&field, &def, &StoryState::at(4), 1, &[]).unwrap();
+    assert!(result.unknown_persistent_reads.contains(&(3, 5)));
+}
+
+#[test]
+fn read_audit_conservatively_flags_replacing_an_unknown_persistent_byte() {
+    let field = field_of(script(vec![("a", vec![(1, vec![setbyte(3, 5, 1)])])], vec![]));
+    let def = demo_def(vec![member(0, "aya")], start(0, 1));
+    let result = run_to_end(&field, &def, &StoryState::at(4), 1, &[]).unwrap();
+    assert!(result.unknown_persistent_reads.contains(&(3, 5)));
+}
+
 // ---- the play layer: cast, ground, speakers, writes --------------------------------------------
 
 fn demo_def(cast: Vec<CastMember>, root: Vec<Step>) -> SceneDef {

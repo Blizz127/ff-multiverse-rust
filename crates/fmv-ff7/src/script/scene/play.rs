@@ -83,6 +83,8 @@ pub struct Outcome {
     pub jump: Option<super::vm::SceneJump>,
     /// Interpreter observations from the stage setup, before the main scene starts.
     pub setup_stats: Stats,
+    /// Persistent bytes consulted without a complete authoritative value.
+    pub unknown_persistent_reads: BTreeSet<(u8, u8)>,
     pub stats: Stats,
 }
 
@@ -371,7 +373,8 @@ pub fn run_to_end(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u
             }
         }
     };
-    Ok(Outcome { end, windows, writes: play.writes(), jump: play.vm.destination(), setup_stats: play.setup_stats().clone(), stats: play.stats().clone() })
+    let writes = play.writes();
+    Ok(Outcome { end, windows, writes, jump: play.vm.destination(), setup_stats: play.setup_stats().clone(), unknown_persistent_reads: play.vm.vars().unknown_persistent_reads(), stats: play.stats().clone() })
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).

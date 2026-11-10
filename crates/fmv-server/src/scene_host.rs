@@ -37,6 +37,7 @@ fn safe_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
         "PRTYP", "PRTYM", "PRTYE", "MMBud", "MMBLK", "MMBUK",
     ];
     complete_outcome(outcome)
+        && outcome.unknown_persistent_reads.is_empty()
         && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !UNSUPPORTED_STATE.iter().any(|op| s.ignored.contains_key(op)))
         // Banks 1–4 may contain persistent game state (for example Tifa's affection in
         // bank 1). Local field scratch variables remain allowed, but untracked persistent
@@ -147,8 +148,12 @@ mod tests {
 
     #[test]
     fn incomplete_or_economic_scenes_cannot_advance_or_travel() {
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), unknown_persistent_reads: Default::default(), stats: Stats::default() };
         assert!(safe_outcome(&outcome));
+        outcome.unknown_persistent_reads.insert((3, 211));
+        assert!(!safe_outcome(&outcome), "assumed persistent inputs cannot drive real progress");
+        assert!(complete_outcome(&outcome), "preview remains available");
+        outcome.unknown_persistent_reads.clear();
         outcome.stats.ignored.insert("GOLDu", 1);
         assert!(!safe_outcome(&outcome));
         outcome.stats.ignored.clear();

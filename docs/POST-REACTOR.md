@@ -42,15 +42,15 @@ those assumptions are useful for a preview but are not evidence of an individual
 state. Keep the post-reactor scenes unregistered until their decision inputs and effects are
 modeled and verified against saved state.
 
-A read guard needs more than checking whether a byte was written in the VM. A bit operation
-can preserve unknown bits, arithmetic can propagate an assumed value into another byte, and a
-bit-test may depend on only one known bit of a partially tracked byte. Track knownness through
-the operations that produce values and reject a real run whenever an unknown persistent input
-can affect a branch, a persistent effect, or a scene result. Treat `Given` as preview context,
-not authoritative saved data; retain the separate preview path. Exercise partial-byte tests,
-word reads, overwrites versus bit operations, and propagation through scratch variables before
-using this as a safety check. This is an implementation requirement, not a proposed change to
-the live story format or authorization to migrate player data.
+The initial read guard is deliberately conservative: it records every baseline read of a
+persistent byte unless the entire byte is carried by the story, and refuses a real outcome
+if any such read occurred. It also sees inputs copied into scratch variables and reads from
+setup. `Given` remains preview context, not authoritative saved data. The guard may reject
+safe runs: even a known bit of a partially tracked byte, and an overwrite whose old value was
+consulted internally, can be flagged. Bit-level knownness and propagation can later reduce
+those false refusals; they must not weaken the conservative guard. This does not establish that
+party state, unimplemented effects or every other interpretation gap is correct, and changes
+neither the live story format nor authorization to migrate player data.
 The existing story merge unions tracked bits and is not a numeric affection merge. The correct
 initial affection and the behavior of later increases/decreases must be established from owned
 game data before proposing a durable numeric representation; treating the observed `+5` as a
@@ -60,7 +60,10 @@ run also leaves progress untouched rather than silently choosing any remaining a
 The server also checks the setup interpreter's unknown instructions, unresolved positions,
 dropped requests and ignored stateful operations before accepting an outcome. Setup reports
 when it stops at a budget or an unexpected scene end rather than silently accepting partial state.
-These checks do not resolve the separate unknown-variable-read gap above.
+In owned bar data, asking the host to replay a preview against a story with the bar mark already
+set runs an actor setup loop until that budget and is refused; normal offering already excludes
+the marked story. A fresh preview remains available.
+The read guard above remains conservative, and these checks do not establish correct party state.
 Echo-S uses a
 rewritten field script with different entity and window numbering, so scene presentation and
 watcher synchronization must be reconciled before claiming that all scene dialogue and voices use it.

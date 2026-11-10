@@ -66,6 +66,12 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
     assert_eq!(scenes.len(), 1);
     assert_eq!((scenes[0].id.as_str(), scenes[0].field.as_str()), (PROOF_SCENE_ID, "mds7pb_1"));
     let moment_72 = host.preview_progress(PROOF_SCENE_ID).expect("a made-up story");
+    let field = opened.adapter.load_field("mds7pb_1").unwrap();
+    let story = fmv_ff7::story::StoryState::at(72);
+    for answer in [1usize, 2] {
+        let outcome = fmv_ff7::script::scene::run_to_end(field.field_file(), &def, &story, 1, &[answer]).unwrap();
+        assert!(!outcome.unknown_persistent_reads.is_empty(), "real proof scene uses assumed persistent state");
+    }
     assert_eq!(moment_72, [1, 72, 0], "the scene's own moment");
     assert!(host.offered(PROOF_SCENE_ID, &moment_72));
     assert!(!host.offered(PROOF_SCENE_ID, &[1, 71, 0]) && !host.offered(PROOF_SCENE_ID, &[]), "a new account (moment 1) is not offered it");
@@ -83,8 +89,12 @@ async fn the_proof_scene_starts_from_its_trigger_on_the_real_field_holds_the_pla
     assert!(finished.changed, "the proof scene writes the bar's mark: {finished:?}");
     assert_eq!(finished.progress, [2, 72, 0, 1, 3, 212, 4], "moment 72 and the mark (var 3/212 = 0b100), the one way to write it");
     assert!(!host.offered(PROOF_SCENE_ID, &finished.progress), "a story that has had the conversation is not offered it again");
-    let again = host.finish_preview(PROOF_SCENE_ID, &finished.progress, 1, &[2]).expect("the preview runs again for a story that has it");
-    assert!(!again.changed && again.progress == finished.progress, "its write is applied once: {again:?}");
+    // With the mark already set, the authored setup enters a persistent actor loop and reaches
+    // the setup budget. Refuse even this artificial replay preview instead of accepting partial setup.
+    let marked = fmv_ff7::story::StoryState::decode(&finished.progress).unwrap();
+    let replay = fmv_ff7::script::scene::run_to_end(field.field_file(), &def, &marked, 1, &[2]).unwrap();
+    assert!(replay.setup_stats.setup_incomplete);
+    assert!(host.finish_preview(PROOF_SCENE_ID, &finished.progress, 1, &[2]).is_none());
 
     // A real server over the same archive, entry field md1stin, previews on, a private state directory.
     let state = tempfile::tempdir().unwrap();
