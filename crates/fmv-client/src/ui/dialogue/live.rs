@@ -7,10 +7,26 @@
 //! [`MessageSource`] a [`super::DialogueWindow`] pulls it from: that one message, then the end. How the window ended
 //! (dismissed, or the line picked) is read back from the shared [`Outcome`] to answer the server.
 
+use super::layout::is_blank;
+use crate::mods::{ModSink, VoiceCue};
 use fmv_ff7::script::dialogue::{Beat, Choice, End, Message, MessageOrigin, MessageSource, Piece};
 use fmv_protocol::LiveAsk;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
+
+/// Where a live window's voice goes: the area it is in (voice files are named by it) and the sink the cues are sent to.
+#[derive(Clone)]
+pub struct LiveVoice {
+    pub field: String,
+    pub sink: Arc<dyn ModSink>,
+}
+
+/// A live window's message, and the voice that goes with it when the text is Echo-S's.
+pub struct LiveText {
+    pub message: Message,
+    pub voice: Option<LiveVoice>,
+}
 
 /// How a live window was left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -28,17 +44,36 @@ pub enum Outcome {
 pub struct LiveSource {
     message: Option<Message>,
     outcome: Rc<Cell<Outcome>>,
+    voice: Option<LiveVoice>,
 }
 
 impl LiveSource {
     pub fn new(message: Message, outcome: Rc<Cell<Outcome>>) -> Self {
-        Self { message: Some(message), outcome }
+        Self { message: Some(message), outcome, voice: None }
+    }
+
+    /// The same source, cueing the voice of the message's first page when it is given out (a window that shows nothing has none)
+    /// and a stop when it is dropped, as a voiced conversation does.
+    pub fn with_voice(mut self, voice: Option<LiveVoice>) -> Self {
+        self.voice = voice;
+        self
+    }
+}
+
+impl Drop for LiveSource {
+    fn drop(&mut self) {
+        if let Some(voice) = &self.voice {
+            voice.sink.cue(VoiceCue::Stop);
+        }
     }
 }
 
 impl MessageSource for LiveSource {
     fn next(&mut self, answer: Option<usize>) -> Beat {
         if let Some(message) = self.message.take() {
+            if let (Some(voice), MessageOrigin::Canon { dialog, .. }, false) = (&self.voice, &message.origin, is_blank(&message)) {
+                voice.sink.cue(VoiceCue::Say { field: voice.field.clone(), window: message.window, dialog: *dialog, page: 0 });
+            }
             return Beat::Message(message);
         }
         self.outcome.set(answer.map_or(Outcome::Dismissed, Outcome::Answered));

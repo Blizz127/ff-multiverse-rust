@@ -40,6 +40,7 @@
 //! happens, as in the game.
 
 mod layout;
+mod echo_live;
 pub mod live;
 
 pub mod ff7;
@@ -59,7 +60,7 @@ use crate::ui::hud::hud_scale;
 use crate::ui::widgets::{Canvas, ACCENT, BORDER, DIM, PANEL_BOTTOM, PANEL_TOP, TEXT};
 use fmv_core::Pos;
 use fmv_ff7::script::dialogue::{Beat, Message, MessageOrigin, MessageSource, TextColour};
-use crate::live::LiveClient;
+use crate::live::{LiveClient, LiveWindowView};
 use fmv_protocol::LiveAsk;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -464,6 +465,12 @@ pub trait Conversations {
         None
     }
 
+    /// The window `view` of a live field as this machine shows it: [`Conversations::live_message`] by default; with a text layer
+    /// that has its own numbering, the layer's line (and the voice that goes with it) found by the instruction that opened it.
+    fn live_window(&mut self, area: &str, view: &LiveWindowView) -> Option<live::LiveText> {
+        self.live_message(area, view.window, usize::from(view.dialog), view.ask).map(|message| live::LiveText { message, voice: None })
+    }
+
     /// Where the story comes from (the hook for story progress), for sources whose branches depend
     /// on it; the others ignore it.
     fn set_story(&mut self, _story: ff7::StoryFactory) {}
@@ -562,10 +569,20 @@ impl Talk {
         self.live_failed = None;
         self.armed.clear();
         self.conversations.set_story(story());
-        let message = self.conversations.live_message(area, view.window, usize::from(view.dialog), view.ask);
+        let text = self.conversations.live_window(area, &view);
         let outcome = Rc::new(Cell::new(live::Outcome::Open));
-        let first = message.as_ref().and_then(|m| m.choice).map_or(0, |c| c.first);
-        let built = message.and_then(|m| DialogueWindow::open(Box::new(live::LiveSource::new(m, Rc::clone(&outcome)))));
+        // The answer goes back counted from the first line of the question as shown (the server counts from the original's).
+        let first = text.as_ref().and_then(|t| t.message.choice).map_or(0, |c| c.first);
+        let voice = text.as_ref().and_then(|t| t.voice.clone());
+        let built = text.and_then(|t| {
+            let source = live::LiveSource::new(t.message, Rc::clone(&outcome)).with_voice(t.voice);
+            DialogueWindow::open(Box::new(source))
+        });
+        // Later pages and the lines of a question cue their voices as the window's player reaches them.
+        let built = built.map(|w| match voice {
+            Some(v) => w.with_voice(&v.field, v.sink),
+            None => w,
+        });
         match built {
             Some(window) => {
                 self.live = Some(LiveShown { window: view.window, serial: view.serial, answerable: view.answerable, first, view: window, outcome });
