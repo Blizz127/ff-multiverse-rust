@@ -65,6 +65,8 @@ pub struct Intent {
 /// The locally predicted own player.
 #[derive(Debug, Clone)]
 pub struct OwnPlayer {
+    /// Story commits and ordinary Game Over hold prediction independently of visible scene/result panels.
+    story_held: bool,
     pos: Pos,
     facing: f32,
     anim: AnimState,
@@ -93,6 +95,7 @@ impl OwnPlayer {
     pub fn at(pos: Pos, facing: f32) -> Self {
         let facing = if facing.is_finite() { facing } else { 0.0 };
         Self {
+            story_held: false,
             pos,
             facing,
             anim: AnimState::Idle,
@@ -117,6 +120,7 @@ impl OwnPlayer {
 
     /// Adopt the result of local prediction.
     pub fn set_motion(&mut self, pos: Pos, facing: f32, anim: AnimState) {
+        if self.story_held { return; }
         if pos.is_finite() {
             self.pos = pos;
         }
@@ -154,6 +158,7 @@ impl OwnPlayer {
     /// `MoveRejected { seq, corrected }`. Applied (returns true) only when `seq` is the newest
     /// intent we sent; a rejection of an older one is stale (see the module docs) and ignored.
     pub fn on_rejected(&mut self, seq: u32, corrected: Pos) -> bool {
+        if self.story_held { return false; }
         // Before the first intent no rejection can be about us; `seq` alone cannot tell (both 0).
         let sent_any = self.last_intent_t.is_finite();
         if !sent_any || seq != self.seq || !corrected.is_finite() {
@@ -183,6 +188,7 @@ impl OwnPlayer {
     /// [`OwnPlayer::walk`] announcing `moving` (`Walk` or `Run`) as the animation while the player
     /// moves: the window runs by default and walks while Shift is held.
     pub fn walk_as(&mut self, area: &dyn AreaRuntime, dir: (f32, f32), speed: f32, dt: f32, moving: AnimState) -> bool {
+        if self.story_held { return false; }
         let len = dir.0.hypot(dir.1);
         if !(len.is_finite() && len > 1e-6 && dt.is_finite() && dt > 0.0 && speed.is_finite()) {
             self.anim = AnimState::Idle;
@@ -225,6 +231,7 @@ impl OwnPlayer {
     /// only when position, facing or animation differ from what the server last knew (or a
     /// correction asked for a resync).
     pub fn next_intent(&mut self, now: f64) -> Option<Intent> {
+        if self.story_held { return None; }
         // Every call, not only when an intent is due: adoption must not wait for the rate limit.
         self.adopt_server_pos_if_quiet(now);
         if now - self.last_intent_t < MIN_INTENT_INTERVAL_S - RATE_EPS_S {
@@ -371,6 +378,14 @@ fn kept_appearance(avatar: &AvatarAppearance) -> Option<String> {
     avatar.appearance_ref.as_deref().filter(|r| r.len() <= MAX_APPEARANCE_REF).map(str::to_string)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct StoryHold {
+    id: u64,
+    area: AreaId,
+    pos: Pos,
+    facing: f32,
+}
+
 #[derive(Debug)]
 pub struct ClientState {
     self_entity: EntityId,
@@ -382,11 +397,17 @@ pub struct ClientState {
     pub party: PartyMirror,
     /// The battle we are in, replayed from the server's messages (see `crate::battle`).
     pub battle: BattleClient,
+    /// Classified once at the acknowledged defeat using its existing scene association; terminal until disconnect.
+    ordinary_game_over: bool,
     /// What the server says our character has earned (level, experience, AP, gil; see
     /// `crate::progress`). Empty until it says (a server without battles never does).
     pub progress: ProgressMirror,
     /// Where the server says our story stands (see `crate::story`). Empty until it says: a new account.
     pub story: StoryMirror,
+    story_hold: Option<StoryHold>,
+    story_last_hold: u64,
+    story_hold_epoch: u64,
+    story_hold_ack: Option<u64>,
     /// The story scene we are in, if any, and what is owed the server about it (see `crate::scene`).
     pub scene: SceneClient,
     /// The countdown the server runs for our story, as it last said (see `crate::ui::countdown`). Empty until it says.
@@ -430,8 +451,13 @@ impl ClientState {
             own: OwnPlayer::new(spawn),
             party: PartyMirror::new(account),
             battle: BattleClient::new(account),
+            ordinary_game_over: false,
             progress: ProgressMirror::default(),
             story: StoryMirror::default(),
+            story_hold: None,
+            story_last_hold: 0,
+            story_hold_epoch: 0,
+            story_hold_ack: None,
             scene: SceneClient::new(),
             countdown: CountdownMirror::default(),
             remotes: BTreeMap::new(),
@@ -472,6 +498,58 @@ impl ClientState {
         self.npc_epoch
     }
 
+    /// A story write is held until both its durable commit and ordered input fence are acknowledged.
+    pub fn is_story_pending(&self) -> bool { self.story_hold.is_some() }
+
+    /// An ordinary authored defeat returns to the title. Later scene traffic cannot reclassify that defeat.
+    pub fn ordinary_game_over(&self) -> bool { self.ordinary_game_over }
+
+    /// Field input remains held through a story transaction or an ordinary authored Game Over.
+    pub fn field_controls_held(&self) -> bool { self.is_story_pending() || self.ordinary_game_over() }
+
+    pub fn story_pending_id(&self) -> Option<u64> { self.story_hold.as_ref().map(|h| h.id) }
+
+    /// Changes even when pending and committed arrive in one pump, so old held keys are retired.
+    pub fn story_pending_epoch(&self) -> u64 { self.story_hold_epoch }
+
+    pub fn take_story_pending_ack(&mut self) -> Option<u64> { self.story_hold_ack.take() }
+
+    fn begin_story_hold(&mut self, hold: StoryHold) -> Option<String> {
+        if hold.id == 0 { return Some("protocol error: a story hold has a zero id".into()); }
+        if hold.id < self.story_last_hold || (hold.id == self.story_last_hold && self.story_hold.is_none()) { return None; }
+        if let Some(active) = &self.story_hold {
+            if *active == hold {
+                self.story_hold_ack = Some(hold.id);
+                return None;
+            }
+            return Some("protocol error: a story hold changed before its matching commit".into());
+        }
+        if hold.area != self.area || !hold.pos.is_finite() || !hold.facing.is_finite() {
+            return Some("protocol error: a story hold has an invalid field or pose".into());
+        }
+        self.own.adopt_held_pose(hold.pos, hold.facing, AnimState::Idle);
+        self.own.story_held = true;
+        self.story_last_hold = hold.id;
+        self.story_hold_epoch = self.story_hold_epoch.wrapping_add(1);
+        self.story_hold_ack = Some(hold.id);
+        self.story_hold = Some(hold);
+        None
+    }
+
+    fn commit_story_hold(&mut self, id: u64) -> Option<String> {
+        if id == 0 || id > self.story_last_hold {
+            return Some("protocol error: a story commit has no preceding hold".into());
+        }
+        if self.story_pending_id() == Some(id) {
+            if self.ordinary_game_over() {
+                return Some("protocol error: a story commit cannot release Game Over".into());
+            }
+            self.story_hold = None;
+            self.own.story_held = self.field_controls_held();
+        }
+        None
+    }
+
     /// The server moved us to `area` and we hold it (the session checked it against local content
     /// and answered `JoinArea`): everything that belongs to the old area goes (the other players,
     /// the NPCs, the peers seen), and we stand at `arrival` heading `facing` (the server's own
@@ -490,6 +568,7 @@ impl ClientState {
         self.scene.end_local();
         self.scene.discard_background();
         self.scene.discard_field_effects();
+        self.own.story_held = self.field_controls_held();
         if forward {
             self.area_changes += 1;
         }
@@ -587,6 +666,8 @@ impl ClientState {
             ServerMsg::PlayerLeft { entity } => {
                 self.remotes.remove(&entity);
             }
+            ServerMsg::StoryPending { id, area, pos, facing } => return self.begin_story_hold(StoryHold { id, area, pos, facing }),
+            ServerMsg::StoryCommitted { id } => return self.commit_story_hold(id),
             ServerMsg::MoveRejected { seq, corrected } => {
                 self.rejected += 1;
                 self.own.on_rejected(seq, corrected);
@@ -610,11 +691,23 @@ impl ClientState {
             ServerMsg::PartyEvent { seq, event, names } => self.party.on_event(seq, event, names),
             ServerMsg::PartyState { seq, party, invites, names } => self.party.on_state(seq, party, invites, names),
             ServerMsg::PartyRejected { error } => self.party.on_rejected(&error),
-            // Battle traffic never ends the session: the battle mirror judges it (and says so
-            // loudly when the replay diverges).
+            // Ordinary Game Over is terminal on this connection. Durable scene retries use their own hold.
+            ServerMsg::EncounterStart { .. } if self.ordinary_game_over() => {
+                return Some("protocol error: an encounter cannot release Game Over".into());
+            }
+            msg @ ServerMsg::BattleEnd { .. } => {
+                let ended = self.battle.ended();
+                let scene_battle = self.scene.battle_input();
+                self.battle.on_message(now, msg);
+                // Only a matching, acknowledged end can classify the defeat. A scene must already
+                // own that fight; neither delayed scene traffic nor scene teardown can change it.
+                if self.battle.ended() != ended && self.battle.game_over().is_some() && !scene_battle {
+                    self.ordinary_game_over = true;
+                }
+            }
+            // The battle mirror judges the remaining traffic (and says so when replay diverges).
             msg @ (ServerMsg::EncounterStart { .. }
             | ServerMsg::BattleEvent { .. }
-            | ServerMsg::BattleEnd { .. }
             | ServerMsg::BattleRejected { .. }) => self.battle.on_message(now, msg),
             // Our own character's numbers (protocol v5). Like battle traffic it never ends the session:
             // it is the server's word about us, shown and counted, and nothing here acts on it.
@@ -626,6 +719,9 @@ impl ClientState {
             // Where our story stands (the server's word, never ends the session): the mirror keeps the
             // blob for whatever reads story variables on this side (see `crate::story`).
             ServerMsg::StoryUpdate { progress, advance } => self.story.on_update(progress, advance),
+            ServerMsg::SceneStart { .. } if self.ordinary_game_over() => {
+                return Some("protocol error: a scene cannot replace Game Over".into());
+            }
             // A story scene (the server's word; it never ends the session): the scene client plays it from this machine's own
             // game and says what is owed back (see `crate::scene`).
             msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }
@@ -643,6 +739,7 @@ impl ClientState {
                 return Some("protocol error: the server announced a deleted character to a joined session".to_string());
             }
         }
+        self.own.story_held = self.field_controls_held();
         None
     }
 
@@ -653,7 +750,7 @@ impl ClientState {
         if snap.id == self.self_entity {
             self.own_echoes = self.own_echoes.saturating_add(1);
             self.own_echo_at = Some(snap.pos);
-            if self.scene.holds_authoritative_pose() {
+            if self.field_controls_held() || self.scene.holds_authoritative_pose() {
                 self.own.adopt_held_pose(snap.pos, snap.facing, snap.anim);
             } else {
                 self.own.note_server_pos(now, snap.pos);
@@ -1678,3 +1775,6 @@ mod tests {
         assert_eq!((s.battle.inventory_total(), s.battle.inventory_updates()), (0, 2));
     }
 }
+
+#[cfg(test)]
+mod story_pending_tests;

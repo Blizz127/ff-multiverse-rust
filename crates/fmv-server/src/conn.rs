@@ -605,6 +605,7 @@ impl Conn {
                 | ClientMsg::PartySync
                 | ClientMsg::BattleCommand { .. }
                 | ClientMsg::RequestEncounter { .. }
+                | ClientMsg::StoryPendingAck { .. }
                 | ClientMsg::SceneStep { .. }
                 | ClientMsg::SceneBattleReady { .. }
                 | ClientMsg::SceneRetry { .. }
@@ -637,6 +638,8 @@ impl Conn {
                         JoinError::AlreadyOnline => Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE),
                         JoinError::ProgressChanged => Close::reject(RejectCode::Internal, "A scene save completed during login. Please reconnect to load current progress."),
                         JoinError::StorageUnavailable => Close::reject(RejectCode::Internal, "Server storage requires recovery. Please reconnect after the server restarts."),
+                        JoinError::UnsupportedFieldVisit => Close::reject(RejectCode::Internal, "This save needs field-visit support that this server does not yet provide."),
+                        JoinError::UnsupportedProgression => Close::reject(RejectCode::Internal, "This save uses a story format that this server does not yet support for gameplay."),
                     })
             })
         };
@@ -687,6 +690,9 @@ impl Conn {
                 ClientMsg::BattleCommand { battle_id, actor, command } => {
                     self.battle(|w, now| w.battle_command(entity, battle_id, actor, command, now))?
                 }
+                // This ordered barrier can arrive while an AreaChange is still being accepted.
+                // Let the world match its exact hold id; it is not a gameplay or travel request.
+                ClientMsg::StoryPendingAck { id } => self.on_story_pending_ack(entity, id)?,
                 // The answer to an `AreaChange` (a transfer between areas, see `world::areas`).
                 ClientMsg::JoinArea { area, fingerprint, provenance } => {
                     self.travel(|w, now| w.join_area(entity, &area, &fingerprint, &provenance, now))?
@@ -808,6 +814,11 @@ impl Conn {
                     debug!(code = ?e.code(), why = e.client_text(), "registration refused");
                     Close::reject(e.code(), e.client_text())
                 })?;
+                // Only a fresh registration gets an initial story. An explicit debug story
+                // takes precedence on the throw-away servers that allow it; token logins
+                // retain their exact stored bytes, including an empty legacy story.
+                let story = shared.cfg.scenes.as_ref().and_then(|scenes|
+                    scenes.debug_new_story.clone().or_else(|| scenes.host.fresh_story()));
                 let permit = shared.limits.registrations.reserve(self.peer, Instant::now()).map_err(|refusal| match refusal {
                     RegistrationRefusal::Server => Close::reject(
                         RejectCode::RateLimited,
@@ -825,10 +836,7 @@ impl Conn {
                 }
                 tokio::task::spawn_blocking(move || {
                     let on_created = move || permit.commit(Instant::now());
-                    match rules.as_deref() {
-                        Some(rules) => accounts::register_with_rules(&store, game, registration, now, on_created, rules),
-                        None => accounts::register(&store, game, registration, now, on_created),
-                    }
+                    accounts::register_with_initial_state(&store, game, registration, now, on_created, rules.as_deref(), story)
                 })
             }
         };
@@ -966,6 +974,16 @@ impl Conn {
             PressOutcome::Nothing => Ok(()),
             PressOutcome::Relocated { corrected } => self.send(ServerMsg::MoveRejected { seq: self.last_move_seq, corrected }),
             PressOutcome::Gone => Err(Close::Dropped("removed from the world")),
+        }
+    }
+
+    /// The client has installed the exact story hold. Keep this in the joined message order, including
+    /// during an area transfer, so input sent before the acknowledgement cannot cross the barrier.
+    fn on_story_pending_ack(&mut self, entity: EntityId, id: u64) -> Result<(), Close> {
+        match self.shared.with_world(|world| world.story_pending_ack(entity, id, Instant::now())) {
+            SceneReply::Done => Ok(()),
+            SceneReply::Refused(reason) => self.send(ServerMsg::SceneRefused { reason }),
+            SceneReply::Gone => Err(Close::Dropped("removed from the world")),
         }
     }
 

@@ -471,7 +471,20 @@ struct GpuBackdrop {
     id: u64,
     bind_group: wgpu::BindGroup,
     /// Owns the pixels the bind group's view looks at.
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
+}
+
+fn backdrop_bind_group(device: &wgpu::Device, pipeline: &wgpu::RenderPipeline,
+    texture: &wgpu::Texture, sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fmv-backdrop-bind"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 
 /// Pipelines + buffers, independent of any window surface.
@@ -485,6 +498,7 @@ pub struct Gpu {
     format: wgpu::TextureFormat,
     quad_pipeline: wgpu::RenderPipeline,
     quad_sampler: wgpu::Sampler,
+    background_filter: crate::graphics::BackgroundFilter,
     quad_buf: wgpu::Buffer,
     /// The picture currently on the GPU, replaced when a scene brings a different one.
     backdrop: Option<GpuBackdrop>,
@@ -582,8 +596,8 @@ impl Gpu {
         });
         let quad_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("fmv-backdrop-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: crate::graphics::BackgroundFilter::default().filter_mode(),
+            min_filter: crate::graphics::BackgroundFilter::default().filter_mode(),
             ..wgpu::SamplerDescriptor::default()
         });
         let quad_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -603,6 +617,7 @@ impl Gpu {
             format,
             quad_pipeline,
             quad_sampler,
+            background_filter: crate::graphics::BackgroundFilter::default(),
             quad_buf,
             backdrop: None,
             ui,
@@ -612,6 +627,23 @@ impl Gpu {
             fade: None,
             last_scale_fallback: None,
         }
+    }
+
+    /// Change only field picture sampling. Existing textures are rebound immediately, without
+    /// replacing the picture, uploading its pixels again, or touching model and UI samplers.
+    pub fn set_background_filter(&mut self, filter: crate::graphics::BackgroundFilter) {
+        if self.background_filter == filter { return; }
+        self.background_filter = filter;
+        self.quad_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fmv-backdrop-sampler"),
+            mag_filter: filter.filter_mode(),
+            min_filter: filter.filter_mode(),
+            ..wgpu::SamplerDescriptor::default()
+        });
+        if let Some(backdrop) = self.backdrop.as_mut() {
+            backdrop.bind_group = backdrop_bind_group(&self.device, &self.quad_pipeline, &backdrop.texture, &self.quad_sampler);
+        }
+        self.avatars.set_background_filter(filter);
     }
 
     pub fn set_anti_aliasing(&mut self, mode: crate::graphics::AntiAliasing) {
@@ -823,26 +855,11 @@ impl Gpu {
             },
             size,
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let layout = self.quad_pipeline.get_bind_group_layout(0);
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fmv-backdrop-bind"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.quad_sampler),
-                },
-            ],
-        });
+        let bind_group = backdrop_bind_group(&self.device, &self.quad_pipeline, &texture, &self.quad_sampler);
         self.backdrop = Some(GpuBackdrop {
             id: backdrop.id,
             bind_group,
-            _texture: texture,
+            texture,
         });
         true
     }
@@ -1108,7 +1125,33 @@ impl Renderer {
     pub fn set_graphics(&mut self, settings: crate::graphics::Settings) {
         self.gpu.set_anti_aliasing(settings.anti_aliasing);
         self.gpu.set_render_scale(settings.render_scale);
+        self.gpu.set_background_filter(settings.background_filter);
         self.graphics = settings;
+    }
+
+    /// The persisted choices and the resolution this window can actually allocate now.
+    pub fn graphics_status(&self) -> crate::graphics::panel::Status {
+        crate::graphics::panel::Status {
+            anti_aliasing: self.graphics.anti_aliasing,
+            render_scale: self.graphics.render_scale,
+            effective_scale: self.gpu.render_plan(self.size).effective,
+            background_filter: self.graphics.background_filter,
+        }
+    }
+
+    /// Restore all graphics defaults immediately, with one attempt to remember the choices.
+    pub fn restore_graphics_defaults(&mut self) -> String {
+        let saved = self.graphics.restore_defaults();
+        self.gpu.set_anti_aliasing(self.graphics.anti_aliasing);
+        self.gpu.set_render_scale(self.graphics.render_scale);
+        self.gpu.set_background_filter(self.graphics.background_filter);
+        match saved {
+            Ok(()) => "Graphics defaults restored".to_string(),
+            Err(e) => {
+                eprintln!("graphics: {e}");
+                "Graphics defaults restored for this session; settings could not be saved".to_string()
+            }
+        }
     }
 
     /// The choice applies immediately even if the local settings file cannot be written.
@@ -1130,6 +1173,16 @@ impl Renderer {
             Ok(_) => notice.to_string(),
             Err(e) => { eprintln!("graphics: {e}"); format!("{notice}; not saved") }
         }
+    }
+
+    pub fn toggle_background_filter(&mut self) -> &'static str {
+        let saved = self.graphics.toggle_background_filter();
+        self.gpu.set_background_filter(self.graphics.background_filter);
+        if let Err(e) = saved {
+            eprintln!("graphics: {e}");
+            return "Graphics changed for this session; settings could not be saved";
+        }
+        self.graphics.background_filter.notice()
     }
 
     /// "adapter name (backend, device type)" for logs.
@@ -1689,6 +1742,67 @@ mod tests {
     // Offscreen GPU tests (they need a GPU or a software Vulkan/GL driver, e.g. lavapipe, so they
     // only run on request: `cargo test -p fmv-client -- --ignored offscreen`)
     // ------------------------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs a GPU or software Vulkan/GL driver"]
+    fn offscreen_background_filter_changes_cached_flat_pixels_and_restores_them_without_touching_ui() {
+        use crate::graphics::{AntiAliasing, BackgroundFilter, RenderScale};
+        use crate::ui::draw::DrawList;
+        use crate::ui::testkit::{save, Offscreen};
+        let picture = Backdrop::new(2, 2,
+            [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]].concat(),
+            [-100.0, -100.0], [100.0, 100.0]).unwrap();
+        let scene = Scene { bounds: bounds(-100.0, -100.0, 100.0, 100.0), triangles: &[],
+            players: &[], fixture_banner: false, backdrop: Some(&picture) };
+        let mut overlay = DrawList::new();
+        overlay.fill_rect(0, 0, 256, 24, [8, 24, 80, 255]);
+        overlay.draw_text(4, 8, 1, [255, 255, 255, 255], "BACKGROUND FILTER / NATIVE UI");
+        for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb] {
+            let mut offscreen = Offscreen::with_format(format).expect("GPU or software adapter");
+            let size = (320, 240);
+            let mut render = |mode: Option<BackgroundFilter>, effects: bool, size: (u32, u32)| {
+                offscreen.render_with(size.0, size.1, |gpu, target, srgb| {
+                    if let Some(mode) = mode { gpu.set_background_filter(mode); }
+                    gpu.set_anti_aliasing(if effects { AntiAliasing::Fxaa } else { AntiAliasing::Off });
+                    gpu.set_render_scale(if effects { RenderScale::Double } else { RenderScale::Native });
+                    gpu.draw_field(target, size, &scene, None, srgb);
+                    assert_eq!(gpu.backdrop.as_ref().map(|b| b.id), Some(picture.id), "the same picture stays cached");
+                    gpu.draw_overlay(target, &overlay.vertices(size.0, size.1, srgb));
+                })
+            };
+            let baseline = render(None, false, size);
+            assert_eq!(baseline, render(Some(BackgroundFilter::Linear), false, size), "Linear preserves the current default");
+            let nearest = render(Some(BackgroundFilter::Nearest), false, size);
+            assert!(baseline.as_chunks::<4>().0.iter().zip(nearest.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count() > 1_000,
+                "the already cached picture changes immediately, {format:?}");
+            for y in 0..24 { for x in 0..256 {
+                let at = (y * size.0 as usize + x) * 4;
+                assert_eq!(&baseline[at..at + 4], &nearest[at..at + 4], "native UI at {x},{y}, {format:?}");
+            } }
+            // Inside the picture, away from its edge and UI, nearest chooses only an authored
+            // texel. Linear introduces intermediate colours in this deliberately tiny picture.
+            let mut blended = 0;
+            let source = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+            for y in 32..208 { for x in 72..248 {
+                let chosen = pixel(&nearest, size.0, x, y);
+                assert!(source.contains(&chosen), "nearest must select a texel at {x},{y}: {chosen:?}");
+                if !source.contains(&pixel(&baseline, size.0, x, y)) { blended += 1; }
+            } }
+            assert!(blended > 1_000, "linear interpolates between the source texels");
+            assert_eq!(baseline, render(Some(BackgroundFilter::Linear), false, size), "switching back restores every pixel");
+            let _ = render(Some(BackgroundFilter::Nearest), false, (401, 257));
+            assert_eq!(nearest, render(Some(BackgroundFilter::Nearest), false, size), "resize keeps the chosen filter");
+            for mode in [BackgroundFilter::Linear, BackgroundFilter::Nearest] {
+                let with_effects = render(Some(mode), true, size);
+                let other = if mode == BackgroundFilter::Linear { BackgroundFilter::Nearest } else { BackgroundFilter::Linear };
+                let _ = render(Some(other), true, size);
+                assert_eq!(with_effects, render(Some(mode), true, size), "filter changes remain reversible with 2x and FXAA");
+            }
+            let suffix = if format.is_srgb() { "srgb" } else { "unorm" };
+            save(&format!("background-filter-flat-linear-{suffix}"), size.0, size.1, &baseline);
+            save(&format!("background-filter-flat-nearest-{suffix}"), size.0, size.1, &nearest);
+        }
+    }
 
     /// Render `scene` into an offscreen `w` x `h` texture exactly the way the window does
     /// (backdrop upload, quad, vertices) and read the pixels back as tightly packed RGBA8.

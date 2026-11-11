@@ -20,9 +20,13 @@ use crate::error::{PersistError, Result};
 /// the version: [`CharacterProgress::inventory`] was added that way. (What that costs a build
 /// that is rolled back is documented there.)
 pub const SCHEMA_VERSION: u32 = 1;
+/// Highest private character-envelope schema understood by this build. Ordinary records
+/// stay at version 1; version 5 is selected only for a visit with enlarged opaque payloads.
+pub const MAX_CHARACTER_PROGRESS_SCHEMA_VERSION: u32 = 5;
 /// Default format version of a new account index (`index.log`, and the small `index.json`
-/// marker beside it). Scene batches raise the log header to version 3 before their first
-/// write, while retaining the legacy marker at version 2. Version 1 was a single
+/// marker beside it). Explicit durable story writes raise the log header to version 4,
+/// while retaining the legacy marker at version 2. Version 3 introduced scene batches and
+/// remains readable without an implicit upgrade. Version 1 was a single
 /// `index.json` holding every name and token; it is migrated
 /// transparently on open. An older build that finds the marker refuses to open the directory
 /// with [`PersistError::FutureSchema`] instead of misreading it.
@@ -44,14 +48,17 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024;
 /// The original fields and a full inventory use under 18 KiB. Up to
 /// [`MAX_SCENE_RECEIPTS`](crate::MAX_SCENE_RECEIPTS) durable receipt hashes fit alongside them;
 /// those receipts are never evicted. Ordinary receipts require schema 2; batch receipts,
-/// checkpoints and reservations require schema 3. The first batch also upgrades the index
-/// header so older servers refuse the entire store. Records without metadata retain schema 1.
+/// checkpoints and reservations require schema 3. Visits and their bounded last-operation
+/// receipt require schema 4 and index header 5. An entry or anchor larger than 1024 bytes
+/// selects schema 5 and index header 6; earlier durable batches require header 4.
+/// These recognized fences make earlier writers refuse the whole store. Records without
+/// metadata retain schema 1.
 /// A checkpoint's replay has up to 256 KiB of bytes; pretty JSON puts each on an indented
 /// line. This cap includes that expansion, a complete inventory and all 2,048 receipts.
-/// A conservative character bound is `12 * 256 KiB + 16 * (2 * 8 KiB)` for replay,
-/// original story and landing arrays, `256 * 2048` for receipts, and 32 KiB for the
-/// remaining fields: 3,964,928 bytes. The actual widest validated envelope is exercised
-/// in `store::scene::batch::tests::size_bounds`, including the deeper intent indentation.
+/// The actual widest validated envelope is exercised in
+/// `store::scene::batch::tests::size_bounds`; `store::field_visit::large_tests` additionally
+/// combines the enlarged visit, maximum checkpoint, full inventory and receipt history.
+/// These checks serialize the real record, including its pretty-JSON indentation.
 /// Raising the bound changes no serialization, receipt identity or recovery checksum.
 pub const MAX_CHARACTER_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// Longest accepted `base_archetype` (bytes).
@@ -128,6 +135,10 @@ pub(crate) struct AccountRecord {
     /// The digest binds the complete initial file, including its account id and timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_progress: Option<RegistrationProgress>,
+    /// The optional story file written in the same registration commit. Together with
+    /// `registration_progress`, this declares the complete, byte-exact initial file set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_story: Option<RegistrationProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +343,22 @@ impl Progression {
     }
 }
 
+/// Game-authored story for a genuinely new registration. The store supplies the account
+/// id, record version and timestamp; this API never seeds an existing account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProgression {
+    pub game: GameId,
+    pub blob: Vec<u8>,
+}
+
+impl NewProgression {
+    pub fn new(game: GameId, blob: Vec<u8>) -> Self { Self { game, blob } }
+
+    pub(crate) fn record(&self, account: AccountId, now: u64) -> Progression {
+        Progression::new(account, self.game, self.blob.clone(), now)
+    }
+}
+
 /// One account's character progress for one game: which of the game's characters it plays, what
 /// that character has earned (level, experience, AP, gil) and, once the game stores one, what the
 /// account carries (the inventory). **Not** [`Progression`]: that blob is the account's story
@@ -359,7 +386,7 @@ impl Progression {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterProgress {
     /// Record format version. The store stamps the base [`SCHEMA_VERSION`], or its private
-    /// receipt/checkpoint envelope's version (2 or 3); callers cannot downgrade that metadata.
+    /// receipt/checkpoint/visit envelope's version (2 through 5); callers cannot downgrade that metadata.
     pub schema_version: u32,
     pub account_id: AccountId,
     pub game: GameId,
@@ -529,12 +556,24 @@ fn check_inventory(inventory: &[InventoryEntry]) -> Result<()> {
 }
 
 /// `Vec<u8>` <-> hex string, rejecting oversized input before decoding it.
-mod hex_blob {
+pub(crate) mod hex_blob {
     use super::MAX_BLOB_BYTES;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(blob: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&hex::encode(blob))
+    }
+
+    /// Fixed snapshots require one canonical lowercase encoding, with no allocation of
+    /// decoded data before the exact size and alphabet have been checked.
+    pub fn deserialize_exact<'de, D: Deserializer<'de>, const N: usize>(d: D) -> Result<[u8; N], D::Error> {
+        let text = String::deserialize(d)?;
+        if text.len() != N * 2 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(serde::de::Error::custom("expected exact lowercase hexadecimal snapshot"));
+        }
+        let mut bytes = [0; N];
+        hex::decode_to_slice(text, &mut bytes).map_err(serde::de::Error::custom)?;
+        Ok(bytes)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {

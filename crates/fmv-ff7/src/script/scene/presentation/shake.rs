@@ -39,15 +39,60 @@ impl ShakeState {
         self.axes.map(|axis| axis.rng_index)
     }
 
+    /// Exact presentation state, embedded in the versioned terminal-stage checkpoint.
+    /// The 34-byte payload includes the retained offset and segment endpoints: neither
+    /// the visible offset nor the random cursor alone determines the following frame.
+    #[cfg_attr(not(test), allow(dead_code))] // Retained phase API; ready-anchor admission remains gated.
+    pub(super) fn checkpoint_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(34);
+        for axis in &self.axes {
+            bytes.extend_from_slice(&[u8::from(axis.enabled), u8::from(axis.active), axis.rng_index, axis.offset as u8, axis.amplitude]);
+            for word in [axis.start, axis.target, axis.steps, axis.step] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&self.fraction.to_bits().to_le_bytes());
+        bytes
+    }
+
+    /// Restore only a bounded, safe machine state. This validates the representation;
+    /// the enclosing checkpoint separately binds it to the actual source and arrival.
+    #[cfg_attr(not(test), allow(dead_code))] // Retained phase API; ready-anchor admission remains gated.
+    pub(super) fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 34 { return Err("shake checkpoint has the wrong length".into()); }
+        let first = bytes.get(..13).ok_or("shake checkpoint has no first axis")?;
+        let second = bytes.get(13..26).ok_or("shake checkpoint has no second axis")?;
+        let fraction: [u8; 8] = bytes.get(26..).ok_or("shake checkpoint has no fraction")?
+            .try_into().map_err(|_| "shake checkpoint has the wrong fraction length")?;
+        let fraction = f64::from_bits(u64::from_le_bytes(fraction));
+        if !fraction.is_finite() || fraction.is_sign_negative() || !(0.0..1.0).contains(&fraction) {
+            return Err("shake checkpoint has an invalid fractional frame".into());
+        }
+        Ok(Self { axes: [Axis::from_checkpoint_bytes(first)?, Axis::from_checkpoint_bytes(second)?], fraction })
+    }
+
+    /// Match an authored configuration whose amplitude and segment length never change,
+    /// such as the train's alternating on/off shake. Segment phase and random cursors may
+    /// differ after real dialogue dwell, but endpoints and offsets must still be possible
+    /// under those operands. This is not a proof of historical timing or RNG provenance.
+    /// Do not use it for a script that changes amplitude/steps: SHAKE intentionally keeps
+    /// the old endpoints when those operands change.
+    pub(super) fn matches_constant_configuration(&self, reference: &Self) -> bool {
+        self.axes.iter().zip(&reference.axes).all(|(axis, expected)| {
+            if axis.steps == 0 { return axis == expected; }
+            axis.enabled == expected.enabled && axis.amplitude == expected.amplitude
+                && axis.steps == expected.steps && axis.constant_phase_possible()
+        })
+    }
+
     /// Apply SHAKE without restarting either axis's phase. Disabled-axis operands are ignored.
     /// Returns false, preserving both axes, if an enabled axis has zero segment steps.
     pub fn apply(&mut self, mask: u8, x_amplitude: u8, x_steps: u8, y_amplitude: u8, y_steps: u8) -> bool {
         if (mask & 1 != 0 && x_steps == 0) || (mask & 2 != 0 && y_steps == 0) {
             return false;
         }
-        for (index, (amplitude, steps)) in [(x_amplitude, x_steps), (y_amplitude, y_steps)].into_iter().enumerate() {
-            let axis = &mut self.axes[index];
-            axis.enabled = mask & (1 << index) != 0;
+        for (axis, (bit, amplitude, steps)) in self.axes.iter_mut().zip([(1, x_amplitude, x_steps), (2, y_amplitude, y_steps)]) {
+            axis.enabled = mask & bit != 0;
             if axis.enabled {
                 axis.amplitude = amplitude;
                 axis.steps = i16::from(steps);
@@ -90,6 +135,61 @@ struct Axis {
 }
 
 impl Axis {
+    #[cfg_attr(not(test), allow(dead_code))] // Used only by the staged retained phase decoder.
+    fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let bytes: [u8; 13] = bytes.try_into().map_err(|_| "shake axis has the wrong length")?;
+        let [enabled, active, rng_index, offset, amplitude, s0, s1, t0, t1, n0, n1, i0, i1] = bytes;
+        let boolean = |value| match value {
+            0 => Ok(false), 1 => Ok(true), _ => Err("shake axis has an invalid boolean".to_string()),
+        };
+        let axis = Self {
+            enabled: boolean(enabled)?, active: boolean(active)?, rng_index, offset: offset as i8, amplitude,
+            start: i16::from_le_bytes([s0, s1]), target: i16::from_le_bytes([t0, t1]),
+            steps: i16::from_le_bytes([n0, n1]), step: i16::from_le_bytes([i0, i1]),
+        };
+        if !(0..=255).contains(&axis.steps) || !(-128..=128).contains(&axis.start) || !(-128..=128).contains(&axis.target) {
+            return Err("shake axis has invalid segment operands".into());
+        }
+        // Zero steps is possible only for an axis that has never been enabled. Every
+        // interpolating state needs a nonzero divisor. A nonzero-step counter can be
+        // negative after the original disabled-axis counter wraps; preserve that case.
+        if axis.steps == 0 && (axis.enabled || axis.active || axis.offset != 0 || axis.amplitude != 0
+            || axis.start != 0 || axis.target != 0 || axis.step != 0) {
+            return Err("shake axis would interpolate with zero steps".into());
+        }
+        Ok(axis)
+    }
+
+    fn constant_phase_possible(&self) -> bool {
+        if !(1..=255).contains(&self.steps) || !(0..=self.steps + 1).contains(&self.step) { return false; }
+        // Generate the actual signed product/narrowing results, not a symmetric bound
+        // guessed from amplitude. A later segment can negate a raw target.
+        let mut targets = vec![0];
+        for sample in RANDOM {
+            let raw = ((u16::from(sample) * u16::from(self.amplitude)) as i16) / 256;
+            targets.extend([raw, -raw]);
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        if !targets.contains(&self.start) || !targets.contains(&self.target) { return false; }
+        if self.active {
+            let sample = RANDOM.get(usize::from(self.rng_index.wrapping_sub(1))).copied().unwrap_or(0);
+            let raw = ((u16::from(sample) * u16::from(self.amplitude)) as i16) / 256;
+            let possible = if self.start < 0 { self.target == raw }
+                else if self.start > 0 { self.target == -raw }
+                else { self.target == raw || self.target == -raw };
+            if !possible { return false; }
+        } else if self.target != 0 { return false; }
+        if self.step > 0 {
+            return self.offset == ease(self.start, self.target, self.steps, self.step) as i8;
+        }
+        // Starting or replacing a segment retains the previous rendered offset. That
+        // predecessor may be any segment phase under the constant operands; requiring
+        // the new segment's step-zero value would incorrectly snap valid captures.
+        self.offset == 0 || targets.iter().any(|&start| targets.iter().any(|&target|
+            (1..=self.steps + 1).any(|step| ease(start, target, self.steps, step) as i8 == self.offset)))
+    }
+
     fn settled(&self) -> bool {
         !self.enabled && !self.active && self.step == self.steps
     }
@@ -137,7 +237,9 @@ impl Axis {
 
     fn random_target(&mut self) -> i16 {
         // The original narrows the product before division, including at large amplitudes.
-        let product = (u16::from(RANDOM[usize::from(self.rng_index)]) * u16::from(self.amplitude)) as i16;
+        // A u8 index is always present in the fixed 256-entry table.
+        let sample = RANDOM.get(usize::from(self.rng_index)).copied().unwrap_or(0);
+        let product = (u16::from(sample) * u16::from(self.amplitude)) as i16;
         self.rng_index = self.rng_index.wrapping_add(1);
         product / 256
     }
@@ -186,7 +288,8 @@ fn ease(start: i16, target: i16, steps: i16, step: i16) -> i32 {
     debug_assert!(steps > 0);
     // Preserve the integer angle arithmetic, its byte wrap and signed truncation of the result.
     let angle = (((i32::from(step) << 12) / i32::from(steps)) / 32 + 128) as u8;
-    let cosine = i32::from(FIELD_COS[usize::from(angle)]);
+    // A u8 angle is always present in the fixed 256-entry table.
+    let cosine = i32::from(FIELD_COS.get(usize::from(angle)).copied().unwrap_or(0));
     i32::from(start) + (cosine + 4096) * (i32::from(target) - i32::from(start)) / 8192
 }
 
@@ -235,6 +338,114 @@ const RANDOM: [u8; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_configuration_accepts_real_phases_and_rejects_impossible_train_amplitudes() {
+        for (amplitude, steps) in [(5, 2), (255, 3)] {
+            let mut state = ShakeState::with_rng_indices([17, 231]);
+            assert!(state.apply(2, 0, 0, amplitude, steps));
+            let mut reference = state.clone();
+            for frame in 0..1400 {
+                let mask = if frame % 67 < 29 { 2 } else { 0 };
+                assert!(state.apply(mask, 0, 1, amplitude, steps));
+                assert!(reference.apply(mask, 0, 1, amplitude, steps));
+                state.advance(0.37);
+                assert!(state.matches_constant_configuration(&reference), "real phase {frame}, amp {amplitude}: {state:?}");
+            }
+        }
+        let mut train = ShakeState::default();
+        assert!(train.apply(2, 0, 0, 5, 2));
+        train.advance(2.25);
+        let mut impossible = train.clone();
+        impossible.axes[1].target = 127;
+        assert!(ShakeState::from_checkpoint_bytes(&impossible.checkpoint_bytes()).is_ok(), "representation alone is safe");
+        assert!(!impossible.matches_constant_configuration(&train), "amplitude5 cannot produce target127");
+        impossible = train.clone(); impossible.axes[1].offset = 127;
+        assert!(!impossible.matches_constant_configuration(&train), "nor render offset127");
+        impossible = train.clone(); impossible.axes[1].step = -1;
+        assert!(!impossible.matches_constant_configuration(&train), "constant steps cannot produce a wrapped retiming counter");
+        impossible = train.clone(); impossible.axes[0].rng_index = 1;
+        assert!(!impossible.matches_constant_configuration(&train), "the never-enabled axis cannot consume randomness");
+        impossible = train.clone(); impossible.axes[1].rng_index = 9;
+        assert!(!impossible.matches_constant_configuration(&train), "the retained target must match its generating random sample");
+        impossible = train.clone(); impossible.axes[1].amplitude = 6;
+        assert!(!impossible.matches_constant_configuration(&train));
+    }
+
+    #[test]
+    fn constant_configuration_is_not_used_for_authored_amplitude_changes() {
+        let mut changed = ShakeState::default();
+        assert!(changed.apply(2, 0, 0, 200, 2));
+        changed.advance(2.0);
+        let retained = changed.axes[1].target;
+        assert!(changed.apply(2, 0, 0, 5, 2));
+        assert_eq!(changed.axes[1].target, retained, "runtime SHAKE still keeps prior endpoints");
+        assert!(!changed.matches_constant_configuration(&changed), "this validator requires a proven constant history");
+    }
+
+    #[test]
+    fn checkpoints_preserve_fraction_segments_and_future_updates_exactly() {
+        let mut original = ShakeState::with_rng_indices([253, 91]);
+        assert!(original.apply(3, 24, 4, 5, 2));
+        for frames in [0.17, 2.5, 1.0, 0.03125] { original.advance(frames); }
+        assert!(original.apply(2, 0, 0, 20, 3));
+        let bytes = original.checkpoint_bytes();
+        assert_eq!(bytes.len(), 34);
+        let mut restored = ShakeState::from_checkpoint_bytes(&bytes).unwrap();
+        assert_eq!(restored.checkpoint_bytes(), bytes, "fraction bits and retained offsets survive");
+        for frames in [0.37, 17.25, 0.01, 2500.5] {
+            original.advance(frames);
+            restored.advance(frames);
+            assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes());
+        }
+        assert!(original.apply(0, 0, 0, 0, 0));
+        assert!(restored.apply(0, 0, 0, 0, 0));
+        for frames in [0.7, 1.0, 30.0] {
+            original.advance(frames);
+            restored.advance(frames);
+            assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes());
+        }
+    }
+
+    #[test]
+    fn checkpoints_preserve_the_disabled_counter_wrap_and_refuse_unsafe_states() {
+        let mut wrapped = ShakeState::default();
+        assert!(wrapped.apply(1, 20, 8, 0, 0));
+        wrapped.advance(4.0);
+        assert!(wrapped.apply(0, 0, 0, 0, 0));
+        wrapped.advance(100.0);
+        assert!(wrapped.apply(1, 20, 2, 0, 0));
+        assert!(wrapped.apply(0, 0, 0, 0, 0));
+        wrapped.advance(32_760.25);
+        assert_eq!(wrapped.axes[0].step, i16::MIN);
+        let bytes = wrapped.checkpoint_bytes();
+        let mut restored = ShakeState::from_checkpoint_bytes(&bytes).unwrap();
+        restored.advance(32_771.5);
+        wrapped.advance(32_771.5);
+        assert_eq!(restored.checkpoint_bytes(), wrapped.checkpoint_bytes());
+
+        let quiet = ShakeState::default().checkpoint_bytes();
+        assert!(ShakeState::from_checkpoint_bytes(&quiet).is_ok());
+        for length in 0..quiet.len() { assert!(ShakeState::from_checkpoint_bytes(&quiet[..length]).is_err()); }
+        let mut longer = quiet.clone(); longer.push(0);
+        assert!(ShakeState::from_checkpoint_bytes(&longer).is_err());
+        for (at, value) in [(0, 2), (1, 2), (13, 2), (14, 2), (0, 1), (1, 1), (4, 1), (11, 1)] {
+            let mut invalid = quiet.clone(); invalid[at] = value;
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err(), "invalid byte {at}");
+        }
+        for steps in [-1i16, 256] {
+            let mut invalid = bytes.clone(); invalid[9..11].copy_from_slice(&steps.to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+        for endpoint in [-129i16, 129] {
+            let mut invalid = bytes.clone(); invalid[5..7].copy_from_slice(&endpoint.to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+        for fraction in [f64::NAN, f64::INFINITY, -0.25, -0.0, 1.0] {
+            let mut invalid = bytes.clone(); invalid[26..].copy_from_slice(&fraction.to_bits().to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn large_updates_match_individual_frames_including_long_segments_and_extreme_amplitudes() {

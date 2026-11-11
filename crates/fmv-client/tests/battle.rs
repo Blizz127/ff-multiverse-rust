@@ -168,6 +168,8 @@ async fn serve(stream: TcpStream, on_request: OnRequest) -> Report {
                         }
                         OnRequest::FightFor(how_long) | OnRequest::FightAndPay(how_long) => {
                             let start = ServerMsg::EncounterStart {
+                                victory_fanfare: true,
+                                game_over_on_defeat: false,
                                 initial_party: None,
                                 escape_policy: fmv_protocol::EscapePolicy::Formation,
                                 battle_id: BattleId(1),

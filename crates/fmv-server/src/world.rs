@@ -126,6 +126,7 @@ pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
 pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
+pub(crate) use scene::saved_landing_evidence;
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;
@@ -254,6 +255,9 @@ struct Player {
     fence: Option<press::Fence>,
     /// The story scene this player is held in (as owner or watcher), if any (see the `scene` module).
     scene: Option<fmv_protocol::SceneRunId>,
+    /// Correlated ordinary story/battle save hold. Controls return only after storage and the
+    /// client's ordered acknowledgement have both reached the server.
+    story_pending: Option<u64>,
     /// Set while the player is in a debug scene preview: its `progression` is made up and nothing of it is ever saved.
     preview: Option<scene::Preview>,
     /// The account whose countdown this player was last told is running (see the `countdown` module): `None` when it was
@@ -294,6 +298,10 @@ pub enum JoinError {
     ProgressChanged,
     /// The shared store or save worker requires recovery before gameplay can resume.
     StorageUnavailable,
+    /// The stored visit needs runtime restoration that this build does not yet implement.
+    UnsupportedFieldVisit,
+    /// The adapter can preserve this story format, but cannot run it in this build.
+    UnsupportedProgression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,6 +363,8 @@ pub struct World {
     logs: DeferredLogs,
     /// Story scenes: the game's scenes, the runs in progress and the debug preview switch (see `scene`).
     scenes: scene::SceneWorld,
+    /// Ordered exact story writes and their deferred field work.
+    story_saves: story::StorySaves,
     /// The countdowns that story steps started, one per account (see `countdown`).
     countdowns: BTreeMap<AccountId, countdown::Countdown>,
     /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
@@ -398,6 +408,7 @@ impl World {
             saver: None,
             logs,
             scenes: scene::SceneWorld::default(),
+            story_saves: story::StorySaves::default(),
             countdowns: BTreeMap::new(),
             clock: Instant::now(),
             resume: resume::Resume::default(),
@@ -461,6 +472,10 @@ impl World {
         self.by_account.contains_key(&account)
     }
 
+    fn saved_progression_supported(&self, progress: &[u8]) -> bool {
+        self.areas.get(&self.home).is_some_and(|area| area.runtime().supports_saved_progression(progress))
+    }
+
     /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` and
     /// then the `InstancePlacement` to the joiner (always the first things in its queue after the
     /// handshake replies) and `PlayerJoined` to everyone else. The movement budget starts empty.
@@ -474,6 +489,17 @@ impl World {
 
     pub fn join(&mut self, new: NewPlayer, now: Instant) -> Result<Pos, JoinError> {
         if self.scenes.storage_failed { return Err(JoinError::StorageUnavailable); }
+        if !self.saved_progression_supported(&new.progression)
+            || new.scene_group.iter().filter(|state| state.pair.story.game == self.home_game())
+                .any(|state| !self.saved_progression_supported(&state.pair.story.blob)) {
+            return Err(JoinError::UnsupportedProgression);
+        }
+        // The storage foundation can preserve visits before the field runtime can restore
+        // them. Never replace a saved anchor/scratch image with an ordinary story spawn.
+        if new.scene_state.as_ref().is_some_and(|state| state.field_visit.is_some())
+            || new.scene_group.iter().any(|state| state.field_visit.is_some()) {
+            return Err(JoinError::UnsupportedFieldVisit);
+        }
         // Checked here, under the world lock, because two handshakes with the same token can both
         // pass authentication.
         let recovering = new.scene_state.as_ref().is_some_and(|state| state.checkpoint.is_some() || state.reservation.is_some());
@@ -493,13 +519,16 @@ impl World {
             None if new.scene_group.is_empty() => {}
             _ => return Err(JoinError::ProgressChanged),
         }
-        // DEBUG (`SceneSettings::debug_new_story`, off on every real server): an account with no story yet starts with the
-        // one the server was told to give new accounts. Queue that baseline before admission so every later scene
+        // DEBUG (`SceneSettings::debug_new_story`, off on every real server): direct world callers representing new
+        // registrations can still supply an empty seed. Network registration already commits its debug baseline
+        // atomically; token logins carry a coherent scene_state and never receive initialization here.
+        // Queue the direct caller's baseline before admission so every later scene
         // transaction checks the same predecessor after this FIFO write. This is queued, not acknowledged durable at
         // join; if it cannot be saved, the later exact scene precondition fails without publishing its result.
         let mut new = new;
-        if !recovering && new.progression.is_empty() {
+        if !recovering && new.scene_state.is_none() && new.progression.is_empty() {
             if let Some(story) = self.scenes.debug_new_story.clone() {
+                if !self.saved_progression_supported(&story) { return Err(JoinError::UnsupportedProgression); }
                 if self.saver.as_ref().is_some_and(|saver| !saver.save_story(new.account, story.clone())) {
                     return Err(JoinError::StorageUnavailable);
                 }
@@ -563,6 +592,7 @@ impl World {
                 arming: LinkArming::default(),
                 fence: None,
                 scene: None,
+                story_pending: None,
                 preview: None,
                 countdown_told: None,
                 ways: Vec::new(),
@@ -645,7 +675,7 @@ impl World {
                 return MoveOutcome::Gone;
             };
             // A player in a battle, or between two areas, is frozen: its moves are ignored.
-            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() {
+            if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some() {
                 return MoveOutcome::Frozen;
             }
             let Some(area) = self.areas.get(&p.area) else {
@@ -709,6 +739,12 @@ impl World {
                 }
                 // Reaching a story point is what advances the story (a no-op in an area without any).
                 self.check_story(entity, from, accepted, now);
+                if let Some(player) = self.players.get(&entity).filter(|player| player.story_pending.is_some() || player.scene.is_some()) {
+                    let followup = story::StoryFollowup::Move { area: player.area.clone(), from, to: accepted, distance: dist };
+                    self.defer_story_followup(entity, followup);
+                    return MoveOutcome::Applied;
+                }
+                if !self.players.contains_key(&entity) { return MoveOutcome::Gone; }
                 // Walking up to a line that no key fires may put the player somewhere else in the area.
                 if let Some(corrected) = self.walk_links(entity, from, accepted, now) {
                     return MoveOutcome::Relocated { corrected };
@@ -729,6 +765,25 @@ impl World {
                 }
                 MoveOutcome::Rejected { corrected: place, reason: Rejection::Blocked }
             }
+        }
+    }
+
+    /// Continue the exact accepted move after its story sweep has durably finished. The original
+    /// chord and distance are retained so a delayed save neither loses a link nor rolls twice.
+    pub(super) fn resume_after_story_move(&mut self, entity: EntityId, area: AreaKey, from: Pos, to: Pos, distance: f64, now: Instant) {
+        if !self.players.get(&entity).is_some_and(|player| player.area == area && player.transit.is_none()
+            && player.scene.is_none() && player.battle.is_none() && self.ordinary_story_resuming(entity)) { return; }
+        if self.walk_links(entity, from, to, now).is_some() {
+            if let Some(snapshot) = self.players.get(&entity).map(|player| player.snapshot.clone()) {
+                let mut failed = Vec::new();
+                self.send_to(entity, fmv_protocol::ServerMsg::EntityUpdate { tick: self.tick, entities: vec![snapshot] }, &mut failed);
+                self.drop_failed(failed);
+            }
+            return;
+        }
+        if self.players.get(&entity).is_some_and(|player| player.scene.is_none() && player.battle.is_none()
+            && player.transit.is_none() && self.ordinary_story_resuming(entity)) {
+            self.roll_encounter(entity, distance, now);
         }
     }
 
@@ -1610,7 +1665,7 @@ mod tests {
                 pair: fmv_persist::ProgressPair {
                     story: fmv_persist::Progression::empty(account, w.home_game()), character: None,
                 },
-                checkpoint: None, reservation: None,
+                checkpoint: None, reservation: None, field_visit: None,
             };
             let (tx, mut rx) = mpsc::channel(32);
             let mut new = NewPlayer {
@@ -1644,7 +1699,7 @@ mod tests {
                 pair: fmv_persist::ProgressPair {
                     story: fmv_persist::Progression::new(account, w.home_game(), stored_story.clone(), 0), character: None,
                 },
-                checkpoint: None, reservation: None,
+                checkpoint: None, reservation: None, field_visit: None,
             };
             let (tx, mut rx) = mpsc::channel(32);
             let new = NewPlayer {
@@ -1657,6 +1712,46 @@ mod tests {
             assert!(w.join(new, Instant::now()).is_ok());
             assert!(w.has_session(account));
             assert!(matches!(&*rx.try_recv().unwrap(), ServerMsg::AreaSnapshot { .. }));
+        }
+    }
+
+    #[test]
+    fn stored_field_visits_refuse_admission_before_their_runtime_can_be_restored() {
+        for in_cohort_only in [false, true] {
+            let mut w = world();
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let mut state = fmv_persist::SceneState {
+                pair: fmv_persist::ProgressPair {
+                    story: fmv_persist::Progression::empty(account, w.home_game()), character: None,
+                },
+                checkpoint: None, reservation: None, field_visit: None,
+            };
+            let mut group = vec![state.clone()];
+            let visit = fmv_persist::FieldVisitV1 {
+                schema_version: 1, visit_id: [1; 16], revision: 3, field: "tin_1".into(),
+                source_identity: [2; 32],
+                entry: fmv_persist::FieldVisitEntryV1 { operation: [3; 16], arrival: vec![1] },
+                anchor: vec![2], scratch_values: [0; 256], scratch_known_masks: [255; 256],
+                active_continuation: None,
+            };
+            if in_cohort_only {
+                group[0].field_visit = Some(visit);
+            } else {
+                state.field_visit = Some(visit);
+                group[0] = state.clone();
+            }
+            let (tx, mut rx) = mpsc::channel(32);
+            let new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "visit".into(), tint: [0; 3], appearance_ref: None },
+                progression: Vec::new(), progress: Default::default(),
+                scene_state: Some(state), scene_group: group, tx, close: Arc::new(watch::channel(false).0),
+            };
+            assert_eq!(w.join(new, Instant::now()), Err(JoinError::UnsupportedFieldVisit));
+            assert_eq!(w.player_count(), 0);
+            assert!(!w.has_session(account));
+            assert!(rx.try_recv().is_err(), "do not publish a guessed field spawn or replay a visit initializer");
         }
     }
 

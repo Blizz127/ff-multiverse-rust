@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use super::{Battle, Member, World};
 use crate::saver::SceneBattleSettlement;
 
+#[cfg(test)]
+#[path = "continuation/roster_tests.rs"]
+mod roster_tests;
+
 /// The persistent attempt identity plus its current presentation run. Runtime ids never identify
 /// a durable operation; they only route the live presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,23 +103,56 @@ fn same_actor(a: &BattleMember, b: &BattleMember) -> bool {
     }
 }
 
-/// Apply complete resources by stable identity. Rebuilding the default templates first validates
-/// the preserved HP/MP against any newly earned level; it does not refill a carried actor.
-fn apply_carry(setup: &mut BattleSetup, carry: &SceneCombatCarry, rules: &dyn fmv_protocol::BattleRules,
-    require_all: bool) -> Result<(), BattleRejection> {
+/// Canon actors occupy the source-ordered prefix; saved player slots follow it. `None`
+/// is the legacy query path, while `Some(&[])` proves that no canon actor belongs here.
+fn canon_prefix_matches(party: &[BattleMember], canon: Option<&[u8]>) -> bool {
+    let first_player = party.iter().position(BattleMember::is_player).unwrap_or(party.len());
+    if party[first_player..].iter().any(|member| !member.is_player()) { return false; }
+    canon.is_none_or(|expected| party[..first_player].iter().map(|member| member.character).eq(expected.iter().copied()))
+}
+
+/// Carry is evidence from the previous engine, in its actor order. Validate that evidence
+/// before mapping resources to a newly ordered roster; names/levels cannot replace identities.
+fn carry_matches_plan(plan: &SceneBattlePlan, carry: &SceneCombatCarry) -> bool {
+    carry.members.len() == plan.setup.party.len()
+        && carry.members.iter().zip(&plan.setup.party).all(|((member, _), original)| member == original)
+        && plan.setup.party.iter().enumerate().all(|(index, member)| !plan.setup.party[..index].iter().any(|old| same_actor(old, member)))
+}
+
+/// A script may reorder or remove known companions. It cannot create resources for an actor
+/// absent from the preceding fight. Every frozen player's position and identity are retained.
+fn reorder_canon(setup: &mut BattleSetup, canon: &[u8]) -> Result<(), BattleRejection> {
+    if !canon_prefix_matches(&setup.party, None)
+        || canon.iter().enumerate().any(|(index, character)| canon[..index].contains(character)) {
+        return Err(BattleRejection::Unsupported);
+    }
+    let mut party = Vec::with_capacity(setup.party.len());
+    for &character in canon {
+        let mut matches = setup.party.iter().filter(|member| !member.is_player() && member.character == character);
+        let member = matches.next().ok_or(BattleRejection::Unsupported)?;
+        if matches.next().is_some() { return Err(BattleRejection::Unsupported); }
+        party.push(member.clone());
+    }
+    party.extend(setup.party.iter().filter(|member| member.is_player()).cloned());
+    setup.party = party;
+    Ok(())
+}
+
+/// Apply complete resources by stable identity, then validate the preserved HP/MP against
+/// templates at the acknowledged level. A missing actor is refused, never refilled.
+fn apply_carry(setup: &mut BattleSetup, carry: &SceneCombatCarry, rules: &dyn fmv_protocol::BattleRules) -> Result<(), BattleRejection> {
+    if carry.members.iter().enumerate().any(|(index, (member, _))| carry.members[..index].iter().any(|(old, _)| same_actor(old, member)))
+        || carry.members.iter().any(|(member, _)| member.is_player() && !setup.party.iter().any(|current| same_actor(member, current))) {
+        return Err(BattleRejection::Unsupported);
+    }
     setup.initial_party = None;
-    let state = rules.build(setup).map_err(|_| BattleRejection::UnknownFormation)?;
     let mut initial = Vec::with_capacity(setup.party.len());
-    for (i, member) in setup.party.iter_mut().enumerate() {
-        let actor = state.actor(ActorId(i as u8)).ok_or(BattleRejection::Unsupported)?;
+    for member in &mut setup.party {
         let matches: Vec<_> = carry.members.iter().filter(|(old, _)| same_actor(old, member)).collect();
-        if matches.len() > 1 || (require_all && matches.len() != 1) { return Err(BattleRejection::Unsupported); }
-        let value = if let Some((old, value)) = matches.first() {
-            if old.character != member.character { return Err(BattleRejection::Unsupported); }
-            *value
-        } else {
-            BattleInitialState { hp: actor.hp, mp: actor.mp, status: actor.status.set(), limit: actor.limit }
-        };
+        if matches.len() != 1 { return Err(BattleRejection::Unsupported); }
+        let (old, value) = matches[0];
+        if old.character != member.character { return Err(BattleRejection::Unsupported); }
+        let value = *value;
         member.status = value.status;
         member.limit = value.limit;
         initial.push(value);
@@ -136,6 +173,8 @@ fn start_message(id: BattleId, setup: &BattleSetup, fingerprint: Fingerprint) ->
         battle_speed: setup.battle_speed,
         ticks_per_second: setup.ticks_per_second,
         escape_policy: setup.escape_policy,
+        victory_fanfare: setup.victory_fanfare,
+        game_over_on_defeat: setup.game_over_on_defeat,
         initial_party: setup.initial_party.clone(),
         data_fingerprint: fingerprint,
     }
@@ -167,11 +206,14 @@ impl World {
     /// Select the same nearby co-op roster as an ordinary battle, allowing the named scene's hold.
     /// No engine starts and no message is sent until the caller has committed this plan.
     pub(crate) fn prepare_scene_battle(&mut self, requester: EntityId, run: SceneRunId, formation: u16,
-        escape_policy: EscapePolicy, carry: Option<&SceneCombatCarry>) -> Result<SceneBattlePlan, BattleRejection> {
-        let mut setup = self.prepare_battle_setup(requester, formation, Some(run))?;
+        escape_policy: EscapePolicy, carry: Option<&SceneCombatCarry>, canon: Option<&[u8]>) -> Result<SceneBattlePlan, BattleRejection> {
+        let mut setup = self.prepare_battle_setup_with_canon(requester, formation, Some(run), false, canon)?;
         setup.escape_policy = escape_policy;
+        // The continuation caller admits only source BTLMD 8 (high byte zero): defeat
+        // retains its checkpoint and is presented by the scene-specific Game Over flow.
+        setup.game_over_on_defeat = true;
         let rules = self.battle.as_ref().ok_or(BattleRejection::Unsupported)?.settings.rules.as_ref();
-        if let Some(carry) = carry { apply_carry(&mut setup, carry, rules, false)?; }
+        if let Some(carry) = carry { apply_carry(&mut setup, carry, rules)?; }
         rules.build(&setup).map_err(|_| BattleRejection::UnknownFormation)?;
         let inventories = setup.party.iter().filter_map(BattleMember::account).map(|account| {
             let inventory = self.by_account.get(&account).and_then(|entity| self.players.get(entity))
@@ -186,12 +228,12 @@ impl World {
     /// inventory or starting an engine. The plan cannot invent a participant, change its combat
     /// character or level, or replace the durable bag. Carried combat-only resources are validated
     /// by the shared engine; the scene coordinator additionally binds them to its accepted replay.
-    pub(crate) fn validate_scene_battle_plan(&self, plan: &SceneBattlePlan, states: &[fmv_persist::SceneState]) -> bool {
+    pub(crate) fn validate_scene_battle_plan(&self, plan: &SceneBattlePlan, states: &[fmv_persist::SceneState], canon: Option<&[u8]>) -> bool {
         let Some(bw) = self.battle.as_ref() else { return false; };
         let rules = bw.rules();
         let accounts = plan.accounts();
         let unique: BTreeSet<_> = accounts.iter().copied().collect();
-        if plan.fingerprint != rules.data_fingerprint() || plan.setup.party.is_empty()
+        if plan.fingerprint != rules.data_fingerprint() || plan.setup.party.is_empty() || !canon_prefix_matches(&plan.setup.party, canon)
             || plan.setup.party.len() > MAX_BATTLE_PARTY || accounts.is_empty() || accounts.len() != unique.len()
             || states.len() != accounts.len() || plan.inventories.len() != accounts.len()
             || states.first().is_some_and(|first| states.iter().any(|s| s.pair.story.game != first.pair.story.game))
@@ -219,6 +261,9 @@ impl World {
                 continue;
             };
             let Some(state) = states.iter().find(|s| s.pair.story.account_id == account) else { return false; };
+            if state.reservation.as_ref().is_some_and(|reservation| accounts.get(usize::from(reservation.slot)) != Some(&account)) {
+                return false;
+            }
             let Some(record) = state.pair.character.as_ref() else { return false; };
             if record.account_id != account || record.game != state.pair.story.game
                 || member.character != record.character || member.level != bw.settings.level.unwrap_or(record.level)
@@ -237,17 +282,24 @@ impl World {
         rules.build(&plan.setup).is_ok()
     }
 
+    /// A prepared fight starts with exactly the retained result resources. The previous
+    /// roster may contain removed canon actors, but no retained actor gets a fresh template
+    /// or different HP/MP/status/limit just because a checkpoint was reconstructed.
+    pub(crate) fn validate_scene_battle_initial_carry(&self, plan: &SceneBattlePlan, carry: Option<&SceneCombatCarry>) -> bool {
+        let Some(carry) = carry else { return plan.setup.initial_party.is_none(); };
+        let Some(bw) = self.battle.as_ref() else { return false; };
+        let mut rebuilt = plan.setup.clone();
+        apply_carry(&mut rebuilt, carry, bw.rules()).is_ok() && rebuilt == plan.setup
+    }
+
     /// Validate a recovered postbattle resume without consuming a seed or rewriting anything.
     /// The retained plan describes the fight before its rewards, so player levels and bags are
     /// refreshed from the acknowledged records before checking the carried combat resources.
     /// Every carry entry must identify exactly its original frozen actor, in the original order.
     pub(crate) fn validate_scene_battle_resume(&self, plan: &SceneBattlePlan, carry: &SceneCombatCarry,
-        states: &[fmv_persist::SceneState]) -> bool {
+        states: &[fmv_persist::SceneState], canon: Option<&[u8]>) -> bool {
         let Some(bw) = self.battle.as_ref() else { return false; };
-        if carry.members.len() != plan.setup.party.len()
-            || carry.members.iter().zip(&plan.setup.party).any(|((member, _), original)| member != original) {
-            return false;
-        }
+        if !carry_matches_plan(plan, carry) { return false; }
         let mut resumed = plan.clone();
         resumed.inventories.clear();
         for member in &mut resumed.setup.party {
@@ -260,18 +312,20 @@ impl World {
             let inventory = crate::inventory::Inventory::resolve(bw.rules(), record.inventory.as_deref());
             resumed.inventories.push((account, inventory.entries().to_vec()));
         }
-        if apply_carry(&mut resumed.setup, carry, bw.rules(), true).is_err() { return false; }
-        self.validate_scene_battle_plan(&resumed, states)
+        if apply_carry(&mut resumed.setup, carry, bw.rules()).is_err() { return false; }
+        self.validate_scene_battle_plan(&resumed, states, canon)
     }
 
-    /// The next authored fight retains every frozen player and companion, including disconnected
-    /// accounts. Levels and bags come from the preceding acknowledged transaction; HP/MP come from
+    /// The next authored fight retains every frozen player, including disconnected accounts.
+    /// The authoritative canon prefix may reorder or remove companions, but cannot add actors
+    /// without carried resources. Levels and bags come from the preceding acknowledged transaction; HP/MP come from
     /// that fight's engine result. Canon companions keep the first fight's level throughout this
     /// chain: they have no independent experience record, and a different online party leader must
     /// not reinterpret the frozen group. This is a port policy, not original companion progression.
     /// No nearby roster selection or healing occurs here.
     pub(crate) fn prepare_next_scene_battle(&mut self, previous: &SceneBattlePlan, formation: u16,
-        carry: &SceneCombatCarry, states: &[fmv_persist::SceneState]) -> Result<SceneBattlePlan, BattleRejection> {
+        carry: &SceneCombatCarry, states: &[fmv_persist::SceneState], canon: Option<&[u8]>) -> Result<SceneBattlePlan, BattleRejection> {
+        if !self.validate_scene_battle_resume(previous, carry, states, None) { return Err(BattleRejection::Unsupported); }
         let bw = self.battle.as_mut().ok_or(BattleRejection::Unsupported)?;
         if previous.fingerprint != bw.rules().data_fingerprint() { return Err(BattleRejection::Unsupported); }
         let accounts = previous.accounts();
@@ -281,6 +335,7 @@ impl World {
         }
         let info = bw.rules().formation(formation).ok_or(BattleRejection::UnknownFormation)?;
         let mut setup = previous.setup.clone();
+        if let Some(canon) = canon { reorder_canon(&mut setup, canon)?; }
         setup.formation_id = formation;
         setup.seed = bw.next_seed();
         setup.preemptive = info.preemptive;
@@ -295,8 +350,7 @@ impl World {
             let inventory = crate::inventory::Inventory::resolve(bw.rules(), record.inventory.as_deref());
             inventories.push((account, inventory.entries().to_vec()));
         }
-        if carry.members.len() != setup.party.len() { return Err(BattleRejection::Unsupported); }
-        apply_carry(&mut setup, carry, bw.rules(), true)?;
+        apply_carry(&mut setup, carry, bw.rules())?;
         Ok(SceneBattlePlan { setup, fingerprint: previous.fingerprint, inventories })
     }
 

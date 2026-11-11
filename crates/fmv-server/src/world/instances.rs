@@ -219,7 +219,8 @@ impl World {
         for &account in accounts {
             // A frozen scene cohort keeps its field presentation across party cleanup and
             // intermediate durable writes. Its final release explicitly refreshes placement.
-            if self.continuation_account_held(account) { continue; }
+            if self.continuation_account_held(account) || self.ordinary_story_placement_held(account)
+                || self.ordinary_battle_account_held(account) { continue; }
             if let Some(&entity) = self.by_account.get(&account) {
                 self.settle(entity, false, failed);
             }
@@ -232,7 +233,8 @@ impl World {
     /// `refresh_placements` and do not generate this additional traffic.
     pub(super) fn refresh_story_placements(&mut self, accounts: &BTreeSet<AccountId>, failed: &mut Vec<(EntityId, bool)>) {
         let before: Vec<_> = accounts.iter().filter_map(|account| {
-            if self.continuation_account_held(*account) { return None; }
+            if self.continuation_account_held(*account) || self.ordinary_story_placement_held(*account)
+                || self.ordinary_battle_account_held(*account) { return None; }
             let entity = *self.by_account.get(account)?;
             self.players.get(&entity).filter(|player| player.transit.is_none())?;
             Some((entity, *account, self.instances.instance_of(*account)?))

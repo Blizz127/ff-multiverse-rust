@@ -65,6 +65,12 @@
 //! reads; a stand-in or a box has none and moves procedurally. A clip is posed IN PLACE ([`ActorRig::clip_pose`]): the root's travel along the
 //! ground is taken out (the weapon's track too, which is in the character's space) and the scene moves
 //! the actor itself.
+//!
+//! Bodies with weapons use the same authored integer frame for both meshes. Interpolating the body's
+//! joint angles and the weapon's independent world-space track separately detaches the weapon between
+//! frames: its grip follows a straight line while the hand follows the arm's arc. Such rigs keep their
+//! authored pose cadence at the configured clip rate; smooth interpolation needs a separate, validated
+//! attachment scheme. Rigs without weapons retain their interpolated poses.
 
 use super::clips::{ClipSet, Kit, Slot};
 use super::effects::EffectKit;
@@ -614,12 +620,19 @@ fn in_place(pose: &mut [[f32; 16]], root: [f32; 2]) {
 }
 
 impl ActorRig {
+    /// Weapons have independent tracks in the owner's space, not bones of its skeleton. Their
+    /// authored frames agree with the body's hands; independently interpolated subframes do not.
+    fn pose_frame(&self, frame: f32) -> f32 {
+        if self.attachments.is_empty() { frame } else { frame.floor() }
+    }
+
     /// The pose of clip `slot` at the (fractional) frame position `frame`, standing IN PLACE: the root's
     /// translation along the ground is taken out (see [`super::clips`]: the game's clips carry travel of
     /// hundreds of units that this client composes itself), its height is kept. `None` when the rig has no
     /// such slot or the clip does not fit the skeleton; the root's `(x, z)` that was taken out comes with
     /// the pose, for the attachments.
     pub fn clip_pose(&self, slot: Slot, frame: f32) -> Option<(Vec<[f32; 16]>, [f32; 2])> {
+        let frame = self.pose_frame(frame);
         let clip = self.clips.get(usize::from(slot))?;
         let mut pose = clip.pose_at(&self.asset.character.model.bones, frame)?;
         let root = root_xz(clip, frame);
@@ -631,6 +644,7 @@ impl ActorRig {
     /// out: the weapon's track is in the character's space, so it moves by the same. An attachment with no
     /// track for `slot` is left out.
     pub fn attachment_clip_poses(&self, slot: Slot, frame: f32, root: [f32; 2]) -> Vec<(&Arc<AvatarAsset>, Vec<[f32; 16]>)> {
+        let frame = self.pose_frame(frame);
         self.attachments
             .iter()
             .filter_map(|a| {
@@ -644,7 +658,7 @@ impl ActorRig {
     /// The frame position `seconds` into the idle loop: 0 for a still pose, else the loop's own.
     fn frame_at(&self, seconds: f32) -> Option<f32> {
         let clip = self.clips.first()?;
-        Some(if self.procedural_idle || clip.frame_count() <= 1 { 0.0 } else { seconds * self.fps })
+        Some(if self.procedural_idle || clip.frame_count() <= 1 { 0.0 } else { self.pose_frame(seconds * self.fps) })
     }
 
     /// The pose of the idle loop `seconds` into it (a still pose for a one-frame clip): per-bone
@@ -1038,6 +1052,9 @@ impl ModelKit {
         }
     }
 }
+
+#[cfg(test)]
+mod weapon_tests;
 
 #[cfg(test)]
 mod tests {

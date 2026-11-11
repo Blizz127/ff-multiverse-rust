@@ -11,7 +11,7 @@
 //!
 //! * **The progression blob** ([`StoryState`]): `[1, moment_lo, moment_hi]`, three bytes, and, once a story
 //!   step has set one of the few other variables the model carries ([`TRACKED_VARS`]), a second version
-//!   with those variables after the moment (below). The **empty blob is a new account** and means
+//!   with those variables after the moment (below). For legacy compatibility, the **empty blob** means
 //!   [`NEW_GAME_MOMENT`] (1): the value the opening scene of `md1stin` leaves behind (`SETWORD Var[2][0] =
 //!   1`, then control is handed to the player), so a player starts where the game first lets them walk.
 //!   A legacy account keeps its recorded state and format until explicitly upgraded. Anything that is not
@@ -55,12 +55,28 @@
 //! [`StoryState::add_byte_checked`] provides ordered numeric changes with caller-supplied bounds.
 //! Existing version 1/2 states keep their byte-for-byte representation until explicitly promoted;
 //! promotion retains their tracked knowledge and does not infer new-game defaults or past choices.
-//! The largest representation is [`MAX_BANK_BLOB_BYTES`] bytes. Readers must allow that bound before
-//! enabling this format. The legacy union merge refuses version 3: a transactional store must use
+//! The largest version-3 representation is [`MAX_BANK_BLOB_BYTES`] bytes. Readers must allow that bound before
+//! enabling this format. The legacy union merge refuses versions 3 and 4: a transactional store must use
 //! [`compare_exchange_progression`] against the exact previous blob, under the same lock as its
 //! scene receipt, so stale saves cannot undo clears or numeric updates. This module performs no I/O.
 //! Version 3 phases include every carried value and knowledge mask; this conservative partition can
 //! later be narrowed with field-specific dependency evidence.
+//!
+//! **Version 4** adds explicit [`NativePartyState`] resources after the same bank records:
+//! main-party slots and independent PHS availability/lock masks. Raw field-party slots stay
+//! in the banks. [`StoryState::into_native_party`] promotes with entirely unknown resources;
+//! [`StoryState::fresh_native_first_control`] is a separate, explicit fresh port profile.
+//! Neither changes version-3 defaults. The maximum v4 blob is [`MAX_NATIVE_PARTY_BLOB_BYTES`]
+//! bytes. Exact replacement also preserves party knowledge and refuses a v4 downgrade.
+//! Its phase identity includes all party values and knownness. This schema alone does not
+//! enable v4 execution: interpreters and authoritative roster consumers must use these
+//! resources before registration or gameplay can opt into the new format.
+//!
+//! Explicit new-account registration can use [`StoryState::fresh_first_control`], the port's
+//! source-backed reset/opening profile. [`StoryState::fresh_reset`] separately describes the earlier
+//! engine reset. Neither constructor is used by decoding or legacy promotion: missing state in an
+//! existing account stays unknown. The first-control profile documents the unsupported engine-owned
+//! fields it withholds and the unresolved original startup routine; it is not a captured PC save.
 //!
 //! # Story points
 //!
@@ -147,10 +163,10 @@
 //!
 //! # The canon party
 //!
-//! The moment also says who the STORY's party is ([`CANON_PARTIES`], [`canon_party`]): Cloud and Barret
-//! in the first reactor mission. A battle starts with that party (server-controlled companions) and the players'
+//! The moment also says who the STORY's party is ([`CANON_PARTIES`], [`canon_party`]): Cloud starts alone,
+//! Barret joins at the reactor door (moment 11), and leaves at the post-escape station (moment 36). A battle starts with that party (server-controlled companions) and the players'
 //! own characters join it as extra members; nobody is replaced and the canon characters are never field NPCs. The
-//! table has one row today and says, in its own docs, how a later row is established.
+//! table names the source assignments that establish each transition.
 //!
 //! # What this does not do
 //!
@@ -171,11 +187,20 @@ use fmv_core::{PhaseKey, Pos};
 
 use crate::field::Walkmesh;
 use crate::script::dialogue::{self, StoryVars};
-use crate::script::{FieldScript, Instruction, Operand, SCRIPTS_PER_ENTITY};
+use crate::script::{FieldScript, Instruction, Operand, INIT_SCRIPT, SCRIPTS_PER_ENTITY};
 
 pub(crate) mod scan;
 mod banks;
+mod point_exact;
+pub use point_exact::StoryPointError;
+mod party_visibility;
+pub use party_visibility::{party_visibility_matches, reviewed_party_visibility};
+mod fresh;
 pub use banks::{canonical_persistent_bank, compare_exchange_progression, StoryWriteError, BLOB_VERSION_BANKS, MAX_BANK_BLOB_BYTES};
+mod native_party;
+pub use native_party::{checked_canon_party_of, evaluate_native_party, NativePartyAssignments, NativePartyEffect, NativePartyError,
+    NativePartyImage, NativePartyOp, NativePartyOpError, NativePartyState, BLOB_VERSION_NATIVE_PARTY, MAX_NATIVE_PARTY_BLOB_BYTES, NATIVE_PARTY_BYTES};
+pub use native_party::{NativeStoryAssignment, NativeStoryBuilder, NativeStoryError, NativeStoryEvent, NativeStoryJournal};
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;
@@ -267,7 +292,8 @@ pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {
     TRACKED_VARS.iter().copied().find(|t| t.bank == bank && t.address == address)
 }
 
-/// An account's FF7 story state: its moment, legacy variables, or version 3 persistent bank knowledge.
+/// An account's FF7 story state: its moment, legacy variables, persistent bank knowledge,
+/// and, only in version 4, explicit native party resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoryState {
     /// The main progress counter (`Var[2][0]`).
@@ -276,21 +302,26 @@ pub struct StoryState {
     vars: BTreeMap<(u8, u8), u8>,
     /// Canonical persistent banks with known-bit masks; absent in the legacy formats.
     banks: Option<BTreeMap<(u8, u8), banks::KnownByte>>,
+    /// Resources outside the field banks; absent in versions 1–3. Raw field-party slots
+    /// remain in the bank image, never duplicated here.
+    native_party: Option<NativePartyState>,
 }
 
 impl StoryState {
-    /// Where a new account starts ([`NEW_GAME_MOMENT`], every other variable 0).
+    /// The legacy initial state at [`NEW_GAME_MOMENT`]: tracked bits zero, other variables unknown.
+    /// Explicit extended-state registration uses [`Self::fresh_first_control`] instead.
     pub const fn new_game() -> Self {
         Self::at(NEW_GAME_MOMENT)
     }
 
-    /// The story at `moment` with every other variable 0.
+    /// A legacy state at `moment`, with tracked bits zero and other variables unknown.
     pub const fn at(moment: u16) -> Self {
-        Self { moment, vars: BTreeMap::new(), banks: None }
+        Self { moment, vars: BTreeMap::new(), banks: None, native_party: None }
     }
 
-    /// Read a progression blob: empty is a new account, `[1, lo, hi]` a stored moment, a canonical version 2
-    /// blob a moment and variables, version 3 persistent values and known masks; anything else is unreadable (`None`).
+    /// Read a progression blob: empty retains the legacy initial state, `[1, lo, hi]` a stored moment, a canonical version 2
+    /// blob a moment and variables, version 3 persistent values and known masks, or version 4
+    /// banks and native party resources; anything else is unreadable (`None`).
     // (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `lgp`.)
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn decode(blob: &[u8]) -> Option<Self> {
@@ -317,15 +348,16 @@ impl StoryState {
                 }
                 Some(state)
             }
-            [BLOB_VERSION_BANKS, ..] => banks::decode(blob),
+            [BLOB_VERSION_BANKS | BLOB_VERSION_NATIVE_PARTY, ..] => banks::decode(blob),
             _ => None,
         }
     }
 
     /// The blob that stores this state: version 1 (`[1, lo, hi]`, exactly what version 1 builds wrote) when no
-    /// variable is set, else the canonical version 2; an explicitly extended state always writes version 3.
+    /// variable is set, else the canonical version 2. Extended banks write version 3 unless
+    /// native party resources were explicitly added, in which case they write version 4.
     pub fn encode(&self) -> Vec<u8> {
-        if let Some(banks) = &self.banks { return banks::encode(self.moment, banks); }
+        if let Some(banks) = &self.banks { return banks::encode(self.moment, banks, self.native_party); }
         let [lo, hi] = self.moment.to_le_bytes();
         if self.vars.is_empty() {
             return vec![BLOB_VERSION, lo, hi];
@@ -451,17 +483,12 @@ pub struct CanonParty {
 /// that fight BESIDE the players as server-controlled companions. A player's original character is added to this
 /// party, never put in a member's place, so these stay in the story whoever plays.
 ///
-/// What is established, and from where: the first reactor mission (the Bombing Mission: the moments of `md1stin`
-/// and `md1_1`, and every moment after them until a row below says otherwise) is fought by **Cloud and Barret**.
-/// That is the game's story (the opening mission's party), what
-/// [`StartOfGame`](crate::script::dialogue::StartOfGame) has always answered to a dialogue script's `IFPRTYQ`, and
-/// what the first mission's own fields are built for: `md1stin` and `md1_1` each bind one party entity to character
-/// 0 and one to character 1 (a `PC` operand; the second wears Barret's skeleton: measured by
-/// `tests/area_real.rs`, `barret_is_a_party_member_in_the_data_...`). The table does NOT read `kernel.bin`'s initial
-/// party bytes (they read Barret, Tifa, Cloud on the owned copy: a savemap default the game's first script
-/// replaces) nor the party-setting instructions of those fields (the only one, in `md1stin`'s opening scene, is
-/// `PRTYE 0, 254, 254`, whose last two operands are not character ids: a cutscene's party, measured with
-/// `examples/script_dump`).
+/// **Opening through moment 10: Cloud alone.** The owned `md1stin` director executes
+/// `PRTYE 0,254,254` at offset `0x03FD` before handing control back at moment 1. The
+/// empty slots are not Barret: a field's `PC` model binding does not establish party membership.
+/// **Moment 11: Cloud and Barret.** The reactor door's awaited `nmkin_1` entity 12 slot 3
+/// executes `PRTYE 0,1,254` at `0x0C20` before its caller finishes the moment-11 step.
+/// The exact point evaluator journals that change and requires its final party to match this row.
 ///
 /// **A later row is added when someone has established, from the field scripts' `PRTYP`, `PRTYM` and `PRTYE`
 /// instructions and the moment they run at, who joins or leaves and when.** Rows ascend by moment and the first is
@@ -474,48 +501,48 @@ pub struct CanonParty {
 /// when this table agrees with what its script did ([`party_after`]): the table is how the server carries the change.
 /// Tifa and Aerith join later, in fields nothing offers yet; until a row says so, a story past 36 keeps Cloud alone
 /// rather than an invented party.
-pub const CANON_PARTIES: &[CanonParty] =
-    &[CanonParty { from_moment: 0, members: &[CLOUD, BARRET] }, CanonParty { from_moment: 36, members: &[CLOUD] }];
+pub const CANON_PARTIES: &[CanonParty] = &[
+    CanonParty { from_moment: 0, members: &[CLOUD] },
+    CanonParty { from_moment: 11, members: &[CLOUD, BARRET] },
+    CanonParty { from_moment: 36, members: &[CLOUD] },
+];
 
 /// What a field script does to the story's party (`PRTYP`, `PRTYM`, `PRTYE`), in the script's own words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartyOp {
-    /// `PRTYP`: the character joins (the first free slot).
+    /// `PRTYP`: join at the first free field-party slot, replacing its last slot when full.
     Add(u8),
-    /// `PRTYM`: the character leaves.
+    /// `PRTYM`: leave the matching field-party slot empty, without compacting either tuple.
     Remove(u8),
-    /// `PRTYE`: the party is exactly these three slots (254 and 255 are empty slots, as the scripts write them).
+    /// `PRTYE`: requested field-party slots. 254 forces an empty slot; 255 retains a remaining
+    /// old member, in field-party order. Retained main-party members keep their original slots.
     Set([u8; 3]),
 }
 
-/// The party after `ops`, starting from `party`: joins go to the end (nobody twice, at most three), a leave closes
-/// the gap, a set replaces everyone (ids above 8 are empty slots). The party a script leaves behind, to be held
-/// against [`canon_party`] of the story it wrote.
+/// Replay authored party operations, retaining both field and main slot arrays between operations.
+/// `PRTYE`'s 255 operands preserve unrequested old members; 254 forces empty slots. Transfers to the
+/// main party retain surviving members in place, then fill its holes with new members. Only the
+/// returned comparison list omits empty slots; intermediate operations never compact them.
+///
+/// This starts from a canonical party whose field and main slots agree. Exact scene execution
+/// separately validates authoritative field-bank inputs and rejects outcomes its durable party table
+/// cannot represent. Invalid character IDs or duplicate tuples do not change this comparison state.
 pub fn party_after(party: &[u8], ops: &[PartyOp]) -> Vec<u8> {
-    let mut party = party.to_vec();
-    for op in ops {
-        match *op {
-            PartyOp::Add(character) => {
-                if character <= 8 && !party.contains(&character) && party.len() < 3 {
-                    party.push(character);
-                }
-            }
-            PartyOp::Remove(character) => party.retain(|&c| c != character),
-            PartyOp::Set(slots) => {
-                party.clear();
-                for character in slots {
-                    if character <= 8 && !party.contains(&character) {
-                        party.push(character);
-                    }
-                }
-            }
+    let mut bank = [255; 3];
+    for (slot, &member) in bank.iter_mut().zip(party) { *slot = member; }
+    let mut main = bank;
+    for &op in ops {
+        if let Ok(change) = crate::script::party::transition(bank, main, op) {
+            bank = change.bank;
+            main = change.main;
         }
     }
-    party
+    main.into_iter().filter(|&member| member != 255).collect()
 }
 
 /// The canon party of a story state ([`CANON_PARTIES`]): the row with the greatest `from_moment` that is not past
-/// the moment. Cloud and Barret in every row there is today.
+/// the moment. The reviewed opening starts with Cloud, adds Barret at the reactor door, and
+/// returns to Cloud alone at the post-escape station.
 pub fn canon_party(state: &StoryState) -> Vec<u8> {
     CANON_PARTIES
         .iter()
@@ -538,6 +565,8 @@ pub fn canon_party_of(progress: &[u8]) -> Vec<u8> {
 /// whichever character the player looks like: `talk.set_story(Box::new(move || Box::new(state.clone())))` with
 /// `state` decoded from the progression the server told this client (`fmv-client`'s `StoryMirror::progress`).
 impl StoryVars for StoryState {
+    fn execution_supported(&self) -> bool { !self.supports_native_party() }
+
     fn byte(&self, bank: u8, address: u8) -> u8 {
         let [lo, hi] = self.moment.to_le_bytes();
         match (bank, address) {
@@ -816,6 +845,29 @@ struct PointDef {
     /// A timer the write's block sets (`STTIM` with literal hours, minutes and seconds, in the same block as the write):
     /// its length in seconds. The step carries it as [`StoryStep::countdown`], and the server runs the countdown.
     countdown: Option<u32>,
+    /// The exact script entry behind this point. Version 3 executes this entry and retains
+    /// every supported persistent write instead of using the legacy curated projection.
+    source: Option<PointSource>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PointSource {
+    entity: usize,
+    slot: usize,
+    start_offset: Option<usize>,
+    setup: bool,
+    triangle_vars: Vec<(u8, u8)>,
+    triangle_sources: Vec<(u8, u8, usize)>,
+}
+
+/// The authored entry admitted by an existing story point. This identifies source only;
+/// it supplies no projected after-image and does not authorize skipping script effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoryPointSource {
+    pub entity: u8,
+    pub slot: u8,
+    /// The main program immediately after script zero's initial RET.
+    pub main: bool,
 }
 
 impl PointDef {
@@ -922,6 +974,8 @@ fn panel_step(script: &FieldScript<'_>, entity: usize, triangle: usize, vars: &[
         triangle: BTreeMap<(u8, u8), u8>,
     }
     impl StoryVars for Standing<'_> {
+        fn execution_supported(&self) -> bool { self.state.execution_supported() }
+
         fn byte(&self, bank: u8, address: u8) -> u8 {
             self.triangle.get(&(bank, address)).copied().unwrap_or_else(|| self.state.byte(bank, address))
         }
@@ -986,9 +1040,47 @@ pub struct AreaStory {
     /// First moment of every interval after the first, ascending (all in `1..=65535`).
     edges: Vec<u16>,
     points: Vec<PointDef>,
+    source: StoryScript,
+}
+
+/// Keep the scanned source available to `advance`, without dumping owned script bytes in Debug.
+#[derive(Clone, Default, PartialEq)]
+struct StoryScript(Vec<u8>);
+
+impl std::fmt::Debug for StoryScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoryScript").field("bytes", &self.0.len()).finish()
+    }
 }
 
 impl AreaStory {
+    /// A version-3 point's source entry when its known story guards admit a forward effect.
+    /// A scene host can match this to an independently reviewed scene root, then evaluate
+    /// that whole scene. No legacy projection is returned or applied here.
+    pub fn point_source(&self, progress: &[u8], id: u32) -> Option<StoryPointSource> {
+        let state = StoryState::decode(progress).filter(StoryState::supports_extended)?;
+        if state.supports_native_party() { return None; }
+        let point = self.points.get(usize::try_from(id).ok()?)?;
+        if !point.requires.iter().all(|guard| guard.holds(&state)) { return None; }
+        let advances = point.effects.iter().filter(|effect| effect.requires.iter().all(|guard| guard.holds(&state)))
+            .any(|effect| match effect.op {
+                Op::Moment(moment) => moment > state.moment,
+                Op::Bit { bank, address, bit, on } => on && state.known_bit(bank, address, bit) != Some(true),
+            });
+        if !advances { return None; }
+        let source = point.source.as_ref()?;
+        let script = FieldScript::parse(&self.source.0).ok()?;
+        script.span(source.entity, source.slot)?;
+        let main = source.start_offset.is_some();
+        if let Some(offset) = source.start_offset {
+            if source.slot != INIT_SCRIPT { return None; }
+            let first_ret = script.disassemble_partial(source.entity, INIT_SCRIPT).ok()?.instructions.into_iter()
+                .find(|instruction| instruction.opcode == 0x00)?;
+            if first_ret.end() != offset { return None; }
+        }
+        Some(StoryPointSource { entity: u8::try_from(source.entity).ok()?, slot: u8::try_from(source.slot).ok()?, main })
+    }
+
     /// Read a field's story out of its script and walkmesh (see the module docs). A script that
     /// cannot be decoded in places contributes what did decode.
     pub fn scan(script: &FieldScript, mesh: &Walkmesh) -> Self {
@@ -1009,7 +1101,7 @@ impl AreaStory {
         }
         let mut points = scan::scan_points(script, mesh);
         points.truncate(MAX_STORY_POINTS);
-        Self { edges: edges.into_iter().collect(), points }
+        Self { edges: edges.into_iter().collect(), points, source: StoryScript(script.bytes().to_vec()) }
     }
 
     /// The first moment of the interval that holds `moment`.
@@ -1027,7 +1119,8 @@ impl AreaStory {
             // Conservatively partition on all known persistent inputs, including their knownness.
             // Include the exact moment too: the legacy interval scanner does not yet recognize
             // every byte-alias/variable comparison that version 3 scripts can make.
-            let mut key = vec![PHASE_TAG, BLOB_VERSION_BANKS];
+            let version = if state.supports_native_party() { BLOB_VERSION_NATIVE_PARTY } else { BLOB_VERSION_BANKS };
+            let mut key = vec![PHASE_TAG, version];
             key.extend(blake3::hash(&state.encode()).as_bytes());
             return Some(PhaseKey(key));
         }
@@ -1050,11 +1143,14 @@ impl AreaStory {
 
     /// What reaching point `id` does for `blob` (see `AreaRuntime::story_advance`), for the points the script's text
     /// decides by itself. A talk point has no script here to run and is never reached by this; the adapter asks
-    /// [`AreaStory::advance_with`]. Version 3 is withheld until this legacy point path has an exact-base transaction:
-    /// publishing its effects through the legacy monotonic merge would discard the new state.
+    /// [`AreaStory::advance_with`]. Version 3 executes the retained source and returns a replacement
+    /// for an exact-base transaction; publishing it through legacy monotonic merge is unsupported.
     pub fn advance(&self, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
-        if state.supports_extended() { return None; }
+        if state.supports_extended() {
+            let script = FieldScript::parse(&self.source.0).ok()?;
+            return self.advance_exact_with(&script, blob, id).ok().flatten();
+        }
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let next = point.apply(&state)?;
         Some(StoryStep { summary: summary(&state, &next), progress: next.encode(), countdown: point.countdown })
@@ -1065,9 +1161,7 @@ impl AreaStory {
     /// (the moment up, a tracked bit on). A character that is hidden or not to be talked to in that story gives nothing.
     pub fn advance_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32) -> Option<StoryStep> {
         let state = StoryState::decode(blob)?;
-        // Refuse before interpreting talks/panels or returning a point that could start a battle/reward. The extended
-        // scene path commits against an exact base; these legacy points do not yet carry that transaction.
-        if state.supports_extended() { return None; }
+        if state.supports_extended() { return self.advance_exact_with(script, blob, id).ok().flatten(); }
         let point = self.points.get(usize::try_from(id).ok()?)?;
         let (next, countdown) = match &point.trigger {
             Trigger::Talk { entity, .. } => (talk_step(script, *entity, &state)?, None),
@@ -1081,6 +1175,14 @@ impl AreaStory {
     /// whose win is what moves the story.
     pub fn battle_of(&self, id: u32) -> Option<u16> {
         self.points.get(usize::try_from(id).ok()?)?.battle_first
+    }
+
+    /// Version 3 gates the complete authored action on its battle, including a battle after
+    /// the first story write (the station's formation 300). Legacy saves retain their lookup.
+    pub fn battle_for(&self, progress: &[u8], id: u32) -> Option<u16> {
+        let state = StoryState::decode(progress)?;
+        let point = self.points.get(usize::try_from(id).ok()?)?;
+        if state.supports_extended() { point.battle_first.or(point.battle) } else { point.battle_first }
     }
 
     /// Add the talk points of a field: one for each character (of the NPCs the field places, `npcs`) whose talk script
@@ -1107,6 +1209,7 @@ impl AreaStory {
                 battle: None,
                 battle_first: None,
                 countdown: None,
+                source: None,
             });
         }
     }

@@ -36,10 +36,11 @@ use crate::saver::{SceneBatchJob, SceneBatchMember, SceneSaveError};
 use super::{SceneRun, World, SCENE_STEP_POINT};
 use super::super::battle::{SceneBattleContext, SceneBattleFinished, SceneBattlePlan, SceneCombatCarry};
 
-// Persisted execution contract, independent of the JSON envelope. Version 2 adds authored
-// ambient tasks and field effects/motion; an older checkpoint must not be silently rerun
-// under changed execution semantics. The adapter also binds its interpreter in source_hash.
-const REPLAY_VERSION: u32 = 2;
+// Persisted execution contract, independent of the JSON envelope. Version 3 adds authored
+// model offsets/palette commands and corrected byte-extraction semantics. Earlier checkpoints
+// must not be silently rerun under changed execution rules; the adapter also binds its
+// interpreter in source_hash.
+const REPLAY_VERSION: u32 = 3;
 
 /// Only validated scalar metadata is persisted. In particular, a final landing drops the battle
 /// roster and contains no nested account ids, so the account can later be restored under a new id.
@@ -69,6 +70,39 @@ impl Landing {
         Exit { line: (Pos::default(), Pos::default()), target: self.field.clone(), arrival: self.position,
             arrival_facing: self.facing, arrival_hint: self.hint, kind: ExitKind::Gateway }
     }
+}
+
+/// Read the original retained landing carrier without authorizing its script effects.
+/// The adapter must independently replay the recorded scene/original story/gil/seed,
+/// verify the current pair and authored MAPJUMP, and bind the accepted entry operation.
+/// In particular this never substitutes a checked-entry source identity for the legacy one.
+pub(crate) fn saved_landing_evidence(state: &SceneState, expected_source_field: &str) -> Option<(SceneReplay, Exit)> {
+    let checkpoint = state.checkpoint.as_ref()?;
+    let ScenePhase::Landing { destination } = &checkpoint.phase else { return None };
+    let field_name = |name: &str| !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control);
+    if state.reservation.is_some() || state.field_visit.is_some() || checkpoint.replay_version != REPLAY_VERSION
+        || checkpoint.instance == [0; 32] || checkpoint.source_hash == [0; 32]
+        || checkpoint.scene_key.is_empty() || checkpoint.scene_key.len() > 256 || checkpoint.scene_key.chars().any(char::is_control)
+        || checkpoint.original_story.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
+        || destination.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
+        || !field_name(expected_source_field) || !checkpoint_can_be_announced(checkpoint) {
+        return None;
+    }
+    let payload: Payload = serde_json::from_slice(&checkpoint.replay).ok()?;
+    let landing = payload.landing.as_ref()?;
+    if payload.field != expected_source_field || !field_name(&payload.field) || !field_name(&landing.field)
+        || !payload.position.is_finite() || !payload.facing.is_finite()
+        || !landing.position.is_finite() || landing.facing.is_some_and(|facing| !facing.is_finite())
+        || payload.plan.is_some() || payload.carry.is_some() || payload.game_over
+        || payload.replay.source != checkpoint.source_hash || payload.replay.validate().is_err()
+        || serde_json::from_slice::<Landing>(destination).ok().as_ref() != Some(landing) {
+        return None;
+    }
+    let consumed = payload.replay.events.iter().rev().find_map(|event| match event {
+        SceneReplayEvent::Battle { ordinal, .. } => Some(*ordinal), _ => None,
+    }).unwrap_or(0);
+    if consumed != checkpoint.consumed_battles { return None; }
+    Some((payload.replay, landing.exit()))
 }
 
 pub(super) struct Continuation {
@@ -109,6 +143,9 @@ enum Action {
     Finish(SceneResult),
     Continue { record: SceneRun, instance: [u8; 32], boundary: SceneBoundary, payload: Box<Payload> },
     Complete(SceneResult),
+    /// The authored terminal destination is already the source-backed login entry. Retire
+    /// only its metadata, after arrival, without changing any saved story or resources.
+    RetireLanding,
 }
 
 fn fresh_instance() -> Option<[u8; 32]> {
@@ -166,13 +203,33 @@ impl Continuation {
 }
 
 impl World {
+    /// An FF7 native-party boundary names an authoritative roster snapshot. Legacy scenes keep
+    /// the existing online leader policy; an explicitly known empty native party remains
+    /// `Some(empty)`. Non-FF7 fixture hosts may use their own opaque story representation.
+    fn scene_battle_canon(&self, field: &str, progress: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        let area = self.areas.get(field).ok_or(())?;
+        // Progression is adapter-owned. Another game's opaque bytes are not FF7 merely
+        // because they happen to decode; Fixture explicitly permits synthetic FF7 stories.
+        if !matches!(area.id().game, fmv_core::GameId::Ff7 | fmv_core::GameId::Fixture) { return Ok(None); }
+        match fmv_ff7::story::StoryState::decode(progress) {
+            Some(story) if story.supports_native_party() => area.runtime().try_story_party(progress).map(Some).map_err(|_| ()),
+            Some(_) => Ok(None),
+            None if area.id().game == fmv_core::GameId::Ff7 => Err(()),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn initialize_continuation(&mut self, run: SceneRunId, record: &SceneRun) -> bool {
         if self.scenes.continuations.contains_key(&run) { return true; }
-        let Some(host) = self.scenes.host.as_ref().filter(|host| host.continuation(&record.scene)) else { return true; };
-        if record.preview { return true; }
+        let Some(host) = self.scenes.host.as_ref().filter(|host| host.continuation_for(&record.scene, &record.progress)) else { return true; };
+        // The same registered source can still provide the legacy point's presentation. Only
+        // an explicitly admitted writing run owns the strict continuation and its travel.
+        if record.preview || !record.writes_story || record.then.is_some() { return true; }
         let Some(player) = self.players.get(&record.owner) else { return false; };
-        if !record.writes_story || record.then.is_some() || player.preview.is_some() { return false; }
-        let origin = (!host.automatic(&record.scene)).then_some(fmv_protocol::SceneOrigin {
+        if player.preview.is_some() || self.account_in_battle(player.account)
+            || record.watchers.iter().any(|entity| self.players.get(entity)
+                .is_some_and(|watcher| self.account_in_battle(watcher.account))) { return false; }
+        let origin = host.requires_origin(&record.scene).then_some(fmv_protocol::SceneOrigin {
             pos: player.snapshot.pos, facing: player.snapshot.facing, triangle: None,
         });
         let Some(boundary) = host.initial_continuation(&record.scene, &record.progress, record.seed, record.gil, origin) else { return false; };
@@ -188,11 +245,12 @@ impl World {
     /// Run only after the adapter accepted the movement. A line scene owns the remainder of this move.
     pub(in crate::world) fn check_scene_line(&mut self, entity: EntityId, from: Pos, to: Pos, now: Instant) -> bool {
         let Some(player) = self.players.get(&entity) else { return false; };
-        if player.scene.is_some() || player.battle.is_some() || player.transit.is_some() || player.preview.is_some()
+        if player.scene.is_some() || player.battle.is_some() || player.transit.is_some() || player.preview.is_some() || player.story_pending.is_some()
+            || self.account_in_battle(player.account)
             || player.placement.as_ref().is_some_and(|p| !p.story_advance_allowed) { return false; }
         let Some(host) = self.scenes.host.as_ref() else { return false; };
         let Some(scene) = host.line_scene(&player.area, &player.progression, from, to) else { return false; };
-        if !host.continuation(&scene) || !host.offered(&scene, &player.progression) { return false; }
+        if !host.continuation_for(&scene, &player.progression) || !host.offered(&scene, &player.progression) { return false; }
         let watchers = self.watchers_for(entity, player.account, to);
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
@@ -207,6 +265,11 @@ impl World {
         let Some(record) = self.scenes.runs.get(&run).cloned().filter(|r| r.owner == entity) else { return; };
         let Some(mut c) = self.scenes.continuations.remove(&run) else { return; };
         if !matches!(c.phase, Phase::Playing) { self.scenes.continuations.insert(run, c); return; }
+        if !self.continuation_carry_allowed(&record.scene, &c.payload) {
+            self.scenes.continuations.insert(run, c);
+            self.continuation_failure(run, "a noncombat scene contains carried battle state");
+            return;
+        }
         let accepted = c.payload.replay.events.len();
         let valid = match &c.boundary.at {
             SceneBoundaryKind::Window { step: expected, identity, choices } if *expected == step && record.steps == step => {
@@ -257,9 +320,12 @@ impl World {
         let previous = c.payload.plan.clone();
         let carry = c.payload.carry.clone();
         let states = c.states.clone();
+        let Ok(canon) = self.scene_battle_canon(&c.payload.field, &c.boundary.progress) else {
+            self.continuation_failure(run, "the authored battle party is not fully known"); return;
+        };
         let plan = if let (Some(previous), Some(carry)) = (previous, carry) {
-            self.prepare_next_scene_battle(&previous, formation, &carry, &states)
-        } else { self.prepare_scene_battle(record.owner, run, formation, EscapePolicy::Forbidden, None) };
+            self.prepare_next_scene_battle(&previous, formation, &carry, &states, canon.as_deref())
+        } else { self.prepare_scene_battle(record.owner, run, formation, EscapePolicy::Forbidden, None, canon.as_deref()) };
         let Ok(plan) = plan else { self.continuation_failure(run, "the frozen battle roster cannot be prepared"); return; };
         self.snapshot_continuation(run, Action::Prepare { plan, ordinal });
     }
@@ -292,6 +358,7 @@ impl World {
                 let record = record.clone();
                 self.scenes.runs.remove(&run);
                 self.scenes.continuations.remove(&run);
+                self.discard_scene_story_followups(run);
                 let mut failed = vec![];
                 let released = std::iter::once(record.owner).chain(record.watchers).collect::<Vec<_>>();
                 for &entity in &released { self.release(entity, run, SceneOutcome::Aborted, &mut failed); }
@@ -427,13 +494,15 @@ impl World {
     }
 
     fn continuation_job(&self, c: &Continuation, record: &SceneRun, action: &Action) -> Option<SceneBatchJob> {
+        if !self.continuation_carry_allowed(&record.scene, &c.payload) { return None; }
         let owner_index = c.states.iter().position(|s| s.pair.story.account_id == c.owner)?;
-        let mut members = c.states.iter().map(|state| SceneBatchMember { expected: state.clone(), next_story: None,
+        let mut members = c.states.iter().map(|state| SceneBatchMember { next_visit: None, expected: state.clone(), next_story: None,
             next_gil: None, checkpoint: state.checkpoint.clone(), reservation: state.reservation.clone(), battle: None }).collect::<Vec<_>>();
         let mut operation = SceneOperation { instance: c.instance, ordinal: c.consumed(), attempt: 0, kind: SceneOperationKind::Finish };
         match action {
             Action::Prepare { plan, ordinal } => {
-                if *ordinal != c.consumed() + 1 || plan.setup.escape_policy != EscapePolicy::Forbidden { return None; }
+                if *ordinal != c.consumed() + 1 || plan.setup.escape_policy != EscapePolicy::Forbidden
+                    || !plan.setup.victory_fanfare || !plan.setup.game_over_on_defeat { return None; }
                 let mut payload = c.payload.clone();
                 payload.plan = Some(plan.clone());
                 payload.game_over = false;
@@ -512,6 +581,7 @@ impl World {
             }
             Action::Continue { record: next_record, instance, boundary, payload } => {
                 if members.len() != 1 || !matches!(c.checkpoint.as_ref()?.phase, ScenePhase::Landing { .. }) { return None; }
+                if !self.continuation_carry_allowed(&next_record.scene, payload) { return None; }
                 let encoded = serde_json::to_vec(payload).ok()?;
                 members[owner_index].checkpoint = Some(SceneCheckpoint { instance: *instance, scene_key: next_record.scene.clone(),
                     source_hash: boundary.source, replay_version: REPLAY_VERSION, original_story: next_record.progress.clone(),
@@ -536,6 +606,12 @@ impl World {
                 members[owner_index].next_gil = Some(c.boundary.gil);
                 operation.kind = SceneOperationKind::Complete;
             }
+            Action::RetireLanding => {
+                self.retirable_continuation_landing(c, record)?;
+                if members.len() != 1 || members[owner_index].reservation.is_some() { return None; }
+                members[owner_index].checkpoint = None;
+                operation.kind = SceneOperationKind::Complete;
+            }
         }
         if members.iter().filter_map(|member| member.checkpoint.as_ref()).any(|checkpoint| !checkpoint_can_be_announced(checkpoint)) {
             return None;
@@ -548,6 +624,37 @@ impl World {
             && self.areas.get(&landing.field).is_some_and(|a| a.runtime().place_arrival(landing.position, landing.hint).is_finite())
     }
 
+    fn continuation_carry_allowed(&self, scene: &str, payload: &Payload) -> bool {
+        self.scenes.host.as_ref().is_none_or(|host| !host.noncombat_continuation(scene))
+            || (payload.plan.is_none() && payload.carry.is_none())
+    }
+
+    /// A terminal landing can disappear only when the exact persisted story reproduces it on
+    /// login and no authored linked arrival remains. Reinterpret the accepted transcript here
+    /// so metadata retirement cannot turn a changed source or incomplete scene into success.
+    fn retirable_continuation_landing(&self, c: &Continuation, record: &SceneRun) -> Option<Landing> {
+        if c.states.len() != 1 || c.payload.plan.is_some() || c.payload.carry.is_some() || c.payload.game_over { return None; }
+        let state = c.states.first().filter(|state| state.pair.story.account_id == c.owner && state.reservation.is_none())?;
+        let checkpoint = c.checkpoint.as_ref()?;
+        if state.checkpoint.as_ref() != Some(checkpoint) { return None; }
+        let ScenePhase::Landing { destination } = &checkpoint.phase else { return None; };
+        let landing = c.payload.landing.as_ref()?;
+        if serde_json::from_slice::<Landing>(destination).ok().as_ref() != Some(landing)
+            || !self.valid_continuation_destination(landing) { return None; }
+        let host = self.scenes.host.as_ref()?;
+        let boundary = host.evaluate_continuation(&record.scene, &record.progress, record.seed, record.gil, Some(&c.payload.replay))?;
+        if boundary != c.boundary || boundary.source != checkpoint.source_hash
+            || boundary.progress != state.pair.story.blob
+            || state.pair.character.as_ref().is_none_or(|character| character.gil != boundary.gil) { return None; }
+        let SceneBoundaryKind::Complete(result) = &boundary.at else { return None; };
+        if result.progress != state.pair.story.blob || result.travel.as_ref().map(Landing::from_exit).as_ref() != Some(landing)
+            || Landing::from_exit(&host.entry(&state.pair.story.blob)?) != *landing
+            || self.scenes.list.iter().any(|info| info.field.eq_ignore_ascii_case(&landing.field)
+                && host.requires_landing_for(&info.id, &state.pair.story.blob)
+                && host.offered(&info.id, &state.pair.story.blob)) { return None; }
+        Some(landing.clone())
+    }
+
     fn continuation_committed(&mut self, run: SceneRunId, action: Action, saved: SceneBatchCommitted, now: Instant) {
         self.scenes.save_epoch = self.scenes.save_epoch.wrapping_add(1);
         let Some(mut c) = self.scenes.continuations.remove(&run) else { return; };
@@ -558,7 +665,8 @@ impl World {
                 && state.checkpoint == member.checkpoint && state.reservation == member.reservation
                 && state.pair.story.game == member.expected.pair.story.game
                 && state.pair.story.blob == member.next_story.as_ref().unwrap_or(&member.expected.pair.story.blob).as_slice()
-                && self.continuation_character_matches(state, member)));
+                && self.continuation_character_matches(state, member)
+                && (!matches!(action, Action::RetireLanding) || state.pair == member.expected.pair)));
         if !valid { self.scenes.continuations.insert(run,c); self.continuation_failure(run,"saver acknowledgment did not match the selected checkpoint"); return; }
         c.states = saved.current;
         c.checkpoint = c.states.iter().find(|s| s.pair.story.account_id == c.owner).and_then(|s| s.checkpoint.clone());
@@ -570,7 +678,7 @@ impl World {
         }
         let states = c.states.clone();
         self.scenes.continuations.insert(run,c);
-        self.mirror_scene_states(states);
+        if !matches!(action, Action::RetireLanding) { self.mirror_scene_states(states); }
         match action {
             Action::Prepare { .. } => self.launch_continuation_battle(run, now),
             Action::Resolve(finished) => {
@@ -594,6 +702,8 @@ impl World {
                     battle_id: finished.id, progress, gil });
             }
             Action::Finish(result) => {
+                // Its authored jump owns the remainder of the original move/point sweep.
+                self.discard_scene_story_followups(run);
                 let mut record = self.scenes.runs.get(&run).cloned().expect("present");
                 record.watchers.retain(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run)));
                 self.scenes.runs.get_mut(&run).expect("present").watchers = record.watchers.clone();
@@ -650,6 +760,28 @@ impl World {
                 self.refresh_story_placements(&accounts, &mut failed);
                 for entity in everyone { self.release(entity,run,SceneOutcome::Finished,&mut failed); }
                 self.drop_failed(failed);
+            }
+            Action::RetireLanding => {
+                let Some(record) = self.scenes.runs.get(&run).cloned() else { return; };
+                let everyone = std::iter::once(record.owner).chain(record.watchers.iter().copied())
+                    .filter(|entity| self.players.get(entity).is_some_and(|player| player.scene == Some(run))).collect::<Vec<_>>();
+                self.scenes.continuations.remove(&run);
+                self.scenes.runs.remove(&run);
+                let mut failed = Vec::new();
+                self.refresh_continuation_release(&everyone, &mut failed);
+                for &entity in &everyone { self.release(entity, run, SceneOutcome::Finished, &mut failed); }
+                self.drop_failed(failed);
+                // Entry scripts waited behind the landing checkpoint. The owner runs first;
+                // nearby followers selected by its point scene remain presentation watchers.
+                for entity in everyone {
+                    if self.players.get(&entity).is_some_and(|player| player.scene.is_none() && player.battle.is_none()
+                        && player.transit.is_none() && player.story_pending.is_none()) {
+                        self.enter_story(entity, now);
+                        if self.players.get(&entity).is_some_and(|player| player.scene.is_none() && player.story_pending.is_none()) {
+                            self.automatic_scene_entered(entity, now);
+                        }
+                    }
+                }
             }
         }
     }
@@ -720,7 +852,12 @@ impl World {
         let Some(c) = self.scenes.continuations.get(&run) else { return; };
         let Some(context) = c.context(run) else { self.continuation_failure(run,"prepared battle checkpoint missing"); return; };
         let Some(plan) = c.payload.plan.clone() else { self.continuation_failure(run,"prepared battle setup missing"); return; };
-        if !self.validate_scene_battle_plan(&plan, &c.states) {
+        let Ok(canon) = self.scene_battle_canon(&c.payload.field, &c.boundary.progress) else {
+            self.continuation_failure(run, "the saved battle party is not fully known"); return;
+        };
+        if (c.consumed() > 0) != c.payload.carry.is_some()
+            || !self.validate_scene_battle_plan(&plan, &c.states, canon.as_deref())
+            || !self.validate_scene_battle_initial_carry(&plan, c.payload.carry.as_ref()) {
             self.continuation_failure(run, "the saved battle plan disagreed with its coherent roster"); return;
         }
         if !c.accounts.iter().any(|a| self.by_account.contains_key(a))
@@ -771,37 +908,50 @@ impl World {
         let checkpoint = owner_state.checkpoint.clone().ok_or(JoinError::StorageUnavailable)?;
         let owner = owner_state.pair.story.account_id;
         let player = self.players.get(&entity).ok_or(JoinError::StorageUnavailable)?;
+        let (player_account, player_area, player_facing) = (player.account, player.area.clone(), player.snapshot.facing);
         // ContinueLanding changes the durable instance before its acknowledgment reaches this
         // process. Fence by reserved account as well as instance so that new id cannot create a
         // second runtime while the old runtime is still committing the handoff.
-        if self.scenes.continuations.values().any(|c| c.accounts.contains(&player.account)
+        if self.scenes.continuations.values().any(|c| c.accounts.contains(&player_account)
             && (matches!(c.phase, Phase::Snapshot { .. } | Phase::Commit { .. })
                 // Terminal combat and last-player disconnect queue a handoff for the scene
                 // tick. Admission must not try to attach to the engine removed in that gap.
-                || (matches!(c.phase, Phase::Fighting { .. }) && !self.account_in_battle(player.account)))) {
+                || (matches!(c.phase, Phase::Fighting { .. }) && !self.account_in_battle(player_account)))) {
             return Err(JoinError::ProgressChanged);
         }
-        if !group.iter().any(|s|s.pair.story.account_id==player.account) { return Err(JoinError::StorageUnavailable); }
-        let host = self.scenes.host.as_ref().ok_or(JoinError::StorageUnavailable)?;
-        if checkpoint.replay_version != REPLAY_VERSION || !host.continuation(&checkpoint.scene_key)
+        if !group.iter().any(|s|s.pair.story.account_id==player_account) { return Err(JoinError::StorageUnavailable); }
+        let host = self.scenes.host.clone().ok_or(JoinError::StorageUnavailable)?;
+        if checkpoint.replay_version != REPLAY_VERSION || !host.continuation_for(&checkpoint.scene_key, &checkpoint.original_story)
             || !checkpoint_can_be_announced(&checkpoint) {
             return Err(JoinError::StorageUnavailable);
         }
         let payload: Payload = serde_json::from_slice(&checkpoint.replay).map_err(|_|JoinError::StorageUnavailable)?;
+        if !self.continuation_carry_allowed(&checkpoint.scene_key, &payload) { return Err(JoinError::StorageUnavailable); }
         if payload.replay.source != checkpoint.source_hash || !payload.position.is_finite() || !payload.facing.is_finite()
             || !self.scenes.list.iter().any(|info| info.id == checkpoint.scene_key && info.field.eq_ignore_ascii_case(&payload.field))
             || payload.field.is_empty() || payload.field.len()>128 { return Err(JoinError::StorageUnavailable); }
         let boundary = host.evaluate_continuation(&checkpoint.scene_key,&checkpoint.original_story,checkpoint.seed,
             checkpoint.original_gil,Some(&payload.replay)).ok_or(JoinError::StorageUnavailable)?;
         if boundary.source != checkpoint.source_hash { return Err(JoinError::StorageUnavailable); }
+        // A reconnect may start in another entry field. Load the validated scene's field
+        // before asking its adapter to check the saved roster; the area handshake still
+        // controls when the player enters it and combat may start.
+        let roster_field = if matches!(checkpoint.phase, ScenePhase::BeforeBattle { .. })
+            || (matches!(checkpoint.phase, ScenePhase::Resume { .. }) && checkpoint.consumed_battles > 0) {
+            self.ensure_area(&payload.field).map_err(|_| JoinError::StorageUnavailable)?
+        } else { payload.field.clone() };
         let valid = match &checkpoint.phase {
             ScenePhase::BeforeBattle{ordinal,formation,battle_seed,..} => {
+                let canon = self.scene_battle_canon(&roster_field, &boundary.progress).map_err(|_| JoinError::StorageUnavailable)?;
                 matches!(&boundary.at,SceneBoundaryKind::Battle{ordinal: actual,formation:actual_formation,flags:Some(8),..}
                     if *actual==ordinal+1 && actual_formation==formation)
                     && boundary.progress==owner_state.pair.story.blob
                     && owner_state.pair.character.as_ref().is_some_and(|r|r.gil==boundary.gil)
+                    && (checkpoint.consumed_battles > 0) == payload.carry.is_some()
                     && payload.plan.as_ref().is_some_and(|p|p.setup.formation_id==*formation && p.setup.seed==*battle_seed
-                        && p.setup.escape_policy==EscapePolicy::Forbidden && self.validate_scene_battle_plan(p, &group)
+                        && p.setup.escape_policy==EscapePolicy::Forbidden && p.setup.victory_fanfare && p.setup.game_over_on_defeat
+                        && self.validate_scene_battle_plan(p, &group, canon.as_deref())
+                        && self.validate_scene_battle_initial_carry(p, payload.carry.as_ref())
                         && p.accounts().len()==group.len() && p.accounts().iter().all(|a|group.iter().any(|s|s.pair.story.account_id==*a)))
             }
             ScenePhase::Resume{segment} => {
@@ -810,8 +960,14 @@ impl World {
                         && group[0].reservation.is_none() && host.automatic(&checkpoint.scene_key)
                         && payload.landing.as_ref().is_some_and(|l| l.field.eq_ignore_ascii_case(&payload.field))
                 } else {
+                    // The retained plan describes the completed battle. The newly evaluated
+                    // boundary may already contain later authored party changes.
+                    let progress = payload.replay.events.iter().rev().find_map(|event| match event {
+                        SceneReplayEvent::Battle { progress, .. } => Some(progress.as_slice()), _ => None,
+                    }).ok_or(JoinError::StorageUnavailable)?;
+                    let canon = self.scene_battle_canon(&roster_field, progress).map_err(|_| JoinError::StorageUnavailable)?;
                     match (&payload.plan, &payload.carry) {
-                        (Some(plan), Some(carry)) => self.validate_scene_battle_resume(plan, carry, &group),
+                        (Some(plan), Some(carry)) => self.validate_scene_battle_resume(plan, carry, &group, canon.as_deref()),
                         _ => false,
                     }
                 };
@@ -837,11 +993,11 @@ impl World {
         let desired = if matches!(checkpoint.phase, ScenePhase::Landing { .. }) { payload.landing.clone() }
             else { Some(Landing { field: payload.field.clone(), position: payload.position, facing: Some(payload.facing),
                 hint: payload.replay.origin.as_ref().and_then(|origin| origin.triangle) }) };
-        let placement = desired.as_ref().filter(|d| d.field.eq_ignore_ascii_case(&player.area)).map(|d| {
-            let area = self.areas.get(&player.area).ok_or(JoinError::StorageUnavailable)?;
+        let placement = desired.as_ref().filter(|d| d.field.eq_ignore_ascii_case(&player_area)).map(|d| {
+            let area = self.areas.get(&player_area).ok_or(JoinError::StorageUnavailable)?;
             let pos = area.runtime().place_arrival(d.position, d.hint);
             if !pos.is_finite() { return Err(JoinError::StorageUnavailable); }
-            Ok((pos, d.facing.unwrap_or(player.snapshot.facing)))
+            Ok((pos, d.facing.unwrap_or(player_facing)))
         }).transpose()?;
         let existing=self.scenes.continuations.iter().find(|(_,c)|c.instance==checkpoint.instance).map(|(id,_)|*id);
         let run=if let Some(run)=existing {
@@ -934,9 +1090,16 @@ impl World {
             let (area, pos, facing) = (owner.area.clone(), owner.snapshot.pos, owner.snapshot.facing);
             let Some(owner_state)=c.states.iter().find(|s|s.pair.story.account_id==c.owner) else{return true;};
             let Some(host)=self.scenes.host.as_ref() else{return true;};
-            let Some(info)=self.scenes.list.iter().find(|info|info.field.eq_ignore_ascii_case(&area)
-                && host.automatic(&info.id) && host.continuation(&info.id) && host.offered(&info.id,&owner_state.pair.story.blob)).cloned() else {
-                self.continuation_failure(run,"required landing arrival scene is unavailable");return true;
+            let next=self.scenes.list.iter().find(|info|info.field.eq_ignore_ascii_case(&area)
+                && host.automatic(&info.id) && host.continuation_for(&info.id,&owner_state.pair.story.blob)
+                && host.offered(&info.id,&owner_state.pair.story.blob)).cloned();
+            let Some(info)=next else {
+                if self.retirable_continuation_landing(c, previous).is_some() {
+                    self.queue_continuation_action(run, Action::RetireLanding);
+                } else {
+                    self.continuation_failure(run,"required landing arrival scene is unavailable");
+                }
+                return true;
             };
             let progress=owner_state.pair.story.blob.clone();
             let gil=owner_state.pair.character.as_ref().map_or(0,|r|r.gil);

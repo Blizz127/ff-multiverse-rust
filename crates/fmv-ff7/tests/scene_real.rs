@@ -698,7 +698,7 @@ fn mesh_parts(mesh: &fmv_ff7::field::Walkmesh) -> Vec<usize> {
 fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
     use fmv_ff7::script::scene::{story_entry, STORY_ENTRIES};
     assert!(STORY_ENTRIES.windows(2).all(|w| w[0].from_moment < w[1].from_moment), "rows ascend by moment");
-    for row in STORY_ENTRIES {
+    for row in STORY_ENTRIES.iter().copied().chain(story_entry(7)) {
         let f = field(row.field).unwrap_or_else(|| panic!("FMV_FF7_DATA and {}", row.field));
         let mesh = f.walkmesh().unwrap();
         let tri = mesh.triangles.get(usize::from(row.spot.triangle)).unwrap_or_else(|| panic!("{}: triangle {}", row.field, row.spot.triangle));
@@ -754,15 +754,46 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
                 on.iter().map(|&t| parts[t]).collect::<Vec<_>>());
         }
     }
-    // the rows are the arrivals the data names: the gateway out of the reactor, and the jump the first scene ends in
+    // The exact early exception is the team's authored jump, without a new interval for moments 8..32.
+    let early = story_entry(7).unwrap();
+    // This entry/geometry check pins the original instruction independently of runtime support.
+    // The dedicated team-talk test above still requires full execution through this MAPJUMP.
+    let gate = field("md1_1").unwrap();
+    let script = FieldScript::from_field(&gate).unwrap();
+    let director = script.disassemble(0, 0).unwrap();
+    let jump = director.iter().find(|ins| ins.offset == 0x0414).expect("the director's authored map jump");
+    assert_eq!(jump.mnemonic, "MAPJUMP");
+    let [target, x, y, triangle, direction] = ["field", "x", "y", "triangle", "direction"]
+        .map(|name| jump.literal(name).expect("the map jump uses literal operands"));
+    assert_eq!([target, x, y, triangle, direction], [118, 3549, 30574, 60, 128]);
+    assert_eq!((early.field, i32::from(early.spot.x), i32::from(early.spot.y), i32::from(early.spot.triangle), i32::from(early.spot.direction)),
+        ("md1_2", x, y, triangle, direction));
+    assert!((8..=32).all(|moment| story_entry(moment).is_none()));
+    // Later entries distinguish the incoming jump from the station scene's final control position.
     assert_eq!(story_entry(32), None, "a story still in the reactor joins where everyone joins");
     let outside = story_entry(33).unwrap();
     let nrthmk = field("nrthmk").unwrap();
     let to_md8_4 = nrthmk.triggers().unwrap().gateways.into_iter().filter(fmv_ff7::field::Gateway::is_used).find(|g| g.destination[0] == outside.spot.x && g.destination[1] == outside.spot.y);
     assert!(to_md8_4.is_some(), "the entry of moment 33 is where nrthmk's own gateway arrives");
     let jump = run_to_end(&field("md8_4").unwrap(), &fmv_ff7::script::scene::post_escape_scene(), &StoryState::at(33), 1, &[]).unwrap().jump.unwrap();
+    assert_eq!((jump.field, jump.x, jump.y, jump.triangle, jump.direction), (133, 1629, -5357, 15, 192));
     let street = story_entry(36).unwrap();
-    assert_eq!((street.field, street.spot.x, street.spot.y, i16::try_from(street.spot.triangle).unwrap(), street.spot.direction), ("md8_1", jump.x, jump.y, jump.triangle, jump.direction));
+    let mut station = ScenePlay::new(&field("md8_1").unwrap(), &fmv_ff7::script::scene::station_scene(), &StoryState::at(33), 1).unwrap();
+    let (mut cloud, mut direction) = (None, None);
+    loop {
+        let beat = station.next(None);
+        for event in beat.stage {
+            match event.what {
+                Stage::Place { entity: 1, x, y, z, .. } | Stage::Move { entity: 1, x, y, z, .. } => cloud = Some((x, y, z)),
+                Stage::Face { entity: 1, heading, .. } => direction = Some(fmv_ff7::facing_to_field_direction(heading)),
+                _ => {},
+            }
+        }
+        if let Then::End { how, .. } = beat.then { assert_eq!(how, End::Finished); break; }
+    }
+    assert_eq!((cloud, direction), (Some((1270, -5357, Some(0))), Some(64)), "the station's final authored Cloud pose");
+    assert_eq!((street.field, street.spot.x, street.spot.y, street.spot.triangle, street.spot.direction), ("md8_1", 1270, -5357, 1, 64));
+    assert_ne!((street.spot.x, street.spot.triangle, street.spot.direction), (jump.x, u16::try_from(jump.triangle).unwrap(), jump.direction));
     assert_eq!(story_entry(38).map(|e| e.field), Some("md8_1"));
     let flower = story_entry(39).unwrap();
     assert_eq!((flower.field, flower.spot.x, flower.spot.y, flower.spot.triangle, flower.spot.direction), ("md8_2", -3989, 21138, 19, 150));
@@ -1271,12 +1302,51 @@ fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero
     use fmv_ff7::script::scene::{Limits, SceneVars, Vm};
     let f = field("md1stin").expect("FMV_FF7_DATA and md1stin");
     let script = FieldScript::from_field(&f).unwrap();
+    let director = script.disassemble(0, 0).unwrap();
+    let at = |offset| director.iter().find(|ins| ins.offset == offset).expect("authored opening instruction");
+    let party = at(0x03FD);
+    assert_eq!(party.mnemonic, "PRTYE");
+    assert_eq!(["character1", "character2", "character3"].map(|name| party.literal(name)), [Some(0), Some(254), Some(254)]);
+    assert_eq!((at(1025).mnemonic, at(1025).literal("character")), ("MMBLK", Some(0)),
+        "the native first-control profile knows only this authored PHS lock bit");
+    let moment = at(1176);
+    assert_eq!((moment.mnemonic, moment.literal("value")), ("SETWORD", Some(1)));
+    assert_eq!(moment.operands.iter().find(|op| op.name == "var").map(|op| (op.bank, op.value)), Some((2, 0)));
+    for (offset, mnemonic) in [(1181, "UC"), (1183, "MENU2")] {
+        let control = at(offset);
+        assert_eq!((control.mnemonic, control.literal("disabled")), (mnemonic, Some(0)));
+        assert!(party.offset < moment.offset && moment.offset < control.offset);
+    }
+    // Check every entry, including concurrently requested actor scripts, for an intervening
+    // party mutation or explicit mirror access. The single PRTYE therefore establishes the
+    // raw tuple independently of the earlier opaque startup routine.
+    assert_eq!(script.entity_count(), 12);
+    let mut code = std::collections::BTreeMap::new();
+    for entity in 0..script.entity_count() {
+        for slot in 0..fmv_ff7::script::SCRIPTS_PER_ENTITY {
+            if script.span(entity, slot).is_some() {
+                for ins in script.disassemble(entity, slot).unwrap() { code.insert(ins.offset, ins); }
+            }
+        }
+    }
+    let mutations: Vec<_> = code.values().filter(|ins| matches!(ins.mnemonic, "PRTYE" | "PRTYP" | "PRTYM" | "SPTYE" | "MENU" | "TUTOR"))
+        .map(|ins| (ins.offset, ins.mnemonic)).collect();
+    assert_eq!(mutations, [(1021, "PRTYE")]);
+    let locks: Vec<_> = code.values().filter(|ins| matches!(ins.mnemonic, "MMBLK" | "MMBUK"))
+        .map(|ins| (ins.offset, ins.mnemonic, ins.literal("character"))).collect();
+    assert_eq!(locks, [(1025, "MMBLK", Some(0))]);
+    assert!(code.values().all(|ins| ins.operands.iter().all(|op| !matches!(op.bank, 3 | 4))));
     let story = StoryState::at(0).into_extended().unwrap();
     let mut vm = Vm::new(SceneVars::new(story.clone(), &[]), 1, Limits::default());
     vm.begin(vec![Step::StartMain(0)]);
     assert!(matches!(vm.resume(&script, None).then, Then::Window(_)));
     for (address, value) in [(3, 50), (4, 30), (5, 10), (6, 0), (80, 100), (81, 100), (82, 100), (83, 100), (28, 251), (29, 2)] {
         assert_eq!(vm.writes().get(&(1, address)), Some(&value), "authored byte {address}");
+    }
+    let fresh = StoryState::fresh_first_control();
+    for (address, value) in [(9, 0), (10, 255), (11, 255)] {
+        assert_eq!(vm.writes().get(&(3, address)), Some(&value), "the original PRTYE assigns every raw party byte");
+        assert_eq!(fresh.known_byte(3, address), Some(value), "fresh first control carries the authored assignment");
     }
     assert!(vm.vars().unknown_persistent_reads().is_empty(), "literal initialization has no old-value dependency");
     assert_eq!(vm.vars().story, story, "observing the opening never initializes a real save");

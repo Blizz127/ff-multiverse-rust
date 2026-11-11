@@ -192,6 +192,7 @@ use crate::progress;
 use crate::saver::SaveJob;
 
 mod continuation;
+mod ordinary;
 pub(super) use continuation::{SceneBattleContext, SceneBattlePlan, SceneBattleFinished, SceneCombatCarry};
 
 /// Most random-encounter rolls one move can make (a move is bounded by the speed budget anyway).
@@ -403,6 +404,9 @@ pub(super) struct BattleWorld {
     rng: Rng,
     scene_finished: Vec<SceneBattleFinished>,
     scene_dormant: Vec<(SceneBattleContext, SceneBattlePlan)>,
+    ordinary: BTreeMap<BattleId, ordinary::OrdinaryBattle>,
+    /// Acknowledged authored defeats retain only each live session's input hold.
+    game_over: BTreeMap<AccountId, ordinary::GameOverHold>,
 }
 
 /// An area's encounters as they run here: its table (only a table that can trigger at all), the
@@ -419,6 +423,13 @@ pub(super) struct AreaEncounters {
 }
 
 impl BattleWorld {
+    /// Runtime entities can change on reconnect; a retained roster still owns its account
+    /// until the engine can no longer pay it or an acknowledged hold is released.
+    fn account_reserved(&self, account: AccountId) -> bool {
+        self.game_over.contains_key(&account) || self.ordinary.values().any(|battle| battle.contains(account))
+            || self.battles.values().any(|battle| battle.members.iter().any(|member| member.info.account() == Some(account)))
+    }
+
     /// The rules over this server's own game data (the characters' experience curves are in them).
     pub(super) fn rules(&self) -> &dyn BattleRules {
         self.settings.rules.as_ref()
@@ -426,7 +437,7 @@ impl BattleWorld {
 
     pub(super) fn new(settings: BattleSettings, debug_encounters: bool) -> Self {
         let rng = Rng::new(settings.fixed_seed.unwrap_or_else(fresh_seed));
-        Self { settings, debug_encounters, battles: BTreeMap::new(), next_id: 1, rng, scene_finished: Vec::new(), scene_dormant: Vec::new() }
+        Self { settings, debug_encounters, battles: BTreeMap::new(), next_id: 1, rng, scene_finished: Vec::new(), scene_dormant: Vec::new(), ordinary: BTreeMap::new(), game_over: BTreeMap::new() }
     }
 
     /// The encounters of `area` under these settings (`None`: it has no usable table). Random rolls
@@ -560,8 +571,7 @@ impl World {
     /// connection left. A replacement session has no battle marker, but its old fighter remains
     /// in the roster until that battle ends or its last connected player leaves.
     pub(super) fn account_in_battle(&self, account: AccountId) -> bool {
-        self.battle.as_ref().is_some_and(|world| world.battles.values()
-            .any(|battle| battle.members.iter().any(|member| member.info.account() == Some(account))))
+        self.battle.as_ref().is_some_and(|world| world.account_reserved(account))
     }
 
     /// `ClientMsg::RequestEncounter`: start a battle for `entity`'s party, if the server allows
@@ -594,6 +604,9 @@ impl World {
     /// it now and the point's step is applied if it is won. Returns whether the battle started; when it cannot (the
     /// server runs no battles, a member is already in one) the story waits, and the server says so.
     pub(super) fn start_story_battle(&mut self, entity: EntityId, point: u32, formation: u16, now: Instant) -> bool {
+        let exact = self.players.get(&entity).is_some_and(|p| self.areas.get(&p.area)
+            .is_some_and(|area| area.runtime().story_requires_transaction(&p.progression)));
+        if exact { return self.begin_ordinary_story_battle(entity, point, formation, now); }
         let Some(area) = self.players.get(&entity).map(|p| p.area.clone()) else { return false };
         let game_area = self.areas.get(&area).map_or_else(|| area.clone(), |a| a.id().to_string());
         match self.begin_battle(entity, formation, now, Some(StoryThen { entity, area, point })) {
@@ -611,17 +624,28 @@ impl World {
         }
     }
 
-    /// Select the ordinary nearby co-op roster, permitting only the explicitly named scene hold.
-    fn prepare_battle_setup(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>) -> Result<BattleSetup, BattleRejection> {
+    /// Only the exact story battle selected by a committed sweep may inherit its acknowledged
+    /// field hold. Debug/random requests cannot borrow an unrelated pending story barrier.
+    fn prepare_battle_setup_with_story_hold(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>, inherit_story_hold: bool) -> Result<BattleSetup, BattleRejection> {
+        self.prepare_battle_setup_with_canon(requester, formation, scene, inherit_story_hold, None)
+    }
+
+    /// An authored battle may supply its already checked canon roster. `None` keeps the
+    /// ordinary online leader policy; `Some(&[])` is an explicitly known empty roster.
+    fn prepare_battle_setup_with_canon(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>, inherit_story_hold: bool,
+        canon: Option<&[u8]>) -> Result<BattleSetup, BattleRejection> {
+        let transferred_hold = inherit_story_hold && self.players.get(&requester).and_then(|p| p.story_pending)
+            .is_some_and(|id| self.ordinary_story_barrier_acked(requester, id));
         let Some(bw) = self.battle.as_mut() else {
             return Err(BattleRejection::Unsupported);
         };
         let Some(player) = self.players.get(&requester) else {
             return Err(BattleRejection::NotInBattle);
         };
-        if player.battle.is_some() {
+        if player.battle.is_some() || bw.account_reserved(player.account) {
             return Err(BattleRejection::AlreadyInBattle);
         }
+        if player.story_pending.is_some() && !transferred_hold { return Err(BattleRejection::Unsupported); }
         // Ordinary encounters accept no hold; checkpointed fights accept exactly their own run.
         if player.transit.is_some() || player.scene != scene {
             return Err(BattleRejection::Unsupported);
@@ -638,7 +662,8 @@ impl World {
             .filter_map(|member| self.by_account.get(member).copied())
             .filter(|&entity| {
                 entity == requester
-                    || self.players.get(&entity).is_some_and(|p| p.battle.is_none() && p.transit.is_none() && p.scene == scene && p.area == player.area)
+                    || self.players.get(&entity).is_some_and(|p| p.battle.is_none() && p.transit.is_none() && p.story_pending.is_none() && p.scene == scene && p.area == player.area
+                        && !bw.account_reserved(p.account))
             })
             .collect();
         if !entities.contains(&requester) {
@@ -660,7 +685,15 @@ impl World {
         let max_limit = bw.rules().progress_limits().max_limit;
         let companion_level = bw.settings.level.unwrap_or_else(|| leader.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER)).level);
         let companion_limit = if bw.settings.debug_limit_full { max_limit } else { 0 };
-        let canon: Vec<u8> = self.areas.get(&player.area).map_or_else(Vec::new, |area| area.runtime().story_party(&leader.progression));
+        let canon = match canon {
+            Some(canon) => canon.to_vec(),
+            None => self.areas.get(&player.area).ok_or(BattleRejection::Unsupported)?
+                .runtime().try_story_party(&leader.progression).map_err(|_| BattleRejection::Unsupported)?,
+        };
+        if canon.len() > MAX_BATTLE_PARTY.saturating_sub(entities.len())
+            || canon.iter().enumerate().any(|(index, character)| canon[..index].contains(character)) {
+            return Err(BattleRejection::Unsupported);
+        }
         // Who commands them (`--companions-player-commanded`, `BattleMember::commander`): the party's LEADER when it fights, else
         // the first player that does (a solo battle's only player), as FF7's player commands the whole party. Nobody when the
         // switch is off: the server commands them. Every other player commands only their own character.
@@ -672,16 +705,15 @@ impl World {
         };
         let companions: Vec<BattleMember> = canon
             .iter()
-            .filter_map(|&character| {
-                let name = clip_character_name(&bw.rules().character_name(character)?);
+            .map(|&character| {
+                let name = clip_character_name(&bw.rules().character_name(character).ok_or(BattleRejection::Unsupported)?);
                 let member = BattleMember { status: bw.settings.debug_status, ..BattleMember::companion(name, character, companion_level, companion_limit) };
-                Some(match commander {
+                Ok(match commander {
                     Some(account) => member.commanded_by(account),
                     None => member,
                 })
             })
-            .take(MAX_BATTLE_PARTY.saturating_sub(entities.len()))
-            .collect();
+            .collect::<Result<_, BattleRejection>>()?;
 
         // Each player fights as its own character (its stat curve) at its own level (see `progress`); `--battle-level`
         // pins the level of the fight, not what the account has earned.
@@ -714,6 +746,8 @@ impl World {
             battle_speed: bw.settings.battle_speed,
             ticks_per_second: bw.settings.ticks_per_second,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             initial_party: None,
         };
         Ok(setup)
@@ -721,7 +755,11 @@ impl World {
 
     /// Start an ordinary encounter or the existing presentation-only story fight.
     fn begin_battle(&mut self, requester: EntityId, formation: u16, now: Instant, then: Option<StoryThen>) -> Result<BattleId, BattleRejection> {
-        let setup = self.prepare_battle_setup(requester, formation, None)?;
+        // Only synchronous continuation of an already acknowledged story sweep may hand its
+        // field hold to the random fight selected by that accepted move. Raw debug requests
+        // have no resuming context, even when their client ACKed an outstanding CAS.
+        let inherit = self.ordinary_story_resuming(requester);
+        let setup = self.prepare_battle_setup_with_story_hold(requester, formation, None, inherit)?;
         let bw = self.battle.as_mut().ok_or(BattleRejection::Unsupported)?;
         let info = bw.settings.rules.formation(formation).ok_or(BattleRejection::UnknownFormation)?;
         let (party, seed) = (setup.party.clone(), setup.seed);
@@ -750,6 +788,8 @@ impl World {
             ticks_per_second: setup.ticks_per_second,
             data_fingerprint: bw.settings.rules.data_fingerprint(),
             escape_policy: setup.escape_policy,
+            victory_fanfare: setup.victory_fanfare,
+            game_over_on_defeat: setup.game_over_on_defeat,
             initial_party: setup.initial_party.clone(),
         });
         bw.battles.insert(
@@ -947,6 +987,7 @@ impl World {
             left = Some(inventory.count(item));
             told = Some(Arc::new(inventory.message()));
         }
+        self.note_ordinary_item(battle, account, item);
         let staged = self.battle.as_mut().and_then(|bw| bw.battles.get_mut(&battle))
             .and_then(|b| b.continuation.as_mut()).map(|c| c.item_uses.entry(account).or_default().push(item)).is_some();
         let saving = match if staged { None } else { self.saver.as_ref().map(|saver| saver.save(SaveJob::used_item(account, character, item))) } {
@@ -966,6 +1007,8 @@ impl World {
 
     /// Advance every battle to `now` and announce what happened. Call it every tick.
     pub fn advance_battles(&mut self, now: Instant) {
+        self.advance_ordinary_battles(now);
+        if self.scenes.storage_failed { return; }
         let ids: Vec<BattleId> = match &self.battle {
             Some(bw) => bw.battles.keys().copied().collect(),
             None => return,
@@ -973,6 +1016,7 @@ impl World {
         for id in ids {
             self.step_one(id, now);
         }
+        self.advance_ordinary_battles(now);
     }
 
     /// Advance one battle's engine to `now`, tell its members what that produced (only if it
@@ -1127,6 +1171,10 @@ impl World {
         ));
         if battle.continuation.is_some() {
             self.queue_scene_battle_finished(id, battle, outcome, rewards);
+            return;
+        }
+        if self.battle.as_ref().is_some_and(|bw| bw.ordinary.contains_key(&id)) {
+            self.queue_ordinary_battle_outcome(id, battle, outcome, rewards);
             return;
         }
         let told = self.pay_members(id, &battle.members, &rewards);
@@ -1312,6 +1360,9 @@ impl World {
     /// "every member is gone" means every player).
     pub(super) fn member_gone(&mut self, id: BattleId, entity: EntityId) {
         let Some(bw) = self.battle.as_mut() else { return };
+        // A title-only Game Over has already settled every resource. Each departed session
+        // releases independently; reconnect reads its saved predecessor and accepted costs.
+        bw.game_over.retain(|_, hold| hold.battle != id || hold.entity != entity);
         let Some(battle) = bw.battles.get_mut(&id) else { return };
         battle.scene_member_gone(entity);
         for m in &mut battle.members {
@@ -1319,13 +1370,15 @@ impl World {
                 m.connected = false;
             }
         }
-        if battle.members.iter().all(|m| !m.connected) && (battle.continuation.is_none() || battle.state.outcome().is_none()) {
+        if battle.members.iter().all(|m| !m.connected)
+            && ((battle.continuation.is_none() && !bw.ordinary.contains_key(&id)) || battle.state.outcome().is_none()) {
             if let Some(battle) = bw.battles.remove(&id) {
                 if let Some(scene) = battle.continuation {
                     bw.scene_dormant.push((scene.context, scene.plan));
                     self.logs.info(format!("scene battle dormant: every player left battle={}", id.0));
                 } else {
                     self.logs.info(format!("battle dropped: every player left battle={}", id.0));
+                    self.abandon_ordinary_battle(id);
                 }
             }
         }
@@ -1381,6 +1434,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
+    mod roster_snapshot;
     use super::*;
     use std::collections::BTreeSet;
     use crate::world::{MoveOutcome, NewPlayer};
@@ -1498,7 +1552,8 @@ mod tests {
                 Msg::Save(job) => jobs.push(job),
                 // Story saves are `saved_story`'s business (world/story.rs tests), not a payment.
                 Msg::Story(_) => {}
-                Msg::Scene { .. } => panic!("a battle test did not request a scene transaction"),
+                Msg::Scene { .. } | Msg::StoryCas { .. } | Msg::StoryBattle { .. } | Msg::StoryBattleSnapshot { .. } | Msg::FieldVisit { .. } =>
+                    panic!("a legacy battle test did not request a story transaction"),
                 Msg::SceneBatch { .. } | Msg::SceneSnapshot { .. } => panic!("an ordinary battle test did not request a continuation transaction"),
                 Msg::Stop(_) => panic!("nobody asked the saver to stop"),
             }
@@ -1580,7 +1635,7 @@ mod tests {
                 seat.drain();
                 while seen[i] < seat.log.len() {
                     match &seat.log[seen[i]] {
-                        ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, escape_policy, initial_party, .. } => {
+                        ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, escape_policy, initial_party, victory_fanfare, game_over_on_defeat, .. } => {
                             let setup = BattleSetup {
                                 formation_id: *formation_id,
                                 seed: *seed,
@@ -1590,7 +1645,7 @@ mod tests {
                                 battle_speed: *battle_speed,
                                 ticks_per_second: *ticks_per_second,
                                 escape_policy: *escape_policy,
-                                initial_party: initial_party.clone(),
+                                initial_party: initial_party.clone(), victory_fanfare: *victory_fanfare, game_over_on_defeat: *game_over_on_defeat,
                             };
                             replays[i] = Some(BattleReplay::start(rules, &setup).expect("builds"));
                         }
@@ -1677,7 +1732,7 @@ mod tests {
         assert_eq!(w.battle_count(), 1);
 
         match &a.battle_msgs()[..] {
-            [ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, data_fingerprint, escape_policy, initial_party }] => {
+            [ServerMsg::EncounterStart { battle_id, formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, data_fingerprint, escape_policy, initial_party, victory_fanfare, game_over_on_defeat }] => {
                 assert_eq!((*battle_id, *formation_id, *seed), (BattleId(1), 1, 7), "the fixed seed of the settings");
                 assert_eq!(party.len(), 1);
                 assert_eq!((party[0].entity(), party[0].account(), party[0].character, party[0].level), (Some(a.entity), Some(a.account), 0, 5));
@@ -1687,6 +1742,8 @@ mod tests {
                 assert_eq!(*data_fingerprint, SyntheticRules::FINGERPRINT);
                 assert_eq!(*escape_policy, fmv_protocol::EscapePolicy::Formation);
                 assert!(initial_party.is_none(), "an ordinary encounter starts from the normal character templates");
+                assert!(*victory_fanfare, "an ordinary fixture encounter keeps its victory fanfare");
+                assert!(!game_over_on_defeat, "ordinary fixture/debug defeats retain normal field release");
             }
             other => panic!("{other:?}"),
         }
@@ -2402,7 +2459,7 @@ mod tests {
         let mut replay = None;
         for m in &seat.log {
             match m {
-                ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, escape_policy, initial_party, .. } => {
+                ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second, escape_policy, initial_party, victory_fanfare, game_over_on_defeat, .. } => {
                     let setup = BattleSetup {
                         formation_id: *formation_id,
                         seed: *seed,
@@ -2412,7 +2469,7 @@ mod tests {
                         battle_speed: *battle_speed,
                         ticks_per_second: *ticks_per_second,
                         escape_policy: *escape_policy,
-                        initial_party: initial_party.clone(),
+                        initial_party: initial_party.clone(), victory_fanfare: *victory_fanfare, game_over_on_defeat: *game_over_on_defeat,
                     };
                     replay = Some(BattleReplay::start(rules, &setup).expect("builds"));
                 }
@@ -3733,9 +3790,13 @@ mod tests {
 
     /// The fixture's plaza with a story: `story_party` answers `party(progression)`, the canon party at that story
     /// state. Everything else is the plaza's.
+    type CheckedParty = fn(&[u8]) -> Result<Vec<u8>, fmv_adapter_api::AdapterError>;
+
     struct StoryArea {
         inner: Box<dyn AreaRuntime>,
         party: fn(&[u8]) -> Vec<u8>,
+        checked_party: Option<CheckedParty>,
+        admit: fn(&[u8]) -> bool,
     }
 
     impl AreaRuntime for StoryArea {
@@ -3760,19 +3821,123 @@ mod tests {
         fn story_party(&self, progress: &[u8]) -> Vec<u8> {
             (self.party)(progress)
         }
+        fn try_story_party(&self, progress: &[u8]) -> Result<Vec<u8>, fmv_adapter_api::AdapterError> {
+            self.checked_party.map_or_else(|| Ok(self.story_party(progress)), |query| query(progress))
+        }
+        fn supports_saved_progression(&self, progress: &[u8]) -> bool { (self.admit)(progress) }
     }
 
-    /// Cloud and Barret whatever the story state: the first reactor mission's canon party.
+    /// Pin this two-companion machinery fixture to the source-backed reactor stage at moment 11.
+    /// The opening station has Cloud alone; callers deliberately do not derive this pair from a new game.
     fn cloud_and_barret(_: &[u8]) -> Vec<u8> {
-        vec![0, 1]
+        fmv_ff7::story::canon_party(&fmv_ff7::story::StoryState::at(11))
     }
 
     /// A world over the plaza whose story's canon party is `party(progression)`, with battles on.
     fn world_with_party(settings: BattleSettings, party: fn(&[u8]) -> Vec<u8>) -> World {
         let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
-        let mut w = World::new(Box::new(StoryArea { inner, party })).unwrap();
+        let mut w = World::new(Box::new(StoryArea { inner, party, checked_party: None, admit: |_| true })).unwrap();
         w.configure_battle(Some(settings), true);
         w
+    }
+
+    #[test]
+    fn unknown_canon_party_refuses_a_battle_but_known_empty_and_ordered_slots_are_distinct() {
+        use fmv_ff7::story::StoryState;
+        let checked: CheckedParty = |blob| fmv_ff7::story::checked_canon_party_of(blob)
+            .ok_or_else(|| fmv_adapter_api::AdapterError::Unsupported("unknown party".into()));
+        let unknown = StoryState::fresh_first_control().into_native_party().unwrap();
+        let mut empty = StoryState::fresh_native_first_control();
+        empty.native_party_mut().unwrap().write_main_slots([255; 3], 7).unwrap();
+        let mut ordered = StoryState::fresh_native_first_control();
+        ordered.native_party_mut().unwrap().write_main_slots([2, 255, 0], 7).unwrap();
+        // Main membership is independent of availability and of the raw field tuple.
+        ordered.native_party_mut().unwrap().write_availability_masked(0, u16::MAX);
+        for (blob, expected) in [
+            (unknown.encode(), None), (vec![254], None),
+            (empty.encode(), Some(vec![])), (ordered.encode(), Some(vec![2, 0])),
+        ] {
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| panic!("the unchecked fallback must not build a battle"), checked_party: Some(checked), admit: |_| true,
+            })).unwrap();
+            w.configure_battle(Some(settings(SyntheticRules::default())), true);
+            let now = Instant::now();
+            let mut player = seat_story(&mut w, "A", now, ProgressSeed::of(0, None), blob);
+            player.drain();
+            let reply = w.request_encounter(player.entity, Some(1), now);
+            if let Some(expected) = expected {
+                assert_eq!(reply, BattleReply::Done);
+                let roster = roster_of(&mut player);
+                assert_eq!(roster.iter().filter(|m| m.is_companion()).map(|m| m.character).collect::<Vec<_>>(), expected);
+                assert_eq!(roster.iter().filter(|m| m.entity().is_some()).count(), 1);
+            } else {
+                assert_eq!(reply, refused(None, BattleRejection::Unsupported));
+                assert_eq!(w.battle_count(), 0);
+                assert!(!w.in_battle(player.entity));
+                assert!(!player.battle_msgs().iter().any(|m| matches!(m, ServerMsg::EncounterStart { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_duplicate_or_oversized_canon_rosters_are_refused_instead_of_silently_dropped() {
+        for party in [vec![0, 0], vec![0, 255], vec![0, 200, 1], (0..8).collect()] {
+            let checked: CheckedParty = |blob| Ok(blob.to_vec());
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| panic!("checked roster required"), checked_party: Some(checked), admit: |_| true,
+            })).unwrap();
+            w.configure_battle(Some(settings(SyntheticRules::default())), true);
+            let now = Instant::now();
+            let mut player = seat_story(&mut w, "A", now, ProgressSeed::of(0, None), party);
+            player.drain();
+            assert_eq!(w.request_encounter(player.entity, Some(1), now), refused(None, BattleRejection::Unsupported));
+            assert_eq!(w.battle_count(), 0);
+            assert!(!player.battle_msgs().iter().any(|m| matches!(m, ServerMsg::EncounterStart { .. })));
+        }
+    }
+
+    #[test]
+    fn unsupported_saved_progression_never_reaches_a_client_or_a_debug_save() {
+        use fmv_persist::{ProgressPair, Progression, SceneState};
+        for source in 0..3 {
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| Vec::new(), checked_party: None, admit: |blob| blob != [4],
+            })).unwrap();
+            let (saver, mut queue) = SaverHandle::channel();
+            w.set_progress_saver(saver);
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let (tx, mut rx) = mpsc::channel(32);
+            let mut new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "Unsupported".into(), tint: [0; 3], appearance_ref: None },
+                progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(),
+                tx, close: Arc::new(watch::channel(false).0),
+            };
+            match source {
+                0 => new.progression = vec![4],
+                1 => {
+                    let state = SceneState {
+                        pair: ProgressPair { story: Progression::empty(account, w.home_game()), character: None },
+                        checkpoint: None, reservation: None, field_visit: None,
+                    };
+                    let mut peer = state.clone();
+                    peer.pair.story.account_id = AccountId(account.0 + 1);
+                    peer.pair.story.blob = vec![4];
+                    new.scene_state = Some(state.clone());
+                    new.scene_group = vec![state, peer];
+                }
+                _ => w.scenes.debug_new_story = Some(vec![4]),
+            }
+            assert_eq!(w.join(new, Instant::now()), Err(crate::world::JoinError::UnsupportedProgression));
+            assert_eq!(w.player_count(), 0);
+            assert!(!w.has_session(account));
+            assert!(rx.try_recv().is_err(), "no story, scene or placement publication");
+            assert!(queue.try_recv().is_err(), "even a selected debug baseline must be checked before saving");
+        }
     }
 
     /// A player with a story `progression` (what the canon party is read from) and character progress `progress`.
@@ -3964,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_story_with_no_canon_party_or_a_rule_set_that_names_nobody_fights_with_the_players_only() {
+    fn a_story_with_no_canon_party_fights_with_the_players_only() {
         let t0 = Instant::now();
         // No canon party in the story (the plaza's own default).
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
@@ -3972,16 +4137,6 @@ mod tests {
         a.drain();
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         assert_eq!(who(&roster_of(&mut a)), vec![("player", "A".to_string(), 0, 5)]);
-        // An id the rules know nobody by is left out rather than invented.
-        fn odd(_: &[u8]) -> Vec<u8> {
-            vec![0, 200, 1]
-        }
-        let mut w = world_with_party(settings(SyntheticRules::default()), odd);
-        let mut b = seat(&mut w, "B", t0);
-        b.drain();
-        assert_eq!(w.request_encounter(b.entity, Some(0), t0), BattleReply::Done);
-        let names: Vec<String> = roster_of(&mut b).iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, ["Cloud", "Barret", "B"]);
     }
 
     /// Preemptive start: every gauge is full at once. With pacing off the companions act on the server's first step, as
@@ -4606,14 +4761,14 @@ mod tests {
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
         w.players.get_mut(&b.entity).unwrap().scene = Some(run);
         w.players.get_mut(&c.entity).unwrap().scene = Some(SceneRunId(42));
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("the matching scene party");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("the matching scene party");
         assert_eq!(plan.accounts(), vec![a.account, b.account]);
         assert_eq!(plan.setup.party.iter().map(|m| m.character).collect::<Vec<_>>(), [0, 1, 0, 0]);
         assert!(plan.setup.party.iter().filter_map(BattleMember::entity).all(|entity| entity == EntityId(0)),
             "a frozen plan must survive session ids changing");
         assert_eq!(w.battle_count(), 0, "preparing does not start before the durable checkpoint acknowledgment");
         assert!(!w.in_battle(a.entity) && !w.in_battle(b.entity) && !w.in_battle(c.entity));
-        assert!(w.prepare_scene_battle(c.entity, run, 0, EscapePolicy::Forbidden, None).is_err(),
+        assert!(w.prepare_scene_battle(c.entity, run, 0, EscapePolicy::Forbidden, None, None).is_err(),
             "an unrelated held player cannot be the requester either");
     }
 
@@ -4631,7 +4786,7 @@ mod tests {
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
         let before = w.players.get(&a.entity).unwrap().progress;
         a.drain();
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [7; 32], ordinal: 0, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("checkpoint acknowledged");
         let t = until_ready(&mut w, id, ActorId(0), t0);
@@ -4676,7 +4831,7 @@ mod tests {
         let (a, b) = party_of_two(&mut w, t0);
         let run = SceneRunId(44);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 1, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 1, EscapePolicy::Forbidden, None, None).expect("prepare");
         let original = plan.clone();
         let context = SceneBattleContext { run, instance: [8; 32], ordinal: 2, attempt: 3 };
         w.start_scene_battle(context, plan, t0).expect("checkpoint acknowledged");
@@ -4706,7 +4861,7 @@ mod tests {
         let a = seat(&mut w, "A", t0);
         let run = SceneRunId(45);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let id = w.start_scene_battle(SceneBattleContext { run, instance: [9; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Escape, t), refused(Some(id), BattleRejection::CannotEscape));
@@ -4717,7 +4872,7 @@ mod tests {
         let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
         let mut a = seat(&mut w, "A", t0);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 2, EscapePolicy::Forbidden, None).expect("prepare defeat");
+        let plan = w.prepare_scene_battle(a.entity, run, 2, EscapePolicy::Forbidden, None, None).expect("prepare defeat");
         w.start_scene_battle(SceneBattleContext { run, instance: [10; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start defeat");
         a.drain();
         let mut finished = Vec::new();
@@ -4746,7 +4901,7 @@ mod tests {
         let (mut a, mut b) = party_of_two_as(&mut w, t0, seeded_with(&[(0, 3)]), ProgressSeed::default());
         let run = SceneRunId(46);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [11; 32], ordinal: 1, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
@@ -4775,11 +4930,11 @@ mod tests {
         for message in &messages {
             match message {
                 ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second,
-                    escape_policy, initial_party, .. } => {
+                    escape_policy, initial_party, victory_fanfare, game_over_on_defeat, .. } => {
                     assert_eq!(party.iter().find(|m| m.account() == Some(account)).and_then(BattleMember::entity), Some(entity));
                     let setup = BattleSetup { formation_id: *formation_id, seed: *seed, party: party.clone(), preemptive: *preemptive,
                         back_attack: *back_attack, battle_speed: *battle_speed, ticks_per_second: *ticks_per_second,
-                        escape_policy: *escape_policy, initial_party: initial_party.clone() };
+                        escape_policy: *escape_policy, initial_party: initial_party.clone(), victory_fanfare: *victory_fanfare, game_over_on_defeat: *game_over_on_defeat };
                     replay = Some(BattleReplay::start(&rules, &setup).expect("the saved setup builds"));
                 }
                 ServerMsg::BattleEvent { tick, events, command, .. } => replay.as_mut().expect("start before log")
@@ -4812,7 +4967,7 @@ mod tests {
         let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(20, 1)]));
         let run = SceneRunId(47);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let id = w.start_scene_battle(SceneBattleContext { run, instance: [12; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
         a.drain();
@@ -4841,7 +4996,7 @@ mod tests {
         let (a, b) = party_of_two(&mut w, t0);
         let run = SceneRunId(48);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [13; 32], ordinal: 0, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("start");
         // Repeated zero-time updates are a valid engine log. This test exercises transport sizing
@@ -4879,10 +5034,10 @@ mod tests {
         for message in &messages {
             match message {
                 ServerMsg::EncounterStart { formation_id, seed, party, preemptive, back_attack, battle_speed, ticks_per_second,
-                    escape_policy, initial_party, .. } => replay = Some(BattleReplay::start(&rules, &BattleSetup {
+                    escape_policy, initial_party, victory_fanfare, game_over_on_defeat, .. } => replay = Some(BattleReplay::start(&rules, &BattleSetup {
                         formation_id: *formation_id, seed: *seed, party: party.clone(), preemptive: *preemptive, back_attack: *back_attack,
                         battle_speed: *battle_speed, ticks_per_second: *ticks_per_second, escape_policy: *escape_policy,
-                        initial_party: initial_party.clone(),
+                        initial_party: initial_party.clone(), victory_fanfare: *victory_fanfare, game_over_on_defeat: *game_over_on_defeat,
                     }).expect("the retained setup builds")),
                 ServerMsg::BattleEvent { tick, events, command, .. } => replay.as_mut().expect("setup before log")
                     .apply(*tick, events, command.as_ref()).expect("complete replay, with no gap or reordering"),
@@ -4907,7 +5062,7 @@ mod tests {
         party_up(&mut w, &a, &b, t0);
         let run = SceneRunId(49);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let previous = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("first boundary");
+        let previous = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("first boundary");
         let mut states: Vec<fmv_persist::SceneState> = [a.entity, b.entity].iter().enumerate().map(|(i, entity)| {
             let player = w.players.get(entity).unwrap();
             let mut character = player.progress.unwrap().to_record(player.account, GameId::Ff7, 0);
@@ -4916,23 +5071,23 @@ mod tests {
             character.inventory = Some(vec![InventoryEntry::new(i as u16 * 3, 1)]);
             fmv_persist::SceneState { pair: fmv_persist::ProgressPair {
                 story: fmv_persist::Progression::empty(player.account, GameId::Ff7), character: Some(character),
-            }, checkpoint: None, reservation: None }
+            }, checkpoint: None, reservation: None, field_visit: None }
         }).collect();
         let carry = SceneCombatCarry { members: previous.setup.party.iter().enumerate().map(|(i, member)| {
             (member.clone(), BattleInitialState { hp: 140 - 10 * i as u32, mp: 20 - i as u32,
                 status: StatusSet::EMPTY.with(Status::Sadness), limit: 0 })
         }).collect() };
         assert!(w.leave(b.entity));
-        assert!(w.validate_scene_battle_resume(&previous, &carry, &states),
+        assert!(w.validate_scene_battle_resume(&previous, &carry, &states, None),
             "a postbattle resume validates acknowledged levels and bags instead of the prebattle values");
         let mut damaged_carry = carry.clone();
         damaged_carry.members[0].0.level += 1;
-        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states),
+        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states, None),
             "resume cannot replace a frozen actor even with otherwise valid resources");
         let mut damaged_carry = carry.clone();
         damaged_carry.members[0].1.mp = u32::MAX;
-        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states), "resume cannot invent MP");
-        let next = w.prepare_next_scene_battle(&previous, 1, &carry, &states).expect("the acknowledged next boundary");
+        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states, None), "resume cannot invent MP");
+        let next = w.prepare_next_scene_battle(&previous, 1, &carry, &states, None).expect("the acknowledged next boundary");
         assert_eq!(next.accounts(), [a.account, b.account], "disconnect and party removal cannot change the frozen battle roster");
         assert_eq!(next.setup.party.iter().map(|m| m.character).collect::<Vec<_>>(), [0, 1, 0, 0]);
         assert_eq!(next.setup.party.iter().filter(|m| m.is_player()).map(|m| m.level).collect::<Vec<_>>(), [6, 7],
@@ -4943,29 +5098,861 @@ mod tests {
         assert_eq!(next.setup.escape_policy, EscapePolicy::Forbidden);
         assert_eq!(next.setup.formation_id, 1);
         assert!(next.setup.party.iter().filter_map(BattleMember::entity).all(|entity| entity == EntityId(0)));
-        assert!(w.validate_scene_battle_plan(&next, &states), "the recovered frozen input matches the complete committed group");
+        assert!(w.validate_scene_battle_plan(&next, &states, None), "the recovered frozen input matches the complete committed group");
         let mut bad = next.clone();
         bad.inventories[0].1[0].count += 1;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "a checkpoint cannot mint a staged item by replacing the durable bag");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "a checkpoint cannot mint a staged item by replacing the durable bag");
         let mut bad = next.clone();
         bad.setup.party.iter_mut().find(|m| m.account() == Some(a.account)).unwrap().level += 1;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "a checkpoint cannot invent a player level");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "a checkpoint cannot invent a player level");
         let mut bad = next.clone();
         bad.inventories[1].0 = a.account;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "every participant needs its own exact bag");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "every participant needs its own exact bag");
         let mut bad = next.clone();
         bad.setup.party.iter_mut().find(|m| m.account() == Some(a.account)).unwrap().controller =
             fmv_protocol::Controller::Player { entity: a.entity, account: a.account };
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "process-local entities cannot become durable identity");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "process-local entities cannot become durable identity");
         let mut bad = next.clone();
         bad.setup.initial_party.as_mut().unwrap()[0].hp = u32::MAX;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "carried resources still obey the shared engine's bounds");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "carried resources still obey the shared engine's bounds");
         let mut incomplete_carry = carry.clone();
         incomplete_carry.members.pop();
-        assert!(!w.validate_scene_battle_resume(&previous, &incomplete_carry, &states), "resume cannot omit an actor");
-        assert!(w.prepare_next_scene_battle(&previous, 1, &incomplete_carry, &states).is_err(), "missing resources cannot silently refill an actor");
+        assert!(!w.validate_scene_battle_resume(&previous, &incomplete_carry, &states, None), "resume cannot omit an actor");
+        assert!(w.prepare_next_scene_battle(&previous, 1, &incomplete_carry, &states, None).is_err(), "missing resources cannot silently refill an actor");
         states.pop();
-        assert!(!w.validate_scene_battle_resume(&previous, &carry, &states), "resume requires every participant's acknowledged record");
-        assert!(w.prepare_next_scene_battle(&previous, 1, &carry, &states).is_err(), "an absent offline baseline cannot become a fresh character");
+        assert!(!w.validate_scene_battle_resume(&previous, &carry, &states, None), "resume requires every participant's acknowledged record");
+        assert!(w.prepare_next_scene_battle(&previous, 1, &carry, &states, None).is_err(), "an absent offline baseline cannot become a fresh character");
+    }
+
+    // ---- ordinary exact story battles: snapshot, accepted FIFO item saves, outcome commit ----
+
+    const EXACT_BATTLE_BEFORE: &[u8] = &[3, 70, 0];
+    const EXACT_BATTLE_AFTER: &[u8] = &[3, 71, 0];
+
+    /// A minimal adapter whose ordered story assignment cannot use the legacy merge saver.
+    /// Its point is invoked directly so the tests isolate battle persistence from line geometry.
+    struct ExactStoryBattleArea(Box<dyn AreaRuntime>);
+
+    impl AreaRuntime for ExactStoryBattleArea {
+        fn info(&self) -> &AreaInfo { self.0.info() }
+        fn spawn_points(&self) -> Vec<Pos> { self.0.spawn_points() }
+        fn validate_move(&self, from: Pos, to: Pos) -> MoveResult { self.0.validate_move(from, to) }
+        fn bounds(&self) -> Bounds { self.0.bounds() }
+        fn walk_triangles(&self) -> Vec<[Pos; 3]> { self.0.walk_triangles() }
+        fn max_speed(&self) -> f32 { self.0.max_speed() }
+        fn encounters(&self) -> Option<EncounterTable> { self.0.encounters() }
+        fn story_requires_transaction(&self, _: &[u8]) -> bool { true }
+        fn story_advance(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryStep> {
+            (point == 7 && progress == EXACT_BATTLE_BEFORE).then(|| fmv_adapter_api::StoryStep {
+                progress: EXACT_BATTLE_AFTER.to_vec(), summary: "exact story battle won".into(), countdown: None,
+            })
+        }
+        fn story_battle(&self, point: u32) -> Option<u16> { (point == 7).then_some(3) }
+    }
+
+    fn exact_story_battle_world(rules: SyntheticRules) -> (World, mpsc::UnboundedReceiver<Msg>) {
+        let area = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+        let mut world = World::new(Box::new(ExactStoryBattleArea(area))).unwrap();
+        world.configure_battle(Some(settings(rules)), true);
+        let (saver, messages) = SaverHandle::channel();
+        world.set_progress_saver(saver);
+        (world, messages)
+    }
+
+    fn exact_battle_states(world: &World, accounts: &[AccountId]) -> Vec<fmv_persist::SceneState> {
+        accounts.iter().map(|account| {
+            let player = world.players.get(world.by_account.get(account).expect("online fixture account")).unwrap();
+            let mut character = player.progress.expect("battle progress").to_record(*account, world.home_game(), 0);
+            character.inventory = Some(player.inventory.as_ref().expect("battle inventory").entries().to_vec());
+            fmv_persist::SceneState {
+                pair: fmv_persist::ProgressPair {
+                    story: fmv_persist::Progression::new(*account, world.home_game(), player.progression.clone(), 0),
+                    character: Some(character),
+                }, checkpoint: None, reservation: None, field_visit: None,
+            }
+        }).collect()
+    }
+
+    type ExactBattleSnapshotAck = tokio::sync::oneshot::Sender<Result<Vec<fmv_persist::SceneState>, crate::saver::SceneSaveError>>;
+
+    fn exact_battle_snapshot(messages: &mut mpsc::UnboundedReceiver<Msg>) -> (Vec<AccountId>, ExactBattleSnapshotAck) {
+        match messages.try_recv().expect("a queued coherent snapshot") {
+            Msg::StoryBattleSnapshot { accounts, done } => (accounts, done),
+            _ => panic!("expected a snapshot before battle input/output can be published"),
+        }
+    }
+
+    type ExactBattleOutcomeAck = tokio::sync::oneshot::Sender<Result<fmv_persist::SceneBatchCommitted, crate::saver::SceneSaveError>>;
+
+    fn exact_battle_outcome(messages: &mut mpsc::UnboundedReceiver<Msg>) -> (crate::saver::StoryBattleJob, ExactBattleOutcomeAck) {
+        match messages.try_recv().expect("the atomic story and roster outcome") {
+            Msg::StoryBattle { job, done } => (job, done),
+            _ => panic!("a completed exact story battle must queue its atomic outcome"),
+        }
+    }
+
+    fn exact_battle_committed(job: &crate::saver::StoryBattleJob, rules: &SyntheticRules) -> fmv_persist::SceneBatchCommitted {
+        let current = job.members.iter().map(|member| {
+            let mut pair = member.expected.clone();
+            pair.character = Some(crate::saver::preview_scene_settlement(pair.character.as_ref().expect("stored character"), rules, &member.battle)
+                .expect("valid test battle settlement"));
+            pair.character.as_mut().unwrap().schema_version = 3; // the durable outcome receipt stamps this envelope
+            if pair.story.account_id == job.owner { pair.story.blob = job.next_story.clone(); }
+            fmv_persist::SceneState { pair, checkpoint: None, reservation: None, field_visit: None }
+        }).collect();
+        fmv_persist::SceneBatchCommitted { commit: fmv_persist::SceneCommit::Applied, current }
+    }
+
+    fn exact_battle_pending(seat: &mut Seat) -> u64 {
+        seat.drain();
+        seat.log.iter().rev().find_map(|message| match message {
+            ServerMsg::StoryPending { id, .. } => Some(*id),
+            _ => None,
+        }).expect("the ordered story hold was sent before combat")
+    }
+
+    fn exact_battle_assert_no_completion(messages: &[ServerMsg]) {
+        assert!(!messages.iter().any(|message| matches!(message,
+            ServerMsg::BattleEnd { .. } | ServerMsg::CharacterProgress { .. } | ServerMsg::StoryUpdate { .. })),
+            "unacknowledged battle output must not publish progress: {messages:?}");
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_waits_for_both_acks_and_never_debits_accepted_items_twice() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100, drop_item: Some(0), player_limits: true };
+        let (mut world, mut messages) = exact_story_battle_world(rules);
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        let before = world.players.get(&a.entity).unwrap().progress;
+        a.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.expect("reserved before the snapshot");
+        assert!(world.ordinary_battle_account_held(a.account));
+        assert!(!a.drain().iter().any(|message| matches!(message, ServerMsg::EncounterStart { .. })), "no engine before its baseline");
+        let token = exact_battle_pending(&mut a);
+        assert_eq!(world.apply_move(a.entity, Pos::new(-90.0, 0.0, 0.0), 0.0, AnimState::Walk, t0), MoveOutcome::Frozen);
+        let (accounts, initial_done) = exact_battle_snapshot(&mut messages);
+        assert_eq!(accounts, [a.account]);
+        initial_done.send(Ok(exact_battle_states(&world, &accounts))).expect("initial snapshot receiver");
+        assert!(a.drain().is_empty(), "sending an acknowledgment alone does not publish under the world lock");
+        world.advance_ordinary_battles(t0);
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id), "the durable baseline alone cannot start combat before the client installs its hold");
+        assert!(!a.drain().iter().any(|message| matches!(message, ServerMsg::EncounterStart { .. })));
+        assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+        assert!(a.drain().iter().any(|message| matches!(message, ServerMsg::EncounterStart { battle_id, .. } if *battle_id == id)));
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        a.drain();
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(1)) }, ready), BattleReply::Done);
+        let pending = a.drain();
+        exact_battle_assert_no_completion(&pending);
+        assert!(pending.iter().any(|message| matches!(message, ServerMsg::Inventory { items } if items == &vec![InventoryEntry::new(20, 1)])),
+            "accepted item use keeps the ordinary immediate inventory feedback");
+        match messages.try_recv().expect("the accepted FIFO item write") {
+            Msg::Save(job) => assert_eq!(job, crate::saver::SaveJob::used_item(a.account, 0, 20)),
+            _ => panic!("the item debit must be ahead of the terminal snapshot"),
+        }
+        let (accounts, terminal_done) = exact_battle_snapshot(&mut messages);
+        let post_item = exact_battle_states(&world, &accounts);
+        assert_eq!(post_item[0].pair.character.as_ref().unwrap().inventory, Some(vec![InventoryEntry::new(20, 1)]));
+        assert_eq!(world.players.get(&a.entity).unwrap().progress, before);
+        assert_eq!(world.players.get(&a.entity).unwrap().progression, EXACT_BATTLE_BEFORE);
+        assert!(world.ordinary_battle_account_held(a.account));
+        terminal_done.send(Ok(post_item)).expect("terminal snapshot receiver");
+        world.advance_ordinary_battles(ready);
+        let (job, outcome_done) = exact_battle_outcome(&mut messages);
+        assert_eq!((job.owner, job.expected_story.as_slice(), job.next_story.as_slice()), (a.account, EXACT_BATTLE_BEFORE, EXACT_BATTLE_AFTER));
+        assert_eq!(job.members.len(), 1);
+        assert!(job.members[0].battle.consumed_items.is_empty(), "the FIFO item write already paid the cost");
+        assert_eq!(job.members[0].expected.character.as_ref().unwrap().inventory, Some(vec![InventoryEntry::new(20, 1)]));
+        exact_battle_assert_no_completion(&a.drain());
+        assert!(world.in_battle(a.entity));
+        let committed = exact_battle_committed(&job, &rules);
+        let expected = committed.current[0].pair.character.clone().unwrap();
+        outcome_done.send(Ok(committed)).expect("atomic outcome receiver");
+        world.advance_ordinary_battles(ready);
+        let published = a.drain();
+        assert_eq!(published.iter().filter(|message| matches!(message, ServerMsg::BattleEnd { outcome: Outcome::Victory, .. })).count(), 1);
+        assert_eq!(published.iter().filter(|message| matches!(message, ServerMsg::StoryUpdate { progress, .. } if progress == EXACT_BATTLE_AFTER)).count(), 1);
+        assert_eq!(world.players.get(&a.entity).unwrap().progress, Some(Progress::from_record(&expected)));
+        assert_eq!(mirror_of(&world, &a), [(0, 1), (20, 1)], "one FIFO cost and one acknowledged drop");
+        assert!(!world.in_battle(a.entity) && !world.ordinary_battle_account_held(a.account));
+        assert!(messages.try_recv().is_err(), "rewards, gauges and story were not separately queued again");
+        for _ in 0..3 { world.advance_ordinary_battles(ready); }
+        exact_battle_assert_no_completion(&a.drain());
+        assert_eq!(world.players.get(&a.entity).unwrap().progress, Some(Progress::from_record(&expected)), "a polled acknowledgment pays once");
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_keeps_the_disconnected_owners_account_through_outcome_ack() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100, ..SyntheticRules::default() };
+        let (mut world, mut messages) = exact_story_battle_world(rules);
+        let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        let mut b = seat_story(&mut world, "B", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &a, &b, t0);
+        a.drain(); b.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let (accounts, initial_done) = exact_battle_snapshot(&mut messages);
+        assert_eq!(accounts, [a.account, b.account]);
+        let mut durable = exact_battle_states(&world, &accounts);
+        let (a_token, b_token) = (exact_battle_pending(&mut a), exact_battle_pending(&mut b));
+        initial_done.send(Ok(durable.clone())).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id));
+        assert!(world.ordinary_battle_pending_ack(a.entity, a_token, t0));
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id), "every connected co-op player must install the hold");
+        assert!(!a.drain().iter().chain(b.drain().iter()).any(|message| matches!(message, ServerMsg::EncounterStart { .. })));
+        assert!(world.ordinary_battle_pending_ack(b.entity, b_token, t0));
+        assert!(world.battle.as_ref().unwrap().battles.contains_key(&id));
+        a.drain(); b.drain();
+        assert!(world.leave(a.entity));
+        assert!(world.ordinary_battle_account_held(a.account));
+        let (session, entity) = world.allocate_ids();
+        let (tx, _attempted_messages) = mpsc::channel(256);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "A again".into(), tint: [1, 2, 3], appearance_ref: None };
+        let attempted = NewPlayer { session, entity, account: a.account, avatar, progression: EXACT_BATTLE_BEFORE.to_vec(),
+            progress: ProgressSeed::default(), scene_state: None, scene_group: Vec::new(), tx, close };
+        assert!(world.join(attempted, t0).is_err(), "the retained account cannot start a replacement session before settlement");
+        assert!(!world.players.contains_key(&entity));
+        let ready = until_ready(&mut world, id, ActorId(1), t0);
+        b.drain();
+        assert_eq!(world.battle_command(b.entity, id, ActorId(1), Command::Item { item: 20, target: Target::One(ActorId(2)) }, ready), BattleReply::Done);
+        exact_battle_assert_no_completion(&b.drain());
+        match messages.try_recv().expect("B's accepted item") {
+            Msg::Save(job) => assert_eq!(job, crate::saver::SaveJob::used_item(b.account, 0, 20)),
+            _ => panic!("the item write precedes the outcome snapshot"),
+        }
+        let (snapshot_accounts, terminal_done) = exact_battle_snapshot(&mut messages);
+        assert_eq!(snapshot_accounts, accounts, "snapshot includes the disconnected owner");
+        durable.iter_mut().find(|state| state.pair.story.account_id == b.account).unwrap().pair.character.as_mut().unwrap()
+            .inventory = Some(vec![InventoryEntry::new(20, 1)]);
+        terminal_done.send(Ok(durable)).expect("terminal snapshot");
+        world.advance_ordinary_battles(ready);
+        let (job, outcome_done) = exact_battle_outcome(&mut messages);
+        assert_eq!(job.owner, a.account, "the story's owner is a stable account, not the now-absent entity");
+        assert_eq!(job.next_story, EXACT_BATTLE_AFTER);
+        assert_eq!(job.members.iter().map(|member| member.expected.story.account_id).collect::<Vec<_>>(), accounts);
+        assert!(job.members.iter().all(|member| member.battle.consumed_items.is_empty()));
+        assert!(world.ordinary_battle_account_held(a.account) && world.ordinary_battle_account_held(b.account));
+        let committed = exact_battle_committed(&job, &rules);
+        assert_eq!(committed.current.iter().find(|state| state.pair.story.account_id == a.account).unwrap().pair.story.blob, EXACT_BATTLE_AFTER);
+        outcome_done.send(Ok(committed)).expect("outcome receiver");
+        world.advance_ordinary_battles(ready);
+        assert!(!world.ordinary_battle_account_held(a.account) && !world.ordinary_battle_account_held(b.account));
+        assert!(!world.players.contains_key(&a.entity));
+        let placement = world.players.get(&b.entity).unwrap().placement.as_ref().expect("remaining member is placed");
+        assert_eq!(placement.phase_owner, b.account, "the departed leader's frozen phase must not survive the outcome acknowledgment");
+        assert!(placement.story_advance_allowed, "the surviving member can advance its own story after release");
+        assert_eq!(world.players.get(&b.entity).unwrap().progression, EXACT_BATTLE_BEFORE, "another participant's own story is not advanced");
+        assert_eq!(b.drain().iter().filter(|message| matches!(message, ServerMsg::BattleEnd { outcome: Outcome::Victory, .. })).count(), 1);
+        assert!(messages.try_recv().is_err(), "the offline owner's story was part of the atomic outcome, not a later best-effort write");
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_refuses_a_stale_initial_snapshot_before_starting_the_engine() {
+        for damage in ["story", "inventory", "roster"] {
+            let t0 = Instant::now();
+            let (mut world, mut messages) = exact_story_battle_world(SyntheticRules::default());
+            let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+            a.drain();
+            assert!(world.start_story_battle(a.entity, 7, 3, t0));
+            let (accounts, done) = exact_battle_snapshot(&mut messages);
+            let token = exact_battle_pending(&mut a);
+            assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+            let mut states = exact_battle_states(&world, &accounts);
+            match damage {
+                "story" => states[0].pair.story.blob = EXACT_BATTLE_AFTER.to_vec(),
+                "inventory" => states[0].pair.character.as_mut().unwrap().inventory = Some(vec![InventoryEntry::new(20, 1)]),
+                _ => states.clear(),
+            }
+            done.send(Ok(states)).expect("snapshot receiver");
+            world.advance_ordinary_battles(t0);
+            let output = a.drain();
+            assert!(!output.iter().any(|message| matches!(message, ServerMsg::EncounterStart { .. })), "{damage}: invalid baseline started combat");
+            exact_battle_assert_no_completion(&output);
+            assert!(world.players.get(&a.entity).is_none_or(|player| player.battle.is_some()), "{damage}: a failed baseline cannot free unverified gameplay");
+            assert!(messages.try_recv().is_err(), "{damage}: invalid input queued no payment");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_refuses_a_terminal_snapshot_that_has_not_paid_its_fifo_item() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100, ..SyntheticRules::default() };
+        let (mut world, mut messages) = exact_story_battle_world(rules);
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        a.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let (accounts, initial_done) = exact_battle_snapshot(&mut messages);
+        let stale = exact_battle_states(&world, &accounts);
+        let token = exact_battle_pending(&mut a);
+        assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+        initial_done.send(Ok(stale.clone())).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        a.drain();
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(1)) }, ready), BattleReply::Done);
+        exact_battle_assert_no_completion(&a.drain());
+        assert!(matches!(messages.try_recv().expect("accepted FIFO cost"), Msg::Save(crate::saver::SaveJob { change: crate::saver::SavedChange::UsedItem(20), .. })));
+        let (_, terminal_done) = exact_battle_snapshot(&mut messages);
+        terminal_done.send(Ok(stale)).expect("terminal snapshot receiver");
+        world.advance_ordinary_battles(ready);
+        exact_battle_assert_no_completion(&a.drain());
+        assert!(messages.try_recv().is_err(), "the wrong post-item bag must not become the atomic reward transaction's predecessor");
+        assert!(world.players.get(&a.entity).is_none_or(|player| player.battle.is_some()));
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_keeps_abandoned_accounts_reserved_until_the_item_fifo_is_acknowledged() {
+        let t0 = Instant::now();
+        let (mut world, mut messages) = exact_story_battle_world(SyntheticRules { enemy_hp: 10_000, ..SyntheticRules::default() });
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        a.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let token = exact_battle_pending(&mut a);
+        assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+        let (accounts, initial_done) = exact_battle_snapshot(&mut messages);
+        initial_done.send(Ok(exact_battle_states(&world, &accounts))).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        a.drain();
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(1)) }, ready), BattleReply::Done);
+        exact_battle_assert_no_completion(&a.drain());
+        assert!(world.battle.as_ref().unwrap().battles.get(&id).unwrap().state.outcome().is_none(), "the accepted grenade did not finish this fight");
+        let post_item = exact_battle_states(&world, &accounts);
+        assert_eq!(post_item[0].pair.character.as_ref().unwrap().inventory, Some(vec![InventoryEntry::new(20, 1)]));
+        assert!(world.leave(a.entity));
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id), "no sessions remain to drive the unfinished engine");
+        assert!(world.ordinary_battle_account_held(a.account), "the saved bag may still contain the consumed grenade");
+        assert!(matches!(messages.try_recv().expect("accepted FIFO cost"), Msg::Save(crate::saver::SaveJob { change: crate::saver::SavedChange::UsedItem(20), .. })));
+        let (fenced_accounts, fence_done) = exact_battle_snapshot(&mut messages);
+        assert_eq!(fenced_accounts, accounts);
+        world.advance_ordinary_battles(ready);
+        assert!(world.ordinary_battle_account_held(a.account), "disconnect alone cannot authorize a stale re-login");
+        let (session, entity) = world.allocate_ids();
+        let (tx, _rx) = mpsc::channel(256);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "A again".into(), tint: [1, 2, 3], appearance_ref: None };
+        assert!(world.join(NewPlayer { session, entity, account: a.account, avatar, progression: EXACT_BATTLE_BEFORE.to_vec(),
+            progress: seeded_with(&[(20, 2)]), scene_state: None, scene_group: Vec::new(), tx, close }, ready).is_err());
+        assert!(!world.players.contains_key(&entity));
+        fence_done.send(Ok(post_item)).expect("abandonment FIFO fence");
+        world.advance_ordinary_battles(ready);
+        assert!(!world.ordinary_battle_account_held(a.account), "the coherent read proved the accepted debit durable");
+        assert!(messages.try_recv().is_err(), "an abandoned fight earns no reward or story-outcome receipt");
+        exact_battle_assert_no_completion(&a.drain());
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_preflight_refusal_waits_for_the_client_hold_ack_before_release() {
+        let t0 = Instant::now();
+        let (mut world, mut messages) = exact_story_battle_world(SyntheticRules::default());
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        a.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let token = exact_battle_pending(&mut a);
+        let (_, done) = exact_battle_snapshot(&mut messages);
+        done.send(Err(crate::saver::SceneSaveError::Store(fmv_persist::PersistError::TransactionConflict(
+            "the ordinary battle receipt capacity is full".into())))).expect("initial snapshot receiver");
+        world.advance_ordinary_battles(t0);
+        let refused = a.drain();
+        assert!(!refused.iter().any(|message| matches!(message, ServerMsg::StoryCommitted { .. } | ServerMsg::EncounterStart { .. })));
+        exact_battle_assert_no_completion(&refused);
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id));
+        assert!(world.ordinary_battle_account_held(a.account));
+        assert_eq!(world.players.get(&a.entity).unwrap().battle, Some(id));
+        assert_eq!(world.apply_move(a.entity, Pos::new(-90.0, 0.0, 0.0), 0.0, AnimState::Walk, t0), MoveOutcome::Frozen);
+        assert!(!world.ordinary_battle_pending_ack(a.entity, token.wrapping_add(1), t0));
+        world.advance_ordinary_battles(t0);
+        assert!(a.drain().is_empty(), "an unrelated acknowledgment cannot release the rejected transaction");
+        assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+        let released = a.drain();
+        assert_eq!(released.iter().filter(|message| matches!(message, ServerMsg::StoryCommitted { id } if *id == token)).count(), 1);
+        exact_battle_assert_no_completion(&released);
+        assert!(!world.ordinary_battle_account_held(a.account));
+        let player = world.players.get(&a.entity).unwrap();
+        assert!(player.battle.is_none() && player.story_pending.is_none());
+        assert_eq!(player.progression, EXACT_BATTLE_BEFORE);
+        assert_eq!(mirror_of(&world, &a), [(20, 2)]);
+        assert!(!world.scenes.storage_failed, "a known no-write preflight refusal is recoverable");
+        assert!(!world.ordinary_battle_pending_ack(a.entity, token, t0));
+        world.advance_ordinary_battles(t0);
+        assert!(a.drain().is_empty(), "a repeated acknowledgment cannot publish a second release");
+        assert!(messages.try_recv().is_err(), "no combat or durable outcome was attempted");
+    }
+
+    struct ExactBattleVictoryHost;
+
+    impl crate::world::SceneHost for ExactBattleVictoryHost {
+        fn scenes(&self) -> Vec<crate::world::SceneInfo> {
+            vec![crate::world::SceneInfo { id: "test/exact-battle-victory".into(), field: FIXTURE_AREA_KEY.into(),
+                arrival: Pos::new(0.0, 0.0, 0.0), arrival_facing: 0.0, arrival_hint: None }]
+        }
+        fn offered(&self, _: &str, _: &[u8]) -> bool { false }
+        fn trigger(&self, _: &str, _: &[u8]) -> Option<crate::world::TriggerInfo> { None }
+        fn preview_progress(&self, _: &str) -> Option<Vec<u8>> { None }
+        fn victory_scene(&self, field: &str, before: &[u8], after: &[u8], formation: u16) -> Option<String> {
+            (field == FIXTURE_AREA_KEY && before == EXACT_BATTLE_BEFORE && after == EXACT_BATTLE_AFTER && formation == 3)
+                .then(|| "test/exact-battle-victory".into())
+        }
+        fn finish(&self, _: &str, _: &[u8], _: u32, _: &[u8]) -> Option<crate::world::SceneResult> {
+            panic!("a victory presentation cannot interpret or save story again")
+        }
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_starts_the_victory_presentation_for_owner_and_nearby_watcher_after_ack() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules { enemy_hp: 100, ..SyntheticRules::default() };
+        let (mut world, mut messages) = exact_story_battle_world(rules);
+        world.configure_scenes(Some(crate::world::SceneSettings { host: Arc::new(ExactBattleVictoryHost),
+            debug_preview: false, debug_new_story: None }));
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        let mut b = seat_story(&mut world, "B", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &a, &b, t0);
+        a.drain(); b.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let (a_token, b_token) = (exact_battle_pending(&mut a), exact_battle_pending(&mut b));
+        assert!(world.ordinary_battle_pending_ack(a.entity, a_token, t0));
+        assert!(world.ordinary_battle_pending_ack(b.entity, b_token, t0));
+        let (accounts, done) = exact_battle_snapshot(&mut messages);
+        done.send(Ok(exact_battle_states(&world, &accounts))).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        a.drain(); b.drain();
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(2)) }, ready), BattleReply::Done);
+        assert!(matches!(messages.try_recv().expect("the accepted item cost"), Msg::Save(crate::saver::SaveJob { change: crate::saver::SavedChange::UsedItem(20), .. })));
+        let (accounts, done) = exact_battle_snapshot(&mut messages);
+        done.send(Ok(exact_battle_states(&world, &accounts))).expect("terminal snapshot");
+        world.advance_ordinary_battles(ready);
+        let (job, done) = exact_battle_outcome(&mut messages);
+        for pending in [a.drain(), b.drain()] {
+            exact_battle_assert_no_completion(&pending);
+            assert!(!pending.iter().any(|message| matches!(message, ServerMsg::SceneStart { .. } | ServerMsg::StoryCommitted { .. })));
+        }
+        done.send(Ok(exact_battle_committed(&job, &rules))).expect("durable battle outcome");
+        world.advance_ordinary_battles(ready);
+        let (owner, watcher) = (a.drain(), b.drain());
+        let starts = |messages: &[ServerMsg]| messages.iter().filter_map(|message| match message {
+            ServerMsg::SceneStart { run, you, progress, participants, .. } =>
+                Some((*run, *you, progress.clone(), participants.iter().map(|participant| participant.entity).collect::<Vec<_>>())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let owner_starts = starts(&owner);
+        let watcher_starts = starts(&watcher);
+        assert_eq!(owner_starts.len(), 1, "the saved owner gets its victory scene: {owner:?}");
+        assert_eq!(watcher_starts.len(), 1, "the nearby co-op member remains a watcher: {watcher:?}");
+        assert_eq!(owner_starts[0].1, fmv_protocol::SceneRole::Owner);
+        assert_eq!(watcher_starts[0].1, fmv_protocol::SceneRole::Watcher);
+        assert_eq!(owner_starts[0].0, watcher_starts[0].0);
+        assert_eq!(owner_starts[0].2, EXACT_BATTLE_BEFORE, "presentation retains the pre-victory scene input");
+        assert_eq!(owner_starts[0].3, vec![a.entity, b.entity]);
+        assert_eq!(watcher_starts[0].3, vec![a.entity, b.entity]);
+        let index = |messages: &[ServerMsg], predicate: fn(&ServerMsg) -> bool| messages.iter().position(predicate).expect("ordered message");
+        for published in [&owner, &watcher] {
+            assert!(index(published, |m| matches!(m, ServerMsg::BattleEnd { .. })) < index(published, |m| matches!(m, ServerMsg::SceneStart { .. })));
+            assert!(index(published, |m| matches!(m, ServerMsg::CharacterProgress { .. })) < index(published, |m| matches!(m, ServerMsg::SceneStart { .. })));
+            assert_eq!(published.iter().filter(|m| matches!(m, ServerMsg::StoryCommitted { .. })).count(), 1, "each inherited field hold releases once");
+        }
+        assert!(index(&watcher, |m| matches!(m, ServerMsg::StoryCommitted { .. })) < index(&watcher, |m| matches!(m, ServerMsg::SceneStart { .. })),
+            "the guest field hold releases before watcher admission");
+        assert!(world.in_scene(a.entity) && world.in_scene(b.entity));
+        assert_eq!(world.players.get(&a.entity).unwrap().progression, EXACT_BATTLE_AFTER);
+        assert_eq!(world.players.get(&b.entity).unwrap().progression, EXACT_BATTLE_BEFORE);
+        world.scene_message(a.entity, fmv_protocol::ClientMsg::SceneEnd { run: owner_starts[0].0, skipped: true }, ready);
+        assert!(!world.in_scene(a.entity) && !world.in_scene(b.entity));
+        assert_eq!(world.players.get(&a.entity).unwrap().progression, EXACT_BATTLE_AFTER, "skipping presentation cannot undo the durable win");
+        assert!(messages.try_recv().is_err(), "the scene cannot queue another story or reward write");
+    }
+
+    #[test]
+    fn an_exact_story_move_resumes_its_random_encounter_after_durable_ack_before_releasing_the_hold() {
+        let t0 = Instant::now();
+        let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+        let wild = Wild { inner, table: Some(EncounterTable { rate: 255,
+            entries: vec![EncounterEntry { formation: 3, weight: 64 }] }) };
+        let mut world = World::new(Box::new(ExactStoryBattleArea(Box::new(wild)))).unwrap();
+        let mut settings = settings(SyntheticRules::default());
+        settings.encounter_step_units = Some(1.0);
+        world.configure_battle(Some(settings), true);
+        let (saver, mut messages) = SaverHandle::channel();
+        world.set_progress_saver(saver);
+        let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        a.drain();
+        let player = world.players.get(&a.entity).unwrap();
+        let (area, from) = (player.area.clone(), player.snapshot.pos);
+        let to = Pos::new(from.x + 1.0, from.y, from.z);
+        // The accepted move has already installed this pose when its story point pauses the remaining work.
+        world.players.get_mut(&a.entity).unwrap().snapshot.pos = to;
+        assert!(world.apply_story_step(a.entity, 8, fmv_adapter_api::StoryStep {
+            progress: EXACT_BATTLE_AFTER.to_vec(), summary: "a deferred accepted move".into(), countdown: None,
+        }));
+        assert!(world.defer_story_followup(a.entity, crate::world::story::StoryFollowup::Move { area, from, to, distance: 1.0 }));
+        let token = exact_battle_pending(&mut a);
+        let (job, done) = match messages.try_recv().expect("the exact story CAS") {
+            Msg::StoryCas { job, done } => (job, done),
+            _ => panic!("the accepted move must save its story before resuming the encounter roll"),
+        };
+        world.story_pending_ack(a.entity, token, t0);
+        assert!(matches!(world.request_encounter(a.entity, Some(3), t0), BattleReply::Refused { .. }),
+            "a client acknowledgment alone cannot turn raw encounter requests into resumed server work");
+        assert!(!world.in_battle(a.entity));
+        assert!(!a.drain().iter().any(|message| matches!(message, ServerMsg::EncounterStart { .. } | ServerMsg::StoryCommitted { .. })));
+        // The table rate is a byte. Select a deterministic PRNG state whose first legal roll hits it;
+        // this test verifies continuation ordering, not the probability distribution.
+        let seed = (0..1024).find(|seed| Rng::new(*seed).below(1024) < 255).expect("a known triggering roll");
+        world.battle.as_mut().unwrap().rng = Rng::new(seed);
+        let mut pair = exact_battle_states(&world, &[a.account]).remove(0).pair;
+        pair.story.blob = job.next_story;
+        done.send(Ok(crate::saver::SceneSaved { commit: fmv_persist::SceneCommit::Applied, pair })).expect("story acknowledgment receiver");
+        world.advance_story_saves(t0);
+        let output = a.drain();
+        let start = output.iter().position(|message| matches!(message, ServerMsg::EncounterStart { formation_id: 3, .. }))
+            .expect("the deferred accepted move still gets its encounter roll");
+        let release = output.iter().position(|message| matches!(message, ServerMsg::StoryCommitted { id } if *id == token))
+            .expect("the completed story hold releases after its continuation");
+        assert!(start < release, "combat freezes the avatar before the story hold is lifted");
+        assert!(world.in_battle(a.entity));
+        assert_eq!(world.players.get(&a.entity).unwrap().progression, EXACT_BATTLE_AFTER);
+        assert!(world.players.get(&a.entity).unwrap().story_pending.is_none());
+        assert!(messages.try_recv().is_err(), "the resumed random battle does not restart the exact story CAS");
+    }
+
+    struct PolicyStoryBattleArea {
+        inner: ExactStoryBattleArea,
+        policy: Option<fmv_adapter_api::StoryBattlePolicy>,
+    }
+
+    impl AreaRuntime for PolicyStoryBattleArea {
+        fn info(&self) -> &AreaInfo { self.inner.info() }
+        fn spawn_points(&self) -> Vec<Pos> { self.inner.spawn_points() }
+        fn validate_move(&self, from: Pos, to: Pos) -> MoveResult { self.inner.validate_move(from, to) }
+        fn bounds(&self) -> Bounds { self.inner.bounds() }
+        fn walk_triangles(&self) -> Vec<[Pos; 3]> { self.inner.walk_triangles() }
+        fn max_speed(&self) -> f32 { self.inner.max_speed() }
+        fn story_requires_transaction(&self, progress: &[u8]) -> bool { self.inner.story_requires_transaction(progress) }
+        fn story_advance(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryStep> {
+            self.inner.story_advance(progress, point)
+        }
+        fn story_battle(&self, point: u32) -> Option<u16> { self.inner.story_battle(point) }
+        fn story_battle_policy(&self, _: &[u8], _: u32) -> Option<fmv_adapter_api::StoryBattlePolicy> { self.policy }
+    }
+
+    fn exact_policy_battle_world(policy: Option<fmv_adapter_api::StoryBattlePolicy>) -> (World, mpsc::UnboundedReceiver<Msg>) {
+        let inner = ExactStoryBattleArea(FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap());
+        let mut world = World::new(Box::new(PolicyStoryBattleArea { inner, policy })).unwrap();
+        world.configure_battle(Some(settings(SyntheticRules::default())), true);
+        let (saver, messages) = SaverHandle::channel();
+        world.set_progress_saver(saver);
+        (world, messages)
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_publishes_and_enforces_its_authored_escape_and_fanfare_policy() {
+        let t0 = Instant::now();
+        let policy = fmv_adapter_api::StoryBattlePolicy { formation: 3, escape_forbidden: true, victory_fanfare: false, game_over_on_defeat: false };
+        let (mut world, mut messages) = exact_policy_battle_world(Some(policy));
+        let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        a.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let token = exact_battle_pending(&mut a);
+        assert!(world.ordinary_battle_pending_ack(a.entity, token, t0));
+        let (accounts, done) = exact_battle_snapshot(&mut messages);
+        done.send(Ok(exact_battle_states(&world, &accounts))).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        let starts = a.drain().into_iter().filter(|message| matches!(message, ServerMsg::EncounterStart { .. })).collect::<Vec<_>>();
+        assert!(matches!(starts.as_slice(), [ServerMsg::EncounterStart { battle_id, formation_id: 3,
+            escape_policy: fmv_protocol::EscapePolicy::Forbidden, victory_fanfare: false, .. }] if *battle_id == id),
+            "the wire carries the selected story policy: {starts:?}");
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        a.drain();
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Escape, ready),
+            refused(Some(id), BattleRejection::CannotEscape), "the server applies the authored prohibition too");
+        assert!(world.in_battle(a.entity));
+        assert!(messages.try_recv().is_err(), "a refused escape neither settles nor advances the story");
+    }
+
+    #[test]
+    fn an_ordinary_exact_story_battle_without_a_matching_authored_policy_refuses_before_any_hold_or_save() {
+        for policy in [None, Some(fmv_adapter_api::StoryBattlePolicy { formation: 0, escape_forbidden: true, victory_fanfare: false, game_over_on_defeat: false })] {
+            let t0 = Instant::now();
+            let (mut world, mut messages) = exact_policy_battle_world(policy);
+            let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+            a.drain();
+            assert!(!world.start_story_battle(a.entity, 7, 3, t0), "an absent or mismatching policy cannot authorize formation3: {policy:?}");
+            assert!(!world.in_battle(a.entity) && !world.ordinary_battle_account_held(a.account));
+            assert!(world.players.get(&a.entity).unwrap().story_pending.is_none());
+            assert_eq!(world.players.get(&a.entity).unwrap().progression, EXACT_BATTLE_BEFORE);
+            assert!(a.drain().is_empty(), "no wire hold or encounter was published");
+            assert!(messages.try_recv().is_err(), "no baseline or outcome save was queued");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_authored_defeat_waits_for_storage_then_holds_each_player_until_they_leave_for_title() {
+        let t0 = Instant::now();
+        let rules = SyntheticRules::default();
+        let policy = fmv_adapter_api::StoryBattlePolicy { formation: 3, escape_forbidden: true,
+            victory_fanfare: false, game_over_on_defeat: true };
+        let (mut world, mut messages) = exact_policy_battle_world(Some(policy));
+        let mut a = seat_story(&mut world, "A", t0, seeded_with(&[(20, 2)]), EXACT_BATTLE_BEFORE.to_vec());
+        let mut b = seat_story(&mut world, "B", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &a, &b, t0);
+        a.drain(); b.drain();
+        assert!(world.start_story_battle(a.entity, 7, 3, t0));
+        let id = world.players.get(&a.entity).unwrap().battle.unwrap();
+        let (a_token, b_token) = (exact_battle_pending(&mut a), exact_battle_pending(&mut b));
+        assert!(world.ordinary_battle_pending_ack(a.entity, a_token, t0));
+        assert!(world.ordinary_battle_pending_ack(b.entity, b_token, t0));
+        let (accounts, done) = exact_battle_snapshot(&mut messages);
+        done.send(Ok(exact_battle_states(&world, &accounts))).expect("initial snapshot");
+        world.advance_ordinary_battles(t0);
+        for started in [a.drain(), b.drain()] {
+            assert!(started.iter().any(|message| matches!(message, ServerMsg::EncounterStart { game_over_on_defeat: true, .. })),
+                "each client knows this authored defeat returns to title");
+        }
+        // Formation3 starts ready. One grenade is accepted and paid, but cannot kill its 200HP enemy.
+        let ready = until_ready(&mut world, id, ActorId(0), t0);
+        assert_eq!(world.battle_command(a.entity, id, ActorId(0), Command::Item { item: 20, target: Target::One(ActorId(2)) }, ready), BattleReply::Done);
+        assert!(world.battle.as_ref().unwrap().battles.get(&id).unwrap().state.outcome().is_none());
+        assert!(matches!(messages.try_recv().expect("one accepted item debit"), Msg::Save(crate::saver::SaveJob { change: crate::saver::SavedChange::UsedItem(20), .. })));
+        let post_item = exact_battle_states(&world, &accounts);
+        let mut terminal = None;
+        let mut ended = ready;
+        for second in 1..=600 {
+            ended = ready + Duration::from_secs(second);
+            world.advance_battles(ended);
+            exact_battle_assert_no_completion(&a.drain());
+            exact_battle_assert_no_completion(&b.drain());
+            if let Ok(message) = messages.try_recv() {
+                let Msg::StoryBattleSnapshot { accounts, done } = message else { panic!("defeat must first queue its ordered terminal snapshot"); };
+                terminal = Some((accounts, done));
+                break;
+            }
+        }
+        let (terminal_accounts, done) = terminal.expect("passive players eventually lose to the synthetic enemy");
+        assert_eq!(terminal_accounts, accounts);
+        assert!(!world.battle.as_ref().unwrap().battles.contains_key(&id));
+        assert!(world.in_battle(a.entity) && world.in_battle(b.entity), "unacknowledged defeat keeps every input hold");
+        done.send(Ok(post_item)).expect("terminal snapshot");
+        world.advance_ordinary_battles(ended);
+        let (job, done) = exact_battle_outcome(&mut messages);
+        assert_eq!(job.expected_story, EXACT_BATTLE_BEFORE);
+        assert_eq!(job.next_story, EXACT_BATTLE_BEFORE, "defeat cannot advance the winning story point");
+        assert!(job.members.iter().all(|member| member.battle.consumed_items.is_empty() && member.battle.reward.is_nothing()),
+            "accepted costs are already paid and defeat earns no resources");
+        exact_battle_assert_no_completion(&a.drain());
+        exact_battle_assert_no_completion(&b.drain());
+        let committed = exact_battle_committed(&job, &rules);
+        let saved_a = committed.current.iter().find(|state| state.pair.story.account_id == a.account).unwrap().clone();
+        done.send(Ok(committed)).expect("durable defeated outcome");
+        world.advance_ordinary_battles(ended);
+        for (seat, token) in [(&mut a, a_token), (&mut b, b_token)] {
+            let output = seat.drain();
+            assert_eq!(output.iter().filter(|message| matches!(message, ServerMsg::BattleEnd { battle_id, outcome: Outcome::Defeat, .. } if *battle_id == id)).count(), 1);
+            assert!(output.iter().any(|message| matches!(message, ServerMsg::CharacterProgress { .. })));
+            assert!(!output.iter().any(|message| matches!(message, ServerMsg::StoryCommitted { .. } | ServerMsg::StoryUpdate { .. })),
+                "the acknowledged game over cannot free or advance the field");
+            let player = world.players.get(&seat.entity).unwrap();
+            assert_eq!((player.battle, player.story_pending), (Some(id), Some(token)));
+            assert!(world.ordinary_battle_account_held(seat.account));
+            assert_eq!(world.apply_move(seat.entity, Pos::new(-90.0, 0.0, 0.0), 0.0, AnimState::Walk, ended), MoveOutcome::Frozen);
+        }
+        assert!(world.leave(a.entity), "returning to title closes this settled session");
+        assert!(!world.ordinary_battle_account_held(a.account), "this departed account is independently settled");
+        assert!(world.ordinary_battle_account_held(b.account) && world.in_battle(b.entity), "another player's game-over screen remains held");
+        assert!(messages.try_recv().is_err(), "leaving a settled game over needs no further save or snapshot");
+        let (session, entity) = world.allocate_ids();
+        let (tx, rx) = mpsc::channel(4096);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "A returned".into(), tint: [1, 2, 3], appearance_ref: None };
+        let record = saved_a.pair.character.as_ref().unwrap();
+        let progress = ProgressSeed { character: record.character, stored: Some(Progress::from_record(record)), inventory: record.inventory.clone() };
+        world.join(NewPlayer { session, entity, account: a.account, avatar, progression: saved_a.pair.story.blob.clone(),
+            progress, scene_state: None, scene_group: Vec::new(), tx, close }, ended).expect("a new session uses the acknowledged predecessor and paid bag");
+        let mut returned = Seat { entity, account: a.account, rx, log: Vec::new() };
+        let joined = returned.drain();
+        assert_eq!(world.players.get(&entity).unwrap().progression, EXACT_BATTLE_BEFORE);
+        assert_eq!(mirror_of(&world, &returned), [(20, 1)], "the accepted grenade stays spent across title and login");
+        assert!(!world.in_battle(entity) && !world.ordinary_battle_account_held(a.account));
+        assert!(!joined.iter().any(|message| matches!(message, ServerMsg::BattleEnd { .. } | ServerMsg::EncounterStart { .. } | ServerMsg::StoryPending { .. })));
+        assert!(world.ordinary_battle_account_held(b.account));
+        assert!(messages.try_recv().is_err(), "login cannot replay the defeat's item cost or outcome receipt");
+        assert!(world.leave(b.entity));
+        assert!(!world.ordinary_battle_account_held(b.account));
+    }
+
+    #[test]
+    fn an_old_battle_roster_reserves_a_relogged_account_from_starting_or_joining_an_exact_story_battle() {
+        let t0 = Instant::now();
+        let (mut world, mut messages) = exact_story_battle_world(SyntheticRules::default());
+        let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        let b = seat_story(&mut world, "B", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &a, &b, t0);
+        assert_eq!(world.request_encounter(a.entity, Some(3), t0), BattleReply::Done);
+        let old_battle = world.players.get(&a.entity).unwrap().battle.unwrap();
+        a.drain();
+        assert!(world.leave(b.entity));
+        assert!(world.account_in_battle(b.account), "B's retained fighter can still earn an old battle reward");
+        let (session, entity) = world.allocate_ids();
+        let (tx, rx) = mpsc::channel(4096);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "B returned".into(), tint: [1, 2, 3], appearance_ref: None };
+        world.join(NewPlayer { session, entity, account: b.account, avatar, progression: EXACT_BATTLE_BEFORE.to_vec(),
+            progress: ProgressSeed::default(), scene_state: None, scene_group: Vec::new(), tx, close }, t0).expect("legacy battle relogin remains supported");
+        let mut returned = Seat { entity, account: b.account, rx, log: Vec::new() };
+        returned.drain();
+        assert!(!world.in_battle(entity), "the replacement entity is not driving its old fighter");
+        assert!(!world.start_story_battle(entity, 7, 3, t0), "stable account reservation prevents a second reward writer");
+        assert!(world.players.get(&entity).unwrap().story_pending.is_none());
+        assert!(returned.drain().is_empty());
+        assert!(messages.try_recv().is_err(), "the refused owner never queued an exact baseline");
+        let mut c = seat_story(&mut world, "C", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &c, &returned, t0);
+        c.drain(); returned.drain();
+        assert!(world.start_story_battle(c.entity, 7, 3, t0));
+        let token = exact_battle_pending(&mut c);
+        let (accounts, done) = exact_battle_snapshot(&mut messages);
+        assert_eq!(accounts, [c.account], "recruiting a relogged fighter cannot duplicate its stable account into another roster");
+        assert!(world.players.get(&entity).unwrap().story_pending.is_none());
+        assert!(!world.ordinary_battle_account_held(returned.account));
+        assert!(world.account_in_battle(returned.account), "the original engine still retains that account");
+        assert!(world.ordinary_battle_pending_ack(c.entity, token, t0));
+        done.send(Ok(exact_battle_states(&world, &accounts))).expect("C's exact baseline");
+        world.advance_ordinary_battles(t0);
+        let output = c.drain();
+        let party = output.iter().find_map(|message| match message {
+            ServerMsg::EncounterStart { party, .. } => Some(party), _ => None,
+        }).expect("C starts its own held story fight");
+        assert_eq!(party.iter().filter_map(BattleMember::account).collect::<Vec<_>>(), [c.account]);
+        assert!(!returned.drain().iter().any(|message| matches!(message, ServerMsg::StoryPending { .. } | ServerMsg::EncounterStart { .. })));
+        let old = world.battle.as_ref().unwrap().battles.get(&old_battle).expect("A continues the old co-op battle");
+        assert!(old.members.iter().any(|member| member.info.account() == Some(b.account) && !member.connected));
+        assert!(messages.try_recv().is_err());
+    }
+
+    const RESERVED_ACCOUNT_SCENE: &str = "test/reserved-account-scene";
+
+    struct RetainedAccountSceneHost {
+        evaluations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::world::SceneHost for RetainedAccountSceneHost {
+        fn scenes(&self) -> Vec<crate::world::SceneInfo> {
+            vec![crate::world::SceneInfo { id: RESERVED_ACCOUNT_SCENE.into(), field: FIXTURE_AREA_KEY.into(),
+                arrival: Pos::default(), arrival_facing: 0.0, arrival_hint: None }]
+        }
+        fn offered(&self, scene: &str, progress: &[u8]) -> bool { scene == RESERVED_ACCOUNT_SCENE && progress == EXACT_BATTLE_BEFORE }
+        fn continuation(&self, scene: &str) -> bool { scene == RESERVED_ACCOUNT_SCENE }
+        fn point_continuation(&self, field: &str, progress: &[u8], point: u32) -> Option<String> {
+            (field == FIXTURE_AREA_KEY && progress == EXACT_BATTLE_BEFORE && point == 99).then(|| RESERVED_ACCOUNT_SCENE.into())
+        }
+        fn line_scene(&self, field: &str, progress: &[u8], _: Pos, _: Pos) -> Option<String> {
+            (field == FIXTURE_AREA_KEY && progress == EXACT_BATTLE_BEFORE).then(|| RESERVED_ACCOUNT_SCENE.into())
+        }
+        fn trigger(&self, _: &str, _: &[u8]) -> Option<crate::world::TriggerInfo> { None }
+        fn preview_progress(&self, _: &str) -> Option<Vec<u8>> { None }
+        fn finish(&self, _: &str, _: &[u8], _: u32, _: &[u8]) -> Option<crate::world::SceneResult> {
+            panic!("this strict scene has no legacy completion")
+        }
+        fn evaluate_continuation(&self, scene: &str, progress: &[u8], _: u32, gil: u32,
+            _: Option<&fmv_protocol::SceneReplay>) -> Option<crate::world::SceneBoundary> {
+            self.evaluations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (scene == RESERVED_ACCOUNT_SCENE && progress == EXACT_BATTLE_BEFORE).then(|| crate::world::SceneBoundary {
+                source: [92; 32], progress: progress.to_vec(), gil,
+                at: crate::world::SceneBoundaryKind::Window { step: 0, identity: vec![1], choices: None },
+            })
+        }
+    }
+
+    #[test]
+    fn an_old_battle_roster_blocks_relogged_strict_scene_owners_and_watchers_before_resource_capture() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let t0 = Instant::now();
+        let rules = player_limit_rules();
+        let (mut world, mut messages) = exact_story_battle_world(rules);
+        let host = Arc::new(RetainedAccountSceneHost { evaluations: AtomicUsize::new(0) });
+        world.configure_scenes(Some(crate::world::SceneSettings { host: host.clone(), debug_preview: false, debug_new_story: None }));
+        let mut a = seat_story(&mut world, "A", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        let b = seat_story(&mut world, "B", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &a, &b, t0);
+        assert_eq!(world.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
+        let old_battle = world.players.get(&a.entity).unwrap().battle.unwrap();
+        a.drain();
+        assert!(world.leave(b.entity));
+        assert!(world.account_in_battle(b.account));
+        let (session, entity) = world.allocate_ids();
+        let (tx, rx) = mpsc::channel(4096);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: "B returned".into(), tint: [1, 2, 3], appearance_ref: None };
+        world.join(NewPlayer { session, entity, account: b.account, avatar, progression: EXACT_BATTLE_BEFORE.to_vec(),
+            progress: ProgressSeed::default(), scene_state: None, scene_group: Vec::new(), tx, close }, t0).expect("legacy relogin");
+        let mut returned = Seat { entity, account: b.account, rx, log: Vec::new() };
+        returned.drain();
+        let before = world.players.get(&entity).unwrap().progress.unwrap();
+        let from = world.players.get(&entity).unwrap().snapshot.pos;
+        let to = Pos::new(from.x + 1.0, from.y, from.z);
+        assert!(!world.in_battle(entity), "the replacement entity has no battle marker");
+        assert!(!world.start_point_continuation(entity, 99, t0), "point scenes must inspect stable account reservations");
+        assert!(!world.check_scene_line(entity, from, to, t0), "line scenes must inspect stable account reservations");
+        assert_eq!(host.evaluations.load(Ordering::SeqCst), 0, "a reserved account never captures gil or evaluates a strict source");
+        assert!(!world.in_scene(entity));
+        assert!(returned.drain().is_empty());
+        assert!(messages.try_recv().is_err(), "refused scene entry never queued a scene transaction");
+
+        let mut c = seat_story(&mut world, "C", t0, ProgressSeed::default(), EXACT_BATTLE_BEFORE.to_vec());
+        party_up(&mut world, &c, &returned, t0);
+        c.drain(); returned.drain();
+        // Keep both eligible by position and instance so exclusion specifically tests the old account reservation.
+        let c_pos = world.players.get(&c.entity).unwrap().snapshot.pos;
+        world.players.get_mut(&entity).unwrap().snapshot.pos = c_pos;
+        assert_eq!(world.instances.instance_of(c.account), world.instances.instance_of(returned.account));
+        assert!(world.start_point_continuation(c.entity, 99, t0));
+        let started = c.drain();
+        let run = started.iter().find_map(|message| match message {
+            ServerMsg::SceneStart { run, participants, you: fmv_protocol::SceneRole::Owner, replay: Some(_), .. } => {
+                assert_eq!(participants.iter().map(|member| member.entity).collect::<Vec<_>>(), [c.entity],
+                    "a nearby party member whose old fighter can still earn is not a strict-scene watcher");
+                Some(*run)
+            }
+            _ => None,
+        }).expect("the unrelated free owner starts its strict scene");
+        assert_eq!(host.evaluations.load(Ordering::SeqCst), 1);
+        assert!(!world.in_scene(entity));
+        assert!(!returned.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { .. })));
+        assert!(messages.try_recv().is_err(), "the initial window has no durable scene boundary to save");
+        assert!(world.battle.as_ref().unwrap().battles.get(&old_battle).unwrap().members.iter()
+            .any(|member| member.info.account() == Some(b.account) && !member.connected));
+
+        play_out(&mut world, &mut [&mut a], &rules, t0);
+        assert!(!world.account_in_battle(b.account));
+        let after = world.players.get(&entity).unwrap().progress.unwrap();
+        assert!(after.gil > before.gil && after.exp > before.exp, "the old reward still follows the stable account into its replacement session");
+        assert_eq!(world.players.get(&entity).unwrap().progression, EXACT_BATTLE_BEFORE);
+        assert!(!world.in_scene(entity));
+        let paid = returned.drain();
+        assert!(paid.iter().any(|message| matches!(message, ServerMsg::CharacterProgress { gil, .. } if *gil == after.gil)));
+        assert!(!paid.iter().any(|message| matches!(message, ServerMsg::SceneStart { .. } | ServerMsg::SceneEnded { .. })));
+        let mut old_jobs = Vec::new();
+        while let Ok(message) = messages.try_recv() {
+            match message {
+                Msg::Save(job) => old_jobs.push(job),
+                _ => panic!("no strict-scene snapshot, batch or story write may accompany the old battle reward"),
+            }
+        }
+        assert!(old_jobs.iter().any(|job| job.account == b.account && matches!(job.change, crate::saver::SavedChange::Reward(_))));
+        assert_eq!(host.evaluations.load(Ordering::SeqCst), 1, "paying the old fighter cannot re-enter or evaluate a new scene");
+        assert!(world.in_scene(c.entity));
+        world.scene_message(c.entity, fmv_protocol::ClientMsg::SceneEnd { run, skipped: true }, t0);
+        assert!(!world.in_scene(c.entity));
+        assert!(messages.try_recv().is_err(), "aborting the untouched window cannot save anything");
     }
 }

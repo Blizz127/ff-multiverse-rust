@@ -39,11 +39,13 @@ impl World {
     }
 
     /// A membership or leadership change can re-phase every member, including someone other
-    /// than the requester. A durable continuation owns that cohort until its last acknowledgment.
+    /// than the requester. Pending story and battle saves own their cohorts through acknowledgment.
     fn party_change_held(&self, account: AccountId) -> bool {
-        self.continuation_account_held(account)
+        let held = |account| self.continuation_account_held(account)
+            || self.ordinary_story_account_held(account) || self.ordinary_battle_account_held(account);
+        held(account)
             || self.parties.party_of(account).is_some_and(|party|
-                party.members.iter().any(|member| self.continuation_account_held(*member)))
+                party.members.iter().any(|member| held(*member)))
     }
 
     fn invite_change_held(&self, account: AccountId, invite: InviteId) -> bool {

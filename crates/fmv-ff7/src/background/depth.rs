@@ -232,9 +232,18 @@ pub fn decode_background_tiles_with_depth_options(
     field: &FieldFile,
     options: &BackgroundOptions,
 ) -> Result<Vec<DepthTile>, FieldError> {
-    let background = field.background()?;
     let palette = field.palette()?;
-    depth_tiles(&background, &palette, options)
+    decode_background_tiles_with_depth_palette(field, &palette, options)
+}
+
+/// The depth-tested path with the same live palette as the flat background decoder.
+pub fn decode_background_tiles_with_depth_palette(
+    field: &FieldFile,
+    palette: &Palette,
+    options: &BackgroundOptions,
+) -> Result<Vec<DepthTile>, FieldError> {
+    let background = field.background()?;
+    depth_tiles(&background, palette, options)
 }
 
 /// Same as [`decode_background_tiles_with_depth_options`] for an already parsed background and palette.

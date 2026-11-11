@@ -30,6 +30,12 @@ pub trait SceneSource {
     /// Durable continuations use the original script's exact boundaries and source identity.
     fn fingerprint(&self) -> Option<[u8; 32]> { None }
     fn boundary(&self) -> Option<SceneBoundary> { None }
+    /// Retained input is available only from the reviewed, strictly completed train-entry
+    /// profile. A generic scene or a moment-51 initializer cannot manufacture a ready anchor.
+    #[cfg_attr(not(test), allow(dead_code))] // Ready-anchor admission remains gated.
+    fn train_arrival_record(&self) -> Result<Vec<u8>, String> {
+        Err("this source is not a completed checked train entry".into())
+    }
     fn next_checked(&mut self, answer: Option<usize>) -> Result<Beat, String> { Ok(self.next(answer)) }
     fn resume_battle(&mut self, _checkpoint: BattleCheckpoint, _story: StoryState, _gil: u32) -> Result<(), String> {
         Err("this scene source cannot continue after combat".into())
@@ -66,6 +72,9 @@ impl SceneSource for ScenePlay {
 
     fn fingerprint(&self) -> Option<[u8; 32]> { Some(self.replay_identity().fingerprint) }
     fn boundary(&self) -> Option<SceneBoundary> { ScenePlay::boundary(self) }
+    fn train_arrival_record(&self) -> Result<Vec<u8>, String> {
+        fmv_ff7::script::scene::train_arrival::codec::encode_train_arrival(self).map_err(|e| e.to_string())
+    }
     fn next_checked(&mut self, answer: Option<usize>) -> Result<Beat, String> {
         let ack = match self.boundary() {
             Some(SceneBoundary::Window(checkpoint)) => Some(WindowAck {

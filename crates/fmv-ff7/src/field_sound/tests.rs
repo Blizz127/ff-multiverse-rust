@@ -280,6 +280,35 @@ fn an_if_on_the_moment_picks_the_branch_for_the_story_the_player_has() {
 }
 
 #[test]
+fn native_party_stories_refuse_sound_before_ignored_party_writes_can_select_a_stale_branch() {
+    // PRTYE replaces raw slot 0 with Cloud; the following Barret test must not be
+    // judged from the original slot. The existing v3 planner behavior stays unchanged.
+    let code = cat(&[vec![0xCA, 0, 254, 254], when_byte(3, 9, 0, 1, &sound(42, 64))]);
+    let bytes = section(vec![director(&code, &[])]);
+    let mut legacy = story(11).into_extended().unwrap();
+    legacy.write_byte(3, 9, 1).unwrap();
+    let (events, stop, _) = run_slot(&bytes, 0, 0, &legacy, 0);
+    assert_eq!(plays(&events), [(0, 1, 42)]);
+    assert_eq!(stop, Stop::Returned);
+    assert_eq!(plays(&start_up(&parsed(&bytes), &legacy).events), [(0, 1, 42)]);
+
+    let unknown = legacy.into_native_party().unwrap();
+    let mut known = unknown.clone();
+    known.native_party_mut().unwrap().write_main_slots([1, 255, 255], 0b111).unwrap();
+    for native in [unknown, known] {
+        let before = native.encode();
+        let (events, stop, machine) = run_slot(&bytes, 0, 0, &native, 0);
+        assert!(events.is_empty());
+        assert_eq!(stop, Stop::NativePartyUnsupported);
+        assert!(machine.runs.iter().all(|run| run.frames.is_none() && run.open == 0b1111));
+        let start = start_up(&parsed(&bytes), &native);
+        assert!(start.events.is_empty() && start.ambient(|_| true).is_empty());
+        assert!(start.runs.iter().all(|run| run.stop == Stop::NativePartyUnsupported));
+        assert_eq!(native.encode(), before);
+    }
+}
+
+#[test]
 fn a_test_of_a_tracked_bit_reads_that_bit_and_one_of_an_untracked_variable_stops_the_run_and_is_counted() {
     // IFUB Var[1][225] bit-off 0 (op 10): true while the lift is up
     let lift_up = cat(&[when_byte(REACTOR_STATE.bank, REACTOR_STATE.address, 10, 0, &play(1, 42)), ret()]);

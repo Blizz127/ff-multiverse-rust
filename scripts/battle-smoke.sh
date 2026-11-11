@@ -14,7 +14,9 @@
 # `--companions-player-commanded=false`, the behaviour of v9 to v16: the roster names no commander (`commander=-`) and the
 # server commands the pair on their own gauges (`companion acted ... held_ms=..`). The checks that follow hold in both.
 #
-# PROTOCOL v9: every battle's party is the story's canon party first (Cloud and Barret in the first mission, commanded as above
+# These battle-only runs seed moment 11 in their throw-away server store: the authored reactor-door party has
+# Cloud and Barret together then. They do not exercise the opening story transition (slice-smoke.sh does).
+# PROTOCOL v9: every battle's party is the story's canon party first (Cloud and Barret at this seeded moment, commanded as above
 # with ordinary commands every client replays, logged `companion acted battle=.. actor=.. name=.. command=..`)
 # and then the players, whose characters are ADDED to it. So the server's per-fighter lists (`levels=`, `limits=`, `names=`,
 # `commands=`) carry `companions=2` and list the two companions first; this script's helpers read the PLAYERS' part
@@ -770,6 +772,7 @@ run_real() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then
@@ -979,6 +982,7 @@ run_solo() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then
@@ -1097,6 +1101,7 @@ run_random() {
 
   # No --debug-encounters and no --no-random-encounters: only the field's own table starts battles.
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   if [[ -n $SEED ]]; then
     server_args+=(--battle-seed "$SEED")
@@ -1389,6 +1394,7 @@ run_progress() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then
@@ -1613,6 +1619,7 @@ run_commands() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --debug-limit-full --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then
@@ -1913,6 +1920,7 @@ run_status() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --debug-status "$STATUS_LIST" --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then
@@ -2106,6 +2114,7 @@ run_boss() {
   export FMV_STATE_DIR="$WORK/state-env"
 
   local -a server_args=(--bind 127.0.0.1:0 --ff7-library "$WORK/lib-state" --state-dir "$WORK/server-state"
+    --debug-start-moment 11
     --debug-encounters --no-random-encounters --battle-speed "$BATTLE_SPEED" --battle-tick-rate "$TICK_RATE" --battle-level "$BOSS_LEVEL")
   server_args+=(--debug-formation "$FORMATION")
   if [[ -n $SEED ]]; then

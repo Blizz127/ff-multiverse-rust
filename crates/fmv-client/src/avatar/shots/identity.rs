@@ -88,7 +88,7 @@ fn dressed(frame: &AvatarFrame, look: Look) -> AvatarFrame {
         Look::Old => (frame.identities.iter().map(|i| if i.strength > 0.0 { body_tint(bytes(i)) } else { Tint::NONE }).collect(), Vec::new()),
         Look::New => (frame.tints.clone(), frame.identities.clone()),
     };
-    AvatarFrame { models, tints, identities, zoom: frame.zoom, overlay_bias: frame.overlay_bias, ground: frame.ground.clone(), scenery: frame.scenery.clone() }
+    AvatarFrame { models, tints, identities, zoom: frame.zoom, field_depth: frame.field_depth, overlay_bias: frame.overlay_bias, ground: frame.ground.clone(), scenery: frame.scenery.clone() }
 }
 
 const W1: u32 = 1920;

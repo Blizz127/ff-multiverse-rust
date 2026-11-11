@@ -64,8 +64,10 @@
 //! 5. the picture's blended tiles (glows, shadows, glass; any of the four PlayStation modes), over
 //!    the models, depth tested but not written, in paint order.
 //!
-//! Every depth of the frame goes through one fixed mapping, the engine's own perspective z (near 50,
-//! far 32 000); see [`scenery`] for why a mapping fitted to the models would be wrong. At one window
+//! Every depth of the frame goes through one mapping fixed for the field: the PC engine's
+//! perspective z calibrated from its baked depths, or the existing near-50/far-32 000 fallback.
+//! Reliable calibrations also enable homogeneous model clipping; fields without one retain the
+//! old clamped geometry policy. See [`scenery`] for why fitting to the models would be wrong. At one window
 //! pixel per picture pixel the tile picture is the flat picture bit for bit (a test checks it on
 //! `md1stin` and `md1_1`); a field with nothing in front, or a frame without models, still draws the
 //! flat picture as before.

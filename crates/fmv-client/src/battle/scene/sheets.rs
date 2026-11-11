@@ -447,7 +447,7 @@ impl Rig {
             clear_rgb: [70, 78, 92],
             stage: Vec::new(),
             location: None,
-            models: AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: view.zoom as f32, overlay_bias: 3.0, ground, scenery: None },
+            models: AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: view.zoom as f32, field_depth: None, overlay_bias: 3.0, ground, scenery: None },
             tints: Vec::new(),
             identities: Vec::new(),
             camera: view.gpu_camera(),
@@ -758,6 +758,8 @@ impl Fight {
         let setup = BattleSetup {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             formation_id: formation,
             seed,
             party: characters.iter().enumerate().map(|(i, &c)| limited(i, c)).collect(),
@@ -940,6 +942,8 @@ fn party_attack_range_by_starting_weapon() {
         let setup = BattleSetup {
             initial_party: None,
             escape_policy: fmv_protocol::EscapePolicy::Formation,
+            victory_fanfare: true,
+            game_over_on_defeat: false,
             formation_id: 301,
             seed: SEED,
             party: ids.iter().map(|&c| canon(c)).collect(),

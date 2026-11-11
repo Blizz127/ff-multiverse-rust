@@ -184,6 +184,12 @@ pub fn smoke_line(smoke: &Smoke<'_>) -> String {
     format!("SMOKE name={name} area={area} fixture={fixture} peers_seen={peers_seen} updates={updates} rejected={rejected} rtt_ms={rtt_ms} party={party} battles={battles} victories={victories} area_changes={area_changes} level={level} exp={exp} items={items}")
 }
 
+/// A blocked one-shot action must remain in the bot, not be produced and then dropped by the
+/// session's outbound guard. Its field-control probe also pauses through story saves and ordinary Game Over.
+fn scene_actions(bot: &mut SceneBot, senses: &Senses<'_>, field_held: bool) -> Vec<Act> {
+    if field_held { Vec::new() } else { bot.step(senses) }
+}
+
 /// What the scene bot looks at, at session time `now` with `peers` other players in view.
 fn scene_senses(session: &Session, now: f64, peers: usize) -> Senses<'_> {
     let (echoes, echo_at) = session.state.own_echo();
@@ -395,7 +401,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         }
         // Conversations: each wanted character is talked to once, when the area has announced it (and with the
         // story this player has reached by then).
-        if !talk_bot.is_done() {
+        if !session.state.field_controls_held() && !talk_bot.is_done() {
             for line in talk_bot.step_with(&session.info.area_id.key, session.state.npc_views(), session.state.story.state()) {
                 eprintln!("{line}");
             }
@@ -419,8 +425,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         story_bot.see_party(session.state.party.party_size(), remotes.len());
         // Party requests: what the bot flags ask for, and a resync if events were lost.
         let visible: Vec<EntityId> = remotes.iter().map(|p| p.id).collect();
-        for cmd in party_bot.step(now, &session.state.party, &visible) {
-            session.send_party(cmd);
+        if !session.state.field_controls_held() {
+            for cmd in party_bot.step(now, &session.state.party, &visible) {
+                session.send_party(cmd);
+            }
         }
         session.flush_party_sync();
         // Story scenes: a bot plays one through without waiting (it moves past every window at once), and the bot's script
@@ -428,7 +436,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         // (every headless run moves past the windows of a scene it is in: without it a scene the server started for a route
         // bot would hold the bot until the server's own timeout, and the story the scene carries would never move)
         let scene_now = Instant::now();
-        let scene_visible = !session.state.battle.in_battle() && !session.state.battle.lingering(now);
+        let scene_visible = !session.state.field_controls_held() && !session.state.battle.in_battle() && !session.state.battle.lingering(now);
         session.state.scene.advance_visible(scene_now.duration_since(scene_tick).as_secs_f32(), scene_visible);
         scene_tick = scene_now;
         if scene_visible {
@@ -443,7 +451,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             }
         }
         if scene_bot.is_active() {
-            let acts = scene_bot.step(&scene_senses(&session, now, remotes.len()));
+            let acts = scene_actions(&mut scene_bot, &scene_senses(&session, now, remotes.len()), session.state.field_controls_held());
             for act in acts {
                 match act {
                     Act::Preview(id) => session.state.scene.request_preview(&id),
@@ -467,8 +475,10 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         session.flush_scene();
         session.log_scene_notes();
         // Battles: attack when our gauge is full, ask for a debug encounter (once) if told to.
-        for cmd in battle_bot.step(now, &session.state.battle, &session.state.party) {
-            session.send_battle(cmd);
+        if !session.state.field_controls_held() || session.state.battle.in_battle() {
+            for cmd in battle_bot.step(now, &session.state.battle, &session.state.party) {
+                session.send_battle(cmd);
+            }
         }
         for note in battle_bot.drain_script_notes() {
             eprintln!("battle: script: {note}");
@@ -478,7 +488,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
         // A player in a battle is frozen in the field: it neither walks nor sends movement. So is one held in a story scene,
         // and one that plays a scene stands still from the moment it asks for its preview (it must stand where its press is
         // judged, and its probe of control afterwards must be the only move it makes).
-        let frozen = session.state.battle.in_battle() || session.state.scene.is_active() || scene_bot.holds_still();
+        let frozen = session.state.field_controls_held() || session.state.battle.in_battle() || session.state.scene.is_active() || scene_bot.holds_still();
         // Whoever moved the player, the bots of an area with links keep the arming of its walk-on lines from what
         // they see (a step is a step, a jump is the server putting the player somewhere).
         if story_bot.is_requested() {
@@ -526,7 +536,7 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             session.state.own.set_motion(step.pos, facing, anim);
         }
         own_walk.feed(session.state.own.pos());
-        if !frozen || scene_bot.probing() {
+        if !session.state.field_controls_held() && (!frozen || scene_bot.probing()) {
             session.flush_intent();
         }
         if !frozen {
@@ -672,6 +682,23 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
 mod tests {
     use super::*;
     use fmv_core::GameId;
+
+    #[test]
+    fn a_pending_save_does_not_consume_the_scene_bots_one_shot_preview() {
+        let scene = fmv_ff7::script::scene::PROOF_SCENE_ID;
+        let mut bot = SceneBot::new(SceneBotConfig {
+            preview: Some(scene.into()), watch: false, answer: None, wait: Duration::from_secs(60),
+            watchers: 0, invite_first_peer: false, accept: false,
+        });
+        let mut senses = Senses { now: 0.0, npcs: &[], npc_epoch: 0, party_size: 0, peers_in_view: 0,
+            unsent: false, echoes: 0, echo_at: None, rejected: 0 };
+        assert!(scene_actions(&mut bot, &senses, true).is_empty());
+        senses.now = 120.0;
+        assert!(scene_actions(&mut bot, &senses, true).is_empty());
+        assert!(!bot.is_done(), "waiting for storage did not start and time out a discarded preview");
+        assert_eq!(scene_actions(&mut bot, &senses, false), [Act::Preview(scene.into())]);
+        assert!(scene_actions(&mut bot, &senses, false).is_empty(), "the retained action is sent once after release");
+    }
 
     #[test]
     fn the_character_line_says_what_the_server_holds_in_percent_encoded_key_value_tokens() {

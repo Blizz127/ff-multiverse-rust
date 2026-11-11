@@ -18,7 +18,8 @@
 //!    without touching the store, so a connection can be refused for it BEFORE it takes a place in
 //!    the registration rate limits (`limits`) and before anything is written.
 //! 2. [`register`] creates the account and its avatar in ONE store call; [`register_with_rules`]
-//!    adds the authored starting progress to that same commit. Both build the reply from its result without
+//!    adds the authored starting progress, and [`register_with_initial_state`] also accepts a fresh story.
+//!    Each builds the reply from the same commit's result without
 //!    reading anything else. So once the name is committed there is nothing left that can fail
 //!    before the token is in the caller's hands.
 //! 3. The caller delivers the token immediately. If the `Welcome` that carries it is never
@@ -53,7 +54,7 @@
 //! cannot put an arbitrary string in front of other players either.
 
 use fmv_core::{AccountId, AvatarAppearance, GameId, NameError, PhaseKey};
-use fmv_persist::{NewCharacterProgress, NewPlayerCharacter, PersistError, SceneState, Store};
+use fmv_persist::{NewCharacterProgress, NewPlayerCharacter, NewProgression, PersistError, SceneState, Store};
 #[cfg(test)]
 use fmv_persist::CharacterProgress;
 use fmv_protocol::{BattleRules, CharacterCard, NewCharacter, RejectCode, Secret};
@@ -83,7 +84,7 @@ pub struct Login {
     /// its binding.
     pub avatar: AvatarAppearance,
     /// The account's story progression for the hosted game: the stored blob, which only the game's
-    /// adapter reads (empty for a new account and for one that never advanced; see
+    /// adapter reads (a new account may have an explicit game-authored seed; see
     /// [`kept_progression`] for what becomes of an enormous one). The world turns it into the phase of
     /// each area the player stands in.
     pub progression: Vec<u8>,
@@ -330,17 +331,26 @@ fn login_with_token_inner(store: &Store, game: GameId, token: &Secret, tint: [u8
 ///
 /// This variant has no battle rules, so it leaves character progress unstored. A brand-new account
 /// has no story progression (the empty blob: a new account to every game), and nothing else is read.
+#[cfg(test)]
 pub fn register(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce()) -> Result<Login, LoginError> {
-    register_inner(store, game, registration, now, on_created, None)
+    register_with_initial_state(store, game, registration, now, on_created, None, None)
 }
 
 /// Atomically create the identity and its authored starting resources before issuing the token.
 /// The returned progress is the committed record, with an explicit starting inventory.
+#[cfg(test)]
 pub fn register_with_rules(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce(), rules: &dyn BattleRules) -> Result<Login, LoginError> {
-    register_inner(store, game, registration, now, on_created, Some(rules))
+    register_with_initial_state(store, game, registration, now, on_created, Some(rules), None)
 }
 
-fn register_inner(store: &Store, game: GameId, registration: Registration, now: u64, on_created: impl FnOnce(), rules: Option<&dyn BattleRules>) -> Result<Login, LoginError> {
+/// Atomically create identity, optional authored resources, and the host's explicit initial
+/// story. Only registration calls this; an existing or imported save is never initialized here.
+/// Check the wire bound before taking the name, so the committed story can be returned intact.
+pub fn register_with_initial_state(store: &Store, game: GameId, registration: Registration, now: u64,
+    on_created: impl FnOnce(), rules: Option<&dyn BattleRules>, story: Option<Vec<u8>>) -> Result<Login, LoginError> {
+    if story.as_ref().is_some_and(|blob| blob.len() > MAX_PROGRESSION_BYTES) {
+        return Err(LoginError::Internal("the game's initial story exceeds the supported progression size".into()));
+    }
     let Registration { name, tint, creation } = registration;
     let initial = rules.map(|rules| {
         let progress = progress::new_character(rules, creation.entry.slot.unwrap_or(progress::DEFAULT_CHARACTER));
@@ -348,8 +358,9 @@ fn register_inner(store: &Store, game: GameId, registration: Registration, now: 
             gil: progress.gil, limit: progress.limit, inventory: Some(crate::inventory::Inventory::resolve(rules, None).entries().to_vec()) }
     });
     let wanted = NewPlayerCharacter::for_game(creation.body.clone(), game, creation.entry.clone());
-    let (registered, initial) = store
-        .register_with_character_and_progress(&name, tint, DEFAULT_ARCHETYPE, creation.v7_look.map(|look| (game, look)), Some(wanted), initial, now)
+    let (registered, initial, story) = store
+        .register_with_character_and_initial_state(&name, tint, DEFAULT_ARCHETYPE, creation.v7_look.map(|look| (game, look)), Some(wanted), initial,
+            story.map(|blob| NewProgression { game, blob }), now)
         .map_err(map_store_error)?;
     on_created();
     // The record the store returned is what was written. (It always returns one when it was given one; the
@@ -362,7 +373,7 @@ fn register_inner(store: &Store, game: GameId, registration: Registration, now: 
     Ok(Login {
         account: registered.account_id,
         avatar,
-        progression: Vec::new(),
+        progression: story.map_or_else(Vec::new, |story| story.blob),
         issued_token: Some(registered.token),
         progress: ProgressSeed { character: slot.unwrap_or(progress::DEFAULT_CHARACTER), stored: initial.as_ref().map(Progress::from_record),
             inventory: initial.and_then(|record| record.inventory) },

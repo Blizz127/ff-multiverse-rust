@@ -7,8 +7,31 @@
 //! host. Bump the domain version if this encoding or the interpreter's replay contract changes.
 
 use super::data::{SceneDef, ScriptRef, Spot, Step};
+use crate::script::FieldScratch;
 
 const DOMAIN: &[u8] = b"fmv-ff7/scene-replay-identity\0v1\0";
+
+/// Fresh entry is different from an existing visit even when both begin with zero bytes.
+pub(super) fn fingerprint_train_entry(checked: [u8; 32], profile: [u8; 32]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fmv-ff7/train-entry-replay\0v1\0quiet-zero-time-init\0");
+    hash.update(&checked);
+    hash.update(&profile);
+    *hash.finalize().as_bytes()
+}
+
+/// Opt-in checked visits bind their original values and knowledge independently of source code.
+/// Absence delegates byte-for-byte to the legacy identity; no deployed replay changes meaning.
+pub(super) fn fingerprint_with_scratch(section: &[u8], def: &SceneDef, scratch: Option<&FieldScratch>) -> [u8; 32] {
+    let source = fingerprint(section, def);
+    let Some(scratch) = scratch else { return source };
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fmv-ff7/scene-checked-scratch\0v1\0");
+    hash.update(&source);
+    hash.update(scratch.values());
+    hash.update(scratch.known_masks());
+    *hash.finalize().as_bytes()
+}
 
 /// The exact script and semantic definition a resumable replay was constructed with. Integers
 /// are little-endian; strings, raw bytes and lists have u64 lengths; variants have explicit tags.
@@ -61,6 +84,15 @@ pub(super) fn fingerprint(section: &[u8], def: &SceneDef) -> [u8; 32] {
         None => out.byte(0),
     }
     out.optional_word(def.resume_after_battle);
+    let name_sites = super::default_names::sites(section, def);
+    if !name_sites.is_empty() {
+        // V3 playback authorizes this policy; legacy playback still ignores these menus.
+        // The host separately binds the story encoding. A v3 replay cannot be reconstructed
+        // as an older ignored MENU run. The exact original bytes are already bound above.
+        out.bytes(super::default_names::POLICY);
+        out.len(name_sites.len());
+        for (offset, character) in name_sites { out.len(offset); out.byte(character); }
+    }
     *out.0.finalize().as_bytes()
 }
 

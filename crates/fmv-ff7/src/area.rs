@@ -210,6 +210,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 const JESSIE_RESCUED_PHASE: u8 = b'J';
 const JESSIE_LOWER_PHASE: u8 = b'L';
 const JESSIE_TRAPPED_PHASE: u8 = b'T';
+const JESSIE_UNKNOWN_PHASE: u8 = b'U';
 const MATERIA_HIDDEN_PHASE: u8 = b'H';
 const RUN_AHEAD_HIDDEN_PHASE: u8 = b'R';
 const JESSIE_DESCENDED_PHASE: u8 = b'D';
@@ -749,6 +750,10 @@ impl GameAdapter for Ff7Adapter {
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
         story::merge_progression(stored, advanced)
     }
+
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], advanced: &[u8]) -> Option<Vec<u8>> {
+        story::compare_exchange_progression(stored, expected, advanced)
+    }
 }
 
 fn finite_xy(p: Pos) -> bool {
@@ -891,6 +896,12 @@ impl Ff7FieldArea {
         &self.field
     }
 
+    /// The exact authored root admitted by an existing version-3 story point. Scene hosts
+    /// use this identity to select a full interpreter; it is not a progression result.
+    pub fn story_point_source(&self, progress: &[u8], point: u32) -> Option<crate::story::StoryPointSource> {
+        self.story.point_source(progress, point)
+    }
+
     /// The parsed walkmesh (triangles and edge-access data).
     pub fn walkmesh(&self) -> &Walkmesh {
         &self.walkmesh
@@ -1029,9 +1040,11 @@ impl AreaRuntime for Ff7FieldArea {
             let story = story::StoryState::decode(progress)?;
             let moment = story.moment as i16; // the owned init's IFSW comparisons are signed
             let marker = if moment >= 27 {
-                Some(if story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) == Some(true) {
-                    JESSIE_RESCUED_PHASE
-                } else { JESSIE_TRAPPED_PHASE })
+                Some(match story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) {
+                    Some(true) => JESSIE_RESCUED_PHASE,
+                    Some(false) => JESSIE_TRAPPED_PHASE,
+                    None => JESSIE_UNKNOWN_PHASE,
+                })
             } else if moment >= 14 { Some(JESSIE_LOWER_PHASE) } else { None };
             if let Some(marker) = marker {
                 // Runtime placement only; preserve the existing interval and saved bytes.
@@ -1068,6 +1081,12 @@ impl AreaRuntime for Ff7FieldArea {
         if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
             let marker = phase.0.first().copied();
             for npc in &mut npcs {
+                if npc.entity_name.eq_ignore_ascii_case("av_j") && marker == Some(JESSIE_UNKNOWN_PHASE) {
+                    // An unknown rescue flag establishes neither pose nor availability.
+                    // Keep her slot for stable NPC IDs; the talk-point filter also withholds it.
+                    npc.unconditional = false;
+                    continue;
+                }
                 if npc.entity_name.eq_ignore_ascii_case("av_j") && matches!(marker, Some(JESSIE_LOWER_PHASE | JESSIE_TRAPPED_PHASE | JESSIE_RESCUED_PHASE)) {
                     npc.pos = Pos::new(-183.0, 1191.0, 1643.0); // owned init: lower platform, triangle 20
                     npc.facing = crate::field_direction_to_facing(if marker == Some(JESSIE_TRAPPED_PHASE) { 0 } else { 128 });
@@ -1155,9 +1174,25 @@ impl AreaRuntime for Ff7FieldArea {
         }
     }
 
+    fn story_requires_transaction(&self, progress: &[u8]) -> bool {
+        story::StoryState::decode(progress).is_some_and(|state| state.supports_extended())
+    }
+
     /// The battle a story point starts before its step is paid (a scripted fight: the guard scorpion).
     fn story_battle(&self, point: u32) -> Option<u16> {
         self.story.battle_of(point)
+    }
+
+    fn story_battle_for(&self, progress: &[u8], point: u32) -> Option<u16> {
+        self.story.battle_for(progress, point)
+    }
+
+    fn story_battle_policy(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryBattlePolicy> {
+        self.story.battle_policy(progress, point)
+    }
+
+    fn story_battle_action(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryBattleAction> {
+        self.story.battle_action(progress, point)
     }
 
     /// The first reactor's countdown matters while the story counter is where the step that started it left it
@@ -1181,6 +1216,17 @@ impl AreaRuntime for Ff7FieldArea {
     /// first reactor mission. The same in every field: the party follows the story, not the place.
     fn story_party(&self, progress: &[u8]) -> Vec<u8> {
         crate::story::canon_party_of(progress)
+    }
+
+    fn try_story_party(&self, progress: &[u8]) -> Result<Vec<u8>, AdapterError> {
+        crate::story::checked_canon_party_of(progress)
+            .ok_or_else(|| AdapterError::Unsupported("the saved canon party is unknown or unreadable".into()))
+    }
+
+    fn supports_saved_progression(&self, progress: &[u8]) -> bool {
+        // V4 is currently a storage foundation. Do not send it to a protocol-21 peer
+        // whose older story decoder could substitute a starting state for this format.
+        !crate::story::StoryState::decode(progress).is_some_and(|story| story.supports_native_party())
     }
 
     // The canon party is in the battle, not in the field (see `crate::story`, "What this does not do").
@@ -1221,6 +1267,21 @@ mod tests {
     use crate::testutil::{build_lgp, FieldSpec};
     use std::io::{self, Cursor, SeekFrom};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn native_party_storage_can_be_inspected_but_cannot_enter_legacy_gameplay() {
+        let area = area();
+        for native in [crate::story::StoryState::fresh_native_first_control(),
+            crate::story::StoryState::fresh_first_control().into_native_party().unwrap()] {
+            assert!(!area.supports_saved_progression(&native.encode()));
+        }
+        for legacy in [Vec::new(), crate::story::StoryState::at(69).encode(),
+            crate::story::StoryState::fresh_first_control().encode(), vec![254]] {
+            assert!(area.supports_saved_progression(&legacy), "the existing legacy admission policy stays unchanged");
+        }
+        assert_eq!(area.try_story_party(&crate::story::StoryState::fresh_native_first_control().encode()).unwrap(), vec![0]);
+        assert!(area.try_story_party(&[254]).is_err());
+    }
 
     /// Synthetic data labelled the way the import pipeline labels it: FIXTURE.
     fn provenance() -> EditionProvenance {

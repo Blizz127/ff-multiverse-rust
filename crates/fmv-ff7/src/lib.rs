@@ -101,6 +101,7 @@ pub mod lgp;
 pub mod links;
 pub mod lzss;
 pub mod model;
+pub mod movie_camera;
 pub mod music;
 pub mod playable;
 pub mod pmodel;

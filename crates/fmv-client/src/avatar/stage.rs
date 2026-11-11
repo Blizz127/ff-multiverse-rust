@@ -7,6 +7,7 @@
 
 use super::scenery::Scenery;
 use fmv_ff7::field::Camera;
+use fmv_ff7::background::DepthMapping;
 use std::sync::Arc;
 
 /// The field camera as a world -> camera-space transform in `f64` (the same camera record
@@ -69,6 +70,8 @@ impl StageCamera {
 #[derive(Debug, Clone)]
 pub struct Stage {
     pub camera: StageCamera,
+    /// Shared model/tile depth mapping calibrated from this PC field's baked background depths.
+    pub depth: DepthMapping,
     /// Walkmesh units per model unit ([`fmv_ff7::default_model_scale`] of the field's own scale).
     pub model_scale: f32,
     /// Walking and running speed in walkmesh units per second (`Ff7FieldArea::walk_speed` and

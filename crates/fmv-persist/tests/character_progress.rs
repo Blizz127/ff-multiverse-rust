@@ -692,9 +692,9 @@ fn an_account_with_character_progress_is_not_released_as_an_orphan() {
     assert!(matches!(
         store.release_unclaimed(played),
         Err(PersistError::NotReleasable {
-            reason: "it has stored progression",
+            account,
             ..
-        })
+        }) if account == played
     ));
     assert_eq!(
         store
@@ -788,7 +788,7 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         assert_eq!(&fs::read(&path).unwrap(), bytes, "{what}");
     }
 
-    // Schema versions: 0 never existed; checkpoint envelopes use v3, so v4 is future.
+    // Schema versions: 0 never existed; enlarged field-visit envelopes use v5, so v6 is future.
     put_raw(&root, a, "Ff7", &doc(|v| v["schema_version"] = json!(0)));
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
@@ -798,12 +798,12 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         &root,
         a,
         "Ff7",
-        &doc(|v| v["schema_version"] = json!(4)),
+        &doc(|v| v["schema_version"] = json!(fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION + 1)),
     );
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
         Err(PersistError::FutureSchema { found, supported, .. })
-            if found == 4 && supported == 3
+            if found == fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION + 1 && supported == fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION
     ));
     // ... and an update refuses to build on such a record rather than overwrite it.
     let mut called = false;

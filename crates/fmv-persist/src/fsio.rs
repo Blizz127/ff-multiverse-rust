@@ -46,6 +46,20 @@ pub(crate) fn atomic_write_with(
 /// The shared core: write a temp file next to `path` with `write`, fsync it, rename it over
 /// `path` and fsync the directory.
 fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> Result<()> {
+    atomic_replace_with_checkpoints(path, write, |_| Ok(()))
+}
+
+/// Exercise interruptions in the same replacement path used by production writes.
+#[cfg(test)]
+pub(crate) fn atomic_write_with_checkpoints(path: &Path, bytes: &[u8], checkpoint: impl FnMut(u8) -> io::Result<()>) -> Result<()> {
+    atomic_replace_with_checkpoints(path, |file| file.write_all(bytes), checkpoint)
+}
+
+fn atomic_replace_with_checkpoints(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    mut checkpoint: impl FnMut(u8) -> io::Result<()>,
+) -> Result<()> {
     let (dir, name) = match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
         (Some(dir), Some(name)) => (dir, name),
         _ => {
@@ -60,8 +74,9 @@ fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) 
         }
     };
 
+    checkpoint(0).map_err(|e| PersistError::io("before atomic write", path, e))?;
     let (tmp_path, mut file) = create_temp(dir, name)?;
-    let written = write(&mut file).and_then(|()| file.sync_all());
+    let written = write(&mut file).and_then(|()| file.sync_all()).and_then(|()| checkpoint(1));
     drop(file);
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp_path);
@@ -71,8 +86,10 @@ fn atomic_replace(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) 
         let _ = fs::remove_file(&tmp_path);
         return Err(PersistError::io("rename into place", path, e));
     }
+    checkpoint(2).map_err(|e| PersistError::io("after atomic rename", path, e))?;
     // The rename is only durable once the directory entry is.
-    sync_dir(dir).map_err(|e| PersistError::io("fsync directory", dir, e))
+    sync_dir(dir).map_err(|e| PersistError::io("fsync directory", dir, e))?;
+    checkpoint(3).map_err(|e| PersistError::io("after atomic directory sync", dir, e))
 }
 
 fn create_temp(dir: &Path, name: &str) -> Result<(PathBuf, File)> {

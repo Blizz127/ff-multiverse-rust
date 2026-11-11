@@ -9,9 +9,14 @@
 
 use super::pieces::parse_message;
 use super::{Beat, Choice, End, Message, MessageOrigin, MessageSource, Piece, StoryVars};
-use crate::script::{decode_at, FieldScript, Instruction, INIT_SCRIPT, TALK_SCRIPT};
+use crate::script::{decode_at, field_wide_bytes, FieldScript, Instruction, INIT_SCRIPT, TALK_SCRIPT};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
+
+#[path = "exact.rs"]
+mod exact;
+pub use exact::{run_panel_exact, run_script_exact, run_talk_exact, ExactBattle, ExactError, ExactRun, ExactScript, ExactWrite};
+pub use exact::{run_script_exact_with_scratch, run_talk_exact_with_scratch};
 
 /// How far one walk may go. The defaults are far above anything the owned data needs (the longest
 /// talk script is a few hundred instructions) and still end a `JMPB 0` wait in a blink.
@@ -234,6 +239,8 @@ pub struct Walk {
     battle: Option<u16>,
     /// A read-back (`AXYZI`) could not fill a variable because the walk did not know the place's height.
     unresolved: bool,
+    /// Opt-in authoritative evaluation; legacy dialogue remains deliberately permissive.
+    exact: Option<exact::ExactState>,
 }
 
 /// The layer of the notes this project adds when a script's effect is not performed.
@@ -279,6 +286,7 @@ impl Walk {
             moves: Vec::new(),
             battle: None,
             unresolved: false,
+            exact: None,
         }
     }
 
@@ -359,6 +367,11 @@ impl Walk {
     /// Run on to the next window or the end. `answer` is the player's answer to the window this
     /// walk handed out last, if that asked (see [`MessageSource::next`]).
     pub fn resume(&mut self, script: &FieldScript<'_>, env: &dyn StoryVars, answer: Option<usize>) -> Beat {
+        if self.exact.is_none() && !env.execution_supported() {
+            self.queued = None;
+            self.pending = None;
+            return self.finish(End::Broken);
+        }
         if let Some(note) = self.queued.take() {
             return Beat::Message(note);
         }
@@ -366,6 +379,14 @@ impl Walk {
             return Beat::End(end);
         }
         if let Some(p) = self.pending.take() {
+            if self.exact.is_some() {
+                match answer {
+                    None => self.fail_exact(ExactError::MissingAnswer),
+                    Some(answer) if !(p.first..=p.last).contains(&answer) =>
+                        self.fail_exact(ExactError::InvalidAnswer { answer, first: p.first, last: p.last }),
+                    _ => {}
+                }
+            }
             let chosen = answer.map_or(p.cursor, |a| a.clamp(p.first, p.last.max(p.first)));
             if let Some((bank, address)) = p.var {
                 self.set_byte(bank, address, u8::try_from(chosen).unwrap_or(u8::MAX));
@@ -379,7 +400,9 @@ impl Walk {
             }
         }
         loop {
-            match self.step(script, env) {
+            let flow = self.step(script, env);
+            if self.exact_fault().is_some() { return self.finish(End::Broken); }
+            match flow {
                 Flow::Continue => {}
                 Flow::Show(message) => {
                     if std::mem::take(&mut self.gift_not_given) && !self.quiet {
@@ -404,21 +427,39 @@ impl Walk {
     // ---- variables --------------------------------------------------------------------------
 
     fn var_byte(&self, env: &dyn StoryVars, bank: u8, address: u8) -> u8 {
-        self.writes.get(&(bank, address)).copied().unwrap_or_else(|| env.byte(bank, address))
+        self.read_masked(env, bank, address, 255)
     }
 
     fn var_word(&self, env: &dyn StoryVars, bank: u8, address: u8) -> u16 {
+        if self.has_checked_scratch() {
+            match field_wide_bytes(bank) {
+                Some(1) => return u16::from(self.var_byte(env, bank, address)),
+                Some(2) => {},
+                _ => { self.invalid_exact(); return 0; },
+            }
+        }
+        if let Some(value) = self.checked_scratch_word(bank, address) { return value; }
+        if address == u8::MAX { self.invalid_exact(); }
         let low = self.var_byte(env, bank, address);
         let high = address.checked_add(1).map_or(0, |a| self.var_byte(env, bank, a));
         u16::from_le_bytes([low, high])
     }
 
     fn set_byte(&mut self, bank: u8, address: u8, value: u8) {
-        self.writes.insert((bank, address), value);
-        self.idle.clear();
+        self.set_byte_with_mask(bank, address, value, 255);
     }
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
+        if self.has_checked_scratch() {
+            match field_wide_bytes(bank) {
+                Some(1) => { self.set_byte(bank, address, value as u8); return; },
+                Some(2) => {},
+                _ => { self.invalid_exact(); return; },
+            }
+        }
+        if self.write_checked_scratch_word(bank, address, value) { return; }
+        if self.exact.is_some() && address == u8::MAX { self.invalid_exact(); return; }
+        if self.native_word(bank, address, value) { return; }
         let [low, high] = value.to_le_bytes();
         self.set_byte(bank, address, low);
         if let Some(next) = address.checked_add(1) {
@@ -458,12 +499,14 @@ impl Walk {
     }
 
     fn arithmetic(&mut self, env: &dyn StoryVars, ins: &Instruction, op: Arith, wide: bool, saturate: bool) {
-        let Some(var) = Self::dest(ins, "var") else { return };
+        let Some(var) = Self::dest(ins, "var") else { self.invalid_exact(); return };
+        let checked_wide = wide && self.has_checked_scratch();
         // (a plain set never looks at what the variable held)
         let cur = if matches!(op, Arith::Set) {
             0
         } else if wide {
-            i64::from(self.var_word(env, var.0, var.1))
+            let value = self.var_word(env, var.0, var.1);
+            if checked_wide { i64::from(i16::from_le_bytes(value.to_le_bytes())) } else { i64::from(value) }
         } else {
             i64::from(self.var_byte(env, var.0, var.1))
         };
@@ -475,11 +518,11 @@ impl Walk {
             Arith::Mul => cur.saturating_mul(value),
             Arith::Div => match cur.checked_div(value) {
                 Some(q) => q,
-                None => return,
+                None => { self.invalid_exact(); return },
             },
             Arith::Mod => match cur.checked_rem(value) {
                 Some(r) => r,
-                None => return,
+                None => { self.invalid_exact(); return },
             },
             Arith::And => cur & value,
             Arith::Or => cur | value,
@@ -487,24 +530,43 @@ impl Walk {
             Arith::Inc => cur.saturating_add(1),
             Arith::Dec => cur.saturating_sub(1),
         };
-        self.store(var, wide, new, saturate);
+        // Native wide arithmetic reads signed operands before narrowing the final write.
+        // PLS2!/INC2! clamp only the upper end (field_opcodes.c:4301–4312,4695–4706).
+        if checked_wide {
+            let new = match ins.opcode {
+                0x77 | 0x7B => new.min(i64::from(i16::MAX)),
+                // Both pinned PSX and PC handlers compare against positive 32768.
+                // This surprising native rule is not a conventional signed lower clamp.
+                0x79 | 0x7D => new.max(32768),
+                _ => new,
+            };
+            self.store(var, true, new, false);
+        } else {
+            self.store(var, wide, new, saturate);
+        }
     }
 
     /// `BITON`/`BITOFF`/`BITXOR`: the variable is a row of bits, bit `n` being bit `n % 8` of the
     /// byte `n / 8` after its address (so bits 8..16 are the second byte of a word, as the word
     /// compare reads them).
     fn bit_op(&mut self, env: &dyn StoryVars, ins: &Instruction, op: u8) {
-        let Some((bank, address)) = Self::dest(ins, "var") else { return };
+        let Some((bank, address)) = Self::dest(ins, "var") else { self.invalid_exact(); return };
         let bit = self.num(env, ins, "bit", Width::U8).rem_euclid(256);
+        // Original BITON/OFF/XOR writes one byte. The legacy preview's cross-byte
+        // interpretation is not evidence for an authoritative write beyond bit seven.
+        if self.exact.is_some() && bit >= 8 { self.invalid_exact(); return; }
         let byte_at = address.checked_add(u8::try_from(bit / 8).unwrap_or(0));
-        let (Some(byte_at), Some(mask)) = (byte_at, 1u8.checked_shl(u32::try_from(bit % 8).unwrap_or(0))) else { return };
-        let cur = self.var_byte(env, bank, byte_at);
+        let (Some(byte_at), Some(mask)) = (byte_at, 1u8.checked_shl(u32::try_from(bit % 8).unwrap_or(0))) else { self.invalid_exact(); return };
+        let cur = if self.exact.is_some() {
+            if op == 0x84 { self.read_masked(env, bank, byte_at, mask) } else { self.peek_byte(env, bank, byte_at) }
+        } else { self.var_byte(env, bank, byte_at) };
         let new = match op {
             0x82 => cur | mask,
             0x83 => cur & !mask,
             _ => cur ^ mask,
         };
-        self.set_byte(bank, byte_at, new);
+        if self.exact.is_some() { self.set_masked(env, bank, byte_at, new, mask); }
+        else { self.set_byte(bank, byte_at, new); }
     }
 
     /// `XYZI`, `XYI`, `XYZ`, `MOVE`, `JUMP` and `LADER`: `entity` is left where the instruction says (the movement
@@ -573,7 +635,8 @@ impl Walk {
         let index = usize::try_from(dialog).ok()?;
         let d = script.dialogs().get(index)?;
         let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
-        let mut message = Message::new(MessageOrigin::Canon { entity, dialog: index }, parse_message(raw, env));
+        let pieces = if self.native_exact() { self.exact_message(raw, env) } else { parse_message(raw, env) };
+        let mut message = Message::new(MessageOrigin::Canon { entity, dialog: index }, pieces);
         message.window = u8::try_from(window).unwrap_or(0);
         Some(message)
     }
@@ -591,15 +654,24 @@ impl Walk {
         let (Some(window), Some(dialog), Some(first), Some(last)) =
             (ins.literal("window"), ins.literal("dialog"), ins.literal("first"), ins.literal("last"))
         else {
+            self.invalid_exact();
             return Flow::Continue;
         };
-        let Some(mut message) = self.message(script, env, entity, window, dialog) else { return Flow::Continue };
+        let Some(mut message) = self.message(script, env, entity, window, dialog) else { self.invalid_exact(); return Flow::Continue };
         let var = Self::dest(ins, "var");
         let first = usize::try_from(first).unwrap_or(0);
         // A last line the text does not have (20 of the 908 `ASK`s) is the text's last line.
         let lines = last_page_lines(&message.pieces);
+        if self.exact.is_some() {
+            if self.quiet { self.fail_exact(ExactError::MissingAnswer); return Flow::End(End::Broken); }
+            if var.is_none() || usize::try_from(last).ok().is_none_or(|last| last < first || last >= lines) {
+                self.invalid_exact();
+                return Flow::End(End::Broken);
+            }
+        }
         let last = usize::try_from(last).unwrap_or(0).max(first).min(lines.saturating_sub(1));
-        let held = var.map(|(bank, address)| usize::from(self.var_byte(env, bank, address)));
+        // An explicit answer does not depend on a possibly unknown previous cursor value.
+        let held = if self.exact.is_some() { None } else { var.map(|(bank, address)| usize::from(self.var_byte(env, bank, address))) };
         let cursor = held.filter(|c| (first..=last).contains(c)).unwrap_or(first);
         if let Some((bank, address)) = var {
             // The variable always ends up holding an answer, even when nobody was asked.
@@ -670,9 +742,10 @@ impl Walk {
             // A script requested without waiting went round a loop: leave it.
             return self.ret();
         }
-        if !self.idle.insert(pc) {
-            // The same instruction again with nothing changed in between: the script idles for
-            // ever (the last `JMPB 0` of a script that has said its piece). The conversation is over.
+        let idle = !self.idle.insert(pc);
+        if idle && self.exact.is_none() {
+            // A permissive preview ends at its unchanged idle loop. Exact mode defers this
+            // decision until a potentially stale actor observation has been checked below.
             return Flow::End(End::Finished);
         }
         let frame = Frame::new(pc, entity);
@@ -684,10 +757,15 @@ impl Walk {
         let code_end = script.layout().code_end;
         if frame.pc >= code_end {
             // Ran off the end of the code: as good as a RET.
+            if self.exact.is_some() { return Flow::End(End::Broken); }
             return self.ret();
         }
         let Some(code) = script.bytes().get(..code_end) else { return Flow::End(End::Broken) };
         let Ok(ins) = decode_at(code, frame.pc, 0) else { return Flow::End(End::Broken) };
+        if self.exact_completed_idle(script, env, &ins) { return Flow::End(End::Finished); }
+        if idle && !self.exact_tainted_getai(&ins) { return Flow::End(End::Finished); }
+        self.exact_instruction(&ins, frame.entity);
+        if self.exact_fault().is_some() { return Flow::End(End::Broken); }
         self.set_pc(ins.end());
         let op = ins.opcode;
         match op {
@@ -702,7 +780,13 @@ impl Walk {
             // REQ, REQSW, REQEW: the requested script runs first, to its end (to its first loop for
             // the two that do not wait for the end), and then the requester goes on.
             0x01..=0x03 => {
+                if self.exact.is_some() && op != 0x03 && !self.exact_joined_request(script, env, &ins)
+                    && !self.exact_presentation_request(script, &ins) {
+                    self.fail_exact(ExactError::Request { offset: ins.offset });
+                    return Flow::End(End::Broken);
+                }
                 if self.frames.len() > self.limits.depth {
+                    self.fail_exact(ExactError::Request { offset: ins.offset });
                     return Flow::Continue;
                 }
                 let target = ins.literal("entity").zip(ins.literal("script")).and_then(|(e, s)| {
@@ -711,11 +795,13 @@ impl Walk {
                 });
                 if let Some((entity, span)) = target {
                     let mut callee = Frame::new(span.start, entity);
-                    if op != 0x03 {
+                    if op != 0x03 && self.exact.is_none() {
                         callee.seen = Some(BTreeSet::new());
                     }
                     self.frames.push(callee);
                     self.idle.clear();
+                } else {
+                    self.fail_exact(ExactError::Request { offset: ins.offset });
                 }
                 Flow::Continue
             }
@@ -727,7 +813,7 @@ impl Walk {
                         self.set_pc(span.start);
                         Flow::Continue
                     }
-                    None => self.ret(),
+                    None => { self.fail_exact(ExactError::Request { offset: ins.offset }); self.ret() },
                 }
             }
             0x10..=0x13 => self.jump(&ins),
@@ -737,8 +823,19 @@ impl Walk {
                     0x16 | 0x17 => (Width::S16, 16),
                     _ => (Width::U16, 16),
                 };
-                let (left, right) = (self.num(env, &ins, "left", width), self.num(env, &ins, "right", width));
-                let holds = compare(ins.literal("op").unwrap_or(-1), left, right, bits);
+                let comparison = ins.literal("op").unwrap_or(-1);
+                if !(0..=10).contains(&comparison) { self.invalid_exact(); }
+                let right = self.num(env, &ins, "right", width);
+                let selected_bit = if self.exact.is_some() && matches!(comparison, 9 | 10) {
+                    Self::dest(&ins, "left").and_then(|(bank, address)| {
+                        let bit = u8::try_from(right).ok().filter(|&bit| u32::from(bit) < bits)?;
+                        if let Some(on) = self.checked_field_bit(env, bank, address, bits == 16, bit) { return Some(on); }
+                        let address = address.checked_add(bit / 8)?;
+                        Some(self.read_masked(env, bank, address, 1 << (bit % 8)) & (1 << (bit % 8)) != 0)
+                    })
+                } else { None };
+                let holds = selected_bit.map(|on| if comparison == 9 { on } else { !on })
+                    .unwrap_or_else(|| compare(comparison, self.num(env, &ins, "left", width), right, bits));
                 self.branch(&ins, holds)
             }
             // The keys the walk presses (none unless asked to: `Walk::pressing`): `IFKEY` and `IFKEYON` hold when one
@@ -755,9 +852,10 @@ impl Walk {
                 self.branch(&ins, holds)
             }
             0x20 => Flow::End(End::MiniGame),
+            0x38 if self.exact.is_some() => { self.exact_countdown(&ins); Flow::Continue },
             0x40 => {
-                let (Some(window), Some(dialog)) = (ins.literal("window"), ins.literal("dialog")) else { return Flow::Continue };
-                let Some(message) = self.message(script, env, frame.entity, window, dialog) else { return Flow::Continue };
+                let (Some(window), Some(dialog)) = (ins.literal("window"), ins.literal("dialog")) else { self.invalid_exact(); return Flow::Continue };
+                let Some(message) = self.message(script, env, frame.entity, window, dialog) else { self.invalid_exact(); return Flow::Continue };
                 if self.quiet {
                     return Flow::Continue;
                 }
@@ -776,14 +874,27 @@ impl Walk {
             0x60 => Flow::End(End::MapJump { field: ins.literal("field").and_then(|f| u16::try_from(f).ok()).unwrap_or(0) }),
             0x70 => {
                 self.battle = u16::try_from(self.num(env, &ins, "battle", Width::U16)).ok();
+                if self.exact.is_some() && self.battle.is_some_and(|formation| self.exact_battle(formation)) {
+                    return Flow::Continue;
+                }
                 Flow::End(End::Battle)
             }
+            0x72 if self.exact.is_some() => { self.exact_battle_mode(&ins); Flow::Continue },
+            0xBF if self.exact.is_some() => { self.exact_control(&ins); Flow::Continue },
+            0x0A | 0x0B | 0xC8..=0xCA | 0xCD..=0xCF if self.native_exact() => {
+                self.native_party_instruction(env, &ins); Flow::Continue
+            }
+            0xCA if self.exact.is_some() => { self.exact_party(&ins); Flow::Continue },
             // The movement opcodes: a character is left where the movement ends.
             0xA5..=0xA8 | 0xC0 | 0xC2 if self.track => {
                 self.moved(env, frame.entity, &ins);
                 Flow::Continue
             }
             // GETAI and AXYZI read a character's place back into variables.
+            0xB9 if self.exact.is_some() => {
+                self.exact_getai(&ins);
+                Flow::Continue
+            }
             0xB9 | 0xC1 if self.track => {
                 self.read_back(env, &ins);
                 Flow::Continue
@@ -791,14 +902,18 @@ impl Walk {
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
+                // Pinned field_opcodes.c:6683–6694 performs no write for slot >= NUM_PARTY.
+                if self.native_exact() && slot >= 3 { return Flow::Continue; }
                 if let Some((bank, address)) = Self::dest(&ins, "var_character") {
-                    self.set_byte(bank, address, env.party_member(slot).unwrap_or(u8::MAX));
+                    self.set_byte(bank, address, self.party_member(env, slot).unwrap_or(u8::MAX));
+                } else if self.native_exact() {
+                    self.invalid_exact();
                 }
                 Flow::Continue
             }
             0x7E => {
-                if let Some(v) = ins.literal("disabled") {
-                    self.talk_off = v != 0;
+                if self.exact.is_none() || frame.entity == self.entity {
+                    if let Some(v) = ins.literal("disabled") { self.talk_off = v != 0; }
                 }
                 Flow::Continue
             }
@@ -816,11 +931,21 @@ impl Walk {
             // LBYTE and HBYTE set the low and the high byte of a word variable.
             0x9A | 0x9B => {
                 if let Some((bank, address)) = Self::dest(&ins, "var") {
+                    if self.exact.is_some() {
+                        // Original OpcodeFuncHbyte extracts the high source byte into the
+                        // stated destination; it does not increment the destination address.
+                        if let Some(value) = self.exact_source_byte(env, &ins, op == 0x9B) {
+                            self.set_byte(bank, address, value);
+                        }
+                        return Flow::Continue;
+                    }
                     let value = u8::try_from(self.num(env, &ins, "value", Width::U16) & 0xFF).unwrap_or(0);
                     let at = if op == 0x9A { Some(address) } else { address.checked_add(1) };
                     if let Some(at) = at {
                         self.set_byte(bank, at, value);
                     }
+                } else {
+                    self.invalid_exact();
                 }
                 Flow::Continue
             }
@@ -833,13 +958,16 @@ impl Walk {
                 Flow::Continue
             }
             0xA4 => {
-                if let Some(v) = ins.literal("visible") {
-                    self.visible = v != 0;
+                if self.exact.is_none() || frame.entity == self.entity {
+                    if let Some(v) = ins.literal("visible") { self.visible = v != 0; }
                 }
                 Flow::Continue
             }
             0xCB | 0xCC => {
-                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| if op == 0xCB { env.in_party(c) } else { env.is_member(c) });
+                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c|
+                    if op == 0xCB { self.in_party(env, c) }
+                    else if self.native_exact() { self.native_member(c) }
+                    else { env.is_member(c) });
                 self.branch(&ins, holds)
             }
             0xFF => Flow::End(End::GameOver),
@@ -868,6 +996,9 @@ pub struct Availability {
 /// the story moves on carries a `TLKON 1` behind a progress test). Returns the variables the
 /// passes wrote too, which the talk that follows starts from.
 fn prelude(script: &FieldScript<'_>, env: &dyn StoryVars, entity: usize, limits: Limits) -> (Availability, BTreeMap<(u8, u8), u8>) {
+    if !env.execution_supported() {
+        return (Availability { talkable: false, visible: false }, BTreeMap::new());
+    }
     let mut walk = Walk::script(entity, INIT_SCRIPT, 1, limits);
     walk.quiet = true;
     // A quiet walk never hands out a window: it only ever ends.
@@ -894,6 +1025,7 @@ pub struct TalkRun {
 /// cursor's starting line) and report what it wrote: the character's own set-up decides first whether it can be
 /// talked to in the story `env` tells (as [`TalkSession::talk`] does), then its talk script runs to its end.
 pub fn run_talk(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars, seed: u32) -> Result<TalkRun, TalkError> {
+    if !env.execution_supported() { return Err(TalkError::UnsupportedStory); }
     if entity >= script.entity_count() {
         return Err(TalkError::NoSuchEntity);
     }
@@ -914,6 +1046,8 @@ pub fn run_talk(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars, se
 /// Why a conversation could not be started.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TalkError {
+    #[error("this story format is not supported by the dialogue interpreter")]
+    UnsupportedStory,
     #[error("the field's script section cannot be read")]
     BadSection,
     #[error("the field has no such entity")]
@@ -933,6 +1067,7 @@ impl TalkSession {
     /// The conversation with `entity`: its talk script, unless its own set-up has hidden it or
     /// switched talking off for the story as `vars` tells it.
     pub fn talk(section: Vec<u8>, entity: usize, vars: Box<dyn StoryVars>, seed: u32) -> Result<Self, TalkError> {
+        if !vars.execution_supported() { return Err(TalkError::UnsupportedStory); }
         let (verdict, writes) = {
             let script = FieldScript::parse(&section).map_err(|_| TalkError::BadSection)?;
             if entity >= script.entity_count() {
@@ -950,6 +1085,7 @@ impl TalkSession {
     /// Script `slot` of `entity`, whatever it is (the lines a character speaks in a cutscene), with
     /// no check of whether it can be talked to.
     pub fn script(section: Vec<u8>, entity: usize, slot: usize, vars: Box<dyn StoryVars>, seed: u32) -> Result<Self, TalkError> {
+        if !vars.execution_supported() { return Err(TalkError::UnsupportedStory); }
         let script = FieldScript::parse(&section).map_err(|_| TalkError::BadSection)?;
         if entity >= script.entity_count() {
             return Err(TalkError::NoSuchEntity);

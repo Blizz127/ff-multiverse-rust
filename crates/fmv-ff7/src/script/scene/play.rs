@@ -18,8 +18,8 @@ use super::vm::{AnimHow, Beat, Limits, MoveHow, SceneVars, SceneResources, Resou
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
-use crate::script::{parse_model_list, triangle_contains_xy, triangle_height_at, FieldScript};
-use crate::story::{canon_party, party_after, tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::script::{parse_model_list, triangle_contains_xy, triangle_height_at, FieldScript, FieldScratch, FieldScratchError, FieldScratchOutcome};
+use crate::story::{canon_party, party_after, tracked_var, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -38,6 +38,22 @@ pub enum SceneError {
     BattleBoundary,
     #[error("the scene cannot prepare its story snapshot: {0}")]
     Story(#[from] crate::story::StoryWriteError),
+    #[error("a battle cannot change between legacy and native-party story representations")]
+    NativePartyUnsupported,
+    #[error("the battle afterimage differs from the exact story at its suspended instruction")]
+    BattleStory,
+    #[error("checked field scratch requires an extended version-3 or version-4 story")]
+    ScratchStory,
+    #[error("checked field scratch cannot be overridden by Given selector {bank}, address {address}")]
+    ScratchGiven { bank: u8, address: u8 },
+    #[error("existing-visit setup changed field scratch values or knowledge")]
+    ScratchSetup,
+    #[error("existing-visit setup changed persistent story, party state, or resources")]
+    SetupState,
+    #[error("checked field scratch access failed: {0}")]
+    Scratch(#[from] FieldScratchError),
+    #[error("the checked scene read unknown persistent story bytes")]
+    UnknownPersistentRead,
     #[error("the scene is missing the answer to question {question}")]
     MissingAnswer { question: usize },
     #[error("answer {answer} to question {question} is outside its choices {first}..={last}")]
@@ -62,10 +78,17 @@ pub enum SceneError {
     WindowData,
     #[error("the accepted scene trigger position cannot be represented on this field's floor")]
     SceneOrigin,
+    #[error("the train entry does not match the reviewed arrival profile")]
+    TrainEntry,
+    #[error("the train entry initializers do not match the reviewed zero-time contract")]
+    TrainEntrySetup,
+    #[error("the checked train arrival has not reached its exact complete ready boundary")]
+    TrainReady,
 }
 
 /// Replay semantics version. Change this when the interpreter's durable replay contract changes.
-pub const REPLAY_VERSION: u32 = 2;
+/// Version 3 adds authored model offsets/palette commands and corrects byte-extraction operands.
+pub const REPLAY_VERSION: u32 = 3;
 
 /// The exact authored instruction at which this run stopped for combat. Ordinals distinguish
 /// repeated executions of the same instruction, including repeated formations.
@@ -163,6 +186,8 @@ pub struct SceneSnapshot {
     pub setup_stats: Stats,
     pub stats: Stats,
     pub unknown_persistent_reads: BTreeSet<(u8, u8)>,
+    /// None is legacy scratch; checked mode remains Some even after a sticky fault.
+    pub scratch: Option<Result<FieldScratchOutcome, FieldScratchError>>,
 }
 
 /// What a scene's script wrote that the story can carry.
@@ -177,11 +202,17 @@ pub struct Writes {
     /// Version 3 persistent assignments: canonical byte key to (value, assigned bits).
     /// Includes known zeroes and clears; only [`Writes::apply_extended_to`] applies these.
     pub persistent: BTreeMap<(u8, u8), (u8, u8)>,
+    /// Version 4's complete ordered persistent assignments and native party effects. This is
+    /// authoritative when present; the other fields remain summaries for inspection and legacy
+    /// consumers. Applying those summaries separately would lose interleaved raw-party writes.
+    pub native_party: Option<NativeStoryJournal>,
 }
 
 impl Writes {
-    /// Whether the scene wrote anything the story carries.
+    /// Whether the complete story is unchanged, including native party values and knownness.
+    /// A net-neutral native journal still retains its ordered effects for replacement comparison.
     pub fn is_story_neutral(&self) -> bool {
+        if let Some(journal) = &self.native_party { return !journal.changed(); }
         self.moment.is_none() && self.tracked.is_empty() && self.persistent.is_empty()
     }
 
@@ -212,6 +243,10 @@ impl Writes {
     /// Validation is atomic: an invalid assignment changes nothing.
     pub fn apply_extended_to(&self, state: &mut StoryState, expected: &StoryState) -> Option<bool> {
         if state != expected || !state.supports_extended() { return None; }
+        if state.supports_native_party() {
+            return self.native_party.as_ref()?.apply_to(state, expected).ok();
+        }
+        if self.native_party.is_some() { return None; }
         let mut next = state.clone();
         if let Some(moment) = self.moment { next.moment = moment; }
         for (&(bank, address), &(value, mask)) in &self.persistent {
@@ -270,22 +305,45 @@ pub struct Outcome {
     pub party: Vec<PartyOp>,
     /// Ordered economic operations and their authoritative before/after values.
     pub resources: ResourceOutcome,
+    /// Field-visit effects are separate from persistent story writes. Some(Err) retains
+    /// checked mode after a fault; it must never be mistaken for legacy scratch.
+    pub scratch: Option<Result<FieldScratchOutcome, FieldScratchError>>,
     pub stats: Stats,
 }
 
 impl Outcome {
     /// Whether the party the scene's scripts leave behind is the one the story has once the scene's writes are
     /// applied: the story's party at `before`, with the scripts' own joins and leaves, equals the story's party at
-    /// `after` ([`crate::story::canon_party`]). A scene that touches no party always passes; one that does passes only
-    /// where the party table has the row for it, which is how a party change is carried (never guessed, never dropped).
+    /// `after` ([`crate::story::canon_party`]). Extended authoritative scenes also require the actual
+    /// assignments to match the reviewed unlocked-member projection, including members temporarily
+    /// added then removed. Version 4 instead validates its complete native journal against both
+    /// snapshots; no moment-derived party or PHS projection is used. Legacy previews retain their
+    /// earlier no-party-operation behavior.
     pub fn party_is_the_storys(&self, before: &StoryState, after: &StoryState) -> bool {
+        if before.supports_native_party() || after.supports_native_party() {
+            return before.supports_native_party() && after.supports_native_party()
+                && self.party.is_empty()
+                && self.writes.native_party.as_ref().is_some_and(|journal| {
+                    if journal.before() != before || journal.after() != after { return false; }
+                    let mut checked = before.clone();
+                    journal.apply_to(&mut checked, before).is_ok() && checked == *after
+                });
+        }
+        if self.writes.native_party.is_some() { return false; }
+        if before.supports_extended() || after.supports_extended() {
+            return party_after(&canon_party(before), &self.party) == canon_party(after)
+                && crate::story::party_visibility_matches(before, after, &self.party);
+        }
         self.party.is_empty() || party_after(&canon_party(before), &self.party) == canon_party(after)
     }
 
     /// Whether both runs were interpreted completely: the stage scripts and the scene met no instruction the interpreter
     /// does not know, read back no place it does not know and dropped no request.
     pub fn is_complete(&self) -> bool {
-        !self.resources.unknown_gil && [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+        ((self.writes.native_party.is_none() && self.scratch.is_none()) || self.unknown_persistent_reads.is_empty())
+            && self.scratch.as_ref().is_none_or(Result::is_ok)
+            && !self.resources.unknown_gil
+            && [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
     }
 
     /// Whether this run and `other` (the same scene from another edition of the field's script) come to the same story: both
@@ -311,8 +369,10 @@ impl Outcome {
             && self.writes.moment == other.writes.moment
             && self.writes.tracked == other.writes.tracked
             && self.writes.persistent == other.writes.persistent
+            && self.writes.native_party == other.writes.native_party
             && persistent(&self.writes) == persistent(&other.writes)
             && self.resources == other.resources
+            && self.scratch == other.scratch
             && self.party == other.party
             && state_ops(self) == state_ops(other)
     }
@@ -405,6 +465,7 @@ pub struct ScenePlay {
     unchecked: bool,
     strict: bool,
     transcript: Vec<SceneInput>,
+    train_entry: Option<super::train_arrival::TrainArrivalEntry>,
 }
 
 impl std::fmt::Debug for ScenePlay {
@@ -426,13 +487,30 @@ impl ScenePlay {
 
     pub fn with_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits) -> Result<Self, SceneError> {
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
-        Self::with_script(field, def, story, seed, limits, &script, SceneResources::default())
+        Self::with_script(field, def, story, seed, limits, &script, SceneResources::default(), None)
     }
 
     /// Play with the account's authoritative resource snapshot (or an explicitly synthetic preview).
     pub fn with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Self, SceneError> {
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
-        Self::with_script(field, def, story, seed, Limits::default(), &script, resources)
+        Self::with_script(field, def, story, seed, Limits::default(), &script, resources, None)
+    }
+
+    /// Interpret against an explicit existing field-visit scratch image. Unknown input remains
+    /// unknown; this never performs an entry clear. Setup may read state but cannot change
+    /// scratch, persistent story, party state, or resources, even temporarily. Field visit
+    /// persistence and admission remain the caller's responsibility.
+    pub fn with_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, scratch: &FieldScratch) -> Result<Self, SceneError> {
+        Self::with_scratch_and_limits(field, def, story, seed, resources, scratch, Limits::default())
+    }
+
+    /// Checked visit execution with an explicit host budget. The host must bind its limit
+    /// policy to durable replay and keep it consistent with the accepted transcript bound.
+    pub fn with_scratch_and_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32,
+        resources: SceneResources, scratch: &FieldScratch, limits: Limits) -> Result<Self, SceneError> {
+        Self::check_scratch_inputs(story, def)?;
+        let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        Self::with_script(field, def, story, seed, limits, &script, resources, Some(scratch))
     }
 
     /// Build a scene from a replacement script section and the original field's walkmesh.
@@ -447,18 +525,78 @@ impl ScenePlay {
         let original = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
         let replacement = FieldScript::parse(section).map_err(|e| SceneError::Script(e.to_string()))?;
         let rebound = def.rebind_entities(&original, &replacement).ok_or(SceneError::UnmatchedEntities)?;
-        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement, resources)
+        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement, resources, None)
     }
 
-    fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources) -> Result<Self, SceneError> {
+    /// Replacement-script playback with the same checked visit input as the original section.
+    pub fn with_script_section_and_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources, scratch: &FieldScratch) -> Result<Self, SceneError> {
+        Self::check_scratch_inputs(story, def)?;
+        let original = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        let replacement = FieldScript::parse(section).map_err(|e| SceneError::Script(e.to_string()))?;
+        let rebound = def.rebind_entities(&original, &replacement).ok_or(SceneError::UnmatchedEntities)?;
+        Self::with_script(field, &rebound, story, seed, Limits::default(), &replacement, resources, Some(scratch))
+    }
+
+    fn check_scratch_inputs(story: &StoryState, def: &SceneDef) -> Result<(), SceneError> {
+        if !story.supports_extended() { return Err(SceneError::ScratchStory); }
+        if def.resume_after_battle.is_some() { return Err(SceneError::UncheckedReplay); }
+        if let Some(given) = def.given.iter().find(|given| matches!(given.bank, 5 | 6)) {
+            return Err(SceneError::ScratchGiven { bank: given.bank, address: given.address });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources, scratch: Option<&FieldScratch>) -> Result<Self, SceneError> {
+        Self::with_script_entry(field, def, story, seed, limits, script, resources, scratch, None)
+    }
+
+    /// No public general entry bypass: the train profile validates the source and landing.
+    pub(super) fn with_train_entry(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32,
+        resources: SceneResources, landing: super::vm::SceneJump, source: [u8; 32]) -> Result<Self, SceneError> {
+        let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        let clear = FieldScratch::cleared_for_entry();
+        Self::with_script_entry(field, def, story, seed, Limits::default(), &script, resources,
+            Some(&clear), Some((landing, source)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_script_entry(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits,
+        script: &FieldScript<'_>, resources: SceneResources, scratch: Option<&FieldScratch>,
+        entry: Option<(super::vm::SceneJump, [u8; 32])>) -> Result<Self, SceneError> {
+        if scratch.is_some() { Self::check_scratch_inputs(story, def)?; }
         let story = def.prepare_story(story)?;
         if usize::from(def.trigger.entity) >= script.entity_count() {
             return Err(SceneError::NoSuchEntity);
         }
         let mesh = field.walkmesh().map_err(|e| SceneError::Walkmesh(e.to_string()))?;
         let section = script.bytes().to_vec();
-        let mut vm = Vm::with_resources(SceneVars::new(story.clone(), &def.given), seed, limits, resources);
-        vm.setup(script, &def.setup);
+        let vars = match scratch {
+            Some(scratch) => SceneVars::with_scratch(story.clone(), &def.given, scratch.clone())?,
+            None => SceneVars::new(story.clone(), &def.given),
+        };
+        let mut vm = Vm::with_resources(vars, seed, limits, resources);
+        if story.supports_extended() {
+            vm.allow_default_name_sites(super::default_names::sites(script.bytes(), def));
+        }
+        if entry.is_some() { vm.setup_train_entry(script, &def.setup); }
+        else { vm.setup(script, &def.setup); }
+        if vm.scratch_setup_changed() { return Err(SceneError::ScratchSetup); }
+        if vm.checked_scratch() && !vm.vars().unknown_persistent_reads().is_empty() {
+            return Err(SceneError::UnknownPersistentRead);
+        }
+        if let Some(Err(error)) = vm.scratch_outcome() { return Err(SceneError::Scratch(error)); }
+        if vm.checked_scratch() && !vm.setup_is_state_neutral() { return Err(SceneError::SetupState); }
+        if entry.is_some() && !super::train_arrival::safe_stats(vm.stats()) {
+            return Err(SceneError::TrainEntrySetup);
+        }
+        let train_entry = match entry {
+            Some((landing, source)) => Some(super::train_arrival::TrainArrivalEntry::new(
+                story.clone(), resources, landing, source,
+                vm.scratch_before().ok_or(SceneError::TrainEntrySetup)?.clone(),
+                vm.scratch_current().ok_or(SceneError::TrainEntrySetup)?.clone())),
+            None => None,
+        };
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
         for m in &def.cast {
@@ -485,7 +623,7 @@ impl ScenePlay {
         let heights = initial.iter().filter_map(|event| match *event {
             Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
         }).collect();
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None, seed, unchecked: false, strict: false, transcript: Vec::new() })
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None, seed, unchecked: false, strict: false, transcript: Vec::new(), train_entry })
     }
 
     fn animation_clips(field: &FieldFile, script: &FieldScript<'_>, cast: &[CastMember]) -> BTreeMap<u8, Vec<String>> {
@@ -529,6 +667,10 @@ impl ScenePlay {
                 let z = w.z.or_else(|| ground.height(w.x, w.y, w.triangle, None).map(|h| h.round() as i16));
                 out.push(Stage::Place { entity: member.entity, x: w.x, y: w.y, z, triangle: w.triangle });
             }
+            let [x, y, z] = vm.offset(member.entity);
+            if [x, y, z] != [0; 3] {
+                out.push(Stage::Offset { entity: member.entity, x, y, z });
+            }
             let heading = vm.heading_of(member.entity).or_else(|| member.start.as_ref().map(|s| field_direction_to_facing(s.direction)));
             if let Some(heading) = heading {
                 out.push(Stage::Face { entity: member.entity, heading, frames: 0 });
@@ -545,6 +687,18 @@ impl ScenePlay {
 
     pub fn def(&self) -> &SceneDef {
         &self.def
+    }
+
+    /// Entry provenance and the actual initializer afterimage, available only for the
+    /// reviewed train-entry factory. This is execution evidence, not world admission.
+    pub fn train_entry(&self) -> Option<&super::train_arrival::TrainArrivalEntry> { self.train_entry.as_ref() }
+
+    pub(super) fn train_ready_pose(&self) -> Option<(Where, f32)> {
+        (self.strict && !self.unchecked && self.ended == Some(End::Finished)
+            && self.vm.visible_of(30) == Some(true)
+            && self.vm.control_instruction(false) == Some((30, 0x153C, 0))
+            && self.vm.control_instruction(true) == Some((30, 0x153E, 0))).then_some(())?;
+        Some((self.vm.place_of(30)?, self.vm.heading_of(30)?))
     }
 
     pub fn ground(&self) -> &Ground {
@@ -615,6 +769,7 @@ impl ScenePlay {
     /// Advance only after acknowledging the exact window previously handed out. At the start
     /// or immediately after a checked battle resume, pass None. Validation never mutates the VM.
     pub fn next_strict(&mut self, ack: Option<WindowAck>) -> Result<Beat, SceneError> {
+        self.validate_checked_execution()?;
         if self.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
         if self.vm.has_invalid_message() { return Err(SceneError::WindowData); }
         if self.unchecked || self.def.resume_after_battle.is_some() { return Err(SceneError::UncheckedReplay); }
@@ -633,6 +788,7 @@ impl ScenePlay {
         }
         self.strict = true;
         let beat = self.advance(None);
+        self.validate_checked_execution()?;
         if self.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
         if self.vm.has_invalid_message() { return Err(SceneError::WindowData); }
         Ok(beat)
@@ -640,8 +796,29 @@ impl ScenePlay {
 
     pub fn boundary(&self) -> Option<SceneBoundary> { self.vm.boundary() }
 
+    /// The checked field-visit result, kept separate from persistent story writes. The beforeimage
+    /// and assignment masks remain cumulative across battle return. None means legacy execution;
+    /// a checked fault remains Some(Err), never an absent visit snapshot.
+    pub fn scratch_outcome(&self) -> Option<Result<FieldScratchOutcome, FieldScratchError>> {
+        self.vm.scratch_outcome()
+    }
+
+    fn validate_checked_execution(&self) -> Result<(), SceneError> {
+        if !self.vm.checked_scratch() { return Ok(()); }
+        if self.vm.scratch_setup_changed() { return Err(SceneError::ScratchSetup); }
+        if !self.vm.vars().unknown_persistent_reads().is_empty() { return Err(SceneError::UnknownPersistentRead); }
+        if let Some(Err(error)) = self.scratch_outcome() { return Err(SceneError::Scratch(error)); }
+        if self.train_entry.is_some() && !super::train_arrival::safe_stats(self.vm.stats()) {
+            return Err(SceneError::TrainReady);
+        }
+        Ok(())
+    }
+
     pub fn replay_identity(&self) -> ReplayIdentity {
-        ReplayIdentity { version: REPLAY_VERSION, fingerprint: super::replay_identity::fingerprint(&self.section, &self.def), seed: self.seed }
+        let fingerprint = super::replay_identity::fingerprint_with_scratch(&self.section, &self.def, self.vm.scratch_before());
+        let fingerprint = self.train_entry.as_ref().map_or(fingerprint, |entry|
+            super::replay_identity::fingerprint_train_entry(fingerprint, entry.source_identity()));
+        ReplayIdentity { version: REPLAY_VERSION, fingerprint, seed: self.seed }
     }
 
     pub fn transcript(&self) -> &[SceneInput] { &self.transcript }
@@ -651,7 +828,25 @@ impl ScenePlay {
             boundary: self.boundary()?, writes: self.writes(), resources: self.resources().clone(),
             party: self.vm.party_ops().to_vec(), jump: self.vm.destination(), setup_stats: self.setup.clone(),
             stats: self.vm.stats().clone(), unknown_persistent_reads: self.vm.vars().unknown_persistent_reads(),
+            scratch: self.scratch_outcome(),
         })
+    }
+
+    /// The complete story evaluated at the current instruction, including version 4 native
+    /// party effects. At BATTLE this is the roster source, not the scene's initial snapshot.
+    /// Unresolved execution cannot produce this afterimage. The caller must still check skipped
+    /// state operations and durably compare the complete predecessor before publishing it.
+    pub fn current_story(&self) -> Option<StoryState> {
+        if !self.vm.scratch_valid() || !self.vm.vars().unknown_persistent_reads().is_empty()
+            || [&self.setup, self.vm.stats()].iter().any(|stats| stats.setup_incomplete
+                || !stats.unknown.is_empty() || stats.unresolved != 0 || stats.dropped_requests != 0) {
+            return None;
+        }
+        let mut current = self.story.clone();
+        let writes = self.writes();
+        if current.supports_extended() { writes.apply_extended_to(&mut current, &self.story)?; }
+        else { writes.apply_to(&mut current); }
+        Some(current)
     }
 
     /// Resume once at the exact pending instruction. No scheduler, scratch, or RNG state is reset.
@@ -665,11 +860,21 @@ impl ScenePlay {
     /// The caller must first commit the segment and verify an actual victorious battle, then supply
     /// its authoritative afterimage. This method itself performs no persistence or combat.
     pub fn resume_battle_checked(&mut self, resume: BattleResume) -> Result<(), SceneError> {
+        self.validate_checked_execution()?;
+        if self.story.supports_native_party() != resume.story.supports_native_party() {
+            return Err(SceneError::NativePartyUnsupported);
+        }
         if self.unchecked || !self.strict { return Err(SceneError::UncheckedReplay); }
         if self.boundary() != Some(SceneBoundary::Battle(resume.checkpoint)) { return Err(SceneError::BattleBoundary); }
         if resume.checkpoint.flags != Some(8) { return Err(SceneError::BattleMode); }
         if !self.story.supports_extended() || !resume.story.supports_extended() || resume.resources.gil.is_none() {
             return Err(SceneError::BattleResources);
+        }
+        // The current combat engine has no authored story/party mutation. A native continuation
+        // must resume from the exact evaluated boundary, including all values and knowledge masks.
+        // Rewards are supplied separately through resources; legacy v3 rebase policy is unchanged.
+        if self.story.supports_native_party() && self.current_story().as_ref() != Some(&resume.story) {
+            return Err(SceneError::BattleStory);
         }
         self.vm.resume_battle(&resume.story, resume.resources);
         self.story = resume.story.clone();
@@ -724,7 +929,7 @@ impl ScenePlay {
             use crate::script::dialogue::StoryVars;
             if extended { base.baseline_byte(bank, address) } else { base.byte(bank, address) }
         });
-        let mut out = Writes::default();
+        let mut out = Writes { native_party: self.vm.native_journal(), ..Writes::default() };
         let lo = byte(MOMENT_BANK, MOMENT_ADDRESS);
         let hi = byte(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1));
         let moment = u16::from_le_bytes([lo, hi]);
@@ -733,6 +938,10 @@ impl ScenePlay {
         }
         for (&(bank, address), &value) in written {
             use crate::script::dialogue::StoryVars;
+            // Checked visit assignments have their own before/after and masks. Summarizing them
+            // through the legacy byte hook would both duplicate them and audit unknown untouched
+            // bits merely for display, turning a valid masked assignment into a false read fault.
+            if self.vm.checked_scratch() && matches!(bank, 5 | 6) { continue; }
             if base.key(bank, address).0 == base.key(MOMENT_BANK, MOMENT_ADDRESS).0 && address <= MOMENT_ADDRESS.wrapping_add(1) {
                 continue;
             }
@@ -802,7 +1011,18 @@ pub fn with_trigger_position(field: &FieldFile, def: &SceneDef, pos: fmv_core::P
 /// Every supplied record must consume the exact next boundary. No choices are defaulted and no
 /// battle is skipped by formation alone. Callers bind initial story/resources and seed durably.
 pub fn replay_scene(field: &FieldFile, def: &SceneDef, story: &StoryState, resources: SceneResources, identity: ReplayIdentity, transcript: &[SceneInput]) -> Result<ScenePlay, SceneError> {
-    let mut play = ScenePlay::with_resources(field, def, story, identity.seed, resources)?;
+    let play = ScenePlay::with_resources(field, def, story, identity.seed, resources)?;
+    replay_inputs(play, identity, transcript)
+}
+
+/// Replay a checked visit from its original scratch preimage, including across acknowledged
+/// battles. Supplying legacy mode, another value, or different knowledge changes its identity.
+pub fn replay_scene_with_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, resources: SceneResources, scratch: &FieldScratch, identity: ReplayIdentity, transcript: &[SceneInput]) -> Result<ScenePlay, SceneError> {
+    let play = ScenePlay::with_scratch(field, def, story, identity.seed, resources, scratch)?;
+    replay_inputs(play, identity, transcript)
+}
+
+fn replay_inputs(mut play: ScenePlay, identity: ReplayIdentity, transcript: &[SceneInput]) -> Result<ScenePlay, SceneError> {
     if play.replay_identity() != identity { return Err(SceneError::ReplayIdentity); }
     play.next_strict(None)?;
     for input in transcript {
@@ -825,9 +1045,17 @@ pub fn replay_scene_to(field: &FieldFile, def: &SceneDef, story: &StoryState, re
     Ok(play)
 }
 
+/// Checked-scratch replay additionally requiring the exact recorded endpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_scene_to_with_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, resources: SceneResources, scratch: &FieldScratch, identity: ReplayIdentity, transcript: &[SceneInput], target: SceneBoundary) -> Result<ScenePlay, SceneError> {
+    let play = replay_scene_with_scratch(field, def, story, resources, scratch, identity, transcript)?;
+    if play.boundary() != Some(target) { return Err(SceneError::ReplayBoundary); }
+    Ok(play)
+}
+
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
-        Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
+        Stage::Place { entity, .. } | Stage::Offset { entity, .. } | Stage::OffsetMove { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
         Stage::Sound { .. } | Stage::Camera(_) | Stage::Background(_) | Stage::Shake { .. } | Stage::Fade(_) => None,
     }
 }
@@ -859,9 +1087,21 @@ pub fn run_to_end_with_resources_strict(field: &FieldFile, def: &SceneDef, story
     outcome_of(ScenePlay::with_resources(field, def, story, seed, resources)?, answers, true)
 }
 
+/// Evaluate a complete checked visit segment with exact answers. Scratch writes are returned
+/// separately and must be committed together with any persistent story/resource changes.
+pub fn run_to_end_with_scratch_strict(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, scratch: &FieldScratch, answers: &[usize]) -> Result<Outcome, SceneError> {
+    outcome_of(ScenePlay::with_scratch(field, def, story, seed, resources, scratch)?, answers, true)
+}
+
 /// Replacement-script equivalent of [`run_to_end_with_resources`].
 pub fn run_section_to_end_with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources, answers: &[usize]) -> Result<Outcome, SceneError> {
     outcome_of(ScenePlay::with_script_section_and_resources(field, def, story, seed, section, resources)?, answers, false)
+}
+
+/// Checked replacement-section equivalent, interpreted against the same visit preimage.
+#[allow(clippy::too_many_arguments)]
+pub fn run_section_to_end_with_scratch_strict(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources, scratch: &FieldScratch, answers: &[usize]) -> Result<Outcome, SceneError> {
+    outcome_of(ScenePlay::with_script_section_and_scratch(field, def, story, seed, section, resources, scratch)?, answers, true)
 }
 
 fn outcome_of(mut play: ScenePlay, answers: &[usize], strict: bool) -> Result<Outcome, SceneError> {
@@ -869,7 +1109,9 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize], strict: bool) -> Result<Ou
     let mut given: Option<usize> = None;
     let (mut windows, mut questions) = (0usize, 0usize);
     let end = loop {
+        if strict { play.validate_checked_execution()?; }
         let beat = play.next(given.take());
+        if strict { play.validate_checked_execution()?; }
         if strict && play.vm.has_implicit_choice() { return Err(SceneError::ImplicitAnswer); }
         if strict && play.vm.has_invalid_message() { return Err(SceneError::WindowData); }
         match beat.then {
@@ -903,6 +1145,7 @@ fn outcome_of(mut play: ScenePlay, answers: &[usize], strict: bool) -> Result<Ou
         unknown_persistent_reads: play.vm.vars().unknown_persistent_reads(),
         party: play.vm.party_ops().to_vec(),
         resources: play.resources().clone(),
+        scratch: play.scratch_outcome(),
         stats: play.stats().clone(),
     })
 }
@@ -1057,7 +1300,11 @@ pub fn auto_witnesses_with_resources(field: &FieldFile, def: &SceneDef, story: &
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).
+/// Native placement remains unavailable until this query receives checked field-visit scratch
+/// and its cache is bound to that visit. The scene interpreter's native journal is not permission
+/// to guess the scratch inputs of this separate read-only admission helper.
 pub fn trigger_npc(field: &FieldFile, def: &SceneDef, story: &StoryState) -> Option<TriggerNpc> {
+    if story.supports_native_party() { return None; }
     let story = def.prepare_story(story).ok()?;
     let script = FieldScript::from_field(field).ok()?;
     let loader: ModelLoader = field.model_loader().ok()?;

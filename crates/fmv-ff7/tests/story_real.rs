@@ -52,6 +52,74 @@ fn at(moment: u16) -> Vec<u8> {
     StoryState::at(moment).encode()
 }
 
+/// Full source evaluation of the ordinary points in the opening/reactor route. The two
+/// points ending in MAPJUMP are separate authored-scene continuations; they are checked
+/// below for source admission and for refusal by this non-travel evaluator.
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn exact_ordinary_route_points_keep_all_writes_and_effective_battle_rules() {
+    use fmv_adapter_api::StoryBattlePolicy;
+    use fmv_ff7::story::compare_exchange_progression;
+    let Some(dir) = data_dir() else { return };
+    let adapter = adapter(&dir);
+    let cases = [
+        ("md1stin", 0, 1, 0, 6, 0, None, Some((300, false))),
+        ("md1_2", 0, 7, 0, 8, 0, None, None),
+        ("nrthmk", 0, 8, 0, 10, 0, None, None),
+        ("nmkin_1", 0, 10, 0, 11, 0, None, None),
+        ("elevtr1", 0, 11, 0, 12, 1, None, None),
+        ("nmkin_2", 0, 12, 1, 13, 1, None, None),
+        ("nmkin_3", 0, 13, 1, 14, 1, None, None),
+        ("nmkin_5", 0, 14, 1, 27, 65, Some(600), Some((324, true))),
+        ("nmkin_3", 0, 27, 1, 27, 33, None, None),
+        ("elevtr1", 1, 27, 33, 27, 32, None, None),
+    ];
+    for (key, point, moment, flags, next_moment, next_flags, countdown, battle) in cases {
+        let area = adapter.load_field(key).unwrap();
+        let script = FieldScript::from_field(area.field_file()).unwrap();
+        let mut story = AreaStory::scan(&script, area.walkmesh());
+        story.add_talk_points(&script, &area.npcs());
+        let mut before = StoryState::fresh_first_control();
+        before.moment = moment;
+        before.write_byte(1, 225, flags).unwrap();
+        let expected = before.encode();
+        let step = story.advance_exact_with(&script, &expected, point)
+            .unwrap_or_else(|error| panic!("{key}#{point}: {error:?}"))
+            .unwrap_or_else(|| panic!("{key}#{point} did not apply"));
+        let after = StoryState::decode(&step.progress).unwrap();
+        assert_eq!((after.moment, after.var(1, 225), step.countdown), (next_moment, next_flags, countdown), "{key}#{point}");
+        assert_eq!(compare_exchange_progression(&expected, &expected, &step.progress), Some(step.progress.clone()), "{key}#{point}");
+        assert!(compare_exchange_progression(&step.progress, &expected, &step.progress).is_none(), "{key}#{point}: stale predecessor refuses");
+        let policy = battle.map(|(formation, victory_fanfare)| StoryBattlePolicy { formation, escape_forbidden: false, victory_fanfare, game_over_on_defeat: true });
+        assert_eq!(area.story_battle_policy(&expected, point), policy, "{key}#{point}: only the mode at BATTLE matters");
+        if key == "nmkin_5" {
+            assert_eq!(after.known_bit(1, 226, 2), Some(true), "the non-curated pre-trigger assignment survives");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn terminal_points_require_their_authored_scene_and_optional_materia_cannot_disappear() {
+    use fmv_ff7::story::StoryPointSource;
+    let Some(dir) = data_dir() else { return };
+    let adapter = adapter(&dir);
+    for (key, point, moment, flags, entity) in [("md1_1", 0, 6, 0, 0), ("nrthmk", 1, 27, 32, 7)] {
+        let area = adapter.load_field(key).unwrap();
+        let script = FieldScript::from_field(area.field_file()).unwrap();
+        let story = AreaStory::scan(&script, area.walkmesh());
+        let mut before = StoryState::fresh_first_control();
+        before.moment = moment;
+        before.write_byte(1, 225, flags).unwrap();
+        assert_eq!(area.story_point_source(&before.encode(), point), Some(StoryPointSource { entity, slot: 0, main: true }), "{key}");
+        assert!(story.advance_exact_with(&script, &before.encode(), point).is_err(), "{key}: MAPJUMP must be committed through its full scene/landing path");
+    }
+    let area = adapter.load_field("nmkin_5").unwrap();
+    let mut before = StoryState::fresh_first_control();
+    before.moment = 14;
+    assert!(area.story_advance(&before.encode(), 3).is_none(), "the optional Restore materia cannot become a moment-only save");
+}
+
 fn corners(area: &dyn AreaRuntime, id: u32) -> Vec<Pos> {
     let point = area.story_points().into_iter().find(|p| p.id == id).expect("the point exists");
     let StoryTrigger::Region(corners) = point.trigger else { panic!("a region") };

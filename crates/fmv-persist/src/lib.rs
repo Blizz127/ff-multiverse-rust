@@ -9,8 +9,8 @@
 //! * **Atomic, durable writes.** Record files: temp file in the same directory, fsync, rename,
 //!   fsync the directory. A crash leaves the old file or the new file, never a torn one. The
 //!   account index is an append-only, checksummed log: one synced line commits a registration.
-//! * **A registration costs the same at any size.** Two small record files and one log line,
-//!   whatever the number of accounts (the version 1 index was rewritten whole, twice, per
+//! * **Ordinary registration costs the same at any size.** A bounded set of record files and
+//!   one log line, whatever the number of accounts (the version 1 index was rewritten whole, twice, per
 //!   registration and stopped accepting registrations for good at about 121,000 accounts). The
 //!   number of accounts is bounded by [`StoreOptions::max_accounts`] instead, with a clear
 //!   error ([`PersistError::AccountLimitReached`]) that costs nothing and touches no login.
@@ -23,8 +23,10 @@
 //!   how a server says that one did (the registering session never logs in with the token, so
 //!   without it every player who has not logged in again would look like an orphan).
 //!   [`Store::register_with_character_and_progress`] includes game-authored initial stats,
-//!   money and inventory in that same commit. Only an untouched initial record is still
-//!   releasable as an orphan; earned progress and scene receipts remain protected.
+//!   money and inventory in that same commit. [`Store::register_with_character_and_initial_state`]
+//!   can also seed an opaque story. Only the complete, byte-identical initial file set remains
+//!   releasable as an orphan; missing files, earned progress and scene receipts prevent release.
+//!   An explicit story seed first raises the index header to version 4, a one-time index rewrite.
 //! * **Names that cannot impersonate.** Display names are unique by `fmv_core::name_key` (case,
 //!   canonical form, width, invisible characters and look-alike letters make no difference),
 //!   and a new name must come from one writing system.
@@ -55,17 +57,27 @@
 //!   scene resumption; finishing releases the guests and retains the owner's pending landing.
 //!   [`Store::get_scene_group`] recovers that complete roster from any participant. Ordinary
 //!   progress writes and trash rekeying refuse active continuations. The first batch durably
-//!   raises the index header to version 3 before its intent: older servers refuse the whole
-//!   store. Later compaction and snapshots retain this fence. Rollback requires a snapshot
-//!   taken before that first batch. Existing stores are not upgraded just by opening them.
+//!   raises the index header to version 4 before its intent: older index-version-2/3 servers
+//!   refuse the whole store. Explicit registration story seeds and restored story records also raise this
+//!   fence, including legacy story-only archives. Detached archives from index-4 stores carry
+//!   manifest version 2 so older import tools also refuse them. Compaction and snapshots retain the fence; rollback
+//!   requires a snapshot taken before opt-in. Opening an existing store alone does not upgrade it.
+//! * **Explicit field visits commit with their story/resource result.** [`Store::commit_field_visit`]
+//!   compares the full [`SceneState`] and retains one exact operation receipt. Enter creates a
+//!   new visit identity; Advance increments its revision without forgetting known scratch bits.
+//!   Both are idle-only until a separate runtime lifecycle is implemented. Ordinary saves and
+//!   scene batches preserve visit metadata. Character envelope 4, intent 3, index header 5 and
+//!   detached archive manifest 3 exclude older writers before success; no legacy record is
+//!   initialized or upgraded merely by opening it. [`Store::require_compatibility`] lets future
+//!   adapter-owned opaque formats explicitly request this fence without inventing a visit.
 //! * **The story blob moves forward through one atomic step.** [`Progression`] (one opaque blob per
 //!   account and game, read only by the game's adapter) is written with [`Store::put_progression`] or,
 //!   when the new value depends on the old one, [`Store::update_progression`]: a read-modify-write under
 //!   the writer lock, so two saves for one account that arrive out of order cannot take a story back
 //!   (the adapter's merge runs inside the closure). A record that cannot be read is an error and is
-//!   never replaced by a default. No record is written for an account that never advanced: an absent
-//!   record is a new account, and the record keeps the shape it always had (`SCHEMA_VERSION` 1, the
-//!   same five keys), so a build from before the story model reads it too (the blob is opaque there).
+//!   never replaced by a default. Without an explicit registration seed or later story write,
+//!   no story record exists. The record retains `SCHEMA_VERSION` 1 and the same five keys;
+//!   the index-format fence controls compatibility when an opaque story is seeded or imported.
 //! * **An inventory that was never stored is not an empty one.** The inventory is optional inside
 //!   the character record: `None` (no `inventory` key on disk, which is what every record written
 //!   before inventories existed looks like) means *never stored*, so the server starts from its
@@ -139,10 +151,13 @@ pub use character::{
     MAX_PLAYER_CHARACTER_BYTES,
 };
 pub use error::{PersistError, Result};
+pub use index::StoreCompatibility;
+pub use store::field_visit::{FieldVisitV1, FieldVisitEntryV1, FieldVisitOperation, FieldVisitOperationKind, FieldVisitCommitted,
+    MAX_FIELD_VISIT_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_ANCHOR_BYTES};
 pub use model::{
-    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, NewCharacterProgress, Progression,
+    game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, NewCharacterProgress, NewProgression, Progression,
     Registered, INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS,
-    MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_INDEX_BYTES,
+    MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_CHARACTER_PROGRESS_SCHEMA_VERSION, MAX_INDEX_BYTES,
     MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};
@@ -151,5 +166,5 @@ pub use store::trash::{Deleted, Restored, TrashEntry, TrashState};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};
 pub use store::location::{SavedLocation, MAX_LOCATION_AREA_BYTES, MAX_LOCATION_RECORD_BYTES, MAX_LOCATION_STORY_BYTES};
 pub use store::scene::{ProgressPair, SceneCommit, SceneBatchCommitted, SceneCheckpoint, SceneOperation,
-    SceneOperationKind, ScenePhase, SceneReservation, SceneState, MAX_SCENE_RECEIPTS,
+    SceneOperationKind, ScenePhase, SceneReservation, SceneState, MAX_ARRIVAL_METADATA_STEPS, MAX_SCENE_RECEIPTS,
     MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};

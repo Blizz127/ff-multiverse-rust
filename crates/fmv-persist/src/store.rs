@@ -22,8 +22,8 @@
 //! # Crash consistency
 //!
 //! `index.log` is the single commit point for everything that allocates an id or must stay
-//! unique. Creating an account (with its avatar and its player-character record) writes the record
-//! files first (nothing references them yet) and appends **one** log entry last: the name, the token
+//! unique. Creating an account (with its avatar, player-character and optional initial
+//! character/story progress) writes the record files first (nothing references them yet) and appends **one** log entry last: the name, the token
 //! and the ids become real together, or not at all. A crash in between leaves unreferenced record
 //! files that the next creation overwrites, never a dangling reference or a reused id. Updates to
 //! an existing avatar or progression are one atomic file write each. So is the one record that is
@@ -70,13 +70,17 @@ use crate::index::{self, AccountEntry, Index, LogWriter, Op, TokenHash, INDEX_LO
 use crate::lock::LockGuard;
 use crate::model::{
     check_new_appearance_ref, game_key, is_safe_key, AccountInfo, AccountRecord, AvatarId,
-    AvatarProfile, CharacterProgress, NewCharacterProgress, Progression, Registered, RegistrationProgress, MAX_BLOB_BYTES,
+    AvatarProfile, CharacterProgress, NewCharacterProgress, NewProgression, Progression, Registered, RegistrationProgress, MAX_BLOB_BYTES,
     MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 use crate::snapshot::{self, SnapshotInfo};
 
 pub mod location;
 mod player_character;
+mod progression_cas;
+#[cfg(test)]
+mod large_visit_compatibility;
+pub(crate) mod field_visit;
 pub(crate) mod scene;
 pub mod restyle;
 pub mod trash;
@@ -132,7 +136,7 @@ struct Counters {
     next_avatar_id: u64,
 }
 
-type NewAccountRecords = (AccountId, Option<AvatarProfile>, Option<PlayerCharacter>, Option<CharacterProgress>);
+type NewAccountRecords = (AccountId, Option<AvatarProfile>, Option<PlayerCharacter>, Option<CharacterProgress>, Option<Progression>);
 
 /// The bytes that are both written and fingerprinted for an untouched registration seed.
 fn registration_progress_bytes(record: &CharacterProgress) -> Result<Vec<u8>> {
@@ -146,9 +150,25 @@ fn registration_progress_bytes(record: &CharacterProgress) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Serialize once: these exact bytes are both written and bound by the orphan fingerprint.
+fn registration_story_bytes(record: &Progression) -> Result<Vec<u8>> {
+    if record.blob.len() > MAX_BLOB_BYTES {
+        return Err(PersistError::BlobTooLarge { len: record.blob.len(), max: MAX_BLOB_BYTES });
+    }
+    let mut bytes = serde_json::to_vec_pretty(record).map_err(|e| PersistError::InvalidField {
+        field: "initial_story", reason: format!("cannot serialize: {e}"),
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(PersistError::InvalidField { field: "initial_story", reason: "record exceeds size limit".into() });
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_REGISTRATION_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_REGISTRATION_AFTER_CHARACTER_SEED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_SCENE_FORMAT_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -511,6 +531,28 @@ impl Store {
         progress: Option<NewCharacterProgress>,
         now: u64,
     ) -> Result<(Registered, Option<CharacterProgress>)> {
+        self.register_with_character_and_initial_state(display_name, tint, base_archetype, appearance_ref, character, progress, None, now)
+            .map(|(registered, progress, _)| (registered, progress))
+    }
+
+    /// Register identity and optional character/story seeds with one account-log commit.
+    /// Both seeds must name the same game. Every input and encoded size is validated before
+    /// any file changes; both files are durable before the account becomes visible. Returned
+    /// records are the exact after-images, without a fallible postcommit read or write.
+    /// Any explicit story seed first raises the recognized index-format fence to version 4;
+    /// binaries limited to index versions 2 or 3 refuse before modifying its story.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_character_and_initial_state(
+        &self,
+        display_name: &str,
+        tint: [u8; 3],
+        base_archetype: &str,
+        appearance_ref: Option<(GameId, &str)>,
+        character: Option<NewPlayerCharacter>,
+        progress: Option<NewCharacterProgress>,
+        story: Option<NewProgression>,
+        now: u64,
+    ) -> Result<(Registered, Option<CharacterProgress>, Option<Progression>)> {
         let name = AvatarAppearance::validate_new_name(display_name)
             .map_err(|_| PersistError::InvalidName)?;
         let mut per_game_overrides = BTreeMap::new();
@@ -535,11 +577,18 @@ impl Store {
             registration_progress_bytes(&largest)?;
             self.character_path(0, new.game)?;
         }
+        if let Some(new) = &story {
+            registration_story_bytes(&new.record(AccountId(u64::MAX), now))?;
+            self.progression_path(0, new.game)?;
+        }
+        if progress.as_ref().zip(story.as_ref()).is_some_and(|(progress, story)| progress.game != story.game) {
+            return Err(PersistError::InvalidField { field: "initial_state", reason: "character and story seeds must belong to the same game".into() });
+        }
 
         self.check_capacity()?;
         let token = new_token()?;
-        let (account_id, profile, record, progress) =
-            self.insert_account(name, token_hash(&token), now, Some(avatar), character, progress)?;
+        let (account_id, profile, record, progress, story) =
+            self.insert_account(name, token_hash(&token), now, Some(avatar), character, progress, story)?;
         let avatar = profile.ok_or_else(|| {
             PersistError::corrupt(&self.log_path(), "a registration produced no avatar")
         })?;
@@ -548,7 +597,7 @@ impl Store {
             token,
             avatar,
             character: record,
-        }, progress))
+        }, progress, story))
     }
 
     /// Create an account without an avatar. Returns its id and the plaintext token, which is
@@ -563,12 +612,13 @@ impl Store {
             .map_err(|_| PersistError::InvalidName)?;
         self.check_capacity()?;
         let token = new_token()?;
-        let (account, _, _, _) = self.insert_account(name, token_hash(&token), now, None, None, None)?;
+        let (account, _, _, _, _) = self.insert_account(name, token_hash(&token), now, None, None, None, None)?;
         Ok((account, token))
     }
 
     /// The write path shared by `register` and `create_account`: take the writer lock, check
     /// that the name is free, write the record files, append the log entry.
+    #[allow(clippy::too_many_arguments)]
     fn insert_account(
         &self,
         name: String,
@@ -577,6 +627,7 @@ impl Store {
         avatar: Option<NewAvatar>,
         character: Option<NewPlayerCharacter>,
         progress: Option<NewCharacterProgress>,
+        story: Option<NewProgression>,
     ) -> Result<NewAccountRecords> {
         let key = name_key(&name);
         let mut counters = self.writer()?;
@@ -601,13 +652,20 @@ impl Store {
         let avatar_id = counters.next_avatar_id;
         let next_avatar = avatar_id.checked_add(1).ok_or(PersistError::IdExhausted)?;
 
-        self.clear_uncommitted_account_state(id)?;
         let progress_dir = self.progression_dir(id);
         let initial = progress.map(|new| new.record(AccountId(id), now));
         let initial_bytes = initial.as_ref().map(registration_progress_bytes).transpose()?;
+        let initial_story = story.map(|new| new.record(AccountId(id), now));
+        let story_bytes = initial_story.as_ref().map(registration_story_bytes).transpose()?;
         let registration_progress = initial.as_ref().zip(initial_bytes.as_ref()).map(|(record, bytes)| RegistrationProgress {
             game: record.game, digest: *blake3::hash(bytes).as_bytes(),
         });
+        let registration_story = initial_story.as_ref().zip(story_bytes.as_ref()).map(|(record, bytes)| RegistrationProgress {
+            game: record.game, digest: *blake3::hash(bytes).as_bytes(),
+        });
+        let _progress_gate = initial_story.as_ref().map(|_| self.progress_write());
+        if initial_story.is_some() { self.ensure_scene_batch_format(&counters)?; }
+        self.clear_uncommitted_account_state(id)?;
 
         // 1. The records. Nothing references them yet.
         let record = AccountRecord {
@@ -617,6 +675,7 @@ impl Store {
             token_hash: hex::encode(hash),
             created_at: now,
             registration_progress,
+            registration_story,
         };
         fsio::write_json(&self.account_path(id), &record, MAX_RECORD_BYTES)?;
         let profile = match &avatar {
@@ -648,6 +707,14 @@ impl Store {
             fsio::atomic_write(&self.character_path(id, initial.game)?, bytes)?;
         }
         #[cfg(test)]
+        if FAIL_REGISTRATION_AFTER_CHARACTER_SEED.with(|flag| flag.replace(false)) {
+            return Err(PersistError::InvalidField { field: "test_checkpoint", reason: "registration interrupted between initial files".into() });
+        }
+        if let (Some(initial), Some(bytes)) = (&initial_story, &story_bytes) {
+            fsio::ensure_dir(&progress_dir)?;
+            fsio::atomic_write(&self.progression_path(id, initial.game)?, bytes)?;
+        }
+        #[cfg(test)]
         registration_checkpoint()?;
 
         // 2. The commit point: one synced log entry. Memory changes only after it is durable.
@@ -676,7 +743,7 @@ impl Store {
         if linked_avatar.is_some() {
             counters.next_avatar_id = next_avatar;
         }
-        Ok((AccountId(id), profile, character_record, initial))
+        Ok((AccountId(id), profile, character_record, initial, initial_story))
     }
 
     /// Remove state left before an account-allocation commit. Both registration and restore
@@ -832,7 +899,7 @@ impl Store {
     /// Allowed only for an account whose token has **never** been used to log in and whose owner
     /// is not recorded as holding it ([`Store::mark_claimed`]; see
     /// [`Store::unclaimed_accounts`]) and that has no stored progression beyond the exact,
-    /// untouched character-progress seed written during registration; otherwise it fails
+    /// untouched character/story seed files written during registration; otherwise it fails
     /// with [`PersistError::NotReleasable`] and nothing changes. The check and the release are
     /// decided under the same lock a first login takes, so an account whose token was just
     /// accepted cannot be released. The account id is retired for good (ids are never reused),
@@ -851,14 +918,9 @@ impl Store {
             .ok_or(PersistError::UnknownAccount(account))?
             .avatar;
         let progression_dir = self.progression_dir(account.0);
-        let progress_files = fsio::list_json_files(&progression_dir)?;
-        let pristine_seed = self.pristine_registration_progress(account, &progress_files)?;
-        if !progress_files.is_empty() && pristine_seed.is_none() {
-            return Err(PersistError::NotReleasable {
-                account,
-                reason: "it has stored progression",
-            });
-        }
+        let pristine_seed = self.pristine_registration_progress(account)?.ok_or(PersistError::NotReleasable {
+            account, reason: "its progression files differ from the complete registration seed",
+        })?;
         {
             let mut log = self.log();
             let claimed = self
@@ -895,19 +957,57 @@ impl Store {
         Ok(())
     }
 
-    /// Only the one byte-identical file written with registration may be discarded before
-    /// token delivery. Story progress, a receipt, a reward or any other edit blocks release.
-    fn pristine_registration_progress(&self, account: AccountId, files: &[String]) -> Result<Option<PathBuf>> {
-        if files.len() != 1 { return Ok(None); }
+    /// Only the complete byte-identical initial file set may be discarded before token
+    /// delivery. A missing file (including an empty directory), extra entry, receipt, reward
+    /// or any other edit blocks release. No seed metadata and no files is a pristine old
+    /// registration. Directory/symlink substitutions are never treated as absent seeds.
+    fn pristine_registration_progress(&self, account: AccountId) -> Result<Option<Vec<PathBuf>>> {
         let path = self.account_path(account.0);
         let Some(record) = fsio::read_json::<AccountRecord>(&path, MAX_RECORD_BYTES)? else { return Ok(None) };
         if record.account_id != account { return Err(PersistError::corrupt(&path, "registration metadata belongs to another account")); }
-        let Some(initial) = record.registration_progress else { return Ok(None) };
-        let expected = format!("{}.character.json", game_key(initial.game));
-        if files.first() != Some(&expected) { return Ok(None); }
-        let progress_path = self.character_path(account.0, initial.game)?;
-        let Some(bytes) = fsio::read_capped(&progress_path, MAX_CHARACTER_RECORD_BYTES)? else { return Ok(None) };
-        Ok((*blake3::hash(&bytes).as_bytes() == initial.digest).then_some(progress_path))
+        if record.registration_progress.as_ref().zip(record.registration_story.as_ref()).is_some_and(|(a, b)| a.game != b.game) {
+            return Err(PersistError::corrupt(&path, "registration seeds belong to different games"));
+        }
+        let mut expected = BTreeMap::new();
+        if let Some(seed) = record.registration_progress {
+            expected.insert(format!("{}.character.json", game_key(seed.game)),
+                (self.character_path(account.0, seed.game)?, seed.digest, MAX_CHARACTER_RECORD_BYTES));
+        }
+        if let Some(seed) = record.registration_story {
+            expected.insert(format!("{}.json", game_key(seed.game)),
+                (self.progression_path(account.0, seed.game)?, seed.digest, MAX_RECORD_BYTES));
+        }
+        let dir = self.progression_dir(account.0);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => return Ok(None),
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(PersistError::io("inspect registration seed directory", &dir, e)),
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(PersistError::io("list registration seed files", &dir, e)),
+        };
+        let mut found = Vec::new();
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry.map_err(|e| PersistError::io("read registration seed entry", &dir, e))?;
+                let kind = entry.file_type().map_err(|e| PersistError::io("inspect registration seed entry", &entry.path(), e))?;
+                if !kind.is_file() { return Ok(None); }
+                let Ok(name) = entry.file_name().into_string() else { return Ok(None) };
+                if !expected.contains_key(&name) { return Ok(None); }
+                found.push(name);
+            }
+        }
+        if found.len() != expected.len() { return Ok(None); }
+        let mut paths = Vec::with_capacity(expected.len());
+        for (path, digest, max) in expected.into_values() {
+            let Some(bytes) = fsio::read_capped(&path, max)? else { return Ok(None) };
+            if *blake3::hash(&bytes).as_bytes() != digest { return Ok(None); }
+            paths.push(path);
+        }
+        Ok(Some(paths))
     }
 
     /// [`Store::release_unclaimed`] for a caller that releases on a best-effort basis, for
@@ -1094,6 +1194,7 @@ impl Store {
         fsio::ensure_dir(&self.progression_dir(progression.account_id.0))?;
         let mut stored = progression.clone();
         stored.schema_version = SCHEMA_VERSION;
+        self.ensure_character_format(&_counters, progression.account_id, progression.game)?;
         fsio::write_json(&path, &stored, MAX_RECORD_BYTES)
     }
 
@@ -1139,6 +1240,7 @@ impl Store {
             return Err(PersistError::BlobTooLarge { len: next.blob.len(), max: MAX_BLOB_BYTES });
         }
         next.schema_version = SCHEMA_VERSION;
+        self.ensure_character_format(&_counters, account, game)?;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
         fsio::write_json(&path, &next, MAX_RECORD_BYTES)?;
         Ok(next)
@@ -1186,7 +1288,10 @@ impl Store {
         let _counters = self.writer()?;
         let _progress = self.progress_write();
         if !self.index().contains_account(account.0) { return Err(PersistError::UnknownAccount(account)); }
-        if let Some(record) = self.read_character_progress(account, game)? { return Ok(record); }
+        if let Some(record) = self.read_character_progress(account, game)? {
+            self.ensure_character_format(&_counters, account, game)?;
+            return Ok(record);
+        }
         let mut record = make();
         if record.account_id != account || record.game != game {
             return Err(PersistError::InvalidField { field: "account_id", reason: "initial record belongs to another account or game".into() });
@@ -1194,7 +1299,7 @@ impl Store {
         record.validate()?;
         record.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
-        self.write_character_record(&path, record)
+        self.write_character_record(&_counters, &path, record)
     }
 
     fn read_character_progress(
@@ -1252,7 +1357,7 @@ impl Store {
         fsio::ensure_dir(&self.progression_dir(record.account_id.0))?;
         let mut stored = record.clone();
         stored.schema_version = SCHEMA_VERSION;
-        self.write_character_record(&path, stored).map(|_| ())
+        self.write_character_record(&_counters, &path, stored).map(|_| ())
     }
 
     /// Read-modify-write of the account's [`CharacterProgress`] for `game`, as one step that no
@@ -1302,24 +1407,71 @@ impl Store {
         next.validate()?;
         next.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
-        self.write_character_record(&path, next)
+        self.write_character_record(&_counters, &path, next)
+    }
+
+    /// Raise the recognized index fence to an explicitly selected minimum compatibility.
+    /// This does not initialize, validate or register records, and cannot downgrade an
+    /// existing store. Existing registration methods keep their own default requirements.
+    /// Callers that need an atomic registration/write must establish its required fence
+    /// inside that operation after validation and before any record becomes visible.
+    /// An uncertain fence replacement blocks progress and writes until this Store reopens.
+    pub fn require_compatibility(&self, minimum: index::StoreCompatibility) -> Result<()> {
+        let counters = self.writer()?;
+        let _progress = self.progress_write();
+        self.ensure_index_format(&counters, minimum.index_version())
     }
 
     /// The caller already holds the writer and progress gates. Raise the recognized index
-    /// header before any batch intent or schema-3 progress is written: older binaries then
-    /// refuse the entire store, including their story-only setters. No account data changes.
+    /// header to version 4 before explicit durable story operations or schema-3 progress are
+    /// acknowledged. Earlier version-3 writers lack the ordinary exact-story/battle commit
+    /// and uncertain-write guarantees; they must refuse the entire store. The character and
+    /// intent formats do not change. No account data changes.
     fn ensure_scene_batch_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_index_format(counters, index::DURABLE_STORY_INDEX_VERSION)
+    }
+
+    /// Larger visit payloads require the new reader/writer bounds before any write or
+    /// successful acknowledgment. The caller already holds the writer and progress gates.
+    fn ensure_large_field_visit_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_index_format(counters, index::LARGE_FIELD_VISIT_INDEX_VERSION)
+    }
+
+    /// Ordinary story writes and successful existing-character acknowledgments retain
+    /// the character envelope. Larger visit data must keep its reader/writer fence even
+    /// though this particular operation does not rewrite that envelope. Pure reads remain
+    /// read-only, and older small-record writes keep their historical format selection.
+    /// The caller holds both writer and progress gates and has validated its new record.
+    fn ensure_character_format(&self, counters: &Counters, account: AccountId, game: GameId) -> Result<()> {
+        let path = self.character_path(account.0, game)?;
+        let Some(record) = scene::CharacterRecord::read(&path)? else { return Ok(()); };
+        if record.progress.account_id != account || record.progress.game != game {
+            return Err(PersistError::corrupt(&path, "character record belongs to another account or game"));
+        }
+        if record.minimum_index_version() >= index::LARGE_FIELD_VISIT_INDEX_VERSION {
+            self.ensure_large_field_visit_format(counters)?;
+        }
+        Ok(())
+    }
+
+    /// Select a supported minimum without changing records or lowering a prior fence.
+    /// Both caller gates are already held. Validation rejects unknown output versions before
+    /// the uncertainty latch; a legacy minimum of 2 leaves existing version-2/3 stores alone.
+    fn ensure_index_format(&self, counters: &Counters, minimum: u32) -> Result<()> {
         self.ensure_transaction_healthy()?;
+        if !(crate::model::INDEX_LOG_VERSION..=index::LARGE_FIELD_VISIT_INDEX_VERSION).contains(&minimum) {
+            return Err(PersistError::InvalidField { field: "store_compatibility", reason: "unsupported index compatibility minimum".into() });
+        }
         let mut log = self.log();
         log.ensure_healthy()?;
-        if self.index().format_version() >= index::SCENE_BATCH_INDEX_VERSION { return Ok(()); }
+        if self.index().format_version() >= minimum { return Ok(()); }
         let path = self.log_path();
         // atomic_write can report a directory-sync failure after replacing the log. Until
         // reopening decides which inode survived, no reader or writer may use this Store.
         self.transaction_poisoned.store(true, Ordering::Release);
         let upgraded = (|| {
             let (len, _) = index::write_compacted_version(&path, &self.index(), counters.next_account_id,
-                counters.next_avatar_id, index::SCENE_BATCH_INDEX_VERSION)?;
+                counters.next_avatar_id, minimum)?;
             #[cfg(test)]
             if FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.replace(false)) {
                 return Err(PersistError::io("injected scene format fence failure", &path,
@@ -1327,7 +1479,7 @@ impl Store {
             }
             let fresh = LogWriter::open(&path, len)?;
             *log = fresh;
-            self.index_mut().require_scene_batch_format();
+            self.index_mut().require_format(minimum);
             Ok(())
         })();
         match upgraded {
@@ -1621,6 +1773,131 @@ mod tests {
         assert_eq!(reopened.get_character_progress(AccountId(3), GameId::Ff7).unwrap().unwrap().gil, 240);
     }
 
+    fn registration_story_fixture() -> NewProgression {
+        NewProgression::new(GameId::Ff7, (0..5117).map(|n| (n % 251) as u8).collect())
+    }
+
+    #[test]
+    fn partial_and_complete_initial_state_failures_never_claim_a_name_or_leak_into_a_reused_id() {
+        for between_files in [false, true] {
+            for reopen in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut store = Store::open(dir.path()).unwrap();
+                let mut seed = NewCharacterProgress::new(GameId::Ff7, 0, 6);
+                seed.gil = 240;
+                seed.inventory = Some(vec![fmv_core::InventoryEntry::new(0, 3)]);
+                if between_files { FAIL_REGISTRATION_AFTER_CHARACTER_SEED.with(|flag| flag.set(true)); }
+                else { FAIL_REGISTRATION_BEFORE_COMMIT.with(|flag| flag.set(true)); }
+                assert!(store.register_with_character_and_initial_state("Interrupted", [1, 2, 3], "default", None,
+                    None, Some(seed), Some(registration_story_fixture()), 5).is_err());
+                assert_eq!(store.account_count(), 0);
+                assert!(store.character_path(1, GameId::Ff7).unwrap().exists());
+                assert_eq!(store.progression_path(1, GameId::Ff7).unwrap().exists(), !between_files);
+                if reopen { drop(store); store = Store::open(dir.path()).unwrap(); }
+                let (account, _) = store.create_account("Interrupted", 6).unwrap();
+                assert_eq!(account, AccountId(1));
+                assert!(store.get_character_progress(account, GameId::Ff7).unwrap().is_none());
+                assert!(store.get_progression(account, GameId::Ff7).unwrap().blob.is_empty());
+                assert!(!store.progression_path(account.0, GameId::Ff7).unwrap().exists());
+                assert_eq!(store.index().format_version(), index::DURABLE_STORY_INDEX_VERSION,
+                    "an interrupted opt-in may safely retain the compatibility fence");
+            }
+        }
+    }
+
+    #[test]
+    fn restore_allocation_replaces_both_uncommitted_seed_files_with_only_the_archived_state() {
+        for archived in [false, true] {
+            for between_files in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store::open(dir.path()).unwrap();
+                let (old, _) = store.create_account("Archived", 1).unwrap();
+                if archived {
+                    store.put_progression(&Progression::new(old, GameId::Ff7, vec![9, 8, 7], 2)).unwrap();
+                    let mut record = CharacterProgress::new(old, GameId::Ff7, 2, 5, 2);
+                    record.gil = 17;
+                    record.inventory = Some(vec![fmv_core::InventoryEntry::new(4, 8)]);
+                    store.put_character_progress(&record).unwrap();
+                }
+                let deleted = store.delete_account(old, 3).unwrap();
+                let mut seed = NewCharacterProgress::new(GameId::Ff7, 0, 6);
+                seed.gil = 240;
+                if between_files { FAIL_REGISTRATION_AFTER_CHARACTER_SEED.with(|flag| flag.set(true)); }
+                else { FAIL_REGISTRATION_BEFORE_COMMIT.with(|flag| flag.set(true)); }
+                assert!(store.register_with_character_and_initial_state("Interrupted", [1, 2, 3], "default", None,
+                    None, Some(seed), Some(registration_story_fixture()), 4).is_err());
+                let restored = store.restore_account(&deleted.entry, 5).unwrap();
+                assert_eq!(restored.account_id, AccountId(2));
+                assert!(restored.unfinished.is_empty());
+                let check = |store: &Store| {
+                    assert_eq!(store.get_progression(restored.account_id, GameId::Ff7).unwrap().blob,
+                        if archived { vec![9, 8, 7] } else { vec![] });
+                    let record = store.get_character_progress(restored.account_id, GameId::Ff7).unwrap();
+                    assert_eq!(record.as_ref().map(|r| r.gil), archived.then_some(17));
+                    if let Some(record) = record { assert_eq!(record.inventory, Some(vec![fmv_core::InventoryEntry::new(4, 8)])); }
+                };
+                check(&store);
+                drop(store);
+                check(&Store::open(dir.path()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn an_uncertain_account_append_cannot_erase_either_initial_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (legacy, _) = store.create_account("Archived", 1).unwrap();
+        let deleted = store.delete_account(legacy, 2).unwrap();
+        let mut seed = NewCharacterProgress::new(GameId::Ff7, 0, 6);
+        seed.gil = 240;
+        FAIL_REGISTRATION_BEFORE_COMMIT.with(|flag| flag.set(true));
+        let story = registration_story_fixture();
+        assert!(store.register_with_character_and_initial_state("Interrupted", [1, 2, 3], "default", None,
+            None, Some(seed), Some(story.clone()), 3).is_err());
+        let paths = [store.character_path(2, GameId::Ff7).unwrap(), store.progression_path(2, GameId::Ff7).unwrap()];
+        let bytes: Vec<_> = paths.iter().map(|path| std::fs::read(path).unwrap()).collect();
+        let account = store.load_account(2).unwrap();
+        store.log().append(&Op::Account { id: 2, name: account.display_name, token: account.token_hash,
+            at: 3, avatar: Some(1), claimed: false }).unwrap();
+        store.log().poison("uncertain append".into());
+        assert!(matches!(store.create_account("Next", 4), Err(PersistError::IndexPoisoned { .. })));
+        assert!(matches!(store.restore_account(&deleted.entry, 4), Err(PersistError::IndexPoisoned { .. })));
+        assert!(matches!(store.register_with_character_and_initial_state("Other", [1, 2, 3], "default", None,
+            None, None, Some(story.clone()), 4), Err(PersistError::IndexPoisoned { .. })));
+        for (path, expected) in paths.iter().zip(bytes) { assert_eq!(std::fs::read(path).unwrap(), expected); }
+        drop(store);
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.get_character_progress(AccountId(2), GameId::Ff7).unwrap().unwrap().gil, 240);
+        assert_eq!(reopened.get_progression(AccountId(2), GameId::Ff7).unwrap().blob, story.blob);
+        reopened.release_unclaimed(AccountId(2)).unwrap();
+        assert_eq!(reopened.account_count(), 0, "the untouched undelivered pair remains releasable after recovery");
+    }
+
+    #[test]
+    fn uncertain_initial_story_format_upgrade_writes_no_account_and_requires_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.set(true));
+        let story = registration_story_fixture();
+        assert!(store.register_with_character_and_initial_state("New Story", [1, 2, 3], "default", None,
+            None, None, Some(story.clone()), 1).is_err());
+        assert_eq!(store.account_count(), 0);
+        assert!(!store.account_path(1).exists());
+        assert!(!store.progression_path(1, GameId::Ff7).unwrap().exists());
+        assert!(matches!(store.create_account("Blocked", 2), Err(PersistError::TransactionRecoveryRequired)));
+        assert!(matches!(store.get_progression(AccountId(1), GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+        drop(store);
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.index().format_version(), index::DURABLE_STORY_INDEX_VERSION);
+        let (registered, character, initial) = reopened.register_with_character_and_initial_state("New Story", [1, 2, 3], "default", None,
+            None, None, Some(story.clone()), 3).unwrap();
+        assert_eq!(registered.account_id, AccountId(1));
+        assert!(character.is_none());
+        assert_eq!(initial.as_ref().unwrap().blob, story.blob);
+        assert_eq!(reopened.get_progression(registered.account_id, GameId::Ff7).unwrap(), initial.unwrap());
+    }
+
     #[test]
     fn store_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
@@ -1739,7 +2016,7 @@ mod tests {
             store.ensure_scene_batch_format(&counters).unwrap();
             store.ensure_scene_batch_format(&counters).unwrap();
         }
-        assert_eq!(store.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(store.index().format_version(), index::DURABLE_STORY_INDEX_VERSION);
         assert_eq!(std::fs::read(store.character_path(account.0, GameId::Ff7).unwrap()).unwrap(), bytes);
         // Authentication must append to the replaced log's new inode, not its old handle.
         assert_eq!(store.authenticate(&token).unwrap(), account);
@@ -1748,35 +2025,45 @@ mod tests {
         store.snapshot(&snapshot).unwrap();
         drop(store);
         let reopened = Store::open(&root).unwrap();
-        assert_eq!(reopened.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(reopened.index().format_version(), index::DURABLE_STORY_INDEX_VERSION);
         assert!(reopened.unclaimed_accounts().is_empty(), "the post-fence claim was durable");
         assert_eq!(reopened.get_character_progress(account, GameId::Ff7).unwrap(), Some(character.clone()));
         let restored = dir.path().join("restored");
         crate::restore_snapshot(&snapshot, &restored).unwrap();
         let restored = Store::open(&restored).unwrap();
-        assert_eq!(restored.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
+        assert_eq!(restored.index().format_version(), index::DURABLE_STORY_INDEX_VERSION);
         assert_eq!(restored.get_character_progress(account, GameId::Ff7).unwrap(), Some(character));
     }
 
     #[test]
     fn scene_batch_format_uncertain_replacement_fences_all_progress_until_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let (account, _) = store.create_account("Fence Failure", 1).unwrap();
-        {
-            let counters = store.writer().unwrap();
-            let _progress = store.progress_write();
-            FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.set(true));
-            assert!(store.ensure_scene_batch_format(&counters).is_err());
+        for prior_version in [crate::model::INDEX_LOG_VERSION, index::SCENE_BATCH_INDEX_VERSION] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let (account, _) = store.create_account("Fence Failure", 1).unwrap();
+            drop(store);
+            // A valid earlier-version store can reach the same uncertain upgrade point.
+            let path = dir.path().join(index::INDEX_LOG_FILE);
+            let previous = index::load_log(&path, false).unwrap().unwrap();
+            index::write_compacted_version(&path, &previous.index, previous.next_account_id,
+                previous.next_avatar_id, prior_version).unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.index().format_version(), prior_version);
+            {
+                let counters = store.writer().unwrap();
+                let _progress = store.progress_write();
+                FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.set(true));
+                assert!(store.ensure_scene_batch_format(&counters).is_err());
+            }
+            assert!(matches!(store.get_progression(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
+            assert!(matches!(store.put_progression(&Progression::empty(account, GameId::Ff7)), Err(PersistError::TransactionRecoveryRequired)));
+            assert!(matches!(store.create_account("Blocked", 2), Err(PersistError::TransactionRecoveryRequired)));
+            drop(store);
+            let reopened = Store::open(dir.path()).unwrap();
+            assert_eq!(reopened.index().format_version(), index::DURABLE_STORY_INDEX_VERSION);
+            assert_eq!(reopened.account_count(), 1);
+            assert!(reopened.get_progression(account, GameId::Ff7).unwrap().blob.is_empty());
         }
-        assert!(matches!(store.get_progression(account, GameId::Ff7), Err(PersistError::TransactionRecoveryRequired)));
-        assert!(matches!(store.put_progression(&Progression::empty(account, GameId::Ff7)), Err(PersistError::TransactionRecoveryRequired)));
-        assert!(matches!(store.create_account("Blocked", 2), Err(PersistError::TransactionRecoveryRequired)));
-        drop(store);
-        let reopened = Store::open(dir.path()).unwrap();
-        assert_eq!(reopened.index().format_version(), index::SCENE_BATCH_INDEX_VERSION);
-        assert_eq!(reopened.account_count(), 1);
-        assert!(reopened.get_progression(account, GameId::Ff7).unwrap().blob.is_empty());
     }
 
 }

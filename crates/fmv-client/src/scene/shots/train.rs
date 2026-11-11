@@ -7,7 +7,7 @@ use crate::camera::FieldCamera;
 use crate::window::camera_input;
 use fmv_protocol::{SceneOrigin, SceneReplay};
 
-fn start_held(rig: &mut Rig, origin: Option<SceneOrigin>) {
+pub(super) fn start_held(rig: &mut Rig, origin: Option<SceneOrigin>) {
     rig.state.apply(0.0, ServerMsg::SceneStart {
         run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED,
         progress: rig.story.encode(), gil: rig.gil,
@@ -18,14 +18,14 @@ fn start_held(rig: &mut Rig, origin: Option<SceneOrigin>) {
     assert!(rig.state.scene.is_active(), "the exact-source arrival is built");
 }
 
-fn frame(rig: &mut Rig, camera: &mut FieldCamera, dt: f32) -> FieldDraw {
+pub(super) fn frame(rig: &mut Rig, camera: &mut FieldCamera, dt: f32) -> FieldDraw {
     rig.draw();
     let drawn = rig.draw();
     rig.view.bounds = camera.update(&camera_input(&rig.view, &rig.state, &drawn, SIZE, dt));
     drawn
 }
 
-fn participants_hidden(rig: &Rig, drawn: &FieldDraw) {
+pub(super) fn participants_hidden(rig: &Rig, drawn: &FieldDraw) {
     let scene = rig.state.scene.player().expect("the authored scene remains held");
     let built = drawn.built.as_ref().expect("the owned models are built");
     assert!(drawn.own_at.is_none(), "an absent participant cannot steer the scene camera");

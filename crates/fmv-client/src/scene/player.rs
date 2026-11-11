@@ -49,12 +49,17 @@ use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
-use fmv_ff7::script::scene::{AnimHow, BattleCheckpoint, Look, MoveHow, SceneBoundary, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
+use fmv_ff7::script::scene::{BattleCheckpoint, Look, MoveHow, SceneBoundary, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
 use fmv_ff7::story::StoryState;
 use fmv_protocol::{BattleId, ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneReplayEvent, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use winit::keyboard::KeyCode;
+
+mod ready;
+pub use ready::PresentationRef;
+#[cfg(test)]
+pub use ready::TrainReadyPresentation;
 
 /// A message for the server about a scene.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +171,10 @@ pub struct CastDraw<'a> {
     /// The script entity it plays.
     pub entity: u8,
     pub look: &'a Look,
+    /// Logical walkmesh position, used by movement and the native following camera.
     pub pos: Pos,
+    /// Model position after its independent world-space OFST offset.
+    pub render_pos: Pos,
     pub facing: f32,
     /// Walking now (the avatar's walk clip), standing otherwise.
     pub moving: bool,
@@ -264,7 +272,7 @@ pub struct ScenePlayer {
 
 impl Drop for ScenePlayer {
     fn drop(&mut self) {
-        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        if !self.silent && self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
     }
 }
 
@@ -365,6 +373,37 @@ impl ScenePlayer {
         if replay.events.is_empty() {
             return Ok(Self::new_mode(run, def, source, instant, true, false, shake_rng));
         }
+        let mut player = Self::replay_silent(run, def, source, replay, shake_rng)?;
+        player.silent = false;
+        player.instant = instant;
+        player.accepted = player.passed;
+        if player.over || player.played_out {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::End { run: player.run.id, skipped: false });
+            }
+        } else if let Some(paused) = &player.battle {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::BattleReady { run: player.run.id, ordinal: paused.checkpoint.ordinal, step: player.passed });
+            }
+        } else {
+            player.sound(SoundAction::Begin);
+            // Only the historical prefix was silent; the current blank window is new work.
+            if player.is_owner() && player.panel.as_ref().is_some_and(Panel::is_blank) {
+                let panel = player.panel.take().expect("the blank current panel");
+                player.pass(panel, None);
+                player.settle();
+            }
+        }
+        Ok(player)
+    }
+
+    /// Rebuild without ever activating a run. In particular an empty prefix is silent too,
+    /// and reaching Finished does not queue End or play a historical sound/voice cue.
+    fn replay_silent(run: Run, def: SceneDef, source: Box<dyn SceneSource>, replay: &SceneReplay, shake_rng: [u8; 2]) -> Result<Self, String> {
+        replay.validate().map_err(str::to_owned)?;
+        if source.fingerprint() != Some(replay.source) {
+            return Err("the scene replay source differs from the installed game".into());
+        }
         let mut player = Self::new_mode(run, def, source, false, true, true, shake_rng);
         for event in &replay.events {
             player.reach_boundary()?;
@@ -401,27 +440,6 @@ impl ScenePlayer {
             }
         }
         player.reach_boundary()?;
-        player.silent = false;
-        player.instant = instant;
-        player.accepted = player.passed;
-        if player.over || player.played_out {
-            if player.is_owner() {
-                player.outbox.push(SceneCmd::End { run: player.run.id, skipped: false });
-            }
-        } else if let Some(paused) = &player.battle {
-            if player.is_owner() {
-                player.outbox.push(SceneCmd::BattleReady { run: player.run.id, ordinal: paused.checkpoint.ordinal, step: player.passed });
-            }
-        } else {
-            player.sound(SoundAction::Begin);
-            // The current window is new work, even when its text is empty. Only the accepted
-            // historical prefix was silent; normal owner auto-acknowledgement resumes here.
-            if player.is_owner() && player.panel.as_ref().is_some_and(Panel::is_blank) {
-                let panel = player.panel.take().expect("the blank current panel");
-                player.pass(panel, None);
-                player.settle();
-            }
-        }
         Ok(player)
     }
 
@@ -504,15 +522,16 @@ impl ScenePlayer {
 
     /// What the scene told the camera, with the stage's own clock of it (see [`super::stage::CameraClock`]): the
     /// window's field camera shows it (`crate::camera`).
+    #[cfg(test)]
     pub fn camera_clock(&self) -> super::stage::CameraClock {
         self.cast.camera_clock()
     }
 
     pub fn background_ops(&self) -> &[fmv_ff7::background::BackgroundOp] { self.cast.background_ops() }
 
-    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> { self.cast.fade() }
+    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> { self.presentation().fade() }
 
-    pub fn shake(&self) -> [f32; 2] { self.cast.shake() }
+    pub fn shake(&self) -> [f32; 2] { self.presentation().shake() }
 
     pub fn shake_rng_indices(&self) -> [u8; 2] { self.cast.shake_rng_indices() }
 
@@ -544,16 +563,7 @@ impl ScenePlayer {
     }
 
     pub fn cast_draws(&self) -> Vec<CastDraw<'_>> {
-        self.cast
-            .actors()
-            .filter(|a| a.shown())
-            .filter_map(|a| {
-                let member = self.def.member(a.entity())?;
-                let [x, y, z] = a.pos()?;
-                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), facing: a.heading(), moving: a.moving(),
-                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation(), return_clip: a.full_once_return() })
-            })
-            .collect()
+        self.presentation().cast_draws()
     }
 
     /// Where every participant stands while the scene runs: on the witness spot it was given, which way the spot faces. A
@@ -700,51 +710,10 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32, movement_phase: f32) {
-        // Presentation uses the script's own field model and loaded clip bounds: normal-rate
-        // Holds/Once, plus full loops and fresh full Holds at normal or doubled speed.
-        // Other forms clear an old override; the stage handles supported standing-loop rate changes.
-        if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_loop(*entity, *animation, clip, late, *speed == 32);
-                return;
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_hold_full(*entity, clip, late, *speed == 32);
-                return;
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: speed @ (16 | 32), divisor: 1 } = event {
-            if first <= last {
-                if let Some(clip) = source.animation_clip(*entity, *animation) {
-                    if first == last { cast.apply_hold(*entity, clip, *first); }
-                    else if *speed == 32 { cast.apply_hold_range_doubled(*entity, clip, *first, *last, late); }
-                    else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
-                    return;
-                }
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                let applied = if *speed == 32 { cast.apply_once_full_doubled(*entity, *animation, clip, late) }
-                    else { cast.apply_once_full(*entity, *animation, clip, late) };
-                if applied { return; }
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
-            if first <= last {
-                if let Some(clip) = source.animation_clip(*entity, *animation) {
-                    if cast.apply_once(*entity, *animation, clip, *first, *last, late) { return; }
-                }
-            }
-        }
-        cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));
-        if let Stage::Move { entity, how: MoveHow::Walk, animation: Some(slot @ (1 | 2)), .. } = event {
-            if let Some(clip) = source.animation_clip(*entity, *slot) {
-                cast.apply_move_animation(*entity, clip, movement_phase);
-            }
-        }
+        let clip = fmv_ff7::script::scene::presentation::animation_slot(event)
+            .and_then(|(entity, slot)| source.animation_clip(entity, slot));
+        fmv_ff7::script::scene::presentation::apply_stage(cast, event, late, movement_phase,
+            clip, &|x, y, triangle| source.height_at(x, y, triangle));
     }
 
     /// Go on as far as the clock allows: pull the next beat, play what is due, open the window or end the scene. Stops at
@@ -1098,7 +1067,7 @@ impl ScenePlayer {
     fn finish(&mut self) {
         if self.over { return; }
         self.sound(SoundAction::End);
-        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        if !self.silent && self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         self.terminal_fade = self.handoff_fade();
         self.over = true;
         self.battle = None;

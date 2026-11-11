@@ -91,8 +91,11 @@ use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
 mod continuation;
+mod door_offsets;
 mod effects;
+mod rootmap;
 mod train;
+mod train_ready;
 
 /// The most of a witness's picture another's may cover on the screen.
 const MAX_COVERED: f32 = 0.10;

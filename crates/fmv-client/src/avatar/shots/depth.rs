@@ -28,6 +28,8 @@ use crate::avatar::stage::Stage;
 use fmv_ff7::background::depth::DepthTile;
 use fmv_ff7::background::{BlendMode, ScreenRect};
 
+mod filter;
+
 // ---------------------------------------------------------------------------------------------
 // Synthetic scenes
 // ---------------------------------------------------------------------------------------------
@@ -82,7 +84,7 @@ fn figure(frame: &AvatarFrame) -> Figure {
 /// the render without scenery.
 fn clear_probe(gpu: &mut Offscreen, frame: &AvatarFrame, f: &Figure) -> (u32, u32) {
     let models = frame.models.iter().map(|m| SkinnedModel { asset: m.asset.clone(), positions: m.positions.clone() }).collect();
-    let bare = AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: frame.zoom, overlay_bias: frame.overlay_bias, ground: Vec::new(), scenery: None };
+    let bare = AvatarFrame { models, tints: Vec::new(), identities: Vec::new(), zoom: frame.zoom, field_depth: frame.field_depth, overlay_bias: frame.overlay_bias, ground: Vec::new(), scenery: None };
     let img = draw(gpu, &bare);
     for (dx, dy) in [(13.0, 13.0), (-13.0, 13.0), (13.0, -13.0), (-13.0, -13.0), (14.0, 0.0), (-14.0, 0.0)] {
         let (x, y) = field_to_pixel(f.centre.0 + dx, f.centre.1 + dy);

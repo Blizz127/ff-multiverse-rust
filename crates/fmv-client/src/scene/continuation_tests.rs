@@ -425,17 +425,20 @@ fn suspended_scene_input_goes_to_combat_and_its_result_but_never_to_the_waiting_
     assert_eq!(route(&mut state, 0.0, KeyCode::KeyW), SceneRoute::Scene);
     begun(&mut state.scene, 1, BATTLE);
     // The real battle mirror holds input even when game data is unavailable on this machine.
-    state.apply(0.0, ServerMsg::EncounterStart {
+    let mut start = ServerMsg::EncounterStart {
         battle_id: BATTLE, formation_id: 3, seed: 5,
         party: vec![BattleMember::player(EntityId(1), AccountId(1), "test", 0, 5, 0)],
         preemptive: true, back_attack: false, battle_speed: 0, ticks_per_second: 1000,
-        escape_policy: EscapePolicy::Formation, initial_party: None, data_fingerprint: SyntheticRules::FINGERPRINT,
-    });
+        escape_policy: EscapePolicy::Formation, victory_fanfare: true, game_over_on_defeat: true, initial_party: None, data_fingerprint: SyntheticRules::FINGERPRINT,
+    };
+    assert_eq!(state.apply(0.0, start.clone()), None);
     assert!(state.battle.in_battle());
     assert_eq!(route(&mut state, 0.1, KeyCode::Enter), SceneRoute::Field, "the existing battle handler receives confirm");
     assert_eq!(route(&mut state, 0.1, KeyCode::F6), SceneRoute::Field, "a battle key cannot queue a scene preview");
     state.apply(1.0, ServerMsg::BattleEnd { battle_id: BATTLE, outcome: fmv_ff7_battle::rules::Outcome::Defeat, rewards: vec![] });
     state.apply(1.0, ServerMsg::SceneGameOver { run: RUN, ordinal: 1, battle_id: BATTLE });
+    assert_eq!(state.battle.game_over(), Some(BATTLE));
+    assert!(!state.ordinary_game_over(), "the authored flag must not hijack the scene owner's retry controls");
     state.scene.advance_visible(0.0, false);
     assert!(state.battle.lingering(1.1));
     assert_eq!(route(&mut state, 1.1, KeyCode::Enter), SceneRoute::Field, "the result panel receives confirm before retry can");
@@ -446,6 +449,12 @@ fn suspended_scene_input_goes_to_combat_and_its_result_but_never_to_the_waiting_
     assert_eq!(route(&mut state, 20.0, KeyCode::F6), SceneRoute::Scene);
     assert_eq!(route(&mut state, 20.0, KeyCode::Enter), SceneRoute::Scene);
     assert_eq!(state.scene.take_commands(), [SceneCmd::Retry { run: RUN }]);
+    let retry = BattleId(BATTLE.0 + 1);
+    begun(&mut state.scene, 1, retry);
+    if let ServerMsg::EncounterStart { battle_id, .. } = &mut start { *battle_id = retry; }
+    assert_eq!(state.apply(20.1, start), None, "a scene-authorized retry remains admissible");
+    assert!(state.battle.in_battle());
+    assert_eq!(state.battle.game_over(), None);
 }
 
 #[test]

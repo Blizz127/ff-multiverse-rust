@@ -41,12 +41,16 @@
 //! # The depth
 //!
 //! Models, tiles and ground marks are all written with [`super::scenery::buffer_depth`] of their
-//! camera depth, the engine's perspective z-buffer value `A - B / z` (near 50, far 32 000), clamped to
-//! 0..1. The mapping is fixed, not fitted to the models of the frame (which would put every tile
+//! camera depth, the PC engine's perspective z-buffer value `A - B / z`. A field calibrates its
+//! coefficients from baked background depths; unsupported data keeps the existing clamped mapping
+//! at near 50, far 32 000. These fallback values are not evidence of that field's clipping planes. The mapping
+//! is fixed for the field, never fitted to the models of the frame (which would put every tile
 //! outside the models' depth range at 0 or 1 and so lose the order of blended tiles), and it is
 //! exact per pixel because `1 / z` is affine in screen space; see [`super::scenery`]. A model
 //! vertex's depth is that of its camera-space `z` (overlay vertices pulled `overlay_bias` towards the
-//! camera); a vertex nearer than the near plane is clamped to 0, nothing is clipped by depth.
+//! camera). Calibrated field models use homogeneous `clip.z = A * camera.z - B`, `clip.w = camera.z`:
+//! the GPU clips near/far crossings, including edges crossing the camera, before division.
+//! Screen-space foreground tiles retain their explicit clamped depth instead of being culled.
 //!
 //! The surface may be sRGB or not (the window prefers not): vertex colours and textures are
 //! authored in sRGB bytes, so for an sRGB target the textures are sampled as sRGB and the vertex
@@ -78,12 +82,13 @@ struct Globals {
     depth: vec4<f32>,
     // tiles: ndc.x = tile.x * screen.x + tile.y, ndc.y = tile.z * screen.y + tile.w
     tile: vec4<f32>,
+    // x: field geometry uses homogeneous near/far clipping; other frames retain their existing depth policy.
+    field: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
 
-// The depth-buffer value of a camera-space depth: the engine's perspective z (near 50, far 32 000),
-// clamped, so a depth below the near plane is "in front of everything", not culled.
+// Screen-space tiles can explicitly be in front of all geometry (depth zero). They are not model geometry.
 fn buffer_depth(z: f32) -> f32 {
     return clamp(g.depth.x - g.depth.y / max(z, 1.0), 0.0, 1.0);
 }
@@ -111,6 +116,8 @@ struct VsOut {
     // whether this triangle keeps its own colours (a face decal, or hair: bit 1 of the overlay attribute).
     @location(3) @interpolate(flat) identity: vec4<f32>,
     @location(4) @interpolate(flat) face: f32,
+    @location(5) camera_depth: f32,
+    @location(6) @interpolate(flat) pull: f32,
 };
 
 @vertex
@@ -129,10 +136,14 @@ fn vs_model(
     let keep = step(1.5, overlay);
     let pull = overlay - 2.0 * keep;
     let depth = buffer_depth(cam.z - pull * g.depth.z);
+    var clip_z = depth * w;
+    if g.field.x > 0.5 {
+        clip_z = g.depth.x * w - g.depth.y;
+    }
     out.position = vec4<f32>(
         g.proj.x * cam.x + g.proj.y * cam.z,
         g.proj.z * cam.y + g.proj.w * cam.z,
-        depth * w,
+        clip_z,
         w,
     );
     out.uv = uv;
@@ -140,6 +151,8 @@ fn vs_model(
     out.tint = tint;
     out.identity = identity;
     out.face = keep;
+    out.camera_depth = cam.z;
+    out.pull = pull;
     return out;
 }
 
@@ -151,8 +164,13 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), c * 12.92, c <= vec3<f32>(0.0031308));
 }
 
+struct ModelOut {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
 @fragment
-fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_model(in: VsOut) -> ModelOut {
     let texel = textureSample(model_tex, model_samp, in.uv);
     if (texel.a < 0.5) {
         discard;
@@ -173,7 +191,16 @@ fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
     // The draw's tint scales the colours (above 1 it brightens) and its alpha the part's own.
-    return vec4<f32>(lit * in.tint.rgb, in.color.a * in.tint.a);
+    var out: ModelOut;
+    out.color = vec4<f32>(lit * in.tint.rgb, in.color.a * in.tint.a);
+    out.depth = in.position.z;
+    // Clip the whole triangle at its geometric depth first. Biasing only its visible vertices
+    // could collapse a near-crossing decal into a zero-area edge. The perspective-interpolated
+    // camera depth lets its visible fragments keep the same depth-only pull toward the camera.
+    if g.field.x > 0.5 && in.pull > 0.0 {
+        out.depth = buffer_depth(in.camera_depth - in.pull * g.depth.z);
+    }
+    return out;
 }
 "#
 );
@@ -190,7 +217,9 @@ struct GroundOut {
 @vertex
 fn vs_ground(@location(0) ndc: vec2<f32>, @location(1) color: vec4<f32>, @location(2) depth: f32) -> GroundOut {
     var out: GroundOut;
-    out.position = vec4<f32>(ndc, buffer_depth(depth), 1.0);
+    var z = buffer_depth(depth);
+    if g.field.x > 0.5 { z = g.depth.x - g.depth.y / max(depth, 1.0); }
+    out.position = vec4<f32>(ndc, z, 1.0);
     out.color = color;
     return out;
 }
@@ -297,6 +326,7 @@ pub struct Globals {
     pub proj: [f32; 4],
     pub depth: [f32; 4],
     pub tile: [f32; 4],
+    pub field: [f32; 4],
 }
 
 /// The projection terms of the shader's `Globals::proj` for the fitted window camera `cam`, the
@@ -318,11 +348,12 @@ pub fn tile_terms(cam: &Camera, vw: u32, vh: u32) -> [f32; 4] {
 
 impl Globals {
     pub fn new(cam: &Camera, frame: &AvatarFrame, vw: u32, vh: u32, srgb: bool) -> Self {
-        let [a, b] = depth_terms();
+        let [a, b] = frame.field_depth.map_or_else(depth_terms, |depth| [depth.a, depth.b]);
         Self {
             proj: projection_terms(cam, frame.zoom, vw, vh),
             depth: [a, b, frame.overlay_bias, if srgb { 1.0 } else { 0.0 }],
             tile: tile_terms(cam, vw, vh),
+            field: [if frame.field_depth.is_some_and(|depth| depth.calibrated) { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -372,6 +403,9 @@ pub struct AvatarGpu {
     additive: wgpu::RenderPipeline,
     ground: wgpu::RenderPipeline,
     model_sampler: wgpu::Sampler,
+    /// Field tiles have their own filter; model textures keep their existing linear sampler.
+    scenery_sampler: wgpu::Sampler,
+    background_filter: crate::graphics::BackgroundFilter,
     white: wgpu::BindGroup,
     _white_texture: wgpu::Texture,
     models: HashMap<u64, GpuModel>,
@@ -408,6 +442,17 @@ fn texture_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
             count: None,
         },
     ]
+}
+
+fn scenery_sampler(device: &wgpu::Device, filter: crate::graphics::BackgroundFilter) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("fmv-scenery-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: filter.filter_mode(),
+        min_filter: filter.filter_mode(),
+        ..wgpu::SamplerDescriptor::default()
+    })
 }
 
 impl AvatarGpu {
@@ -554,6 +599,8 @@ impl AvatarGpu {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        let background_filter = crate::graphics::BackgroundFilter::default();
+        let scenery_sampler = scenery_sampler(device, background_filter);
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fmv-avatar-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -585,6 +632,8 @@ impl AvatarGpu {
             additive,
             ground,
             model_sampler,
+            scenery_sampler,
+            background_filter,
             white,
             _white_texture: white_texture,
             models: HashMap::new(),
@@ -611,6 +660,14 @@ impl AvatarGpu {
     #[cfg(test)]
     pub fn scenery_state(&self) -> (u32, Option<u64>, usize) {
         (self.scenery.uploads(), self.scenery.current_id(), self.scenery.draw_calls())
+    }
+
+    /// Change field tile sampling while retaining the current atlas and every model texture.
+    pub fn set_background_filter(&mut self, filter: crate::graphics::BackgroundFilter) {
+        if self.background_filter == filter { return; }
+        self.background_filter = filter;
+        self.scenery_sampler = scenery_sampler(&self.device, filter);
+        self.scenery.rebind_sampler(&self.device, &self.texture_layout, &self.scenery_sampler);
     }
 
     /// Make sure `asset` is on the GPU (uploaded on first use).
@@ -676,7 +733,7 @@ impl AvatarGpu {
     /// has none or this device cannot hold its atlas: the frame is then drawn over the flat picture.
     pub fn prepare_scenery(&mut self, frame: &AvatarFrame) -> bool {
         let Some(scenery) = frame.scenery.as_deref() else { return false };
-        self.scenery.ensure(&self.device, &self.queue, self.texture_format, &self.texture_layout, &self.model_sampler, scenery)
+        self.scenery.ensure(&self.device, &self.queue, self.texture_format, &self.texture_layout, &self.scenery_sampler, scenery)
     }
 
     /// The depth buffer for a `size` target (made again when the size changes).
@@ -972,6 +1029,25 @@ mod tests {
     use fmv_core::Pos;
 
     #[test]
+    fn field_calibration_changes_shared_depth_and_clip_policy_without_changing_screen_projection() {
+        let camera = Camera::fit(&Bounds { min: Pos::new(-160.0, -120.0, 0.0), max: Pos::new(160.0, 120.0, 0.0) },
+            1100.0, 680.0, crate::render::MARGIN_PX);
+        let mut frame = AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 176.0,
+            field_depth: None, overlay_bias: 3.0, ground: vec![], scenery: None };
+        let previous = Globals::new(&camera, &frame, 1100, 680, true);
+        frame.field_depth = Some(Default::default());
+        assert_eq!(Globals::new(&camera, &frame, 1100, 680, true), previous, "fallback preserves all uniforms");
+        let near = 16.0;
+        let far = 32_000.0;
+        let (a, b) = (far / (far - near), far * near / (far - near));
+        frame.field_depth = Some(fmv_ff7::background::DepthMapping { a, b, near, far, calibrated: true });
+        let calibrated = Globals::new(&camera, &frame, 1100, 680, true);
+        assert_eq!((calibrated.proj, calibrated.tile), (previous.proj, previous.tile), "same framing and tile coordinates");
+        assert_eq!(calibrated.depth, [a, b, 3.0, 1.0], "models and tiles share coefficients; bias and colour space preserved");
+        assert_eq!(calibrated.field, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn the_vertex_layouts_match_the_shader() {
         assert_eq!(std::mem::size_of::<StaticVertex>(), 16);
         let s = static_layout();
@@ -1023,7 +1099,7 @@ mod tests {
         assert_eq!(Identity::NONE.to_array(), [1.0, 1.0, 1.0, 0.0]);
         assert_eq!(Tint::default().to_array(), [1.0; 4]);
         assert_eq!(Tint { rgb: [0.5, 1.0, 2.0], alpha: 0.25 }.to_array(), [0.5, 1.0, 2.0, 0.25]);
-        assert_eq!(std::mem::size_of::<Globals>(), 48, "three vec4s, as the shaders' uniform block");
+        assert_eq!(std::mem::size_of::<Globals>(), 64, "four vec4s, as the shaders' uniform block");
         for entry in ["vs_model", "fs_model", "buffer_depth"] {
             assert!(MODEL_SHADER_WGSL.contains(entry), "{entry}");
         }

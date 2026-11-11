@@ -1,6 +1,5 @@
 use super::*;
 use crate::field::Vertex;
-use crate::script::dialogue::StartOfGame;
 use crate::script::synth::SynthScript;
 
 // ---- a tiny assembler for the opcodes the story reads ----
@@ -157,7 +156,7 @@ fn a_version_1_blob_loads_as_before_and_is_written_back_byte_for_byte() {
         let state = StoryState::decode(&blob).unwrap();
         assert_eq!((state.moment, state.vars().count()), (moment, 0), "{blob:?}");
         assert_eq!(state.encode(), blob, "{blob:?} comes back as it was");
-        assert_eq!(canon_party_of(&blob), if moment >= 36 { vec![CLOUD] } else { vec![CLOUD, BARRET] }, "the party is the moment's, whatever wrote the blob");
+        assert_eq!(canon_party_of(&blob), if (11..36).contains(&moment) { vec![CLOUD, BARRET] } else { vec![CLOUD] }, "the party is the moment's, whatever wrote the blob");
     }
     // a state with no variable never grows a version 2 blob, however it was made
     let mut s = StoryState::at(12);
@@ -238,7 +237,7 @@ fn an_accounts_story_is_the_dialogue_lanes_story_variables() {
     assert_eq!(lifted(12).byte(1, 225), 1);
     assert_eq!(lifted(12).byte(1, 224), 0);
     let state = StoryState::new_game();
-    assert_eq!((0..3).map(|s| state.party_member(s)).collect::<Vec<_>>(), (0..3).map(|s| StartOfGame.party_member(s)).collect::<Vec<_>>());
+    assert_eq!((0..3).map(|s| state.party_member(s)).collect::<Vec<_>>(), [Some(CLOUD), None, None], "the opening PRTYE leaves Cloud alone");
     assert_eq!(StoryState::decode(&[]).map(|s| s.byte(2, 0)), Some(1), "a new account reads moment 1");
 }
 
@@ -256,51 +255,60 @@ fn the_canon_party_table_covers_every_moment_in_order() {
         seen.dedup();
         assert_eq!(seen.len(), row.members.len(), "{row:?}: nobody twice");
     }
-    for moment in [0u16, 1, 6, 7, 27, 33, 35] {
+    // md1stin's opening PRTYE [0,254,254] at 0x03FD leaves Cloud alone. Barret's
+    // field model being present is not evidence that he has joined the battle party.
+    for moment in [0u16, 1, 6, 7, 8, 10] {
+        assert_eq!(canon_party(&StoryState::at(moment)), vec![CLOUD], "moment {moment}");
+    }
+    // nmkin_1 entity12/script3 sets moment11 at 0x0BF5, then PRTYE [0,1,254]
+    // at 0x0C20; the completed doorway action adds Barret at this boundary.
+    for moment in [11u16, 12, 26, 27, 33, 35] {
         assert_eq!(canon_party(&StoryState::at(moment)), vec![CLOUD, BARRET], "moment {moment}");
     }
-    // From 36 on (the team splits up after the escape: `md8_1`'s `PRTYM`) the story's party is Cloud.
+    // md8_1's PRTYM1 at 0x0343 removes Barret before moment36 at 0x0350.
     for moment in [36u16, 39, 72, 255, 1600, u16::MAX] {
         assert_eq!(canon_party(&StoryState::at(moment)), vec![CLOUD], "moment {moment}");
     }
 }
 
-/// What a script does to the party, replayed on a party: a join goes to the end, a leave closes the gap, a set
-/// replaces everyone and reads 254/255 as empty slots. The table row of moment 36 is what `md8_1`'s `PRTYM 1`
-/// leaves of the first mission's party.
+/// Native field and main tuples remain separate during a journal. Only the comparison result
+/// omits empty main slots; 255 preserves old field members whereas 254 explicitly removes them.
 #[test]
 fn party_ops_replay_on_a_party_as_the_scripts_mean_them() {
     use super::{party_after, PartyOp};
+    assert_eq!(party_after(&[BARRET, 2, CLOUD], &[PartyOp::Set([CLOUD, 254, 254])]), canon_party(&StoryState::at(0)), "md1stin replaces the kernel's initial party");
+    assert_eq!(party_after(&canon_party(&StoryState::at(10)), &[PartyOp::Set([CLOUD, BARRET, 254])]), canon_party(&StoryState::at(11)), "nmkin_1's doorway adds Barret");
     let mission = canon_party(&StoryState::at(33));
     assert_eq!(party_after(&mission, &[]), mission);
     assert_eq!(party_after(&mission, &[PartyOp::Remove(BARRET)]), canon_party(&StoryState::at(36)), "the table's row is the script's own result");
     assert_eq!(party_after(&mission, &[PartyOp::Remove(7)]), mission, "someone who is not there leaves nothing");
-    assert_eq!(party_after(&[CLOUD], &[PartyOp::Add(BARRET), PartyOp::Add(BARRET), PartyOp::Add(2), PartyOp::Add(3)]), vec![CLOUD, BARRET, 2], "nobody twice, three at most");
-    assert_eq!(party_after(&mission, &[PartyOp::Add(9), PartyOp::Add(254)]), mission, "not a character");
-    assert_eq!(party_after(&mission, &[PartyOp::Set([CLOUD, 254, 254])]), vec![CLOUD], "254 is an empty slot");
-    assert_eq!(party_after(&mission, &[PartyOp::Set([2, CLOUD, 2])]), vec![2, CLOUD], "a set keeps its order and names nobody twice");
-    assert_eq!(party_after(&mission, &[PartyOp::Set([255, 255, 255]), PartyOp::Add(BARRET)]), vec![BARRET]);
+    assert_eq!(party_after(&[CLOUD], &[PartyOp::Add(BARRET), PartyOp::Add(BARRET), PartyOp::Add(2), PartyOp::Add(3)]), vec![CLOUD, BARRET, 3], "full PRTYP replaces the last field slot");
+    assert_eq!(party_after(&mission, &[PartyOp::Add(9), PartyOp::Add(254)]), mission, "invalid characters do not change a valid tuple");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([CLOUD, 254, 254])]), vec![CLOUD], "254 forces an empty slot");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([2, CLOUD, 2])]), mission, "duplicate tuples are unsupported, not guessed");
+    assert_eq!(party_after(&mission, &[PartyOp::Set([255, 255, 255]), PartyOp::Add(BARRET)]), mission, "255 retains the old members");
+    assert_eq!(party_after(&[0, 1, 2], &[PartyOp::Remove(0), PartyOp::Add(3)]), vec![3, 1, 2], "an intervening operation must see the hole, not a compact list");
+    assert_eq!(party_after(&[0, 1, 2], &[PartyOp::Set([2, 1, 0]), PartyOp::Set([255, 254, 254])]), vec![2], "later retention reads the field order, not main order");
 }
 
-/// The first reactor mission is fought by Cloud and Barret, from the very start: the party the story has
-/// always answered to a dialogue script's `IFPRTYQ`, for a new account (the empty blob), a stored moment and a
-/// blob nobody can read.
+/// Authored party boundaries apply to each readable blob version. The empty blob and an unreadable
+/// blob use the opening party; neither invents Barret before the doorway's moment11 assignment.
 #[test]
-fn the_first_missions_canon_party_is_cloud_and_barret_for_every_blob() {
-    let stored = StoryState::at(6).encode();
-    let blobs: [&[u8]; 5] = [&[], &stored, &[9, 9], &[BLOB_VERSION, 1], &[3, 1, 0]];
-    for blob in blobs {
-        assert_eq!(canon_party_of(blob), vec![CLOUD, BARRET], "{blob:?}");
+fn the_canon_party_uses_authored_boundaries_for_every_blob_version() {
+    for blob in [&[][..], &[9, 9], &[BLOB_VERSION, 1], &[3, 1, 0]] {
+        assert_eq!(canon_party_of(blob), vec![CLOUD], "{blob:?}");
     }
-    assert_eq!(canon_party_of(&lifted(12).encode()), vec![CLOUD, BARRET], "a version 2 blob has the party of its moment");
-    assert_eq!(
-        canon_party(&StoryState::new_game()).iter().map(|&c| Some(c)).collect::<Vec<_>>(),
-        (0..2).map(|slot| StartOfGame.party_member(slot)).collect::<Vec<_>>(),
-        "the table agrees with the new game's party the dialogue lane has always used"
-    );
-    // A table row is what a later moment reads: the lookup takes the last row that has begun.
-    let state = StoryState::at(40);
-    assert_eq!(canon_party(&state), CANON_PARTIES.iter().rev().find(|r| r.from_moment <= 40).unwrap().members.to_vec());
+    for (moment, expected) in [(0, vec![CLOUD]), (1, vec![CLOUD]), (10, vec![CLOUD]),
+        (11, vec![CLOUD, BARRET]), (35, vec![CLOUD, BARRET]), (36, vec![CLOUD]), (u16::MAX, vec![CLOUD])] {
+        let state = StoryState::at(moment);
+        for blob in [state.encode(), lifted(moment).encode(), state.into_extended().unwrap().encode()] {
+            assert_eq!(canon_party_of(&blob), expected, "moment {moment}, blob version {:?}", blob.first());
+            let decoded = StoryState::decode(&blob).unwrap();
+            assert_eq!((0..3).filter_map(|slot| decoded.party_member(slot)).collect::<Vec<_>>(), expected,
+                "dialogue sees the same party at moment {moment}");
+            assert_eq!(decoded.encode(), blob, "reading the corrected party never migrates the save");
+        }
+    }
 }
 
 #[test]
@@ -405,7 +413,7 @@ fn a_field_that_never_compares_the_counter_has_one_phase_for_everybody() {
 // ---- story points: a triangle ----
 
 #[test]
-fn extended_saves_withhold_legacy_points_talks_and_panels_until_they_have_exact_base_transactions() {
+fn extended_points_require_matching_battle_source_and_keep_exact_talk_and_panel_results() {
     let section = field_script(6, 0, 1, Some(0));
     let script = FieldScript::parse(&section).unwrap();
     let mut story = AreaStory::scan(&script, &mesh(13));
@@ -413,7 +421,7 @@ fn extended_saves_withhold_legacy_points_talks_and_panels_until_they_have_exact_
     assert!(story.advance(&at(1), 0).is_some());
     assert_eq!(story.battle_of(0), Some(300));
     let extended = StoryState::at(1).into_extended().unwrap().encode();
-    assert_eq!(story.advance(&extended, 0), None, "no point is published to authorize its battle");
+    assert_eq!(story.advance(&extended, 0), None, "invented battle metadata cannot authorize a battle absent from the exact source");
     assert_eq!(story.advance_with(&script, &extended, 0), None);
 
     let (section, npcs) = field_with_talks();
@@ -421,14 +429,22 @@ fn extended_saves_withhold_legacy_points_talks_and_panels_until_they_have_exact_
     let mut story = AreaStory::scan(&script, &mesh(5));
     story.add_talk_points(&script, &npcs);
     assert!(story.advance_with(&script, &at(13), 0).is_some());
-    assert_eq!(story.advance_with(&script, &StoryState::at(13).into_extended().unwrap().encode(), 0), None);
+    let before = StoryState::at(13).into_extended().unwrap().encode();
+    let step = story.advance_with(&script, &before, 0).expect("the exact conversation is supported");
+    assert_eq!(StoryState::decode(&step.progress).unwrap().moment, 14);
+    assert_eq!(compare_exchange_progression(&before, &before, &step.progress), Some(step.progress));
 
     let section = field_with_player(|s| s.entity("ele", vec![(0, the_panel_with_both_rides())]).entity("lift", vec![(3, concat(&[bitoff(1, 225, 0), ret()]))]));
     let script = FieldScript::parse(&section).unwrap();
     let story = AreaStory::scan(&script, &mesh(9));
     let down = lifted(12);
     assert!(story.advance_with(&script, &down.encode(), 1).is_some());
-    assert_eq!(story.advance_with(&script, &down.into_extended().unwrap().encode(), 1), None);
+    let before = down.into_extended().unwrap().encode();
+    let step = story.advance_with(&script, &before, 1).expect("the exact return ride retains its clear");
+    let after = StoryState::decode(&step.progress).unwrap();
+    assert!(after.supports_extended());
+    assert_eq!((after.moment, after.known_bit(1, 225, 0)), (12, Some(false)));
+    assert_eq!(compare_exchange_progression(&before, &before, &step.progress), Some(step.progress));
 }
 
 #[test]

@@ -130,6 +130,98 @@ fn field_of(section: Vec<u8>) -> FieldFile {
 }
 
 #[test]
+fn native_party_scene_entrypoints_execute_without_replacing_independent_resources() {
+    use crate::story::NativePartyState;
+    let section = script(vec![("a", vec![(0, vec![setbyte(1, 40, 9)]), (1, vec![setword(2, 0, 5)])])], vec![]);
+    let field = field_of(section.clone());
+    let mut def = demo_def(vec![], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 0)];
+    def.speakers.clear();
+    let legacy = StoryState::at(4);
+    let extended = legacy.clone().into_extended().unwrap();
+    let resources = Resources { gil: Some(10) };
+    let identity = ScenePlay::with_resources(&field, &def, &extended, 1, resources).unwrap().replay_identity();
+    let unknown = extended.clone().into_native_party().unwrap();
+    let mut divergent = unknown.clone();
+    *divergent.native_party_mut().unwrap() = NativePartyState::from_parts([2, 255, 0], 7, (0x108, 0xFFFF), (0x80, 0xFFFF)).unwrap();
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { divergent.write_byte(3, address, value).unwrap(); }
+    for state in [unknown, divergent] {
+        let bytes = state.encode();
+        for constructed in [
+            ScenePlay::new(&field, &def, &state, 1),
+            ScenePlay::with_limits(&field, &def, &state, 1, Limits::default()),
+            ScenePlay::with_resources(&field, &def, &state, 1, resources),
+            ScenePlay::with_script_section(&field, &def, &state, 1, &section),
+            ScenePlay::with_script_section_and_resources(&field, &def, &state, 1, &section, resources),
+        ] {
+            let mut play = constructed.unwrap();
+            play.next_strict(None).unwrap();
+            let after = play.current_story().expect("exact native afterimage");
+            assert_eq!(after.moment, 5);
+            assert_eq!(after.var(1, 40), 9);
+            assert_eq!(after.native_party(), state.native_party(), "no opcode selected a different party");
+            for address in 9..=11 { assert_eq!(after.known_byte(3, address), state.known_byte(3, address)); }
+        }
+        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &[]), Err(SceneError::Script(_))));
+        for outcome in [run_to_end(&field, &def, &state, 1, &[]).unwrap(),
+            run_to_end_with_resources_strict(&field, &def, &state, 1, resources, &[]).unwrap()] {
+            let mut after = state.clone();
+            assert_eq!(outcome.writes.apply_extended_to(&mut after, &state), Some(true));
+            assert!(outcome.party_is_the_storys(&state, &after));
+        }
+        let replay = replay_scene(&field, &def, &state, resources, identity, &[]).unwrap();
+        assert_eq!(replay.current_story().unwrap().moment, 5);
+        assert_eq!(state.encode(), bytes, "execution never mutates its borrowed source snapshot");
+    }
+    for state in [legacy, extended] {
+        let outcome = run_to_end(&field, &def, &state, 1, &[]).unwrap();
+        assert_eq!(outcome.end, End::Finished);
+        assert_eq!(outcome.writes.moment, Some(5));
+    }
+}
+
+#[test]
+fn native_party_battle_afterimages_are_rejected_without_consuming_the_pending_boundary() {
+    let field = field_of(script(vec![("a", vec![(1, vec![vec![0x72, 8, 0], vec![0x70, 0, 72, 1], setword(2, 0, 5)])])], vec![]));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(4).into_extended().unwrap();
+    let resources = Resources { gil: Some(10) };
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 1, resources).unwrap();
+    let identity = play.replay_identity();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(checkpoint)) = play.boundary() else { panic!("expected battle") };
+    let before = play.snapshot();
+    let bad_resume = BattleResume { checkpoint, resolution: BattleResolution::Victory,
+        story: story.clone().into_native_party().unwrap(), resources: Resources { gil: Some(20) } };
+    assert_eq!(play.resume_battle_checked(bad_resume.clone()), Err(SceneError::NativePartyUnsupported));
+    assert_eq!(play.snapshot(), before);
+    assert!(play.transcript().is_empty());
+    assert!(matches!(replay_scene(&field, &def, &story, resources, identity, &[SceneInput::Battle(bad_resume.clone())]), Err(SceneError::NativePartyUnsupported)));
+    play.resume_battle_checked(BattleResume { story, ..bad_resume }).unwrap();
+    play.next_strict(None).unwrap();
+    assert_eq!(play.boundary(), Some(SceneBoundary::End(End::Finished)));
+    assert_eq!(play.writes().moment, Some(5));
+    assert_eq!(play.resources().gil_after, Some(20));
+}
+
+#[test]
+fn a_legacy_scene_outcome_cannot_validate_or_apply_to_native_party_state() {
+    let story = StoryState::at(4).into_extended().unwrap();
+    let field = field_of(script(vec![("a", vec![(1, vec![setword(2, 0, 5)])])], vec![]));
+    let outcome = run_to_end(&field, &demo_def(vec![], start(0, 1)), &story, 1, &[]).unwrap();
+    let native = story.clone().into_native_party().unwrap();
+    let mut after = native.clone();
+    assert_eq!(outcome.writes.apply_extended_to(&mut after, &native), None);
+    assert_eq!(after, native);
+    assert!(!outcome.party_is_the_storys(&native, &native));
+    assert!(!outcome.party_is_the_storys(&story, &native));
+    assert!(!outcome.party_is_the_storys(&native, &story));
+    let mut legacy_after = story.clone();
+    assert_eq!(outcome.writes.apply_extended_to(&mut legacy_after, &story), Some(true));
+    assert!(outcome.party_is_the_storys(&story, &legacy_after));
+}
+
+#[test]
 fn replacement_scene_entities_are_rebound_by_unique_name() {
     let original = script(vec![("dic", vec![]), ("cloud", vec![]), ("barret", vec![]), ("biggs", vec![]), ("jessie", vec![]), ("wedge", vec![])], vec![]);
     let replacement = script(vec![("Wedge", vec![]), ("Jessie", vec![]), ("Biggs", vec![]), ("Barret", vec![]), ("Cloud", vec![]), ("Dic", vec![])], vec![]);
@@ -1346,7 +1438,7 @@ fn if_party(character: u8, body: &[u8]) -> Vec<u8> {
 #[test]
 fn party_changes_are_recorded_in_order_and_a_later_test_of_the_party_sees_them() {
     use crate::story::{canon_party, PartyOp, BARRET, CLOUD};
-    let story = StoryState::at(4);
+    let story = StoryState::at(33);
     assert_eq!(canon_party(&story), vec![CLOUD, BARRET]);
     let a = [
         if_party(BARRET, &message(0, 0)), // in the story's party: a window
@@ -2066,6 +2158,9 @@ fn the_trigger_npc_is_found_from_the_stage_script_and_the_models_record() {
     assert_eq!((npc.x, npc.y), (30, 40));
     assert!((npc.talk_radius - 80.0).abs() < 1e-3, "TALKR 80 at scale 512");
     assert!((npc.heading - 0.0).abs() < 1e-5, "DIR 64 faces +x");
+    let native = StoryState::at(4).into_native_party().unwrap();
+    assert!(trigger_npc(&field, &def, &native).is_none(),
+        "native trigger placement requires checked field-visit scratch and a visit-bound cache");
 }
 
 // ---- a scene plays once per story, as far as the story carries its mark ------------------------------
@@ -2512,4 +2607,411 @@ fn bridge_origin_is_quantized_validated_and_bound_into_the_replay_source() {
         assert_eq!(with_trigger_position(&field, &def, pos, angle, hint), Err(SceneError::SceneOrigin));
     }
     assert_eq!(with_trigger_position(&field, &flower_station_scene(), Pos::new(25.0, 10.0, 0.0), 0.0, None), Err(SceneError::SceneOrigin));
+}
+
+#[test]
+fn byte_extracts_write_the_stated_destination_and_read_only_the_selected_source_byte() {
+    let mut story = StoryState::at(4).into_extended().unwrap();
+    story.write_byte(3, 80, 0xCD).unwrap(); // The byte after this remains unknown.
+    story.write_byte(3, 91, 0xAB).unwrap(); // The discarded low byte at90 remains unknown.
+    let body = vec![
+        vec![0x9A, 0x33, 66, 80], // LBYTE bank3[66] = bank3[80].
+        vec![0x9B, 0x44, 70, 90, 0], // HBYTE bank4[70] = high(bank4[90..91]).
+        vec![0x9B, 0x30, 72, 0x80, 0xFF], // Literal0xFF80 extracts0xFF.
+        vec![0x9B, 0x30, 255, 0x34, 0x12], // Destination255 is valid for one byte.
+    ];
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    let result = run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1, SceneResources { gil: None }, &[]).unwrap();
+    assert_eq!(result.end, End::Finished);
+    assert!(result.is_complete());
+    assert!(result.unknown_persistent_reads.is_empty(), "discarded source bytes are not dependencies");
+    assert_eq!(result.writes.persistent, [
+        ((3, 66), (0xCD, 255)), ((3, 70), (0xAB, 255)),
+        ((3, 72), (0xFF, 255)), ((3, 255), (0x12, 255)),
+    ].into_iter().collect());
+    let mut after = story.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), Some(true));
+    assert_eq!(after.known_mask(3, 71), 0, "HBYTE never writes the byte after its destination");
+    assert_eq!(after.known_mask(3, 81), 0);
+    assert_eq!(after.known_mask(3, 90), 0);
+}
+
+#[test]
+fn high_byte_extraction_keeps_unknown_selected_inputs_and_bank_boundary_failures_visible() {
+    let story = StoryState::at(4).into_extended().unwrap();
+    let run = |body| {
+        let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+        run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1, SceneResources { gil: None }, &[]).unwrap()
+    };
+    let unknown = run(vec![vec![0x9B, 0x34, 70, 90, 0]]);
+    assert!(unknown.unknown_persistent_reads.contains(&(3, 91)), "the selected high byte remains authoritative input");
+    assert!(!unknown.unknown_persistent_reads.contains(&(3, 90)), "the discarded low byte is not read");
+    let crossing = run(vec![vec![0x9B, 0x34, 70, 255, 0]]);
+    assert!(!crossing.is_complete());
+    assert_eq!(crossing.stats.unresolved, 1);
+    assert!(!crossing.writes.persistent.contains_key(&(3, 70)), "a word outside the bank cannot manufacture a zero assignment");
+}
+
+
+// ---- native party tuples and exact persistent assignment masks -------------------------------
+
+#[test]
+fn extended_scene_party_validation_preserves_unlocks_and_refuses_missing_authored_joins() {
+    let before = StoryState::at(6).into_extended().unwrap();
+    let temporary = run_party_fixture(&before, vec![vec![0xCA, 0, 2, 254], vec![0xC9, 2]]);
+    assert!(temporary.is_complete());
+    assert_eq!(crate::story::party_after(&[0], &temporary.party), [0]);
+    assert!(!temporary.party_is_the_storys(&before, &StoryState::at(7).into_extended().unwrap()),
+        "a temporary addition still unlocks Tifa, which the reviewed route cannot represent");
+    let quiet = run_party_fixture(&before, vec![]);
+    assert!(!quiet.party_is_the_storys(&before, &StoryState::at(11).into_extended().unwrap()),
+        "an empty journal cannot jump over the reactor's actual party join");
+    let later = StoryState::at(64).into_extended().unwrap();
+    assert!(!quiet.party_is_the_storys(&later, &later), "later PHS state is not inferred");
+}
+
+fn run_party_fixture(story: &StoryState, body: Vec<Vec<u8>>) -> Outcome {
+    let field = field_of(script(vec![("a", vec![(1, body)])], vec![]));
+    run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), story, 1, SceneResources { gil: None }, &[]).unwrap()
+}
+
+#[test]
+fn exact_party_overwrites_unknown_mirrors_without_inventing_a_startup_tuple() {
+    let story = StoryState::at(10).into_extended().unwrap();
+    let untouched = run_party_fixture(&story, vec![]);
+    assert!(untouched.writes.persistent.is_empty());
+    let result = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254]]);
+    assert!(result.is_complete());
+    assert!(result.unknown_persistent_reads.is_empty());
+    assert_eq!(result.writes.persistent, [((3, 9), (0, 255)), ((3, 10), (1, 255)), ((3, 11), (255, 255))].into_iter().collect());
+    let mut after = story.clone();
+    assert_eq!(result.writes.apply_extended_to(&mut after, &story), Some(true));
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] {
+        assert_eq!(after.known_byte(4, address), Some(value), "word selector shares physical bytes");
+    }
+}
+
+#[test]
+fn exact_party_remove_and_no_ops_keep_only_actual_physical_assignments() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let result = run_party_fixture(&story, vec![vec![0xC9, 1]]);
+    assert!(result.is_complete());
+    assert_eq!(result.writes.persistent, [((3, 10), (255, 255))].into_iter().collect());
+    for instruction in [vec![0xC9, 7], vec![0xC8, 1]] {
+        let result = run_party_fixture(&story, vec![instruction]);
+        assert!(result.is_complete());
+        assert!(result.writes.persistent.is_empty(), "a no-op must not become three assignments");
+    }
+    let section = script(vec![("a", vec![(1, vec![vec![0xCA, 0, 1, 254]])])], vec![]);
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+    for address in 9..=11 { assert_eq!(vm.written_mask(3, address), 255, "PRTYE assigns unchanged slots too"); }
+    let same = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254]]);
+    assert!(same.writes.persistent.is_empty(), "known unchanged assignments need no durable delta");
+}
+
+#[test]
+fn exact_party_dependent_unknowns_holes_and_reordered_main_slots_fail_before_writes() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    for instruction in [vec![0xC9, 7], vec![0xC8, 1], vec![0xCA, 0, 255, 254]] {
+        let result = run_party_fixture(&unknown, vec![instruction]);
+        assert!(!result.is_complete());
+        assert_eq!(result.unknown_persistent_reads, [(3, 9), (3, 10), (3, 11)].into_iter().collect());
+        assert!(result.writes.persistent.is_empty());
+        assert!(result.party.is_empty());
+    }
+    let mut known = unknown;
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { known.write_byte(3, address, value).unwrap(); }
+    for instruction in [vec![0xC9, 0], vec![0xCA, 1, 0, 254]] {
+        let result = run_party_fixture(&known, vec![instruction]);
+        assert!(!result.is_complete(), "the durable canonical table cannot represent holes or divergent slot order");
+        assert!(result.writes.persistent.is_empty());
+        assert!(result.party.is_empty());
+    }
+}
+
+#[test]
+fn both_scene_versions_preserve_255_members_and_extended_assignments_feed_later_party_ops() {
+    for story in [StoryState::at(33), StoryState::at(33).into_extended().unwrap()] {
+        let result = run_party_fixture(&story, vec![vec![0xCA, 0, 1, 254], vec![0xCA, 0, 255, 254], vec![0xC9, 1]]);
+        assert!(result.is_complete(), "{:?}", result.stats);
+        assert!(result.unknown_persistent_reads.is_empty());
+        assert_eq!(crate::story::party_after(&[0, 1], &result.party), [0]);
+        if story.supports_extended() {
+            assert_eq!(result.writes.persistent, [((3, 9), (0, 255)), ((3, 10), (255, 255)), ((3, 11), (255, 255))].into_iter().collect());
+        }
+    }
+}
+
+#[test]
+fn scene_getpc_reads_native_main_slots_without_compacting_a_removed_leader() {
+    // GETPC bank5[30+slot] = main party[slot]. PRTYM leaves slot0 empty; Barret stays in slot1.
+    let section = script(vec![("a", vec![(1, vec![
+        vec![0xC9, 0], vec![0x74, 5, 0, 30], vec![0x74, 5, 1, 31],
+        vec![0xC8, 2], vec![0x74, 5, 0, 32], vec![0x74, 5, 1, 33],
+    ])])], vec![]);
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(StoryState::at(33), &[]));
+    assert!(vm.stats().unknown.is_empty());
+    for (address, value) in [(30, 255), (31, 1), (32, 2), (33, 1)] {
+        assert_eq!(vm.writes().get(&(5, address)), Some(&value));
+    }
+}
+
+
+#[test]
+fn exact_generic_party_mirror_writes_refuse_bytes_words_bits_and_both_physical_aliases() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(8, 77), (9, 0), (10, 1), (11, 255), (12, 66)] {
+        story.write_byte(3, address, value).unwrap();
+    }
+    for bank in [3, 4] {
+        for address in 9..=11 {
+            for instruction in [setbyte(bank, address, 2), biton(bank, address, 0),
+                vec![0x83, bank << 4, address, 0], vec![0x84, bank << 4, address, 0]] {
+                let result = run_party_fixture(&story, vec![instruction]);
+                assert!(!result.is_complete());
+                assert_eq!(result.stats.unresolved, 1);
+                assert!(result.writes.persistent.is_empty());
+                assert!(result.party.is_empty());
+            }
+        }
+        for address in 8..=11 {
+            let section = script(vec![("a", vec![(1, vec![setword(bank, address, 0x1234)])])], vec![]);
+            let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(story.clone(), &[]));
+            assert_eq!(vm.stats().unresolved, 1);
+            assert!(vm.writes().is_empty(), "the entire overlapping word is refused, including byte8 or12");
+        }
+    }
+    let allowed = run_party_fixture(&story, vec![setbyte(3, 8, 3), setbyte(4, 12, 4), vec![0xCA, 0, 1, 254], vec![0xC9, 1]]);
+    assert!(allowed.is_complete(), "{:?}", allowed.stats);
+    assert_eq!(allowed.writes.persistent, [((3, 8), (3, 255)), ((3, 10), (255, 255)), ((3, 12), (4, 255))].into_iter().collect());
+}
+
+#[test]
+fn exact_multi_output_gil_reads_refuse_all_assignments_when_one_overlaps_a_party_mirror() {
+    let story = StoryState::at(33).into_extended().unwrap();
+    // CHGLD low half -> bank3[60], high half -> bank4[8..9]; the valid first store must not run.
+    let field = field_of(script(vec![("a", vec![(1, vec![vec![0x3B, 0x34, 60, 8]])])], vec![]));
+    let result = run_to_end_with_resources(&field, &demo_def(vec![], start(0, 1)), &story, 1,
+        SceneResources { gil: Some(0x1234_5678) }, &[]).unwrap();
+    assert!(!result.is_complete());
+    assert_eq!(result.stats.unresolved, 1);
+    assert!(result.writes.persistent.is_empty());
+    assert!(result.party.is_empty());
+}
+
+
+#[test]
+fn exact_party_queries_read_physical_membership_while_getpc_keeps_main_slots() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 2), (10, 255), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let section = script(vec![("a", vec![(1, vec![
+        if_party(0, &message(0, 0)), if_party(1, &message(0, 1)), if_party(2, &message(0, 2)),
+        vec![0x74, 5, 0, 30], vec![0x74, 5, 1, 31],
+    ])])], texts(3));
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story, &[]));
+    assert_eq!(dialogs_of(&beats), [2], "IFPRTYQ follows raw bank3 values, not the canonical main party");
+    assert_eq!(vm.writes().get(&(5, 30)), Some(&0));
+    assert_eq!(vm.writes().get(&(5, 31)), Some(&1));
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    assert!(vm.stats().unknown.is_empty());
+}
+
+#[test]
+fn exact_party_queries_refuse_unknown_mirrors_but_do_not_read_beyond_a_known_match() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    let section = script(vec![("a", vec![(1, vec![if_party(0, &message(0, 0))])])], texts(1));
+    let (_, vm) = run_with(&section, start(0, 1), &[], vm_for(unknown.clone(), &[]));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert_eq!(vm.stats().unknown.get("IFPRTYQ"), Some(&1));
+    assert_eq!(vm.vars().unknown_persistent_reads(), [(3, 9)].into_iter().collect());
+    let mut first_known = unknown;
+    first_known.write_byte(3, 9, 0).unwrap();
+    let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(first_known, &[]));
+    assert_eq!(dialogs_of(&beats), [0]);
+    assert!(vm.vars().unknown_persistent_reads().is_empty(), "native early success never examines the two unknown later slots");
+    assert_eq!(vm.stats().unresolved, 0);
+}
+
+
+#[test]
+fn exact_team_availability_query_after_barret_leaves_refuses_instead_of_using_active_party() {
+    let mut story = StoryState::at(36).into_extended().unwrap();
+    for (address, value) in [(9, 0), (10, 255), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    // The original PRTYM removed Barret from the active tuple without clearing PHS availability.
+    // Those known mirror bytes therefore cannot decide IFMEMBQ1.
+    let result = run_party_fixture(&story, vec![vec![0xCC, 1, 1]]);
+    assert!(!result.is_complete());
+    assert_eq!(result.stats.unresolved, 1);
+    assert_eq!(result.stats.unknown.get("IFMEMBQ"), Some(&1));
+    assert!(result.writes.persistent.is_empty());
+    assert!(result.party.is_empty());
+}
+
+// ---- audited default-name menu return -------------------------------------------------------
+
+fn name_menu_fixture(story: StoryState, instruction: Vec<u8>, allow: Option<(isize, u8)>) -> Vm {
+    let section = script(vec![("a", vec![(1, vec![instruction])])], vec![]);
+    let site = FieldScript::parse(&section).unwrap().span(0, 1).unwrap().start;
+    let mut vm = vm_for(story, &[]);
+    if let Some((delta, param)) = allow {
+        vm.allow_default_name_sites(vec![(site.checked_add_signed(delta).unwrap(), param)]);
+    }
+    run_with(&section, start(0, 1), &[], vm).1
+}
+
+#[test]
+fn audited_default_name_menu_returns_through_native_party_sync_without_a_party_or_phs_operation() {
+    for param in [0, 1] {
+        let mut story = StoryState::at(33).into_extended().unwrap();
+        for (address, value) in [(9, 0), (10, 2), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+        let vm = name_menu_fixture(story, vec![0x49, 0, 6, param], Some((0, param)));
+        assert_eq!(vm.stats().handled.get("MENU"), Some(&1));
+        assert!(vm.stats().ignored.is_empty() && vm.stats().unknown.is_empty());
+        assert_eq!(vm.stats().unresolved, 0);
+        assert!(vm.vars().unknown_persistent_reads().is_empty());
+        assert!(vm.party_ops().is_empty(), "a menu return is not a PRTYE and does not unlock anybody");
+        assert_eq!(vm.writes(), &[( (3, 10), 1), ((3, 11), 255)].into_iter().collect());
+        assert_eq!(vm.written_mask(4, 9), 0, "the retained Cloud slot was never assigned");
+        assert_eq!(vm.written_mask(4, 10), 255);
+        assert_eq!(vm.written_mask(4, 11), 255, "native reconciliation assigns the empty slot even unchanged");
+    }
+}
+
+#[test]
+fn default_name_menu_capability_does_not_allow_other_sites_params_menus_or_banked_operands() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    for (instruction, allow) in [
+        (vec![0x49, 0, 6, 0], None),
+        (vec![0x49, 0, 6, 0], Some((1, 0))),
+        (vec![0x49, 0, 6, 0], Some((0, 1))),
+        (vec![0x49, 0, 6, 2], Some((0, 2))),
+        (vec![0x49, 0, 7, 0], Some((0, 0))),
+        (vec![0x49, 3, 6, 0], Some((0, 0))),
+        (vec![0x49, 0x10, 6, 0], Some((0, 0))),
+    ] {
+        let vm = name_menu_fixture(unknown.clone(), instruction, allow);
+        assert_eq!(vm.stats().ignored.get("MENU"), Some(&1));
+        assert!(vm.writes().is_empty());
+        assert!(vm.party_ops().is_empty());
+        assert!(vm.vars().unknown_persistent_reads().is_empty(), "denied capabilities never read or synchronize a tuple");
+    }
+}
+
+#[test]
+fn audited_default_name_menu_refuses_unknown_or_invalid_raw_party_before_any_assignment() {
+    let unknown = StoryState::at(33).into_extended().unwrap();
+    let vm = name_menu_fixture(unknown.clone(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert_eq!(vm.vars().unknown_persistent_reads(), [(3, 9), (3, 10), (3, 11)].into_iter().collect());
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    let mut invalid = unknown;
+    for address in 9..=11 { invalid.write_byte(3, address, 0).unwrap(); }
+    let vm = name_menu_fixture(invalid, vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+}
+
+#[test]
+fn audited_default_name_menu_preserves_retained_field_slot_order() {
+    let mut story = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 1), (10, 0), (11, 255)] { story.write_byte(3, address, value).unwrap(); }
+    let vm = name_menu_fixture(story, vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().handled.get("MENU"), Some(&1));
+    assert_eq!(vm.writes(), &[((3, 11), 255)].into_iter().collect());
+    assert_eq!(vm.written_mask(3, 9), 0);
+    assert_eq!(vm.written_mask(3, 10), 0);
+    assert_eq!(vm.written_mask(3, 11), 255);
+    assert!(vm.party_ops().is_empty());
+}
+
+
+#[test]
+fn legacy_name_menu_keeps_its_ignored_preview_path_even_with_a_configured_site() {
+    let legacy = StoryState::at(33);
+    let vm = name_menu_fixture(legacy.clone(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().ignored.get("MENU"), Some(&1));
+    assert!(vm.stats().unknown.is_empty());
+    assert_eq!(vm.stats().unresolved, 0);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    let vm = name_menu_fixture(legacy.into_extended().unwrap(), vec![0x49, 0, 6, 0], Some((0, 0)));
+    assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
+    assert_eq!(vm.stats().unresolved, 1);
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+}
+
+
+// ---- native execution preserves its journal across setup and statistics boundaries ------------
+
+#[test]
+fn native_party_vm_keeps_setup_assignments_when_the_scene_begins() {
+    let story = StoryState::at(33).into_native_party().unwrap();
+    let section = script(vec![("a", vec![(0, vec![setbyte(3, 60, 7)]), (1, vec![setbyte(3, 61, 9)])])], vec![]);
+    let source = FieldScript::parse(&section).unwrap();
+    for with_resources in [false, true] {
+        let vars = SceneVars::new(story.clone(), &[]);
+        let mut vm = if with_resources { Vm::with_resources(vars, 1, Limits::default(), SceneResources { gil: Some(77) }) }
+            else { Vm::new(vars, 1, Limits::default()) };
+        vm.setup(&source, &[ScriptRef::new(0, 0)]);
+        assert!(!vm.stats().setup_incomplete);
+        assert_eq!(vm.native_journal().unwrap().after().known_byte(3, 60), Some(7));
+        vm.take_stats();
+        vm.begin(start(0, 1));
+        assert!(matches!(vm.resume(&source, None).then, Then::End { how: End::Finished, .. }));
+        let journal = vm.native_journal().unwrap();
+        assert_eq!(journal.before(), &story);
+        assert_eq!(journal.after().known_byte(3, 60), Some(7));
+        assert_eq!(journal.after().known_byte(3, 61), Some(9));
+        assert_eq!(vm.vars().story, story, "the immutable segment predecessor is retained");
+    }
+}
+
+#[test]
+fn native_party_battle_rebase_poison_cannot_be_cleared_by_a_later_legacy_snapshot() {
+    let legacy = StoryState::at(33).into_extended().unwrap();
+    let native = legacy.clone().into_native_party().unwrap();
+    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 5), message(0, 0), setbyte(3, 60, 7), visi(1)])])], texts(1));
+    let source = FieldScript::parse(&section).unwrap();
+    let mut vm = Vm::with_resources(SceneVars::new(legacy.clone(), &[]), 1, Limits::default(), SceneResources { gil: Some(77) });
+    vm.begin(start(0, 1));
+    assert!(matches!(vm.resume(&source, None).then, Then::Window(_)));
+    assert_eq!(vm.writes().get(&(3, 60)), Some(&5));
+    vm.resume_battle(&native, SceneResources { gil: Some(999) });
+    assert!(vm.is_over());
+    assert_eq!(vm.vars().story, legacy, "unsupported rebase never adopts native state through the legacy interpreter");
+    assert_eq!(vm.resources().gil_after, Some(77));
+    assert!(vm.writes().is_empty());
+    vm.take_stats();
+    vm.resume_battle(&legacy, SceneResources { gil: Some(1) });
+    vm.begin(start(0, 1));
+    let beat = vm.resume(&source, Some(0));
+    assert!(matches!(beat.then, Then::End { how: End::Broken, .. }));
+    assert!(beat.stage.is_empty());
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    assert_eq!(vm.resources().gil_after, Some(77));
+    assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
+}
+
+#[test]
+fn native_party_gate_preserves_legacy_vm_execution_and_scenevars_forwards_support() {
+    use crate::script::dialogue::StoryVars;
+    let v1 = StoryState::at(33);
+    let mut v2 = v1.clone();
+    v2.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, 0, true);
+    let v3 = v2.clone().into_extended().unwrap();
+    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 7), visi(1)])])], vec![]);
+    for story in [v1, v2, v3] {
+        assert!(SceneVars::new(story.clone(), &[]).execution_supported());
+        let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story, &[]));
+        assert!(matches!(beats.last().map(|b| &b.then), Some(Then::End { how: End::Finished, .. })));
+        assert_eq!(vm.writes().get(&(3, 60)), Some(&7));
+        assert!(!vm.stats().setup_incomplete);
+        assert_eq!(vm.stats().unresolved, 0);
+    }
+    let native = SceneVars::new(StoryState::at(33).into_native_party().unwrap(), &[]);
+    let erased: &dyn StoryVars = &native;
+    assert!(!erased.execution_supported(), "wrapping native StoryState must not bypass the dialogue gate");
 }

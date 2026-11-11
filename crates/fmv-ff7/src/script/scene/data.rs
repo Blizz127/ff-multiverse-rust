@@ -29,6 +29,10 @@ use crate::story::StoryState;
 use crate::script::FieldScript;
 use std::ops::RangeInclusive;
 
+mod train_route;
+pub use train_route::{jessie_train_talk_scene, train_map_scene, train_map_return_scene, train_departure_scene,
+    JESSIE_TRAIN_TALK_SCENE_ID, TRAIN_MAP_SCENE_ID, TRAIN_MAP_RETURN_SCENE_ID, TRAIN_DEPARTURE_SCENE_ID};
+
 /// A script of a field: its entity (index in the field's script) and slot (0..32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScriptRef {
@@ -176,7 +180,7 @@ impl SceneDef {
     /// Reviewed scenes that show the authored cast while participant bodies remain hidden.
     /// This affects presentation only, never script execution or its replay identity.
     pub fn hides_participants(&self) -> bool {
-        [CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID].contains(&self.id.as_str())
+        [CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID, TRAIN_MAP_SCENE_ID].contains(&self.id.as_str())
     }
 
     /// Reviewed arrival scenes that require a preceding durable transfer in production.
@@ -188,7 +192,10 @@ impl SceneDef {
     /// The actor initially placed from the accepted crossing, before the script moves it.
     /// A production caller must bind that origin with `with_trigger_position` before playback.
     pub fn origin_actor(&self) -> Option<u8> {
-        match self.id.as_str() { BRIDGE_SCENE_ID => Some(1), CARGO_DOOR_SCENE_ID => Some(11), _ => None }
+        match self.id.as_str() {
+            BRIDGE_SCENE_ID | TEAM_TALK_SCENE_ID => Some(1), CARGO_DOOR_SCENE_ID => Some(11),
+            JESSIE_TRAIN_TALK_SCENE_ID | TRAIN_DEPARTURE_SCENE_ID => Some(30), _ => None,
+        }
     }
 
     /// The snapshot used to interpret this scene. Promotion is local and preserves unknown bits;
@@ -241,6 +248,7 @@ impl SceneDef {
         match self.id.as_str() {
             BRIDGE_SCENE_ID => Some(SceneLineTrigger { a: [-614, 835, 518], b: [-238, 835, 518] }),
             CARGO_DOOR_SCENE_ID => Some(SceneLineTrigger { a: [-15, -104, 0], b: [53, -104, 0] }),
+            TRAIN_DEPARTURE_SCENE_ID => Some(SceneLineTrigger { a: [-55, -210, -53], b: [52, -220, -53] }),
             _ => None,
         }
     }
@@ -302,6 +310,7 @@ impl SceneDef {
     /// story, as far as the story carries its mark).
     pub fn offered_to(&self, story: &StoryState) -> bool {
         !self.is_point_cutscene() && self.applies_at(story.moment) && !self.begun_in(story)
+            && train_route::route_inputs_known(self, story)
     }
 
     /// The same scene with another cast (the entities the script drives stay; the actors that play them change).
@@ -487,6 +496,8 @@ pub fn team_talk_scene() -> SceneDef {
         entity,
         name: name.into(),
         look: Look::Model { hrc: hrc.into(), idle: idle.into() },
+        // Offline preview seed on the director's trigger triangle. Cloud's original init
+        // does not place him; production binds the accepted position before his first MOVE.
         start: (entity == 1).then_some(Spot { x: 1120, y: 1468, triangle: 62, direction: 0 }),
     })
     .collect();
@@ -736,7 +747,8 @@ pub fn sector7_station_scene() -> SceneDef {
     SceneDef {
         id: SECTOR7_STATION_SCENE_ID.into(), game: "ff7".into(), field: "mds7st3".into(),
         trigger: Trigger { entity: 1, name: "produce".into(), slot: 0, talk_radius: 0, moments: 51..=51 },
-        setup: vec![], given: vec![], root: vec![Step::StartMain(1)], cast,
+        setup: (0..23).map(|entity| ScriptRef::new(entity, 0)).collect(),
+        given: vec![], root: vec![Step::StartMain(1)], cast,
         speakers: vec![("Cloud".into(), 11), ("Barret".into(), 12)],
         witness: vec![], arrival: Spot { x: -2891, y: 3392, triangle: 26, direction: 0 }, presents: None, resume_after_battle: None, presents_bit: None,
     }
@@ -990,10 +1002,11 @@ pub fn is_scene_field(field: &str) -> bool {
     scenes().iter().any(|s| s.field.eq_ignore_ascii_case(field))
 }
 
-/// Where an account comes into the world when its story has left the first field behind for good (see [`STORY_ENTRIES`]).
+/// A reviewed continuation position (see [`story_entry`] and [`STORY_ENTRIES`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoryEntry {
-    /// The first story moment (`Var[2][0]`) this entry holds for, until the next row's.
+    /// The first story moment (`Var[2][0]`) this table entry holds for, until the next row's.
+    /// The separate moment-7 exception returned by [`story_entry`] applies only at 7.
     pub from_moment: u16,
     /// The field (the key its archive spells it by).
     pub field: &'static str,
@@ -1009,7 +1022,8 @@ pub struct StoryEntry {
 ///   player that walked out of the reactor stands.
 /// * **From moment 36** the story is in `md8_1`: the scene of `md8_4` ends in a script jump there, a jump only that
 ///   scene makes, and `md8_1` has no way back. Without this row an account that left the game at moment 36 or later
-///   would join in `md1stin` and could never reach the story again. The spot is the arrival that jump names.
+///   would join in `md1stin` and could never reach the story again. Return at Cloud's final control position
+///   after the station scene, not the earlier incoming MAPJUMP placement.
 /// * **From moment 39** the flower scene has finished in `md8_2`. Return at Cloud's authored final MOVE and TURNGEN
 ///   position, on the connected floor leading to both ways out. The scene is no longer offered at that moment.
 /// * **From moment 48** the cargo introduction has finished. Return at Cloud's authored placement and final heading
@@ -1024,17 +1038,24 @@ pub struct StoryEntry {
 /// floor the field's ways out are in.
 pub const STORY_ENTRIES: &[StoryEntry] = &[
     StoryEntry { from_moment: 33, field: "md8_4", spot: Spot { x: 82, y: 267, triangle: 3, direction: 0 } },
-    StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1629, y: -5357, triangle: 15, direction: 192 } },
+    StoryEntry { from_moment: 36, field: "md8_1", spot: Spot { x: 1270, y: -5357, triangle: 1, direction: 64 } },
     StoryEntry { from_moment: 39, field: "md8_2", spot: Spot { x: -3989, y: 21138, triangle: 19, direction: 150 } },
     StoryEntry { from_moment: 48, field: "cargoin", spot: Spot { x: -24, y: 16, triangle: 20, direction: 0 } },
     StoryEntry { from_moment: 51, field: "tin_1", spot: Spot { x: 2, y: 537, triangle: 28, direction: 0 } },
 ];
 
-/// The entry of a story at `moment` ([`STORY_ENTRIES`]): the row with the greatest `from_moment` that is not past it.
-/// `None` for a story that is still where everyone joins.
+/// The entry of a story at `moment`: exactly 7 uses the team talk's authored MAPJUMP to
+/// `md1_2`; otherwise use the greatest applicable row of [`STORY_ENTRIES`]. The early
+/// exception must not redirect moments 8..32 away from their existing reactor route.
+/// `None` for a story with no reviewed continuation entry.
 pub fn story_entry(moment: u16) -> Option<StoryEntry> {
+    if moment == 7 {
+        return Some(StoryEntry { from_moment: 7, field: "md1_2",
+            spot: Spot { x: 3549, y: 30574, triangle: 60, direction: 128 } });
+    }
     STORY_ENTRIES.iter().rev().find(|row| row.from_moment <= moment).copied()
 }
+
 
 /// The scene with id `id`.
 pub fn scene(id: &str) -> Option<SceneDef> {
@@ -1044,4 +1065,30 @@ pub fn scene(id: &str) -> Option<SceneDef> {
 /// The scenes that play in field `field` (the archive's spelling; case does not matter).
 pub fn scenes_in_field(field: &str) -> Vec<SceneDef> {
     scenes().into_iter().filter(|s| s.field.eq_ignore_ascii_case(field)).collect()
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    #[test]
+    fn team_talk_entry_is_an_exact_moment_exception_not_a_reactor_interval() {
+        assert_eq!(story_entry(7), Some(StoryEntry { from_moment: 7, field: "md1_2",
+            spot: Spot { x: 3549, y: 30574, triangle: 60, direction: 128 } }));
+        for moment in (0..=6).chain(8..=32) {
+            assert_eq!(story_entry(moment), None, "moment {moment} retains its existing entry policy");
+        }
+        assert_eq!(STORY_ENTRIES.first().map(|row| row.from_moment), Some(33));
+        assert_eq!(story_entry(33).map(|row| row.field), Some("md8_4"));
+    }
+
+    #[test]
+    fn station_entry_uses_completed_control_position_without_changing_later_fields() {
+        let station = StoryEntry { from_moment: 36, field: "md8_1",
+            spot: Spot { x: 1270, y: -5357, triangle: 1, direction: 64 } };
+        for moment in 36..=38 { assert_eq!(story_entry(moment), Some(station)); }
+        for (moment, field) in [(39, "md8_2"), (47, "md8_2"), (48, "cargoin"), (50, "cargoin"), (51, "tin_1")] {
+            assert_eq!(story_entry(moment).map(|row| row.field), Some(field));
+        }
+    }
 }

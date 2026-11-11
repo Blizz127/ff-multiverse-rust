@@ -65,6 +65,15 @@
 //! be reused while an old recovery intent still names it. An uncertain index append preserves both records
 //! and intent so replay can decide whether the restore committed.
 //!
+//! Archives deleted from index-4/5/6 stores use manifest version 2/3/4, respectively, so older
+//! import tools refuse their detached records. Versions 1 through 4 remain readable. Explicit
+//! restore raises the target to the archive's minimum index: 2/4/5/6 by manifest version, at least
+//! 4 for any story or schema-3 character, 5 for a schema-4 character envelope and 6 for schema 5.
+//! The index-6 requirement survives a large field visit shrinking or being removed. Source record
+//! bytes are unchanged; only restored records are rekeyed. Active intents under an index below
+//! their minimum fail closed during recovery. Complete copied archives do not upgrade a store
+//! merely by being present; their manifest retains the requirement even with no character file.
+//!
 //! Snapshots (`Store::snapshot`) are rollback images of the live records and do not copy the trash.
 
 use std::collections::BTreeSet;
@@ -81,7 +90,7 @@ use super::scene::CharacterRecord;
 use crate::character::{PlayerCharacter, MAX_PLAYER_CHARACTER_BYTES};
 use crate::error::{PersistError, Result};
 use crate::fsio;
-use crate::index::{AccountEntry, Index, Op};
+use crate::index::{AccountEntry, Index, Op, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION, LARGE_FIELD_VISIT_INDEX_VERSION};
 use crate::model::{
     is_safe_key, AccountRecord, AvatarId, AvatarProfile, Progression, MAX_CHARACTER_RECORD_BYTES,
     MAX_RECORD_BYTES, SCHEMA_VERSION,
@@ -92,8 +101,16 @@ use crate::model::{
 pub(crate) const TRASH_DIR: &str = "trash";
 
 const MANIFEST_FILE: &str = "manifest.json";
-/// The newest manifest version this build writes and reads.
-const MANIFEST_VERSION: u32 = 1;
+/// Legacy archives remain readable and are still emitted by untouched index-2/3 stores.
+const LEGACY_MANIFEST_VERSION: u32 = 1;
+/// Version 2 carries the index-4 compatibility requirement outside the originating store.
+const DURABLE_STORY_MANIFEST_VERSION: u32 = 2;
+/// Version 3 carries the index-5 field-visit compatibility requirement even when an archive
+/// has only story or identity records. Older readers reject it before importing anything.
+const FIELD_VISIT_MANIFEST_VERSION: u32 = 3;
+/// Version 4 retains the index-6 large-field-visit requirement, including after the visit
+/// shrinks or disappears. The highest supported manifest version is also the reader's fence.
+const MANIFEST_VERSION: u32 = 4;
 const MANIFEST_KIND: &str = "fmv-trash-entry";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// An account, an avatar, a player character and two records per game: far under this.
@@ -222,6 +239,14 @@ struct RestorePlan {
     at: u64,
 }
 
+/// Read only the version before interpreting a staged archive. A malformed newer manifest
+/// must not bypass its compatibility fence into legacy recovery's abandoned-plan cleanup.
+fn read_manifest_schema(dir: &Path) -> Result<Option<u32>> {
+    let path = dir.join(MANIFEST_FILE);
+    let Some(bytes) = fsio::read_capped(&path, MAX_MANIFEST_BYTES)? else { return Ok(None) };
+    fsio::check_schema_version_upto(&path, &bytes, MANIFEST_VERSION).map(Some)
+}
+
 fn read_manifest(dir: &Path) -> Result<Manifest> {
     let path = dir.join(MANIFEST_FILE);
     let bytes = fsio::read_capped(&path, MAX_MANIFEST_BYTES)?
@@ -244,6 +269,63 @@ fn read_manifest(dir: &Path) -> Result<Manifest> {
 
 fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     fsio::write_json(&dir.join(MANIFEST_FILE), manifest, MAX_MANIFEST_BYTES)
+}
+
+/// Call after the manifest reader has rejected unknown versions.
+fn manifest_minimum_index(version: u32) -> u32 {
+    match version {
+        LEGACY_MANIFEST_VERSION => crate::model::INDEX_LOG_VERSION,
+        DURABLE_STORY_MANIFEST_VERSION => DURABLE_STORY_INDEX_VERSION,
+        FIELD_VISIT_MANIFEST_VERSION => FIELD_VISIT_INDEX_VERSION,
+        _ => LARGE_FIELD_VISIT_INDEX_VERSION,
+    }
+}
+
+/// Preserve the source store's compatibility fence in a detached archive.
+fn manifest_for_index(version: u32) -> u32 {
+    if version >= LARGE_FIELD_VISIT_INDEX_VERSION { MANIFEST_VERSION }
+    else if version >= FIELD_VISIT_INDEX_VERSION { FIELD_VISIT_MANIFEST_VERSION }
+    else if version >= DURABLE_STORY_INDEX_VERSION { DURABLE_STORY_MANIFEST_VERSION }
+    else { LEGACY_MANIFEST_VERSION }
+}
+
+/// Schema-1/2 characters were historically valid in legacy archives and recovery intents
+/// under index 2. Their receipt metadata does not retroactively change that compatibility.
+fn archive_character_minimum_index(record: &CharacterRecord) -> u32 {
+    if record.progress.schema_version <= 2 { crate::model::INDEX_LOG_VERSION }
+    else { record.minimum_index_version() }
+}
+
+/// Existing schema-3 batch records and their interrupted trash operations remain valid
+/// under historical index 3. Only an explicit restore selects the newer index-4 fence.
+fn existing_character_minimum_index(record: &CharacterRecord) -> u32 {
+    match record.progress.schema_version {
+        1 | 2 => crate::model::INDEX_LOG_VERSION,
+        3 => crate::index::SCENE_BATCH_INDEX_VERSION,
+        _ => record.minimum_index_version(),
+    }
+}
+
+/// An older manifest wrapper cannot hide a newer character envelope during recovery.
+/// Pending deletes may have moved only some records; inspect the archived copy first and
+/// then the original live path. A restore's archive is complete before it becomes active.
+/// Story blobs alone do not raise this check: old index-2 deletes/restores legitimately
+/// contain them. Explicit restoration separately selects their current minimum format.
+fn active_character_minimum_index(root: &Path, dir: &Path, manifest: &Manifest, pending: bool) -> Result<u32> {
+    let mut minimum = manifest_minimum_index(manifest.schema_version);
+    for rel in &manifest.files {
+        let file = rel.rsplit('/').next().unwrap_or(rel);
+        if !rel.starts_with(PROGRESSION_DIR) || !matches!(progression_kind(file), Some((_, ProgressKind::Character))) {
+            continue;
+        }
+        let record = match CharacterRecord::read(&dir.join(rel))? {
+            Some(record) => Some(record),
+            None if pending => CharacterRecord::read(&root.join(rel))?,
+            None => None,
+        };
+        if let Some(record) = record { minimum = minimum.max(existing_character_minimum_index(&record)); }
+    }
+    Ok(minimum)
 }
 
 // ---- names and paths -----------------------------------------------------------------------------------------------
@@ -436,7 +518,7 @@ struct EntryRecords {
     account: AccountRecord,
     avatar: Option<AvatarProfile>,
     character: Option<PlayerCharacter>,
-    requires_scene_format: bool,
+    minimum_index_version: u32,
 }
 
 fn load_records(dir: &Path, manifest: &Manifest) -> Result<EntryRecords> {
@@ -474,13 +556,17 @@ fn load_records(dir: &Path, manifest: &Manifest) -> Result<EntryRecords> {
     };
     // The progress records are only checked here (they are written after the commit, by `write_progress`): a
     // restore that would fail on one of them must fail before it changes anything.
-    let mut requires_scene_format = false;
+    let mut minimum_index_version = manifest_minimum_index(manifest.schema_version);
     for rel in manifest.files.iter().filter(|rel| rel.starts_with(PROGRESSION_DIR)) {
-        if let Progress::Character(record) = read_progress(&dir.join(rel), rel, id)? {
-            requires_scene_format |= record.progress.schema_version >= 3;
-        }
+        let required = match read_progress(&dir.join(rel), rel, id)? {
+            // Story blobs are opaque. A field-visit store carries its stronger requirement
+            // in manifest 3/4 even when there is no character envelope to identify it.
+            Progress::Story(_) => DURABLE_STORY_INDEX_VERSION,
+            Progress::Character(record) => archive_character_minimum_index(&record),
+        };
+        minimum_index_version = minimum_index_version.max(required);
     }
-    Ok(EntryRecords { account, avatar, character, requires_scene_format })
+    Ok(EntryRecords { account, avatar, character, minimum_index_version })
 }
 
 /// A progress record of an entry (story blob or character progress), checked against the account it was filed under.
@@ -541,7 +627,8 @@ fn write_progress(root: &Path, dir: &Path, manifest: &Manifest, new_account: u64
                     fsio::write_json(&target, &record, MAX_RECORD_BYTES)
                 }
                 Progress::Character(mut record) => {
-                    // Keep the durable scene receipts along with the character's earned progress.
+                    // Preserve the complete envelope: scene receipts, field visits and their
+                    // receipts remain beside the character's earned progress during rekey.
                     record.progress.account_id = AccountId(new_account);
                     fsio::write_json(&target, record.as_ref(), MAX_CHARACTER_RECORD_BYTES)
                 }
@@ -576,6 +663,31 @@ pub(super) fn recover(root: &Path, index: &Index, next_account_id: u64, warnings
     for name in fsio::list_subdirs(&trash)? {
         let Some(parsed) = parse_name(&name) else { continue };
         let dir = trash.join(&name);
+        // A detached complete archive may sit in an older store until explicit restore.
+        // An active v2/v3/v4 intent cannot: its creator durably fenced index 4/5/6 before writing it.
+        // Refuse a copied/downgraded active intent before any recovery removes or installs files.
+        if matches!(parsed.state, TrashState::Pending | TrashState::Restoring { .. }) {
+            // Check every active version first, including future versions under the latest index.
+            // A version the reader does not understand must never reach legacy cleanup.
+            if let Some(version) = read_manifest_schema(&dir)? {
+                let minimum = manifest_minimum_index(version);
+                if index.format_version() < minimum {
+                    return Err(PersistError::corrupt(&dir,
+                        format!("an active version-{version} trash intent requires index version {minimum}")));
+                }
+            }
+            // A copied or altered legacy wrapper must not permit a newer record to be
+            // installed or discarded under an older index. Preserve existing handling of
+            // malformed manifest bodies; only an understood, ownership-checked file list
+            // is safe to inspect here.
+            if let Ok(manifest) = read_manifest(&dir) {
+                let minimum = active_character_minimum_index(root, &dir, &manifest, matches!(parsed.state, TrashState::Pending))?;
+                if index.format_version() < minimum {
+                    return Err(PersistError::corrupt(&dir,
+                        format!("an active trash intent's character records require index version {minimum}")));
+                }
+            }
+        }
         let outcome = match parsed.state {
             TrashState::Deleted | TrashState::Restored { .. } => continue,
             TrashState::Pending => recover_pending(root, &trash, &dir, &parsed, index, next_account_id),
@@ -757,14 +869,22 @@ impl Store {
     /// Step 1: collect the account's files and write the plan.
     fn prepare_delete(&self, account: AccountId, now: u64) -> Result<Prepared> {
         let (name, avatar, files) = self.collect_files(account)?;
+        let index_version = self.index().format_version();
         // Do not strand one member of an all-participant scene transaction in the trash.
         // Check every game before writing the intent, including reservation-only guests;
         // damaged character records fail closed rather than becoming silently releasable.
         for rel in files.iter().filter(|rel| rel.starts_with(PROGRESSION_DIR) && rel.ends_with(".character.json")) {
-            read_progress(&self.root.join(rel), rel, account.0)?;
+            let path = self.root.join(rel);
+            if let Progress::Character(record) = read_progress(&path, rel, account.0)? {
+                let minimum = existing_character_minimum_index(&record);
+                if index_version < minimum {
+                    return Err(PersistError::corrupt(&path,
+                        format!("deleting this character requires index version {minimum}; no trash intent was written")));
+                }
+            }
         }
         let manifest = Manifest {
-            schema_version: MANIFEST_VERSION,
+            schema_version: manifest_for_index(index_version),
             kind: MANIFEST_KIND.to_owned(),
             account_id: account.0,
             display_name: name,
@@ -916,6 +1036,15 @@ impl Store {
     /// ([`PersistError::Corrupt`]). A refused restore changes nothing and the entry stays where it is.
     /// [`PersistError::NoSuchTrashEntry`] if `entry` is not there or is not restorable (a delete or a restore in
     /// flight, or one that was restored already).
+    /// Version-2 archives, story records and schema-3 characters require at least index 4;
+    /// version-3 archives and schema-4 character envelopes require index 5; version-4 archives
+    /// and schema-5 character envelopes require index 6. The required fence
+    /// is durable before staging the corresponding manifest version, so detached copies retain
+    /// it through rekey. Legacy archives without those records retain an older target's format.
+    /// Record contents are preserved until the normal rekey.
+    /// Once selected, these format fences remain even if a later I/O failure rolls the restore
+    /// back; a failed execution can therefore change compatibility markers without committing
+    /// an account or changing any archived record. Validation refusals above make no changes.
     pub fn restore_account(&self, entry: &str, now: u64) -> Result<Restored> {
         let mut counters = self.writer()?;
         let _progress = self.progress_write();
@@ -930,9 +1059,12 @@ impl Store {
         };
         let token = new_token()?;
         let hash = token_hash(&token);
-        // A completed schema-3 archive can be brought into an older-format store. Its
-        // receipts still require the same global rollback fence as a fresh batch does.
-        if records.requires_scene_format { self.ensure_scene_batch_format(&counters)?; }
+        // Raise the exact minimum required by the archive and its records before installing
+        // any of them. Existing stronger fences are retained, including index 6 after a large visit shrinks.
+        self.ensure_index_format(&counters, records.minimum_index_version)?;
+        // Only after that fence is durable may the detached archive require it. Keep this
+        // marker through rollback, successful rekey and future copies.
+        manifest.schema_version = manifest_for_index(self.index().format_version());
         self.clear_uncommitted_account_state(new_account)?;
 
         // 1. The intent, so that a crash can be undone or finished: the plan goes into the manifest, and the entry
@@ -959,6 +1091,7 @@ impl Store {
                 created_at: records.account.created_at,
                 // A restored account is already claimed, never an undelivered registration.
                 registration_progress: None,
+                registration_story: None,
             };
             fsio::write_json(&self.account_path(new_account), &account, MAX_RECORD_BYTES)?;
             if let (Some(profile), Some(avatar)) = (&records.avatar, new_avatar) {

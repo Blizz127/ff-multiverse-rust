@@ -19,7 +19,7 @@
 //! Players that are not participants keep being drawn at their real places.
 
 use super::panel::{Rect, SpeakerSpot};
-use super::player::ScenePlayer;
+use super::player::{PresentationRef, ScenePlayer};
 use super::stage::CameraState;
 use crate::camera::{scroll_centre, SceneAim, SceneShot};
 use crate::avatar::frame::{Built, NpcRef};
@@ -55,6 +55,11 @@ pub fn is_trigger(id: u32) -> bool {
 /// characters the scene's cast plays (an area character whose name is a cast member's: the cast stands for it, where the scene
 /// puts it, so it is not drawn twice).
 pub fn visible_npcs<'a>(npcs: &'a [NpcView], scene: Option<&ScenePlayer>) -> Cow<'a, [NpcView]> {
+    visible_npcs_from(npcs, scene.map(ScenePlayer::presentation))
+}
+
+/// Passive ready pictures use the same replacement roster as uninterrupted playback.
+pub fn visible_npcs_from<'a>(npcs: &'a [NpcView], scene: Option<PresentationRef<'_>>) -> Cow<'a, [NpcView]> {
     let Some(scene) = scene else { return Cow::Borrowed(npcs) };
     if npcs.iter().any(|n| hides_npc(scene, n)) {
         Cow::Owned(npcs.iter().filter(|n| !hides_npc(scene, n)).cloned().collect())
@@ -63,7 +68,7 @@ pub fn visible_npcs<'a>(npcs: &'a [NpcView], scene: Option<&ScenePlayer>) -> Cow
     }
 }
 
-fn hides_npc(scene: &ScenePlayer, npc: &NpcView) -> bool {
+fn hides_npc(scene: PresentationRef<'_>, npc: &NpcView) -> bool {
     is_trigger(npc.id) || (!npc.name.is_empty() && scene.def().cast.iter().any(|m| m.name.eq_ignore_ascii_case(&npc.name)))
 }
 
@@ -71,7 +76,7 @@ fn hides_npc(scene: &ScenePlayer, npc: &NpcView) -> bool {
 /// pedestrian's label would remain at its field position after the scene moves or hides its body.
 pub fn label_hidden(scene: Option<&ScenePlayer>, subject: Subject, npcs: &[NpcView]) -> bool {
     let (Some(scene), Subject::Npc(id)) = (scene, subject) else { return false };
-    is_trigger(id) || npcs.iter().find(|n| n.id == id).is_some_and(|n| hides_npc(scene, n))
+    is_trigger(id) || npcs.iter().find(|n| n.id == id).is_some_and(|n| hides_npc(scene.presentation(), n))
 }
 
 /// A held participant can be absent from the picture during an authored entrance. Its name
@@ -87,6 +92,10 @@ pub fn participant_label_hidden(scene: Option<&ScenePlayer>, own: EntityId, subj
 
 /// The cast as avatars to draw.
 pub fn cast_players(scene: &ScenePlayer) -> Vec<AvatarPlayer<'_>> {
+    cast_players_from(scene.presentation())
+}
+
+pub fn cast_players_from(scene: PresentationRef<'_>) -> Vec<AvatarPlayer<'_>> {
     scene
         .cast_draws()
         .into_iter()
@@ -97,7 +106,7 @@ pub fn cast_players(scene: &ScenePlayer) -> Vec<AvatarPlayer<'_>> {
             };
             AvatarPlayer {
                 who: cast_who(c.entity),
-                pos: c.pos,
+                pos: c.render_pos,
                 facing: c.facing,
                 anim: if c.moving { AnimState::Walk } else { AnimState::Idle },
                 scene_frame: Some(c.frame),
@@ -146,7 +155,7 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
         let feet = pixels(view.to_view(stands)?);
         Some(((head[0], head[1]), (feet[0], feet[1])))
     };
-    let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.pos)?;
+    let (head, feet) = person(cast_who(entity), casts.iter().find(|c| c.entity == entity)?.render_pos)?;
     // A speaker the field camera has out of the window is nobody to point at.
     let inside = |p: (f32, f32)| (0.0..=vw as f32).contains(&p.0) && (0.0..=vh as f32).contains(&p.1);
     if !inside(head) && !inside(feet) {
@@ -159,15 +168,19 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
         let (cx, pad) = ((head.0 + feet.0) / 2.0, 4.0);
         (cx - half - pad, head.1.min(feet.1) - pad, cx + half + pad, head.1.max(feet.1) + pad)
     };
-    let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.pos)).map(rect).collect();
+    let mut others: Vec<Rect> = casts.iter().filter(|c| c.entity != entity).filter_map(|c| person(cast_who(c.entity), c.render_pos)).map(rect).collect();
     others.extend(scene.witnesses().iter().filter_map(|w| person(Who(w.entity.0), w.pos)).map(rect));
     Some(SpeakerSpot { head, feet, others })
 }
 
 /// What the scene asks of the window's field camera this frame ([`crate::camera`]): its last camera instruction on the
-/// stage's own clock, where the actor it follows is drawn, and where its lead is drawn: the canon Cloud when he is in the
-/// cast and on show (the party's leader, whom FF7's camera follows when a scene says nothing of it).
+/// stage's own clock and the followed actor's logical position. OFST moves the model but not this native camera target.
+/// The default lead is the canon Cloud when he is in the cast and on show.
 pub fn camera_shot(scene: &ScenePlayer, view: &FieldView) -> SceneShot {
+    camera_shot_from(scene.presentation(), view)
+}
+
+pub fn camera_shot_from(scene: PresentationRef<'_>, view: &FieldView) -> SceneShot {
     let clock = scene.camera_clock();
     let casts = scene.cast_draws();
     let drawn = |c: &super::player::CastDraw<'_>| view.to_view(c.pos).map(|p| [p.x, p.y]);

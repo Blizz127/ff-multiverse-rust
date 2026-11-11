@@ -7,7 +7,7 @@
 //! [`fmv_ff7::background::depth`], where the rule, `4 * id` in camera-space units, is derived and
 //! verified on the owned data). A [`Scenery`] is that picture prepared for the GPU once per field:
 //!
-//! * the pixels of every tile in **one atlas** (premultiplied, sampled with the linear filter and a
+//! * the pixels of every tile in **one atlas** (premultiplied, sampled with Linear by default or optional Nearest and a
 //!   per-tile clamp so a tile never reads its neighbour; the texels a nearer tile covers carry the
 //!   colour of what covers them, see below), plus one opaque black texel row that the *base* quad
 //!   samples;
@@ -18,13 +18,14 @@
 //!   of one [`BlendMode`], drawn after the models with the depth test but no depth write.
 //!
 //! Every vertex carries its tile's camera-space depth. All the depth tests of a frame, the models'
-//! ([`super::gpu`]), the tiles' and the ground marks', use [`buffer_depth`], one fixed mapping, so a
+//! ([`super::gpu`]), the tiles' and the ground marks', use one mapping fixed for the field, so a
 //! tile at camera depth `D` compares exactly like a model fragment at camera depth `D`.
 //!
 //! # Hidden texels
 //!
-//! A tile is drawn with the linear filter (the picture is shown at any window size, and the flat
-//! picture it replaces was filtered too) and cut out at half alpha. Where an object stands in front
+//! A tile is drawn with Linear by default (Nearest is optional) and cut out at half alpha.
+//! The picture is shown at any window size, and the flat picture it replaces uses the same choice.
+//! Where an object stands in front
 //! of the back layer, the back layer's tile still holds what is under the object: in `md1stin` 6 277
 //! pure-green key-colour pixels that the artists left there. The filter reads those texels next to
 //! the object's silhouette, so a bright green line would run round it. [`Scenery::choose`] therefore
@@ -35,10 +36,13 @@
 //!
 //! # The depth mapping
 //!
-//! [`buffer_depth`] is the engine's own perspective z-buffer value, `A - B / depth` with
-//! `A = far / (far - near)` and `B = far * near / (far - near)` for the engine's near plane 50 and
-//! far plane 32 000 ([`DEPTH_NEAR`], [`DEPTH_FAR`]; fitted to the stored `IDBig` of the tiles of 394
-//! of 451 owned fields, see `fmv_ff7`), clamped to `0..=1`. It is used for three reasons:
+//! The PC perspective z-buffer value is `A - B / depth`, where `A = far / (far - near)` and
+//! `B = far * near / (far - near)`. [`fmv_ff7::background::calibrate_depth_mapping`] estimates
+//! these coefficients from the field's stored `IDBig` values, with distinct-depth validation;
+//! fields without reliable samples retain near 50, far 32 000 ([`DEPTH_NEAR`], [`DEPTH_FAR`]).
+//! These are fallback values, not universal native planes: cargo and train use lower near planes.
+//! Tiles clamp the result to `0..=1`; calibrated model geometry instead clips in homogeneous
+//! coordinates before division (see [`super::gpu`]). The shared mapping has these properties:
 //!
 //! * It is **fixed**: a mapping fitted to the models of one frame would squeeze every tile outside
 //!   the models' depth range into the same value at either end, and then blended tiles, which are
@@ -50,8 +54,9 @@
 //!   interpolation of this value across a model's triangle is the true value at every pixel (a mapping
 //!   linear in depth would be off by several units across a character-sized triangle, which matters
 //!   right at an object's depth).
-//! * Depths below the near plane (layer 4 at 0, the layer-2 ids 12 and below) clamp to 0: "in front
-//!   of everything", as [`fmv_ff7::background::depth`] requires, not culled.
+//! * Tile depths below the selected near plane (including layer 4 at 0) clamp to 0: "in front
+//!   of everything", as [`fmv_ff7::background::depth`] requires. These screen-space tiles are not
+//!   culled like three-dimensional models.
 
 use bytemuck::{Pod, Zeroable};
 use fmv_ff7::background::depth::{pack_atlas, DepthTile, TileAtlas, ENGINE_FAR_PLANE, ENGINE_NEAR_PLANE};
@@ -59,9 +64,9 @@ use fmv_ff7::background::{decode_background_tiles_with_depth_options, Background
 use fmv_ff7::field::FieldFile;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The engine's near plane (camera-space units): the depth the mapping sends to 0.
+/// Fallback near plane (camera-space units), when a field has no reliable calibration.
 pub const DEPTH_NEAR: f32 = ENGINE_NEAR_PLANE;
-/// The engine's far plane: the depth the mapping sends to 1.
+/// Fallback far plane.
 pub const DEPTH_FAR: f32 = ENGINE_FAR_PLANE;
 
 /// Widest atlas the CPU side packs. Every device this client runs on holds a texture this wide
@@ -71,7 +76,7 @@ pub const ATLAS_MAX_WIDTH: u32 = 2048;
 
 static NEXT_SCENERY_ID: AtomicU64 = AtomicU64::new(1);
 
-/// `[A, B]` of the depth mapping: the z-buffer value of camera depth `d` is `A - B / d`.
+/// `[A, B]` of the fallback mapping: the z-buffer value of camera depth `d` is `A - B / d`.
 pub fn depth_terms() -> [f32; 2] {
     let (near, far) = (f64::from(DEPTH_NEAR), f64::from(DEPTH_FAR));
     [(far / (far - near)) as f32, (far * near / (far - near)) as f32]

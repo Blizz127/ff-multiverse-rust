@@ -50,14 +50,14 @@
 //! request for a slot that is taken waits for it to be free (the engine's own rule for a taken slot is not
 //! documented; waiting loses no line).
 
-use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary};
+use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary, SceneError};
 use super::data::{Given, ScriptRef, Step};
 use super::fade::{FadeOp, FadeState};
 use crate::field_direction_to_facing;
-use crate::background::{BackgroundOp, BackgroundState};
+use crate::background::{BackgroundOp, BackgroundState, PaletteOp};
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
-use crate::script::{decode_at, FieldScript, Instruction};
-use crate::story::{tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::script::{decode_at, field_wide_bytes, FieldScript, FieldScratch, FieldScratchError, FieldScratchOutcome, FieldScratchRun, Instruction};
+use crate::story::{tracked_var, NativePartyOp, NativeStoryBuilder, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Field frames per second (the clock of [`Timed::at`]).
@@ -177,6 +177,11 @@ pub enum CameraOp {
 pub enum Stage {
     /// Stand at a place at once (`XYZI`, `XYI`, `XYZ`). `z` is the script's height, when it gives one (else the ground's).
     Place { entity: u8, x: i16, y: i16, z: Option<i16>, triangle: Option<u16> },
+    /// Replace the model's world-space render offset (`OFST` type 0), independently of its
+    /// logical position, floor, movement and facing. These are field units, not model units.
+    Offset { entity: u8, x: i16, y: i16, z: i16 },
+    /// OFST type 1: integer linear model-offset steps, independently of logical movement.
+    OffsetMove { entity: u8, motion: super::OffsetMotion },
     /// Walk to a place over `frames`, from where the entity stood (`from`, when the scene knows it). `z` is the
     /// script's height (a ladder's), else the ground's at the place ([`super::ScenePlay`] fills it in).
     /// For JUMP, `frames` is N+2: N authored motion steps, the completion update and the script's
@@ -203,7 +208,7 @@ pub enum Stage {
     Camera(CameraOp),
     /// The field's one authored additive/subtractive fade, before dialogue and HUD.
     Fade(FadeOp),
-    /// Change authored background group visibility; frames are bit ordinals, not tile-state bytes.
+    /// Change authored background groups or palette state; frames are bit ordinals, not tile-state bytes.
     Background(BackgroundOp),
     /// Nonblocking field-camera shake. Only enabled axes read their banked operands;
     /// disabled axes retain their previous parameters and settle back to zero.
@@ -306,11 +311,22 @@ pub struct SceneVars {
     pub story: StoryState,
     pub given: Vec<Given>,
     unknown_persistent_reads: std::cell::RefCell<std::collections::BTreeSet<(u8, u8)>>,
+    /// Explicit field-visit scratch. None preserves the historical zero/Given preview model.
+    scratch: Option<FieldScratchRun>,
 }
 
 impl SceneVars {
     pub fn new(story: StoryState, given: &[Given]) -> Self {
-        Self { story, given: given.to_vec(), unknown_persistent_reads: Default::default() }
+        Self { story, given: given.to_vec(), unknown_persistent_reads: Default::default(), scratch: None }
+    }
+
+    /// Read an established visit image without inventing entry initialization or Given bytes.
+    pub fn with_scratch(story: StoryState, given: &[Given], scratch: FieldScratch) -> Result<Self, SceneError> {
+        if !story.supports_extended() { return Err(SceneError::ScratchStory); }
+        if let Some(given) = given.iter().find(|given| matches!(given.bank, 5 | 6)) {
+            return Err(SceneError::ScratchGiven { bank: given.bank, address: given.address });
+        }
+        Ok(Self { story, given: given.to_vec(), unknown_persistent_reads: Default::default(), scratch: Some(FieldScratchRun::new(&scratch)) })
     }
 
     pub fn unknown_persistent_reads(&self) -> std::collections::BTreeSet<(u8, u8)> {
@@ -319,6 +335,7 @@ impl SceneVars {
 
     /// Version 3 uses the game's shared byte/word banks; old replays keep their original interpretation.
     pub(super) fn key(&self, bank: u8, address: u8) -> (u8, u8) {
+        if self.scratch.is_some() && matches!(bank, 5 | 6) { return (5, address); }
         let bank = if self.story.supports_extended() {
             // Temporary selectors 5/6 share bytes too, but never enter persistent story data.
             if bank == 6 { 5 } else { crate::story::canonical_persistent_bank(bank).unwrap_or(bank) }
@@ -328,6 +345,12 @@ impl SceneVars {
 
     /// A preview value without treating an overwrite or comparison for change as a script read.
     pub(super) fn baseline_byte(&self, bank: u8, address: u8) -> u8 {
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &self.scratch {
+                return scratch.current().values().get(usize::from(address)).copied()
+                    .unwrap_or_else(|| scratch.read_u8(bank, usize::from(address)).unwrap_or(0));
+            }
+        }
         if self.story.supports_extended() {
             let key = self.key(bank, address);
             let mask = self.story.known_mask(bank, address);
@@ -347,6 +370,9 @@ impl SceneVars {
     }
 
     fn audit_mask(&self, bank: u8, address: u8, mask: u8) {
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &self.scratch { let _ = scratch.read_masked_u8(bank, usize::from(address), mask); return; }
+        }
         let persistent = if self.story.supports_extended() {
             crate::story::canonical_persistent_bank(bank).is_some()
         } else { (1..=4).contains(&bank) };
@@ -357,6 +383,10 @@ impl SceneVars {
 }
 
 impl StoryVars for SceneVars {
+    // The legacy dialogue walker has no checked visit outcome/fault contract. Only the
+    // explicit SceneVM/ScenePlay path may execute these variables.
+    fn execution_supported(&self) -> bool { self.scratch.is_none() && self.story.execution_supported() }
+
     fn byte(&self, bank: u8, address: u8) -> u8 {
         self.audit_mask(bank, address, u8::MAX);
         self.baseline_byte(bank, address)
@@ -364,6 +394,24 @@ impl StoryVars for SceneVars {
 
     fn party_member(&self, slot: u8) -> Option<u8> {
         self.story.party_member(slot)
+    }
+}
+
+/// Dialogue substitutions read the same native main slots as GETPC, including authored
+/// changes earlier in this segment. An unknown slot is an unresolved read, never Cloud or empty.
+struct NativeMessageVars<'a> {
+    story: &'a StoryState,
+    unknown: std::cell::Cell<bool>,
+}
+
+impl StoryVars for NativeMessageVars<'_> {
+    fn byte(&self, bank: u8, address: u8) -> u8 { self.story.var(bank, address) }
+    fn party_member(&self, slot: u8) -> Option<u8> {
+        match self.story.native_party().and_then(|party| party.known_main_slot(slot).ok()).flatten() {
+            Some(255) => None,
+            Some(member) => Some(member),
+            None => { self.unknown.set(true); None }
+        }
     }
 }
 
@@ -381,6 +429,8 @@ enum State {
     Run,
     /// Blocked until thread `n` has ended (`REQEW`).
     WaitEnd(usize),
+    /// OFSTW waits for the current offset, including a replacement by another script.
+    WaitOffset(u8),
     /// Waiting for its entity's priority slot.
     WaitSlot,
     /// In an idle loop: runs again when anything changes (the epoch it parked at is the one stored).
@@ -598,6 +648,9 @@ pub struct Vm {
     done: Option<End>,
     quiet: bool,
     places: BTreeMap<u8, Where>,
+    /// Presentation offsets survive placement and quiet setup without changing logical places.
+    offsets: BTreeMap<u8, [i16; 3]>,
+    offset_moves: BTreeMap<u8, (u32, super::OffsetMotion)>,
     headings: BTreeMap<u8, f32>,
     visible: BTreeMap<u8, bool>,
     speeds: BTreeMap<u8, i32>,
@@ -619,12 +672,45 @@ pub struct Vm {
     geometry: BTreeMap<u8, (i16, i16, u16, u16)>,
     /// What the scripts did to the party, in the order they did it (setup included): see [`Vm::party_ops`].
     party_ops: Vec<PartyOp>,
+    /// Main-party slots read by GETPC, including holes; field-party order can differ.
+    party_main: [u8; 3],
+    /// Semantic field tuple for old previews and for replaying the published party journal.
+    /// Version 3 operations read their authoritative raw inputs from bank3 instead.
+    party_bank: [u8; 3],
+    /// Source-validated MENU6 sites that retain the existing canonical names.
+    default_name_sites: Vec<(usize, u8)>,
+    /// Ordered persistent assignments and native party operations for this exact v4 segment.
+    /// The original SceneVars story remains the immutable beforeimage; scratch stays in writes.
+    native_story: Option<NativeStoryBuilder>,
+    /// A malformed or representation-changing internal rebase may never resurrect execution.
+    invalid_native_state: bool,
+    /// Checked existing-visit setup may not change scratch, even temporarily. Also catches
+    /// public SceneVars fields changed after its checked constructor validated them.
+    invalid_scratch_setup: bool,
+    /// A checked instruction whose native result is undefined/unrepresentable cannot later
+    /// become a valid visit outcome merely because transient statistics were reset.
+    invalid_scratch_execution: bool,
+    /// Checked quiet setup changed persistent knowledge/value, party state or resources at
+    /// some point. Restoring the original image and resetting counters never clear this audit.
+    setup_state_changed: bool,
+    /// Last actually executed UC/MENU2 instruction. This records authored state only;
+    /// world control remains held until its own durable publication policy releases it.
+    control_instructions: [Option<(usize, usize, u8)>; 2],
     resources: ResourceOutcome,
     stats: Stats,
 }
 
 impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
+        let invalid_scratch_setup = vars.scratch.is_some()
+            && (!vars.story.supports_extended() || vars.given.iter().any(|given| matches!(given.bank, 5 | 6)));
+        let native_story = vars.story.supports_native_party().then(|| NativeStoryBuilder::new(&vars.story)).transpose();
+        let invalid_native_state = native_story.is_err();
+        let native_story = native_story.ok().flatten();
+        // These tuples are exclusively the legacy compatibility model. Native execution reads
+        // the checked builder state and never falls back from unknown main slots to this tuple.
+        let party = if vars.story.supports_native_party() { [255; 3] }
+            else { [0, 1, 2].map(|slot| vars.party_member(slot).unwrap_or(255)) };
         Self {
             jump: None,
             battle: None,
@@ -656,6 +742,8 @@ impl Vm {
             done: None,
             quiet: false,
             places: BTreeMap::new(),
+            offsets: BTreeMap::new(),
+            offset_moves: BTreeMap::new(),
             headings: BTreeMap::new(),
             visible: BTreeMap::new(),
             speeds: BTreeMap::new(),
@@ -670,6 +758,15 @@ impl Vm {
             background_state: BackgroundState::default(),
             geometry: BTreeMap::new(),
             party_ops: Vec::new(),
+            party_main: party,
+            party_bank: party,
+            default_name_sites: Vec::new(),
+            native_story,
+            invalid_native_state,
+            invalid_scratch_setup,
+            invalid_scratch_execution: false,
+            setup_state_changed: false,
+            control_instructions: [None; 2],
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -684,16 +781,220 @@ impl Vm {
 
     pub fn resources(&self) -> &ResourceOutcome { &self.resources }
 
-    /// The party as the scene's scripts see it: the story's own, with what they have done to it so far.
-    fn party_now(&self) -> Vec<u8> {
-        let story: Vec<u8> = (0..3).filter_map(|slot| self.vars.party_member(slot)).collect();
-        crate::story::party_after(&story, &self.party_ops)
+    pub fn checked_scratch(&self) -> bool { self.vars.scratch.is_some() }
+    pub fn scratch_before(&self) -> Option<&FieldScratch> { self.vars.scratch.as_ref().map(FieldScratchRun::before) }
+    pub fn scratch_current(&self) -> Option<&FieldScratch> { self.vars.scratch.as_ref().map(FieldScratchRun::current) }
+    pub fn scratch_setup_changed(&self) -> bool { self.invalid_scratch_setup }
+    /// Whether checked quiet setup left all persistent, party, resource and scratch state
+    /// untouched throughout its execution. Unchanged assignments are allowed; a transient
+    /// change followed by restoration is not neutral. This audit survives every VM reset.
+    /// Unchecked constructors retain their previous behavior and do not perform this audit.
+    pub fn setup_is_state_neutral(&self) -> bool { !self.setup_state_changed && !self.invalid_scratch_setup }
+    pub(super) fn control_instruction(&self, menu: bool) -> Option<(usize, usize, u8)> {
+        self.control_instructions.get(usize::from(menu)).copied().flatten()
+    }
+    fn checked_execution_refused(&self) -> bool {
+        self.checked_scratch() && (self.stats.setup_incomplete || self.stats.unresolved != 0
+            || self.stats.dropped_requests != 0 || !self.stats.unknown.is_empty()
+            || matches!(self.done, Some(End::Broken | End::Budget)))
+    }
+    pub fn scratch_valid(&self) -> bool {
+        !self.invalid_scratch_setup && !self.invalid_scratch_execution && !self.checked_execution_refused()
+            && self.vars.scratch.as_ref().is_none_or(|scratch| scratch.fault().is_none()
+                && self.vars.unknown_persistent_reads.borrow().is_empty())
+    }
+    /// Checked failure remains Some(Err), never the unchecked constructor's None.
+    pub fn scratch_outcome(&self) -> Option<Result<FieldScratchOutcome, FieldScratchError>> {
+        self.vars.scratch.as_ref().map(|scratch| {
+            if let Some(error) = scratch.fault() { Err(error) }
+            else if self.invalid_scratch_setup || self.invalid_scratch_execution || self.checked_execution_refused()
+                || !self.vars.unknown_persistent_reads.borrow().is_empty() { Err(FieldScratchError::InvalidOutcome) }
+            else { scratch.snapshot() }
+        })
     }
 
-    /// What the scripts did to the story's party (`PRTYP`, `PRTYM`, `PRTYE`), in order, the stage scripts' part first.
-    /// The VM changes no party: it only says what was asked, so that the caller can hold it against the party the story
-    /// has after the scene ([`crate::story::party_after`], [`crate::story::canon_party`]) and refuse a scene whose party
-    /// the story would not carry.
+    /// Native persistent state at the current instruction; no scratch or external resources.
+    pub fn current_persistent_story(&self) -> Option<&StoryState> { self.native_story.as_ref().map(NativeStoryBuilder::state) }
+
+    /// Ordered v4 assignments and native effects, including quiet setup and unchanged writes.
+    pub fn native_journal(&self) -> Option<NativeStoryJournal> { self.native_story.as_ref().map(NativeStoryBuilder::snapshot) }
+
+    /// Refuse a malformed or representation-changing internal battle rebase before executing.
+    /// Clear unpublished output; the refusal survives begin and statistics resets.
+    fn refuse_invalid_native_state(&mut self) -> bool {
+        if !self.invalid_native_state { return false; }
+        self.stats.setup_incomplete = true;
+        self.stats.unresolved = self.stats.unresolved.max(1);
+        self.done = Some(End::Broken);
+        self.pending = None;
+        self.queued_note = None;
+        self.out.clear();
+        self.writes.clear();
+        self.written_masks.clear();
+        self.party_ops.clear();
+        self.native_story = None;
+        self.resources.gil_ops.clear();
+        self.resources.gil_after = self.resources.gil_before;
+        self.jump = None;
+        self.battle = None;
+        self.battle_checkpoint = None;
+        self.battle_flags = None;
+        self.window_checkpoint = None;
+        true
+    }
+
+    /// Installed by ScenePlay only after validating the original script and semantic scene.
+    /// An empty list keeps every MENU unsupported; this is not a general name-editor capability.
+    pub(super) fn allow_default_name_sites(&mut self, sites: Vec<(usize, u8)>) {
+        self.default_name_sites = sites;
+    }
+
+    /// Evaluate a native operation on the same ordered state as direct persistent writes.
+    fn change_native_party(&mut self, operation: NativePartyOp) -> bool {
+        if !self.scratch_valid() { return false; }
+        let Some(native) = &mut self.native_story else { return false };
+        let effect = match native.party(operation) {
+            Ok(effect) => effect,
+            Err(_) => {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+        };
+        if effect.changed() { self.epoch = self.epoch.wrapping_add(1); }
+        let assigned = effect.assignments().raw_slots;
+        for (slot, (value, known)) in effect.after().raw_slots().into_iter().enumerate() {
+            if assigned & (1 << slot) != 0 { self.record_assignment_map(3, 9 + slot as u8, value, known); }
+        }
+        true
+    }
+
+    /// Resolve an U8 operand before a native operation. An unknown persistent input is never
+    /// converted to a preview/Given value and then used to mutate the native party.
+    fn native_operand_u8(&mut self, ins: &Instruction, name: &str) -> Option<u8> {
+        let operand = ins.operand(name)?;
+        if operand.bank == 0 { return u8::try_from(operand.value).ok(); }
+        let address = u8::try_from(operand.value).ok()?;
+        if !matches!(operand.bank, 5 | 6) && crate::story::canonical_persistent_bank(operand.bank).is_none() {
+            if self.checked_scratch() { let _ = self.var_byte(operand.bank, address); }
+            return None;
+        }
+        if matches!(operand.bank, 5 | 6) {
+            if let Some(scratch) = &self.vars.scratch { return scratch.read_u8(operand.bank, usize::from(address)).ok(); }
+        }
+        let value = self.var_byte(operand.bank, address);
+        let known = matches!(operand.bank, 5 | 6)
+            || self.native_story.as_ref()?.state().known_mask(operand.bank, address) == 255;
+        if !known { self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+        known.then_some(value)
+    }
+
+    fn default_name_menu(&mut self, ins: &Instruction, class: &mut Class) {
+        if !self.vars.story.supports_extended() {
+            *class = Class::Ignored;
+            return;
+        }
+        let param = ins.literal("param").and_then(|value| u8::try_from(value).ok());
+        if ins.stray_banks || ins.literal("type") != Some(6)
+            || !param.is_some_and(|param| param <= 1 && self.default_name_sites.contains(&(ins.offset, param))) {
+            *class = Class::Ignored;
+            return;
+        }
+        if self.native_story.is_some() {
+            if !self.change_native_party(NativePartyOp::FieldSync) { *class = Class::Unknown; }
+            return;
+        }
+        // Original OpcodeFuncMenu's completion calls FIELD_Init (field_opcodes.c6664), also
+        // called on native main/110B8.c471 menu return. It reconciles raw slots with the saved
+        // main party without changing names, main membership or PHS availability.
+        let bank = [9, 10, 11].map(|address| self.var_byte(3, address));
+        if [9, 10, 11].into_iter().any(|address|
+            (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        }
+        let Ok(change) = crate::script::party::sync_from_main(bank, self.party_main) else {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        };
+        // The journal's semantic raw tuple stays where the last authored PartyOp left it.
+        // A later dependent PartyOp compares it to these actual bytes and resolves its journal.
+        for ((address, value), assigned) in [9, 10, 11].into_iter().zip(change.bank).zip(change.assigned) {
+            if assigned { self.record_assignment(3, address, value, 255); }
+        }
+    }
+
+    /// The main-party slots read by GETPC, including the holes left by PRTYM.
+    fn party_now(&self) -> [u8; 3] { self.party_main }
+
+    /// IFPRTYQ reads the physical field tuple; GETPC independently reads the main tuple.
+    /// Keep the original early return, so a match does not depend on later unexamined slots.
+    fn field_party_contains(&mut self, character: u8) -> Option<bool> {
+        if !self.vars.story.supports_extended() { return Some(self.party_bank.contains(&character)); }
+        for address in 9..=11 {
+            let member = self.var_byte(3, address);
+            if (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255 {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return None;
+            }
+            if member == character { return Some(true); }
+        }
+        Some(false)
+    }
+
+    /// Apply the original field/main tuple transition. No initial physical bytes are invented:
+    /// only an authored assignment becomes a write, and a full PRTYE without 255 reads no old tuple.
+    fn change_party(&mut self, op: PartyOp) -> bool {
+        if self.native_story.is_some() {
+            return self.change_native_party(match op {
+                PartyOp::Add(character) => NativePartyOp::Add(character),
+                PartyOp::Remove(character) => NativePartyOp::Remove(character),
+                PartyOp::Set(slots) => NativePartyOp::Set(slots),
+            });
+        }
+        use crate::script::party::transition;
+        let extended = self.vars.story.supports_extended();
+        let replaces_all = matches!(op, PartyOp::Set(slots) if !slots.contains(&255));
+        let bank = if extended && !replaces_all {
+            let raw = [9, 10, 11].map(|address| self.var_byte(3, address));
+            if [9, 10, 11].into_iter().any(|address|
+                (self.vars.story.known_mask(3, address) | self.written_mask(3, address)) != 255) {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+            raw
+        } else { self.party_bank };
+        let Ok(change) = transition(bank, self.party_main, op) else { return false };
+        if extended {
+            let compact = change.bank.iter().skip_while(|&&member| member != 255).all(|&member| member == 255);
+            if change.main != change.bank || !compact {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+        }
+        // A dependent operation may have consumed a different physical tuple from the journal's
+        // canonical input. Publish resolved slots in that case so replay sees the exact same result.
+        let replay = transition(self.party_bank, self.party_main, op);
+        let journal = if replay.is_ok_and(|r| r.bank == change.bank && r.main == change.main) { op }
+            else { PartyOp::Set(change.bank.map(|member| if member == 255 { 254 } else { member })) };
+        if !transition(self.party_bank, self.party_main, journal)
+            .is_ok_and(|r| r.bank == change.bank && r.main == change.main) { return false; }
+        if self.party_bank != change.bank || self.party_main != change.main { self.epoch = self.epoch.wrapping_add(1); }
+        self.party_bank = change.bank;
+        self.party_main = change.main;
+        self.party_ops.push(journal);
+        if extended {
+            for ((address, value), assigned) in [9, 10, 11].into_iter().zip(change.bank).zip(change.assigned) {
+                if assigned { self.record_assignment(3, address, value, 255); }
+            }
+        }
+        true
+    }
+
+    /// Authored party changes in order, with dependent inputs resolved when replay needs them.
+    /// Version 3 also journals the actual bank3/4 assignments. The caller validates the resulting
+    /// main party against the durable story table ([`crate::story::canon_party`]).
     pub fn party_ops(&self) -> &[PartyOp] {
         &self.party_ops
     }
@@ -713,6 +1014,7 @@ impl Vm {
 
     /// The counters so far, which start again from nothing (the setup's are kept apart from the scene's).
     pub fn take_stats(&mut self) -> Stats {
+        if self.checked_execution_refused() { self.invalid_scratch_execution = true; }
         std::mem::take(&mut self.stats)
     }
 
@@ -738,6 +1040,34 @@ impl Vm {
     /// Where the scene knows `entity` stands.
     pub fn place_of(&self, entity: u8) -> Option<Where> {
         self.places.get(&entity).copied()
+    }
+
+    /// The model's render offset, including quiet setup's result; a new field starts at zero.
+    /// Logical position reads and movement continue to use [`Vm::place_of`].
+    pub fn offset(&self, entity: u8) -> [i16; 3] {
+        self.offset_at(entity, self.clock)
+    }
+
+    /// Scripts run before the model updater: a replacement at F+1 sees step 0,
+    /// not the step 1 that will be drawn after that script pass.
+    fn offset_at(&self, entity: u8, time: u32) -> [i16; 3] {
+        self.offset_moves.get(&entity).map_or_else(
+            || self.offsets.get(&entity).copied().unwrap_or([0; 3]),
+            |(start, motion)| motion.at(time.saturating_sub(*start).saturating_sub(1)))
+    }
+
+    fn offsets_running_at(&self, time: u32) -> bool {
+        self.offset_moves.values().any(|(start, motion)| time < start.saturating_add(motion.completion_frames()))
+    }
+
+    /// Original offsets continue while MES/ASK holds a script. The current scene
+    /// timeline cannot reproduce an arbitrary dialogue dwell, so durable boundaries
+    /// require the motion to have completed; legacy previews retain scene-time playback.
+    fn unresolved_offset_boundary(&mut self, time: u32) -> bool {
+        if self.vars.story.supports_extended() && self.offsets_running_at(time) {
+            self.note_unresolved_motion();
+            true
+        } else { false }
     }
 
     /// The heading the scene knows `entity` has.
@@ -775,6 +1105,12 @@ impl Vm {
     // ---- variables --------------------------------------------------------------------------------------------
 
     fn var_byte(&self, bank: u8, address: u8) -> u8 {
+        if field_wide_bytes(bank).is_none() {
+            if let Some(scratch) = &self.vars.scratch { let _ = scratch.read_u8(bank, usize::from(address)); return 0; }
+        }
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &self.vars.scratch { return scratch.read_u8(bank, usize::from(address)).unwrap_or(0); }
+        }
         if !self.vars.story.supports_extended() {
             return self.writes.get(&(bank, address)).copied().unwrap_or_else(|| self.vars.byte(bank, address));
         }
@@ -793,6 +1129,18 @@ impl Vm {
     }
 
     fn var_word(&self, bank: u8, address: u8) -> u16 {
+        if let Some(scratch) = &self.vars.scratch {
+            if matches!(bank, 5 | 6) { return scratch.read_u16(bank, usize::from(address)).unwrap_or(0); }
+            match field_wide_bytes(bank) {
+                Some(1) => return u16::from(self.var_byte(bank, address)),
+                Some(2) if address == 255 => { let _ = scratch.read_masked_u16(6, 255, 0); return 0; }
+                Some(2) => {},
+                _ => { let _ = scratch.read_u8(bank, usize::from(address)); return 0; }
+            }
+        }
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &self.vars.scratch { return scratch.read_u16(bank, usize::from(address)).unwrap_or(0); }
+        }
         if self.vars.story.supports_extended() && address == u8::MAX {
             // There is no high byte at this address. Do not let a guessed zero authorize an outcome.
             self.vars.unknown_persistent_reads.borrow_mut().insert(self.vars.key(bank, address));
@@ -807,10 +1155,53 @@ impl Vm {
         self.set_masked(bank, address, value, u8::MAX);
     }
 
+    /// Version 3 cannot represent a direct raw/main divergence and refuses these writes.
+    /// Version 4 journals arbitrary raw assignments independently from its native main tuple.
+    fn party_mirror_write(&self, bank: u8, address: u8, wide: bool) -> bool {
+        self.vars.story.supports_extended() && !self.vars.story.supports_native_party() && self.vars.key(bank, address).0 == 3
+            && ((9..=11).contains(&address) || (wide && address.checked_add(1).is_some_and(|next| (9..=11).contains(&next))))
+    }
+
     fn set_masked(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        if self.party_mirror_write(bank, address, false) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            return;
+        }
+        self.record_assignment(bank, address, value, mask);
+    }
+
+    /// Record a validated generic assignment, or an authored party opcode's explicit physical write.
+    fn record_assignment(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        if !self.scratch_valid() { return; }
+        if field_wide_bytes(bank).is_none() {
+            if let Some(scratch) = &self.vars.scratch { let _ = scratch.read_u8(bank, usize::from(address)); return; }
+        }
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &mut self.vars.scratch {
+                if scratch.write_masked_u8(bank, usize::from(address), value, mask).is_err() { return; }
+            }
+        }
+        if crate::story::canonical_persistent_bank(bank).is_some() {
+            if let Some(native) = &mut self.native_story {
+                if native.write_masked(bank, address, value, mask).is_err() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        self.record_assignment_map(bank, address, value, mask);
+    }
+
+    /// Diagnostic overlay update after a native effect has already journaled its assignments.
+    fn record_assignment_map(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
         let key = self.vars.key(bank, address);
-        let old = if self.vars.story.supports_extended() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
+        let old = if self.vars.story.supports_extended() || self.checked_scratch() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
         let old_mask = self.written_masks.get(&key).copied().unwrap_or(0);
+        if self.quiet && self.checked_scratch() && self.native_story.is_none()
+            && crate::story::canonical_persistent_bank(bank).is_some() {
+            let known = self.vars.story.known_mask(bank, address) | old_mask;
+            self.setup_state_changed |= (old ^ value) & mask != 0 || known & mask != mask;
+        }
         if old != value || (self.vars.story.supports_extended() && old_mask & mask != mask) {
             self.epoch = self.epoch.wrapping_add(1);
         }
@@ -819,11 +1210,45 @@ impl Vm {
     }
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
-        if self.vars.story.supports_extended() && address == u8::MAX {
+        if !self.scratch_valid() { return; }
+        if self.checked_scratch() && !matches!(bank, 5 | 6) {
+            match field_wide_bytes(bank) {
+                Some(1) => { self.set_byte(bank, address, value as u8); return; }
+                Some(2) if address < 255 => {},
+                _ => {
+                    if let Some(scratch) = &self.vars.scratch {
+                        if field_wide_bytes(bank) == Some(2) { let _ = scratch.read_masked_u16(6, usize::from(address), 0); }
+                        else { let _ = scratch.read_u8(bank, usize::from(address)); }
+                    }
+                    return;
+                }
+            }
+        }
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &mut self.vars.scratch {
+                if scratch.write_u16(bank, usize::from(address), value).is_err() { return; }
+                let [low, high] = value.to_le_bytes();
+                self.record_assignment_map(bank, address, low, 255);
+                if bank == 6 { self.record_assignment_map(bank, address + 1, high, 255); }
+                return;
+            }
+        }
+        if (self.vars.story.supports_extended() && address == u8::MAX) || self.party_mirror_write(bank, address, true) {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);
-            return; // Refuse the whole assignment, including its low byte.
+            return; // Refuse the whole assignment, including an otherwise valid low byte.
         }
         let [low, high] = value.to_le_bytes();
+        if crate::story::canonical_persistent_bank(bank).is_some() {
+            if let Some(native) = &mut self.native_story {
+                if native.write_word(bank, address, value).is_err() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return;
+                }
+                self.record_assignment_map(bank, address, low, 255);
+                self.record_assignment_map(bank, address + 1, high, 255);
+                return;
+            }
+        }
         self.set_byte(bank, address, low);
         if let Some(next) = address.checked_add(1) {
             self.set_byte(bank, next, high);
@@ -850,6 +1275,11 @@ impl Vm {
     fn known_operand_bit(&self, ins: &Instruction, name: &str, bit: i32) -> Option<bool> {
         let bit = u8::try_from(bit).ok().filter(|bit| *bit < 8)?;
         let (bank, address) = Self::dest(ins, name)?;
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &self.vars.scratch {
+                return scratch.read_masked_u8(bank, usize::from(address), 1 << bit).ok().map(|value| value != 0);
+            }
+        }
         self.writes.get(&self.vars.key(bank, address))
             .filter(|_| !self.vars.story.supports_extended() || self.written_mask(bank, address) & (1 << bit) != 0)
             .map(|value| value & (1 << bit) != 0)
@@ -873,6 +1303,13 @@ impl Vm {
         let op = ins.operand(name)?;
         if op.bank == 0 { return Some(op.value as u16); }
         let address = (op.value & 255) as u8;
+        if self.checked_scratch() {
+            let value = self.var_word(op.bank, address);
+            return self.scratch_valid().then_some(value);
+        }
+        if matches!(op.bank, 5 | 6) {
+            if let Some(scratch) = &self.vars.scratch { return scratch.read_u16(op.bank, usize::from(address)).ok(); }
+        }
         let wide = match op.bank {
             1 | 3 | 5 | 11 | 13 | 15 => false,
             2 | 4 | 6 | 7 | 12 | 14 => true,
@@ -920,6 +1357,23 @@ impl Vm {
             *class = Class::Ignored;
             return;
         };
+        // Overflow during preflight must fault before either CHGLD output is published.
+        if let Some(scratch) = &self.vars.scratch {
+            for name in ["var1", "var2"] {
+                if let Some((bank, address)) = Self::dest(ins, name) {
+                    if field_wide_bytes(bank).is_none() || (field_wide_bytes(bank) == Some(2) && address == 255) {
+                        if field_wide_bytes(bank) == Some(2) { let _ = scratch.read_masked_u16(6, 255, 0); }
+                        else { let _ = scratch.read_u8(bank, usize::from(address)); }
+                        *class = Class::Unknown;
+                        return;
+                    }
+                } else {
+                    self.invalid_scratch_execution = true;
+                    *class = Class::Unknown;
+                    return;
+                }
+            }
+        }
         let destination = |name| {
             let (bank, address) = Self::dest(ins, name)?;
             let wide = match bank {
@@ -934,6 +1388,12 @@ impl Vm {
             *class = Class::Unknown;
             return;
         };
+        // Preflight both destinations: refusing the high output must not leave a low-half write.
+        if [low, high].into_iter().any(|(bank, address, wide)| self.party_mirror_write(bank, address, wide)) {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            *class = Class::Unknown;
+            return;
+        }
         // CHGLD writes the low half first, then the high half; overlapping destinations matter.
         for ((bank, address, wide), value) in [(low, gil as u16), (high, (gil >> 16) as u16)] {
             if wide { self.set_word(bank, address, value); } else { self.set_byte(bank, address, value as u8); }
@@ -951,15 +1411,20 @@ impl Vm {
     }
 
     fn arithmetic(&mut self, ins: &Instruction, op: Arith, wide: bool, saturate: bool) {
-        let Some(var) = Self::dest(ins, "var") else { return };
+        let Some(var) = Self::dest(ins, "var") else {
+            if self.checked_scratch() { self.invalid_scratch_execution = true; }
+            return;
+        };
         let cur = if matches!(op, Arith::Set) {
             0
         } else if wide {
-            i64::from(self.var_word(var.0, var.1))
+            let value = self.var_word(var.0, var.1);
+            if self.checked_scratch() { i64::from(value as i16) } else { i64::from(value) }
         } else {
             i64::from(self.var_byte(var.0, var.1))
         };
         let value = i64::from(self.num(ins, "value", if wide { Width::S16 } else { Width::U8 }));
+        if !self.scratch_valid() { return; }
         let new = match op {
             Arith::Set => value,
             Arith::Plus => cur.saturating_add(value),
@@ -967,11 +1432,17 @@ impl Vm {
             Arith::Mul => cur.saturating_mul(value),
             Arith::Div => match cur.checked_div(value) {
                 Some(q) => q,
-                None => return,
+                None => {
+                    if self.checked_scratch() { self.invalid_scratch_execution = true; self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+                    return;
+                }
             },
             Arith::Mod => match cur.checked_rem(value) {
                 Some(r) => r,
-                None => return,
+                None => {
+                    if self.checked_scratch() { self.invalid_scratch_execution = true; self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+                    return;
+                }
             },
             Arith::And => cur & value,
             Arith::Or => cur | value,
@@ -979,19 +1450,57 @@ impl Vm {
             Arith::Inc => cur.saturating_add(1),
             Arith::Dec => cur.saturating_sub(1),
         };
-        self.store(var, wide, new, saturate);
+        if self.checked_scratch() && wide && saturate {
+            // Verified PC handlers: PLS2!/INC2! cap above32767, while MNS2!/DEC2!
+            // compare against positive32768 and preserve low16bits of that maximum.
+            let value = if matches!(op, Arith::Plus | Arith::Inc) { new.min(32767) } else { new.max(32768) };
+            self.store(var, true, value, false);
+        } else { self.store(var, wide, new, saturate); }
     }
 
-    /// `BITON`/`BITOFF`/`BITXOR`: the variable is a row of bits, bit `n` being bit `n % 8` of the byte `n / 8` after its
-    /// address.
+    /// Checked `BITON`/`BITOFF`/`BITXOR` use the addressed byte; only bit indices 0..7
+    /// have reviewed native semantics. Legacy previews retain their historical row-of-bits behavior.
     fn bit_op(&mut self, ins: &Instruction, op: u8) {
-        let Some((bank, address)) = Self::dest(ins, "var") else { return };
+        let Some((bank, address)) = Self::dest(ins, "var") else {
+            if self.checked_scratch() { self.invalid_scratch_execution = true; }
+            return;
+        };
         let bit = self.num(ins, "bit", Width::U8).rem_euclid(256);
+        if self.checked_scratch() && bit >= 8 {
+            self.invalid_scratch_execution = true;
+            return;
+        }
         self.flip_bit(bank, address, bit, op);
     }
 
     fn flip_bit(&mut self, bank: u8, address: u8, bit: i32, op: u8) {
+        if !self.scratch_valid() { return; }
+        if matches!(bank, 5 | 6) {
+            if let Some(scratch) = &mut self.vars.scratch {
+                let Ok(bit) = usize::try_from(bit) else { return };
+                let at = usize::from(address).saturating_add(bit / 8);
+                let mask = 1u8 << (bit % 8);
+                let value = match op {
+                    0x82 => mask,
+                    0x83 => 0,
+                    _ => match scratch.read_masked_u8(bank, at, mask) { Ok(value) => value ^ mask, Err(_) => return },
+                };
+                if scratch.write_masked_u8(bank, at, value, mask).is_err() { return; }
+                let Some(value) = scratch.current().values().get(at).copied() else {
+                    self.invalid_scratch_execution = true;
+                    return;
+                };
+                self.record_assignment_map(bank, at as u8, value, mask);
+                return;
+            }
+        }
         let byte_at = address.checked_add(u8::try_from(bit / 8).unwrap_or(0));
+        if byte_at.is_none() {
+            if let Some(scratch) = &self.vars.scratch {
+                let at = usize::from(address).saturating_add(usize::try_from(bit / 8).unwrap_or(0));
+                let _ = scratch.read_masked_u8(5, at, 0);
+            }
+        }
         let (Some(byte_at), Some(mask)) = (byte_at, 1u8.checked_shl(u32::try_from(bit % 8).unwrap_or(0))) else { return };
         let extended = self.vars.story.supports_extended();
         let cur = if extended {
@@ -1132,7 +1641,30 @@ impl Vm {
                 }
             }
         }
-        self.threads.iter().enumerate().filter(|(_, t)| t.state == State::Run).min_by_key(|(_, t)| (t.time, t.seq)).map(|(i, _)| i)
+        let (idx, time, _) = self.threads.iter().enumerate().filter_map(|(i, t)| {
+            let time = match t.state {
+                State::Run => t.time,
+                State::WaitOffset(entity) => {
+                    // A native higher-priority script owns the entity until RET,
+                    // including its WAIT/REQEW/OFSTW or parked state. Do not let an
+                    // older waiter observe an intermediate cancellation between two
+                    // instructions of that owner. WaitSlot has not acquired ownership.
+                    if self.threads.iter().any(|owner| owner.entity == t.entity && owner.prio < t.prio
+                        && !matches!(owner.state, State::Done | State::WaitSlot)) { return None; }
+                    let end = self.offset_moves.get(&entity).map_or(self.clock,
+                        |(start, motion)| start.saturating_add(motion.completion_frames()));
+                    t.time.max(end).max(self.clock)
+                },
+                _ => return None,
+            };
+            Some((i, time, t.seq))
+        }).min_by_key(|(_, time, seq)| (*time, *seq))?;
+        // Do not move a waiter's stored time forward until it wins: another script
+        // may replace or cancel the motion before this projected completion frame.
+        let selected = self.threads.get_mut(idx)?;
+        selected.time = time;
+        if matches!(selected.state, State::WaitOffset(_)) { selected.state = State::Run; }
+        Some(idx)
     }
 
     /// A narrow, verified animation tail: CANIM2, WAIT, ANIME1, WAIT, JMPB to the first
@@ -1165,7 +1697,7 @@ impl Vm {
         decode_at(script.bytes(), pc, 0).is_ok_and(|ins| ins.opcode == 0x12 && ins.jump_target == Some(pc))
     }
 
-    /// Preserve the existing idle behavior of constant ASPED/background metadata loops.
+    /// Preserve the idle behavior of constant ASPED/background/instant-offset metadata loops.
     /// Parking proves the last lap produced no epoch-changing work. Additionally require
     /// a linear cycle containing only these presentation commands and WAIT: no condition, request,
     /// actor movement, persistent write, resource operation or window may be hidden here.
@@ -1182,7 +1714,8 @@ impl Vm {
                     Some(target) => pc = target,
                     None => return false,
                 },
-                0x24 | 0xBD | 0xE0..=0xE4 => pc = ins.end(),
+                0xC3 if ins.literal("move_type") == Some(0) => pc = ins.end(),
+                0x24 | 0xBD | 0xC4 | 0xE0..=0xE4 => pc = ins.end(),
                 _ => return false,
             }
         }
@@ -1298,12 +1831,21 @@ impl Vm {
 
     // ---- one instruction --------------------------------------------------------------------------------------
 
-    fn message(&self, script: &FieldScript<'_>, dialog: i32) -> Option<Message> {
+    fn message(&mut self, script: &FieldScript<'_>, dialog: i32) -> Option<Message> {
         let index = usize::try_from(dialog).ok()?;
         let d = script.dialogs().get(index)?;
         let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
+        let pieces = if let Some(native) = &self.native_story {
+            let vars = NativeMessageVars { story: native.state(), unknown: std::cell::Cell::new(false) };
+            let pieces = parse_message(raw, &vars);
+            if vars.unknown.get() {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                self.invalid_message = true;
+            }
+            pieces
+        } else { parse_message(raw, &self.vars) };
         // The speaker's own entity is not known here: the entity is the opener's, set by the caller.
-        Some(Message::new(MessageOrigin::Canon { entity: 0, dialog: index }, parse_message(raw, &self.vars)))
+        Some(Message::new(MessageOrigin::Canon { entity: 0, dialog: index }, pieces))
     }
 
     fn open(&mut self, idx: usize, entity: usize, instruction_offset: usize, window: i32, mut message: Message, pending: Option<Pending>) -> Flow {
@@ -1413,8 +1955,29 @@ impl Vm {
         let Ok(ins) = decode_at(code, pc, 0) else { return Flow::Scene(End::Broken) };
         self.set_pc(idx, ins.end());
         let mut class = Class::Handled;
+        let setup_before = (self.quiet && self.checked_scratch()).then(|| (
+            self.native_story.as_ref().map_or(0, |native| native.events().len()),
+            self.party_main, self.party_bank, self.resources.gil_after,
+        ));
         let flow = self.exec(script, idx, entity, &ins, &mut class);
+        if matches!(ins.opcode, 0x33 | 0x4A) {
+            if let Some(disabled) = ins.literal("disabled").and_then(|value| u8::try_from(value).ok()) {
+                if let Some(last) = self.control_instructions.get_mut(usize::from(ins.opcode == 0x4A)) {
+                    *last = Some((entity, ins.offset, disabled));
+                }
+            }
+        }
+        if let Some((events, main, bank, gil)) = setup_before {
+            self.setup_state_changed |= main != self.party_main || bank != self.party_bank
+                || gil != self.resources.gil_after
+                || self.native_story.as_ref().is_some_and(|native|
+                    native.events().iter().skip(events).any(|event| event.changed()));
+        }
         self.stats.note(class, ins.mnemonic);
+        if !self.scratch_valid() {
+            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+            return Flow::Scene(End::Broken);
+        }
         flow
     }
 
@@ -1467,6 +2030,54 @@ impl Vm {
                 Flow::Yield
             }
             0x01..=0x03 => self.request(script, idx, ins),
+            0x0A if self.native_story.is_some() => {
+                // SPTYE snapshots all three operands before PartyReplace mutates any source.
+                let slots = ["character1", "character2", "character3"].map(|name| self.native_operand_u8(ins, name));
+                match slots {
+                    [Some(a), Some(b), Some(c)] if self.change_native_party(NativePartyOp::Set([a, b, c])) => {},
+                    _ => *class = Class::Unknown,
+                }
+                Flow::Next
+            }
+            0x0B if self.native_story.is_some() => {
+                // GTPYE reads each raw slot immediately before its U8 store. Stage the
+                // instruction so an unknown later read cannot publish a partial assignment.
+                let Some(mut staged) = self.native_story.clone() else {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                };
+                let mut staged_scratch = self.vars.scratch.clone();
+                let mut assigned = Vec::with_capacity(3);
+                let mut valid = true;
+                for (slot, name) in ["var1", "var2", "var3"].into_iter().enumerate() {
+                    let address = 9 + slot as u8;
+                    let Some(value) = staged.state().known_byte(3, address) else {
+                        self.vars.audit_mask(3, address, !self.written_mask(3, address));
+                        valid = false;
+                        break;
+                    };
+                    let Some((bank, destination)) = Self::dest(ins, name) else { valid = false; break };
+                    if crate::story::canonical_persistent_bank(bank).is_some() {
+                        if staged.write_byte(bank, destination, value).is_err() { valid = false; break; }
+                    } else if matches!(bank, 5 | 6) {
+                        if let Some(scratch) = &mut staged_scratch {
+                            if scratch.write_u8(bank, usize::from(destination), value).is_err() { valid = false; break; }
+                        }
+                    } else { valid = false; break; }
+                    assigned.push((bank, destination, value));
+                }
+                if valid {
+                    self.native_story = Some(staged);
+                    self.vars.scratch = staged_scratch;
+                    for (bank, address, value) in assigned { self.record_assignment_map(bank, address, value, 255); }
+                } else {
+                    if self.checked_scratch() { self.invalid_scratch_execution = true; }
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                }
+                Flow::Next
+            }
             // RETTO: carry on in another script of the same entity, in place of this one.
             0x07 => {
                 let slot = ins.literal("script").and_then(|s| usize::try_from(s).ok());
@@ -1498,6 +2109,30 @@ impl Vm {
                 let right = self.num(ins, "right", width);
                 let known = if matches!(op, 0x14 | 0x15) && matches!(operation, 9 | 10) {
                     self.known_operand_bit(ins, "left", right)
+                } else if self.checked_scratch() && matches!(operation, 9 | 10) && (0..16).contains(&right) {
+                    Self::dest(ins, "left").and_then(|(bank, address)| {
+                        if matches!(bank, 5 | 6) {
+                            return self.vars.scratch.as_ref().and_then(|scratch| scratch.read_masked_u16(bank, usize::from(address), 1u16 << right)
+                                .ok().map(|value| value != 0));
+                        }
+                        match field_wide_bytes(bank) {
+                            Some(1) if right >= 8 => Some(false),
+                            Some(2) if address == 255 => {
+                                if let Some(scratch) = &self.vars.scratch { let _ = scratch.read_masked_u16(6, 255, 0); }
+                                None
+                            }
+                            Some(1 | 2) => {
+                                let Some(at) = address.checked_add((right / 8) as u8) else {
+                                    if let Some(scratch) = &self.vars.scratch { let _ = scratch.read_masked_u16(6, 255, 0); }
+                                    return None;
+                                };
+                                let mask = 1u8 << (right % 8);
+                                self.vars.audit_mask(bank, at, mask & !self.written_mask(bank, at));
+                                Some(self.peek_byte(bank, at) & mask != 0)
+                            }
+                            _ => { let _ = self.var_byte(bank, address); None }
+                        }
+                    })
                 } else { None };
                 let holds = known.map_or_else(
                     || compare(operation, self.num(ins, "left", width), right, bits),
@@ -1529,6 +2164,10 @@ impl Vm {
                 self.open(idx, entity, ins.offset, window, message, None)
             }
             0x48 => self.ask(script, idx, entity, ins),
+            0x49 => {
+                self.default_name_menu(ins, class);
+                Flow::Next
+            }
             0x50 => {
                 if let Some(window) = ins.literal("window") {
                     let g = (
@@ -1583,9 +2222,32 @@ impl Vm {
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
-                if let Some((bank, address)) = Self::dest(ins, "var_character") {
+                if self.native_story.is_some() {
+                    // The original does nothing for an out-of-range slot. Known empty is
+                    // 255; an unknown valid slot cannot authorize an assignment.
+                    if slot < 3 {
+                        let Some((bank, address)) = Self::dest(ins, "var_character").filter(|(bank, _)|
+                            matches!(*bank, 5 | 6) || crate::story::canonical_persistent_bank(*bank).is_some()) else {
+                            if self.checked_scratch() { self.invalid_scratch_execution = true; }
+                            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                            *class = Class::Unknown;
+                            return Flow::Next;
+                        };
+                        match self.native_story.as_ref().and_then(|native| native.state().native_party())
+                            .and_then(|party| party.known_main_slot(slot).ok()).flatten() {
+                            Some(who) => self.set_byte(bank, address, who),
+                            None => {
+                                if self.checked_scratch() { self.invalid_scratch_execution = true; }
+                                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                                *class = Class::Unknown;
+                            }
+                        }
+                    }
+                } else if let Some((bank, address)) = Self::dest(ins, "var_character") {
                     let who = self.party_now().get(usize::from(slot)).copied().unwrap_or(u8::MAX);
                     self.set_byte(bank, address, who);
+                } else if self.checked_scratch() {
+                    self.invalid_scratch_execution = true;
                 }
                 Flow::Next
             }
@@ -1600,14 +2262,41 @@ impl Vm {
                 }
                 Flow::Next
             }
-            // LBYTE and HBYTE set the low and the high byte of a word variable.
+            // LBYTE/HBYTE extract a source byte into the stated destination byte. Original
+            // OpcodeFuncHbyte shifts the source word; it never increments the destination.
             0x9A | 0x9B => {
                 if let Some((bank, address)) = Self::dest(ins, "var") {
-                    let value = u8::try_from(self.num(ins, "value", Width::U16) & 0xFF).unwrap_or(0);
-                    let at = if op == 0x9A { Some(address) } else { address.checked_add(1) };
-                    if let Some(at) = at {
-                        self.set_byte(bank, at, value);
-                    }
+                    let value = if op == 0x9A {
+                        self.num(ins, "value", Width::U8) as u8
+                    } else if let Some(source) = ins.operand("value") {
+                        if source.bank == 0 { ((source.value >> 8) & 255) as u8 }
+                        else if let Some(scratch) = &self.vars.scratch {
+                            let address = (source.value & 255) as u8;
+                            // Preserve the selector's width before canonicalizing aliases.
+                            // Byte-wide selectors have no high byte, even when it is unknown.
+                            match field_wide_bytes(source.bank) {
+                                Some(1) => 0,
+                                Some(2) if matches!(source.bank, 5 | 6) => scratch.read_masked_u16(source.bank, usize::from(address), 0xFF00)
+                                    .map(|value| (value >> 8) as u8).unwrap_or(0),
+                                Some(2) if address < 255 => self.var_byte(source.bank, address + 1),
+                                Some(2) => { let _ = scratch.read_masked_u16(6, 255, 0); 0 }
+                                _ => { let _ = scratch.read_u8(source.bank, usize::from(address)); 0 }
+                            }
+                        }
+                        else if let Some(high) = ((source.value & 255) as u8).checked_add(1) {
+                            // The discarded low byte cannot affect this assignment. Audit only
+                            // the selected high byte, preserving unknown low-byte knowledge.
+                            self.var_byte(source.bank, high)
+                        } else {
+                            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                            *class = Class::Unknown;
+                            return Flow::Next;
+                        }
+                    } else {
+                        *class = Class::Unknown;
+                        return Flow::Next;
+                    };
+                    self.set_byte(bank, address, value);
                 }
                 Flow::Next
             }
@@ -1620,12 +2309,28 @@ impl Vm {
                 Flow::Next
             }
             0xCB | 0xCC => {
-                // IFPRTYQ asks who is in the party NOW: what the story says, and what this scene's scripts have done to it
-                // since. IFMEMBQ asks whether the character belongs to the team at all, which a party change does not decide.
-                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| {
-                    if op == 0xCB { self.party_now().contains(&c) } else { self.vars.is_member(c) }
-                });
-                self.branch(idx, ins, holds)
+                // Team/PHS availability is not active membership: Barret remains available after
+                // leaving the party at moment36. V3 has no authoritative input for this query yet.
+                if op == 0xCC && self.vars.story.supports_extended() && self.native_story.is_none() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                }
+                // IFPRTYQ reads the physical field tuple; legacy IFMEMBQ retains preview behavior.
+                let Some(character) = ins.literal("character").and_then(|c| u8::try_from(c).ok()) else {
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                };
+                let holds = if op == 0xCB { self.field_party_contains(character) }
+                    else if let Some(native) = &self.native_story {
+                        let known = native.state().native_party().and_then(|party| party.known_available(character).ok()).flatten();
+                        if known.is_none() { self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+                        known
+                    } else { Some(self.vars.is_member(character)) };
+                match holds {
+                    Some(holds) => self.branch(idx, ins, holds),
+                    None => { *class = Class::Unknown; Flow::Next }
+                }
             }
             // GETAI reads an entity's current walkmesh triangle. A MOVE without an explicit
             // triangle does not establish one; never invent it from a stale position.
@@ -1697,6 +2402,52 @@ impl Vm {
                 self.do_move(idx, me, Goal { x, y, z: Some(z), triangle, how: MoveHow::Ladder, animation: None, frames: Some(frames) });
                 Flow::Yield
             }
+            0xC3 => {
+                // ff7-decomp d4db3de3, field_opcodes.c, OpcodeFuncOfst/OpcodeFuncOfstw:
+                // original OFST reads signed words, including its otherwise unused duration
+                // for type 0. Keep those reads in the unknown-state audit. The offset is an
+                // absolute world-space translation added only when drawing the model.
+                let x = clamp_i16(self.num(ins, "x", Width::S16));
+                let y = clamp_i16(self.num(ins, "y", Width::S16));
+                let z = clamp_i16(self.num(ins, "z", Width::S16));
+                let speed = clamp_i16(self.num(ins, "speed", Width::S16));
+                let time = self.thread_time(idx);
+                let next = [x, y, z];
+                if ins.literal("move_type") == Some(1) {
+                    let Some(motion) = super::OffsetMotion::new(self.offset_at(me, time), next, speed) else {
+                        *class = Class::Ignored;
+                        self.note_unresolved_motion();
+                        return Flow::Scene(End::Budget);
+                    };
+                    self.offset_moves.insert(me, (time, motion));
+                    self.emit(time, Stage::OffsetMove { entity: me, motion });
+                    return Flow::Next;
+                }
+                if ins.literal("move_type") != Some(0) {
+                    // Type 2 needs the original cosine table; zero/negative-duration animated
+                    // offsets are outside the bounded arithmetic above. Never guess either.
+                    *class = Class::Ignored;
+                    self.note_unresolved_motion();
+                    return Flow::Scene(End::Budget);
+                }
+                if self.offset_at(me, time) != next || self.offset_moves.contains_key(&me) { self.epoch = self.epoch.wrapping_add(1); }
+                self.offset_moves.remove(&me);
+                self.offsets.insert(me, next);
+                // Redundant instructions still reach the stage, but must not keep an idle
+                // OFST/JMP loop awake by incrementing the scheduler's epoch.
+                self.out.push(Timed {
+                    at: time.saturating_sub(self.origin),
+                    what: Stage::Offset { entity: me, x, y, z },
+                });
+                Flow::Next
+            }
+            0xC4 => {
+                if self.offset_moves.get(&me).is_some_and(|(start, motion)|
+                    self.thread_time(idx) < start.saturating_add(motion.completion_frames())) {
+                    if let Some(thread) = self.threads.get_mut(idx) { thread.state = State::WaitOffset(me); }
+                    Flow::Yield
+                } else { Flow::Next }
+            },
             0xB2 => {
                 let speed = self.num(ins, "speed", Width::U16);
                 self.speeds.insert(me, speed);
@@ -1862,6 +2613,23 @@ impl Vm {
                 }
                 Flow::Next
             }
+            // Palette positions address 16-colour blocks of the field's shared scratch buffer.
+            // The count operand is inclusive; resolving it here preserves 255 as 256 entries.
+            0xE5 | 0xE6 | 0xE7 | 0xEA => {
+                let count = u16::from(clamp_u8(self.num(ins, "count", Width::U8))) + 1;
+                let byte = |name| clamp_u8(self.num(ins, name, Width::U8));
+                let palette = match op {
+                    0xE5 => PaletteOp::Store { palette: byte("palette"), position: byte("position"), count },
+                    0xE6 => PaletteOp::Load { position: byte("position"), palette: byte("palette"), count },
+                    0xE7 => PaletteOp::Copy { source: byte("pos_src"), destination: byte("pos_dst"), count },
+                    _ => PaletteOp::Multiply { source: byte("pos_src"), destination: byte("pos_dst"),
+                        red: byte("r"), green: byte("g"), blue: byte("b"), count },
+                };
+                let change = BackgroundOp::Palette(palette);
+                if self.quiet { self.initial_background.push(change); }
+                self.emit(self.thread_time(idx), Stage::Background(change));
+                Flow::Next
+            }
             // ---- the camera ----------------------------------------------------------------------------------
             0x5E => {
                 // Original field_opcodes.c opcode_SHAKE: low mask bits enable axes;
@@ -1919,20 +2687,37 @@ impl Vm {
                 }
                 Flow::Next
             }
-            // ---- the party: nothing changes here, what was asked is kept for the caller -----------------------
+            // ---- party slots and their authored physical assignments ----------------------------------------
             0xC8 | 0xC9 => {
                 // (an operand that is not a literal is not made up: the op stays unknown)
                 match ins.literal("character") {
-                    Some(character) => self.party_ops.push(if op == 0xC8 { PartyOp::Add(clamp_u8(character)) } else { PartyOp::Remove(clamp_u8(character)) }),
+                    Some(character) => {
+                        if !self.change_party(if op == 0xC8 { PartyOp::Add(clamp_u8(character)) } else { PartyOp::Remove(clamp_u8(character)) }) {
+                            *class = Class::Unknown;
+                        }
+                    },
                     None => *class = Class::Unknown,
                 }
                 Flow::Next
             }
             0xCA => {
                 match (ins.literal("character1"), ins.literal("character2"), ins.literal("character3")) {
-                    (Some(a), Some(b), Some(c)) => self.party_ops.push(PartyOp::Set([clamp_u8(a), clamp_u8(b), clamp_u8(c)])),
+                    (Some(a), Some(b), Some(c)) => {
+                        if !self.change_party(PartyOp::Set([clamp_u8(a), clamp_u8(b), clamp_u8(c)])) { *class = Class::Unknown; }
+                    },
                     _ => *class = Class::Unknown,
                 }
+                Flow::Next
+            }
+            0xCD..=0xCF if self.native_story.is_some() => {
+                let character = ins.literal("character").and_then(|value| u8::try_from(value).ok());
+                let operation = character.and_then(|character| match op {
+                    0xCD => ins.literal("exists").map(|value| NativePartyOp::Available { character, available: value != 0 }),
+                    0xCE => Some(NativePartyOp::Lock { character, locked: true }),
+                    0xCF => Some(NativePartyOp::Lock { character, locked: false }),
+                    _ => None,
+                });
+                if !operation.is_some_and(|operation| self.change_native_party(operation)) { *class = Class::Unknown; }
                 Flow::Next
             }
             // ---- known, and no change to what a scene shows ---------------------------------------------------
@@ -1992,6 +2777,7 @@ impl Vm {
 
     /// Start the scene: the root thread, which takes the steps the field's own trigger takes.
     pub fn begin(&mut self, root: Vec<Step>) {
+        if self.checked_execution_refused() { self.invalid_scratch_execution = true; }
         self.jump = None;
         self.battle = None;
         self.battle_checkpoint = None;
@@ -2051,6 +2837,19 @@ impl Vm {
     /// other tables hold where everyone stands, and the variables hold what those scripts wrote. The threads are
     /// dropped, loops included.
     pub fn setup(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
+        self.setup_with_entry_policy(script, refs, false);
+    }
+
+    /// Only the reviewed train-entry constructor may permit initializer scratch writes.
+    /// The caller proves that these initializers are finite and take no scene time. Every
+    /// other audit, journal, RNG state and cumulative instruction budget stays in this VM.
+    pub(super) fn setup_train_entry(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
+        self.setup_with_entry_policy(script, refs, true);
+    }
+
+    fn setup_with_entry_policy(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef], entry: bool) {
+        if !self.scratch_valid() { self.stats.setup_incomplete = true; return; }
+        if self.refuse_invalid_native_state() { return; }
         self.quiet = true;
         self.threads.clear();
         self.slots.clear();
@@ -2063,6 +2862,7 @@ impl Vm {
                 break;
             }
             self.steps = self.steps.saturating_add(1);
+            self.clock = self.clock.max(self.thread_time(idx));
             match self.step_script(script, idx) {
                 Flow::Next | Flow::Yield => {}
                 Flow::Window(_) | Flow::Scene(_) => {
@@ -2071,10 +2871,21 @@ impl Vm {
                 }
             }
         }
+        // Quiet setup cannot carry an unfinished native updater into a reset scene
+        // clock. Completed offsets become its initial fixed presentation.
+        if self.offsets_running_at(self.clock) { self.stats.setup_incomplete = true; }
+        for (&entity, &(start, motion)) in &self.offset_moves {
+            self.offsets.insert(entity, motion.at(self.clock.saturating_sub(start).saturating_sub(1)));
+        }
+        self.offset_moves.clear();
         self.threads.clear();
         self.slots.clear();
         self.out.clear();
         self.quiet = false;
+        if !entry && self.vars.scratch.as_ref().is_some_and(FieldScratchRun::any_change) {
+            self.invalid_scratch_setup = true;
+            self.stats.setup_incomplete = true;
+        }
     }
 
     pub(super) fn has_invalid_message(&self) -> bool { self.invalid_message }
@@ -2095,6 +2906,12 @@ impl Vm {
     }
 
     pub(super) fn resume_battle(&mut self, story: &StoryState, resources: SceneResources) {
+        if !self.scratch_valid() { return; }
+        self.invalid_native_state |= self.vars.story.supports_native_party() != story.supports_native_party();
+        let native = story.supports_native_party().then(|| NativeStoryBuilder::new(story)).transpose();
+        self.invalid_native_state |= native.is_err();
+        if self.refuse_invalid_native_state() { return; }
+        self.native_story = native.ok().flatten();
         // Acknowledged persistent assignments now live in the authoritative afterimage. Scratch
         // selectors (5/6) and every scheduler/actor/RNG detail stay exactly where combat paused.
         self.writes.retain(|(bank, _), _| crate::story::canonical_persistent_bank(*bank).is_none());
@@ -2107,6 +2924,10 @@ impl Vm {
         self.resources.gil_after = resources.gil;
         self.resources.gil_ops.clear();
         self.party_ops.clear();
+        if !story.supports_native_party() {
+            self.party_main = [0, 1, 2].map(|slot| self.vars.party_member(slot).unwrap_or(255));
+            self.party_bank = self.party_main;
+        }
         self.done = None;
         self.battle = None;
         self.battle_checkpoint = None;
@@ -2123,6 +2944,26 @@ impl Vm {
     }
 
     fn finish(&mut self, end: End) -> Beat {
+        let end = if !self.scratch_valid() {
+            self.battle = None;
+            self.battle_checkpoint = None;
+            self.battle_flags = None;
+            self.jump = None;
+            self.window_checkpoint = None;
+            self.pending = None;
+            self.queued_note = None;
+            End::Broken
+        } else if end != End::Budget && self.unresolved_offset_boundary(self.clock) {
+            // The terminal opcode may have already prepared a battle or transfer.
+            // Refusal must expose only Budget, never a resumable battle checkpoint
+            // or a destination from a presentation whose outcome was not resolved.
+            self.battle = None;
+            self.battle_checkpoint = None;
+            self.battle_flags = None;
+            self.jump = None;
+            self.window_checkpoint = None;
+            End::Budget
+        } else { end };
         self.done = Some(end);
         let at = self.clock.saturating_sub(self.origin);
         Beat { stage: std::mem::take(&mut self.out), then: Then::End { at, how: end } }
@@ -2132,6 +2973,10 @@ impl Vm {
     /// last, if that asked (the absolute line number of the choice, as a script stores it; anything else is clamped
     /// into the choices, `None` takes the cursor's starting line).
     pub fn resume(&mut self, script: &FieldScript<'_>, answer: Option<usize>) -> Beat {
+        if !self.scratch_valid() { return self.finish(End::Broken); }
+        if self.refuse_invalid_native_state() {
+            return Beat { stage: Vec::new(), then: Then::End { at: self.clock.saturating_sub(self.origin), how: End::Broken } };
+        }
         self.window_checkpoint = None;
         if let Some((opener, note)) = self.queued_note.take() {
             let at = self.clock.saturating_sub(self.origin);
@@ -2182,10 +3027,12 @@ impl Vm {
             self.clock = self.clock.max(time);
             let is_root = self.threads.get(idx).is_some_and(|t| matches!(t.code, Code::Root { .. }));
             let flow = if is_root { self.step_root(script, idx) } else { self.step_script(script, idx) };
+            if !self.scratch_valid() { return self.finish(End::Broken); }
             match flow {
                 Flow::Next | Flow::Yield => {}
                 Flow::Scene(end) => return self.finish(end),
                 Flow::Window(opened) => {
+                    if self.unresolved_offset_boundary(opened.time) { return self.finish(End::Budget); }
                     let at = opened.time.saturating_sub(self.origin);
                     let geometry = self.geometry.get(&opened.id).copied();
                     let window = Window { at, opener: Self::own(opened.opener), speaker: None, id: opened.id, geometry, message: opened.message };
@@ -2211,11 +3058,11 @@ fn is_ignored(op: u8) -> bool {
         op,
         // controls, menus, party and field logic
         0x04..=0x06 | 0x08..=0x0B | 0x21..=0x23 | 0x26 | 0x27 | 0x2A | 0x2B | 0x33 | 0x38 | 0x3B | 0x49 | 0x4A | 0x4B | 0x6D | 0x6E | 0x71..=0x73
-        | 0x7E | 0xBF | 0xC3 | 0xC4 | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
+        | 0x7E | 0xBF | 0xC5..=0xC7 | 0xCD..=0xCF | 0xD0..=0xD3 | 0xD6 | 0xD7 | 0xD8 | 0xD9 | 0xDB | 0xDD | 0xDE | 0xDC
         // windows other than the one that is shown
         | 0x2E | 0x2F | 0x36 | 0x37 | 0x41..=0x43 | 0x51..=0x55 | 0x56 | 0x57 | 0x45 | 0x47 | 0x4D | 0x4F
         // unsupported picture effects (palette changes and layer scrolls among them)
-        | 0x2C | 0x2D | 0x69 | 0x6A | 0x61 | 0x62 | 0x6F | 0xDF | 0xE5..=0xEF
+        | 0x2C | 0x2D | 0x69 | 0x6A | 0x61 | 0x62 | 0x6F | 0xDF | 0xE8 | 0xE9 | 0xEB..=0xEF
         // sound commands other than the supported literal channel plays, and music
         | 0xF0 | 0xF3..=0xF7 | 0xF8..=0xFE
         // items and materia: not given here

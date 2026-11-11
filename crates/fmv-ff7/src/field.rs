@@ -18,9 +18,9 @@
 //!   fields the second record is a byte-for-byte copy of the first; only `mds5_1` (three
 //!   records) has differing ones. Use record 0. Projection model: see [`crate::background`].
 //! * Palette: 256 colours per page, 13 pages in `md1stin`. 14 fields (direct-colour backgrounds
-//!   such as `gldinfo`) have a 12-byte palette section with zero pages. Palette index 0 is the
-//!   transparent colour whatever its RGB value (chosen by comparing renderings; see
-//!   [`Palette::rgba`]).
+//!   such as `gldinfo`) have a 12-byte palette section with zero pages. Palette index 0 is
+//!   transparent only when that page's flag in the background section is set; otherwise it
+//!   is an ordinary opaque colour (see [`Background::palette_transparency`]).
 //! * Triggers: 740 bytes everywhere; the 9-byte name equals the entry name in 687 of 702 fields
 //!   (the other 15, such as `qa` or `min71`, carry a different internal name).
 //!   `control_direction` is an unsigned angle (572 fields store
@@ -85,6 +85,10 @@
 //!   is that key, that a page's size is `depth * 65536` bytes (depth 0 = 32768), that the
 //!   first per-page `u16` is an "is big tile" flag, and that PC palette transparency is
 //!   limited to palette index 0.
+//!   `BackgroundIO.cpp::openPalettes`, `PaletteIO.cpp::readAfter` and `Palette.cpp::isZero`
+//!   give the remaining condition: the 20 bytes at background offset 0x0C are per-palette
+//!   transparency flags. A zero flag keeps entry 0 opaque. This matters in `nmkin_1` to
+//!   `nmkin_4`: ignoring their flags made scattered ordinary colours into black holes.
 //!   Makou Reactor's `src/core/field/BackgroundTilesIO.h` and `BackgroundTilesIO.cpp` also
 //!   define the destination sanity rule applied to every PC tile (see [`MAX_TILE_DST`]).
 //!   Only layout *facts* were taken from the community sources; no code was copied.
@@ -212,6 +216,8 @@ pub const TRIGGERS_MIN_LEN: usize = 56 + GATEWAY_SLOTS * 24 + TRIGGER_SLOTS * 16
 pub const BG_TILE_RECORD_LEN: usize = 52;
 /// Texture slots in the background section.
 pub const BG_TEXTURE_SLOTS: usize = 42;
+/// Per-palette index-zero transparency flags in the PC background header.
+pub const BG_PALETTE_FLAGS: usize = 20;
 /// A tile is kept only if `|dst_x| < MAX_TILE_DST` and `|dst_y| < MAX_TILE_DST`. This is the
 /// rule (and the value, 1024) of Makou Reactor's PC background reader, which discards the
 /// other records as overflowed or unused; see the module docs.
@@ -761,15 +767,15 @@ pub fn rgb555_to_rgba(raw: u16) -> [u8; 4] {
     [expand(raw), expand(raw >> 5), expand(raw >> 10), alpha]
 }
 
-/// Alpha for a palette lookup: palette index 0 is the transparent colour, every other index
-/// is opaque, whatever the RGB values are.
+/// Candidate alpha for a palette-only lookup: only index 0 can be transparent. The field's
+/// per-page flag is applied separately by `Background::tile_rgba`.
 ///
 /// Verified on owned data by comparing renderings: many palette pages store a non-black key
 /// colour at index 0 (pure green `0x03E0` in several fields, for example) that must not show,
 /// while 2.2 million layer-2 pixels use a non-zero index whose colour is exactly `0x0000` and
-/// must stay opaque. "Transparent only if index 0 is also black" paints green blotches over
-/// `cosmin2` and fills the trestle gaps of `mtcrl_5`; "any black is transparent" punches holes
-/// in dark foreground objects.
+/// must stay opaque. For a page with transparency enabled, "transparent only if index 0 is
+/// also black" paints green blotches over `cosmin2` and fills the trestle gaps of `mtcrl_5`;
+/// "any black is transparent" punches holes in dark foreground objects.
 fn palette_alpha(index: usize) -> u8 {
     if index == 0 {
         0
@@ -851,8 +857,23 @@ impl Palette {
         self.colors.get(at).copied()
     }
 
-    /// RGBA8 colour `index` of `page`. **Index 0 is always transparent** (alpha 0, RGB as
-    /// stored), every other index is opaque. See `palette_alpha` for the evidence.
+    /// Replace one raw color, returning whether it changed, or `None` when the page/index is
+    /// absent. Palette animation changes colors only; [`Palette::rgba`]'s transparency rule stays intact.
+    pub fn set_raw(&mut self, page: usize, index: usize, raw: u16) -> Option<bool> {
+        let per_page = usize::from(self.colors_per_page);
+        if index >= per_page {
+            return None;
+        }
+        let at = page.checked_mul(per_page)?.checked_add(index)?;
+        let color = self.colors.get_mut(at)?;
+        let changed = *color != raw;
+        *color = raw;
+        Some(changed)
+    }
+
+    /// Palette-only RGBA8 lookup: index 0 carries alpha 0 and every other index is opaque.
+    /// A field's actual transparency additionally depends on its background header;
+    /// [`Background::tile_rgba`] applies [`Background::palette_transparency`].
     pub fn rgba(&self, page: usize, index: usize) -> Option<[u8; 4]> {
         let raw = self.raw(page, index)?;
         let [r, g, b, _] = rgb555_to_rgba(raw);
@@ -1057,6 +1078,9 @@ pub struct TileSprite {
     pub depth: u8,
     /// Draw-order / identifier field as stored.
     pub id: u16,
+    /// PC background depth baked by the original renderer (`IDBig`, a depth-buffer value times 10,000,000).
+    /// Some foreground/sentinel records use a special marker instead; see `background::DepthMapping`.
+    pub id_big: u32,
     /// Animation/visibility group and frame, as stored (layers 2-4).
     pub param: u8,
     pub state: u8,
@@ -1115,11 +1139,12 @@ impl fmt::Debug for TexturePage<'_> {
 
 /// Decoded background section: layers 1-4 as a flat tile list plus texture page locations.
 ///
-/// Layout (offsets from the section payload; PyFF7 + Makou + Fergusson agree):
+/// Layout (offsets from the section payload; Makou's PC reader identifies the palette flags
+/// where older descriptions named an unused palette header):
 ///
 /// ```text
-/// 0x00 u16 unknown   0x02 u16 depth   0x04 u8 unknown   0x05 "PALETTE" (7)   0x0C u32 size
-/// 0x10 4 x u16 + 6 x u16 (palette-like header, ignored)   0x24 "BACK" (4)
+/// 0x00 u16 unknown   0x02 u16 depth   0x04 u8 unknown   0x05 "PALETTE" (7)
+/// 0x0C u8[20] palette transparency flags   0x20 u32 blank   0x24 "BACK" (4)
 /// layer 1 @0x28: u16 width, u16 height, u16 tile count, u16 depth, u16 blank, tiles, u16 blank
 /// layers 2-4 each: u8 present flag (0 or 1); if 1: u16 w, u16 h, u16 count,
 ///                  16 (layer 2) or 10 (layers 3, 4) unknown bytes, u16 blank, tiles, u16 blank
@@ -1136,6 +1161,11 @@ impl fmt::Debug for TexturePage<'_> {
 pub struct Background<'a> {
     /// Section-level `depth` field (almost always 1).
     pub depth: u16,
+    /// Whether index 0 is transparent for each palette page (nonzero header byte). A false
+    /// flag leaves even entry 0 opaque. The PC header has 20 flags; any later page has none.
+    /// Direct-colour textures do not use these flags. Palette animation changes the colours,
+    /// not these flags, so the same rule applies to every palette used to decode this field.
+    pub palette_transparency: [bool; BG_PALETTE_FLAGS],
     /// Layer headers for layers 1-4 (`None` = layer absent).
     pub layers: [Option<LayerHeader>; 4],
     /// All tiles that passed the destination rule ([`MAX_TILE_DST`]), layer 1 first. A
@@ -1215,7 +1245,9 @@ fn read_tile(r: &mut Reader<'_>, layer: u8, index: u16) -> Result<TileSprite, Fi
     let texture_id2 = t.u8()?; // +34
     t.skip(1)?;
     let depth = t.u8()?; // +36
-    // +37 pad, +38 id_big u32, +42 src_x_big u32, +46 src_y_big u32, +50 blank u16: ignored
+    t.skip(1)?; // +37 pad
+    let id_big = t.u32()?; // +38
+    // +42 src_x_big u32, +46 src_y_big u32, +50 blank u16: ignored
     Ok(TileSprite {
         layer,
         index,
@@ -1232,6 +1264,7 @@ fn read_tile(r: &mut Reader<'_>, layer: u8, index: u16) -> Result<TileSprite, Fi
         type_trans,
         depth,
         id,
+        id_big,
         param,
         state,
         tile_size: if layer > 2 { 32 } else { 16 },
@@ -1302,7 +1335,8 @@ impl<'a> Background<'a> {
         let depth = r.u16()?;
         r.skip(1)?; // unknown (seen as 1)
         expect_tag(&mut r, b"PALETTE")?;
-        r.skip(4 + 8 + 12)?; // u32 size, palX/palY/width/height, 6 colours: ignored
+        let palette_transparency = r.array::<BG_PALETTE_FLAGS>()?.map(|flag| flag != 0);
+        r.skip(4)?; // blank after the palette flags
         expect_tag(&mut r, b"BACK")?;
 
         let mut layers = [None; 4];
@@ -1352,7 +1386,7 @@ impl<'a> Background<'a> {
         } else {
             (false, 0)
         };
-        Ok(Self { depth, layers, tiles, discarded_tiles, textures, texture_error, end_tag, trailing_bytes })
+        Ok(Self { depth, palette_transparency, layers, tiles, discarded_tiles, textures, texture_error, end_tag, trailing_bytes })
     }
 
     /// Tiles of one layer (1-4) in file order.
@@ -1369,8 +1403,9 @@ impl<'a> Background<'a> {
     /// effective source (see [`TileSprite::effective_source`]).
     ///
     /// Depth-0 and depth-1 pages are looked up in palette page `palette_id` (palette index 0 is
-    /// transparent, see [`Palette::rgba`]); depth-2 pages are read as direct 15-bit colour
-    /// ([`rgb555_to_rgba`], raw `0x0000` transparent). `blending` is not applied here.
+    /// transparent only when [`Background::palette_transparency`] enables it); depth-2 pages
+    /// are read as direct 15-bit colour ([`rgb555_to_rgba`], raw `0x0000` transparent).
+    /// `blending` is not applied here.
     ///
     /// Returns `None` if the texture slot or palette page is missing, the page depth is
     /// unknown, or the tile would read outside its 256x256 page (for the 312 owned tiles that
@@ -1384,6 +1419,13 @@ impl<'a> Background<'a> {
             return None;
         }
         let palette_page = usize::from(tile.palette_id);
+        let paletted = |index: u8| {
+            let mut color = palette.rgba(palette_page, usize::from(index))?;
+            if index == 0 && !self.palette_transparency.get(palette_page).copied().unwrap_or(false) {
+                color[3] = 255;
+            }
+            Some(color)
+        };
         let mut out = Vec::with_capacity(size * size);
         for y in 0..size {
             for x in 0..size {
@@ -1392,9 +1434,9 @@ impl<'a> Background<'a> {
                     0 => {
                         let byte = *page.pixels.get(pixel / 2)?;
                         let index = if pixel & 1 == 0 { byte & 0x0F } else { byte >> 4 };
-                        palette.rgba(palette_page, usize::from(index))?
+                        paletted(index)?
                     }
-                    1 => palette.rgba(palette_page, usize::from(*page.pixels.get(pixel)?))?,
+                    1 => paletted(*page.pixels.get(pixel)?)?,
                     2 => {
                         let at = pixel.checked_mul(2)?;
                         let raw = u16::from_le_bytes([*page.pixels.get(at)?, *page.pixels.get(at + 1)?]);
@@ -1862,6 +1904,32 @@ mod tests {
         let mut bad = bg.tiles[0];
         bad.src_x = 250;
         assert!(bg.tile_rgba(&bad, &pal).is_none());
+    }
+
+    #[test]
+    fn background_palette_flags_make_entry_zero_opaque_or_transparent_per_page() {
+        let mut spec = FieldSpec { palette_transparency: [false; 20], ..FieldSpec::default() };
+        spec.palette_transparency[1] = true;
+        let field = parse(&spec);
+        let background = field.background().unwrap();
+        let palette = field.palette().unwrap();
+        assert_eq!(background.palette_transparency, spec.palette_transparency);
+        let mut tile = background.tiles[0];
+        tile.src_x = 0;
+        tile.src_y = 0;
+        tile.texture_id = 0;
+        tile.palette_id = 0;
+        assert_eq!(background.tile_rgba(&tile, &palette).unwrap()[0], [0, 0, 0, 255], "entry zero is opaque with its flag off");
+        tile.palette_id = 1;
+        assert_eq!(background.tile_rgba(&tile, &palette).unwrap()[0], [255, 255, 255, 0], "the other page still has its key colour");
+        let mut changed = palette;
+        changed.set_raw(0, 0, 0x14c6).unwrap();
+        tile.palette_id = 0;
+        assert_eq!(background.tile_rgba(&tile, &changed).unwrap()[0], [49, 49, 41, 255], "palette changes do not change the flag");
+        let mut bytes = field.section(section::BACKGROUND).unwrap().to_vec();
+        bytes[12] = 7;
+        let background = Background::parse(&bytes).unwrap();
+        assert_eq!(background.tile_rgba(&tile, &changed).unwrap()[0][3], 0, "any nonzero flag enables transparency");
     }
 
     #[test]

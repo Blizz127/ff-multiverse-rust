@@ -477,10 +477,20 @@ fn calls_of(events: &[Timed]) -> Vec<PlannedCall> {
     events.iter().map(|e| PlannedCall { at: e.at, channel: e.call.channel, id: e.call.id, pan: e.call.pan }).collect()
 }
 
+/// Keep the sound runner's unsupported native-party state visible to the worker's caller.
+/// Its refused runs must not become a successful plan with no sounds and no unjudged conditions.
+fn field_story(blob: &[u8]) -> Result<StoryState, String> {
+    let story = StoryState::decode(blob).ok_or_else(|| "the progression is not one this adapter reads".to_string())?;
+    if story.supports_native_party() {
+        return Err(format!("{}: field sound planning does not yet support v4 story state", field_sound::Stop::NativePartyUnsupported.label()));
+    }
+    Ok(story)
+}
+
 /// What the scripts of the field `key` play for the progression `blob`, and the clips that names whose ids are not in `have`.
 /// Everything the plan says comes from the field's own scripts ([`fmv_ff7::field_sound`]); the clips are read by id out of
 /// `audio.dat` (only those). An error says why there is no plan (and so no sound): the progression is not one this
-/// adapter reads, the library has no sound files, the field cannot be read.
+/// adapter reads or the sound runner supports, the library has no sound files, the field cannot be read.
 fn read_field(
     adapter: &Ff7Adapter,
     files: &ResolvedAudio,
@@ -490,7 +500,7 @@ fn read_field(
     have: &[u16],
     layer: &SoundLayer,
 ) -> Result<FieldRead, String> {
-    let story = StoryState::decode(blob).ok_or_else(|| "the progression is not one this adapter reads".to_string())?;
+    let story = field_story(blob)?;
     let (Some(fmt), Some(dat)) = (&files.sfx_fmt, &files.sfx_dat) else { return Err("the library has no audio.fmt and audio.dat".to_string()) };
     let bank = SfxBank::open(fmt, dat).map_err(|e| e.to_string())?;
     let is_loop = |id: u16| bank.info_for_sound_id(id).is_some_and(|i| i.loop_region.is_some());
@@ -536,6 +546,24 @@ fn read_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_party_sound_requests_are_explicitly_unsupported_without_changing_legacy_decode() {
+        for story in [StoryState::fresh_native_first_control(), StoryState::fresh_first_control().into_native_party().unwrap()] {
+            let blob = story.encode();
+            let reason = field_story(&blob).unwrap_err();
+            assert!(reason.contains(field_sound::Stop::NativePartyUnsupported.label()) && reason.contains("v4"), "{reason}");
+            assert_eq!(StoryState::decode(&blob), Some(story), "rejection does not change the saved state");
+        }
+        let mut tracked = StoryState::at(27);
+        tracked.set_bit(1, 225, 5, true);
+        assert_eq!(tracked.encode()[0], fmv_ff7::story::BLOB_VERSION_VARS);
+        for story in [StoryState::new_game(), StoryState::at(51), tracked, StoryState::fresh_first_control()] {
+            assert_eq!(field_story(&story.encode()).unwrap(), story, "legacy and extended inputs retain their exact state");
+        }
+        assert_eq!(field_story(&[]).unwrap(), StoryState::new_game(), "the existing empty legacy input stays supported");
+        assert!(field_story(&[254]).unwrap_err().contains("not one this adapter reads"), "malformed data never becomes a starting story");
+    }
 
     /// A use of the music command at `slot`, naming AKAO frame `frame_id`.
     fn used(frame_id: u16, slot: usize) -> MusicUse {

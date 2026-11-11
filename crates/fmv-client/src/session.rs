@@ -127,6 +127,9 @@ impl Session {
             // nothing here should end the session; if something does, say so on the first pump.
             if let Some(reason) = state.apply(0.0, msg) {
                 pending_end.get_or_insert(reason);
+                break;
+            } else if let Some(id) = state.take_story_pending_ack() {
+                net.send(NetCommand::StoryPendingAck { id });
             }
         }
         let info = SessionInfo {
@@ -183,8 +186,10 @@ impl Session {
         if let Some(reason) = self.state.scene.failure() {
             return Some(reason.to_string());
         }
+        self.flush_story_pending_ack();
         while let Some(msg) = self.scene_backlog.pop_front() {
             if let Some(reason) = self.state.apply(self.now(), msg) { return Some(reason); }
+            self.flush_story_pending_ack();
         }
         while let Some(ev) = self.net.try_next() {
             let now = self.now();
@@ -204,6 +209,7 @@ impl Session {
                     if let Some(reason) = self.state.apply(now, msg) {
                         return Some(reason);
                     }
+                    self.flush_story_pending_ack();
                 }
                 NetEvent::Rtt(rtt) => self.state.set_rtt(rtt),
                 NetEvent::Closed(reason) => return Some(format!("connection to the server lost: {reason}")),
@@ -263,8 +269,15 @@ impl Session {
         }
     }
 
+    /// The hold is installed before this ordered acknowledgment enters the same queue as gameplay
+    /// input. Once the server reads it, every command emitted before the hold has drained.
+    fn flush_story_pending_ack(&mut self) {
+        if let Some(id) = self.state.take_story_pending_ack() { self.net.send(NetCommand::StoryPendingAck { id }); }
+    }
+
     /// Send the next `MoveIntent` if one is due (rate limited, only on change).
     pub fn flush_intent(&mut self) {
+        if self.state.field_controls_held() { return; }
         let now = self.now();
         if let Some(intent) = self.state.own.next_intent(now) {
             self.net.send(NetCommand::Intent(intent));
@@ -278,11 +291,13 @@ impl Session {
     /// ([`crate::state::OwnPlayer::has_unsent`]). Whatever the press does comes back as a `StoryUpdate` or a `MoveRejected`
     /// (a ladder), which the mirrors apply as always.
     pub fn send_interact(&self, npc: Option<u32>) {
+        if self.state.field_controls_held() { return; }
         self.net.send(NetCommand::Interact { npc });
     }
 
     /// Send a party request (the server decides and answers with `PartyEvent` / `PartyRejected`).
     pub fn send_party(&self, cmd: PartyCommand) {
+        if self.state.field_controls_held() && cmd != PartyCommand::Sync { return; }
         self.net.send(NetCommand::Party(cmd));
     }
 
@@ -306,6 +321,8 @@ impl Session {
     /// Send a battle request or command (the server decides and answers with battle messages or
     /// `BattleRejected`). A command is remembered as in flight, so it is not sent twice.
     pub fn send_battle(&mut self, cmd: BattleCmd) {
+        if self.state.ordinary_game_over() { return; }
+        if self.state.field_controls_held() && matches!(cmd, BattleCmd::RequestEncounter { .. }) { return; }
         let now = self.now();
         self.state.battle.note_sent(&cmd, now);
         self.net.send(NetCommand::Battle(cmd));
@@ -338,6 +355,7 @@ impl Session {
     /// Send what the scene client owes the server (the owner's steps and end, a watcher's leave, a preview request), in order.
     pub fn flush_scene(&mut self) {
         for cmd in self.state.scene.take_commands() {
+            if self.state.field_controls_held() && matches!(cmd, crate::scene::SceneCmd::Preview { .. }) { continue; }
             self.net.send(NetCommand::Scene(cmd));
         }
     }
@@ -741,3 +759,6 @@ mod tests {
         assert_eq!(own_identity(&[entity(1, "x", [0, 0, 0])], EntityId(7)).0, "?");
     }
 }
+
+#[cfg(test)]
+mod story_pending_tests;

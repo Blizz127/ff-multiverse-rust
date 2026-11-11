@@ -22,9 +22,14 @@
 //!
 //! `index.log` is text, one entry per line: `<8 hex checksum> <JSON>\n`, where the checksum
 //! is the first four bytes of the BLAKE3 hash of the JSON text. The first line is a header
-//! (`{"schema_version":2,"kind":"fmv-index-log"}`). Before the first durable scene batch,
-//! its version is raised to 3 so older binaries refuse the whole store; compaction preserves
-//! that fence. The entries that follow retain the same format:
+//! (`{"schema_version":2,"kind":"fmv-index-log"}`). Version 3 introduced durable scene
+//! batches. Explicit durable story writes now raise the header to 4, excluding earlier
+//! writers that lack exact ordinary story/battle commits and uncertain-write fencing.
+//! Field-visit state requires version 5 so prior writers cannot discard its metadata.
+//! Visits with larger entry or anchor images require version 6, excluding writers with
+//! the earlier bounds. Small visits keep their existing format and compatibility fence.
+//! Reading and compaction preserve each existing supported header. The entries that
+//! follow retain the same format:
 //!
 //! * `{"op":"account","id":7,"name":"Tifa","token":"<64 hex>","at":1700000000}` plus optional
 //!   `"avatar":3` and `"claimed":true`: a registration (the name is the cleaned display name;
@@ -80,9 +85,40 @@ use crate::legacy::{self, LegacyState};
 use crate::model::INDEX_LOG_VERSION;
 
 pub(crate) const INDEX_LOG_FILE: &str = "index.log";
-/// A durable scene batch requires readers that understand its held checkpoints. The header
-/// is raised only before the first batch, so older binaries refuse the entire store.
+/// Minimum header of legacy scene batch intents. Recovery must keep accepting these under
+/// version 3; raising the current writer's fence must not strand an older pending intent.
 pub(crate) const SCENE_BATCH_INDEX_VERSION: u32 = 3;
+/// The minimum fence for explicit durable story writes.
+/// Character schema 3 and batch intent schema 2 are unchanged; version 4 excludes prior
+/// writers whose ordinary story/reward and uncertain-write behavior is incompatible.
+pub(crate) const DURABLE_STORY_INDEX_VERSION: u32 = 4;
+/// The minimum fence for account-owned field visits within the original size bounds.
+pub(crate) const FIELD_VISIT_INDEX_VERSION: u32 = 5;
+/// Current recognized index maximum and the fence for larger field-visit images.
+pub(crate) const LARGE_FIELD_VISIT_INDEX_VERSION: u32 = 6;
+
+/// Explicit minimum reader/writer compatibility for a store. Selecting a level only raises
+/// its recognized index fence; it does not initialize, validate or register game records.
+/// Existing records and registration defaults remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreCompatibility {
+    /// Exact ordinary story and recoverable battle outcomes (index version 4).
+    DurableStory,
+    /// Account-owned field visits and their atomic progress updates (index version 5).
+    FieldVisit,
+    /// Field visits with larger entry or reconstruction images (index version 6).
+    LargeFieldVisit,
+}
+
+impl StoreCompatibility {
+    pub(crate) fn index_version(self) -> u32 {
+        match self {
+            Self::DurableStory => DURABLE_STORY_INDEX_VERSION,
+            Self::FieldVisit => FIELD_VISIT_INDEX_VERSION,
+            Self::LargeFieldVisit => LARGE_FIELD_VISIT_INDEX_VERSION,
+        }
+    }
+}
 const LOG_KIND: &str = "fmv-index-log";
 const CHECKSUM_LEN: usize = 8;
 /// Longest line read back. An account line is under 400 bytes (24 characters of up to four
@@ -119,7 +155,7 @@ pub(crate) struct AccountEntry {
 #[derive(Debug, Default)]
 pub(crate) struct Index {
     /// The actual header read from disk. A fresh/legacy index keeps version 2 until its
-    /// first scene batch; compaction must preserve a raised compatibility fence.
+    /// first explicit durable story write; compaction preserves the actual version read.
     format_version: Option<u32>,
     accounts: HashMap<u64, AccountEntry>,
     /// Name key -> the account that reserved it. Normally one entry per account; an account
@@ -134,8 +170,8 @@ pub(crate) struct Index {
 impl Index {
     pub(crate) fn format_version(&self) -> u32 { self.format_version.unwrap_or(INDEX_LOG_VERSION) }
 
-    pub(crate) fn require_scene_batch_format(&mut self) {
-        self.format_version = Some(SCENE_BATCH_INDEX_VERSION);
+    pub(crate) fn require_format(&mut self, minimum: u32) {
+        self.format_version = Some(self.format_version().max(minimum));
     }
 
     /// Make room for `accounts` accounts in every table now. Registering an account then never
@@ -329,7 +365,7 @@ fn header_line(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
-    if !(INDEX_LOG_VERSION..=SCENE_BATCH_INDEX_VERSION).contains(&version) {
+    if !(INDEX_LOG_VERSION..=LARGE_FIELD_VISIT_INDEX_VERSION).contains(&version) {
         return Err(PersistError::corrupt(path, "unsupported index output version"));
     }
     encode_line(
@@ -342,9 +378,13 @@ fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
 }
 
 fn check_header(path: &Path, line: &[u8]) -> Result<u32> {
+    check_header_upto(path, line, LARGE_FIELD_VISIT_INDEX_VERSION)
+}
+
+fn check_header_upto(path: &Path, line: &[u8], maximum: u32) -> Result<u32> {
     let payload = payload_of(line)
         .map_err(|reason| PersistError::corrupt(path, format!("bad header line: {reason}")))?;
-    fsio::check_schema_version_upto(path, payload, SCENE_BATCH_INDEX_VERSION)?;
+    fsio::check_schema_version_upto(path, payload, maximum)?;
     let header: Header = serde_json::from_slice(payload)
         .map_err(|e| PersistError::corrupt(path, format!("bad header line: {e}")))?;
     if header.kind != LOG_KIND {
@@ -922,33 +962,60 @@ mod tests {
     }
 
     #[test]
-    fn scene_batch_header_fence_rejects_old_readers_and_survives_automatic_compaction() {
+    fn recognized_header_fences_reject_prior_readers_and_preserve_each_version_during_open_and_compaction() {
+        for version in [INDEX_LOG_VERSION, SCENE_BATCH_INDEX_VERSION, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION, LARGE_FIELD_VISIT_INDEX_VERSION] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let path = root.join(INDEX_LOG_FILE);
+            create_fresh(root).unwrap();
+            assert_eq!(load_log(&path, false).unwrap().unwrap().index.format_version(), INDEX_LOG_VERSION);
+            write_compacted_version(&path, &Index::default(), 1, 1, version).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let first = bytes.split(|byte| *byte == b'\n').next().unwrap();
+            assert_eq!(check_header(&path, first).unwrap(), version);
+            if version > INDEX_LOG_VERSION {
+                // The preceding reader used this recognized-version check before reading
+                // accounts or touching transaction recovery: each old maximum rejects the
+                // next fence, including max5 rejecting larger visit images under version6.
+                assert!(matches!(check_header_upto(&path, first, version - 1),
+                    Err(PersistError::FutureSchema { .. })));
+            }
+            let opened = open_index(root, &mut Vec::new(), || Ok(false)).unwrap();
+            assert_eq!(opened.index.format_version(), version);
+            assert_eq!(fs::read(&path).unwrap(), bytes, "opening version {version} does not rewrite it");
+            drop(opened);
+            // Enough valid redundant marks trigger compaction during open. Use one write
+            // to construct the fixture; individual account operations still sync normally.
+            let line = encode_line(&Op::Next { account: 1, avatar: 1 }, &path).unwrap();
+            let tail: Vec<u8> = (0..COMPACT_SLACK + 2).flat_map(|_| line.iter().copied()).collect();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&tail).unwrap();
+            file.sync_all().unwrap();
+            let opened = open_index(root, &mut Vec::new(), || Ok(false)).unwrap();
+            assert_eq!(opened.index.format_version(), version);
+            let replayed = load_log(&path, false).unwrap().unwrap();
+            assert_eq!(replayed.index.format_version(), version);
+            assert_eq!(replayed.entries, 1, "the redundant marks were compacted");
+            assert_eq!(fs::read(&path).unwrap(), bytes, "compaction preserves version {version}");
+            if version > INDEX_LOG_VERSION {
+                assert!(write_compacted_version(&path, &replayed.index, 1, 1, version - 1).is_err(),
+                    "an explicit downgrade is refused too");
+            }
+        }
+    }
+
+    #[test]
+    fn a_header_beyond_large_visit_support_is_refused_without_repair_or_output() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join(INDEX_LOG_FILE);
-        create_fresh(root).unwrap();
-        assert_eq!(load_log(&path, false).unwrap().unwrap().index.format_version(), INDEX_LOG_VERSION);
-        write_compacted_version(&path, &Index::default(), 1, 1, SCENE_BATCH_INDEX_VERSION).unwrap();
-        let bytes = fs::read(&path).unwrap();
-        let first = bytes.split(|byte| *byte == b'\n').next().unwrap();
-        assert_eq!(check_header(&path, first).unwrap(), SCENE_BATCH_INDEX_VERSION);
-        // This is the exact version check performed by the old version-2 header reader.
-        assert!(matches!(fsio::check_schema_version_upto(&path, payload_of(first).unwrap(), INDEX_LOG_VERSION),
-            Err(PersistError::FutureSchema { .. })));
-        // Enough valid redundant marks trigger compaction during open. Use one write to
-        // construct the fixture; individual account operations still sync normally.
-        let line = encode_line(&Op::Next { account: 1, avatar: 1 }, &path).unwrap();
-        let tail: Vec<u8> = (0..COMPACT_SLACK + 2).flat_map(|_| line.iter().copied()).collect();
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(&tail).unwrap();
-        file.sync_all().unwrap();
-        let opened = open_index(root, &mut Vec::new(), || Ok(false)).unwrap();
-        assert_eq!(opened.index.format_version(), SCENE_BATCH_INDEX_VERSION);
-        let replayed = load_log(&path, false).unwrap().unwrap();
-        assert_eq!(replayed.index.format_version(), SCENE_BATCH_INDEX_VERSION);
-        assert_eq!(replayed.entries, 1, "the redundant marks were compacted");
-        assert!(write_compacted_version(&path, &replayed.index, 1, 1, INDEX_LOG_VERSION).is_err(),
-            "an explicit downgrade is refused too");
+        let path = dir.path().join(INDEX_LOG_FILE);
+        let future = encode_line(&Header { schema_version: LARGE_FIELD_VISIT_INDEX_VERSION + 1,
+            kind: LOG_KIND.into() }, &path).unwrap();
+        fs::write(&path, &future).unwrap();
+        assert!(matches!(open_index(dir.path(), &mut Vec::new(), || Ok(false)), Err(PersistError::FutureSchema { .. })));
+        assert_eq!(fs::read(&path).unwrap(), future, "a newer store is not a repairable tail or an empty index");
+        for unsupported in [0, 1, LARGE_FIELD_VISIT_INDEX_VERSION + 1, u32::MAX] {
+            assert!(header_line_version(&path, unsupported).is_err());
+        }
     }
 
     #[test]

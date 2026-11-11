@@ -29,21 +29,41 @@
 //!   ([`Stats`]).
 
 mod data;
+mod default_names;
 mod fade;
 mod jump;
+mod offset;
 mod play;
+pub mod presentation;
 mod replay_identity;
+pub mod train_arrival;
 mod vm;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod background_tests;
+#[cfg(test)]
+mod palette_tests;
+#[cfg(test)]
+mod offset_tests;
+#[cfg(test)]
+mod native_vm_tests;
+#[cfg(test)]
+mod native_outcome_tests;
+#[cfg(test)]
+mod scratch_vm_tests;
+#[cfg(test)]
+mod scratch_scene_tests;
 
 pub use data::*;
 pub use fade::{FadeBlend, FadeColor, FadeOp, FadeState};
 pub use jump::{jump_frames, JumpMotion};
+pub use offset::OffsetMotion;
 pub use play::{auto_witnesses, auto_witnesses_with_resources, cast_places, cast_places_with_resources, run_section_to_end, run_section_to_end_with_resources, run_to_end, run_to_end_with_resources, run_to_end_with_resources_strict, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes, ANNOUNCED_STATE_OPS, FULL_RESTORE_OPS, SKIPPED_STATE_OPS};
 pub use vm::{AnimHow, Beat, CameraOp, GilOp, SceneResources, Resources, ResourceOutcome, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};
 
 pub use play::{BattleCheckpoint, BattleResolution, BattleResume, WindowCheckpoint, WindowAck, SceneInput, SceneBoundary, SceneSnapshot, ReplayIdentity, REPLAY_VERSION, replay_scene, replay_scene_to, with_trigger_position};
+pub use play::{replay_scene_with_scratch, replay_scene_to_with_scratch, run_to_end_with_scratch_strict, run_section_to_end_with_scratch_strict};
+pub use train_arrival::{TrainArrival, TrainArrivalEntry, TrainArrivalReady, TrainArrivalPose,
+    TRAIN_ARRIVAL_LANDING, replay_train_arrival, train_arrival_ready};

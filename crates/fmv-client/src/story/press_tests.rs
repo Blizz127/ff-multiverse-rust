@@ -75,7 +75,7 @@ fn a_story_that_has_not_moved_yet_does_not_make_the_bot_press_the_same_point_twi
     assert!(!bot.wants_press());
 }
 
-/// A game that is not the fixture's and whose progressions join like FF7's (the further moment, the union of bits).
+/// FF7's legacy join and explicit exact-state validation, without loading any game data.
 struct Ff7Join;
 
 impl GameAdapter for Ff7Join {
@@ -90,6 +90,9 @@ impl GameAdapter for Ff7Join {
     }
     fn merge_progression(&self, stored: &[u8], advanced: &[u8]) -> Vec<u8> {
         fmv_ff7::story::merge_progression(stored, advanced)
+    }
+    fn compare_exchange_progression(&self, stored: &[u8], expected: &[u8], advanced: &[u8]) -> Option<Vec<u8>> {
+        fmv_ff7::story::compare_exchange_progression(stored, expected, advanced)
     }
 }
 
@@ -114,6 +117,64 @@ fn a_step_is_forward_when_the_games_own_join_of_it_and_the_story_is_something_ne
     assert!(!bot.is_forward(&at(14, false), &at(13, false)));
     // a bot with no content to judge by pursues every step the area offers
     assert!(StoryBot::new(true, false).is_forward(&at(12, true), &at(12, false)));
+}
+
+fn exact_story() -> StoryState {
+    let mut story = StoryState::at(51).into_extended().unwrap();
+    assert!(story.write_masked(3, 66, 1, 1).unwrap());
+    assert!(story.write_byte(3, 80, 20).unwrap());
+    story
+}
+
+#[test]
+fn an_exact_ff7_story_pursues_authored_flag_clears_and_numeric_changes_at_the_same_moment() {
+    let bot = StoryBot::new(true, false).with_adapter(Some(Arc::new(Ff7Join)));
+    let before = exact_story();
+    let mut cleared = before.clone();
+    assert!(cleared.write_masked(3, 66, 0, 1).unwrap());
+    assert_eq!(cleared.known_bit(3, 66, 0), Some(false));
+    let mut decreased = before.clone();
+    assert!(decreased.add_byte_checked(3, 80, -1, 0, 255).unwrap());
+    assert_eq!(decreased.known_byte(3, 80), Some(19));
+    let mut increased = before.clone();
+    assert!(increased.add_byte_checked(3, 80, 1, 0, 255).unwrap());
+    for next in [cleared, decreased, increased] {
+        assert_eq!(next.moment, before.moment, "the authored step need not advance the main story counter");
+        assert_eq!(Ff7Join.merge_progression(&before.encode(), &next.encode()), before.encode(), "the legacy join cannot judge an ordered replacement");
+        assert!(bot.is_forward(&before.encode(), &next.encode()), "valid exact changes are actionable, including clears and decreases");
+    }
+}
+
+#[test]
+fn exact_forward_judgment_rejects_unchanged_malformed_downgraded_or_incomplete_replacements() {
+    let bot = StoryBot::new(true, false).with_adapter(Some(Arc::new(Ff7Join)));
+    let before = exact_story().encode();
+    let incomplete = StoryState::at(52).into_extended().unwrap().encode();
+    assert!(StoryState::decode(&incomplete).is_some(), "valid bytes can still omit previously known choices");
+    for rejected in [
+        before.clone(),
+        vec![3, 52, 0], // A truncated v3 header.
+        vec![4, 52, 0, 0, 0], // An unsupported future version.
+        StoryState::at(52).encode(), // A newer moment must not downgrade the save.
+        incomplete,
+    ] {
+        assert!(!bot.is_forward(&before, &rejected), "invalid exact successor {rejected:?} must not become a bot target");
+    }
+    assert!(!bot.is_forward(&[3, 51, 0], &exact_story().encode()), "an unreadable predecessor cannot become a new known state");
+}
+
+#[test]
+fn probing_an_extended_step_does_not_implicitly_promote_a_legacy_account() {
+    let bot = StoryBot::new(true, false).with_adapter(Some(Arc::new(Ff7Join)));
+    let mut with_bits = StoryState::at(51);
+    assert!(with_bits.set_bit(1, 225, 0, true));
+    for legacy in [vec![], StoryState::at(51).encode(), with_bits.encode()] {
+        let mut next = StoryState::decode(&legacy).unwrap().into_extended().unwrap();
+        next.moment = 52;
+        assert!(next.write_byte(3, 80, 21).unwrap());
+        assert!(!bot.is_forward(&legacy, &next.encode()), "only an already extended predecessor may use exact replacement while choosing bot targets");
+        assert!(bot.is_forward(&legacy, &StoryState::at(52).encode()), "legacy accounts keep their ordinary join behavior");
+    }
 }
 
 #[test]
@@ -216,6 +277,69 @@ impl AreaRuntime for OnlyBattle {
     fn story_battle(&self, point: u32) -> Option<u16> {
         self.0.story_battle(point)
     }
+}
+
+const BATTLES_ENABLED: &[u8] = &[0xB1];
+
+/// The same fixture points can be ordinary triggers or battles, depending on current progress.
+/// The legacy lookup intentionally has no battle; the progress-aware API is the only authority.
+struct DynamicBattles(Box<dyn AreaRuntime>);
+
+impl AreaRuntime for DynamicBattles {
+    fn info(&self) -> &AreaInfo { self.0.info() }
+    fn spawn_points(&self) -> Vec<Pos> { self.0.spawn_points() }
+    fn validate_move(&self, from: Pos, to: Pos) -> MoveResult { self.0.validate_move(from, to) }
+    fn bounds(&self) -> Bounds { self.0.bounds() }
+    fn walk_triangles(&self) -> Vec<[Pos; 3]> { self.0.walk_triangles() }
+    fn max_speed(&self) -> f32 { self.0.max_speed() }
+    fn exits(&self) -> Vec<Exit> { self.0.exits() }
+    fn story_points(&self) -> Vec<StoryPoint> {
+        self.0.story_points().into_iter().filter(|p| matches!(p.id, 1..=3)).collect()
+    }
+    fn story_advance(&self, _: &[u8], point: u32) -> Option<StoryStep> {
+        // Both mock predecessor states offer the same step; only battle admission differs.
+        self.0.story_advance(&[], point)
+    }
+    fn story_battle_for(&self, progress: &[u8], point: u32) -> Option<u16> {
+        (progress == BATTLES_ENABLED).then(|| self.0.story_battle(point)).flatten()
+    }
+}
+
+#[test]
+fn progress_dependent_battles_are_prioritized_after_nonbattle_points_and_only_avoided_while_active() {
+    let area = DynamicBattles(RoomsAdapter::with_interactions().load_area(HALL).unwrap());
+    let bot = StoryBot::new(true, false);
+    let here = Pos::new(-275.0, 225.0, 0.0);
+    assert_eq!(area.story_battle(2), None);
+    assert_eq!(area.story_battle_for(BATTLES_ENABLED, 2), Some(fmv_fixture::rooms::BATTLE_FORMATION));
+    let target = bot.target(&area, BATTLES_ENABLED, here).expect("the press remains actionable");
+    assert_eq!((target.point.id, target.kind, target.battle), (1, Kind::Press, false), "a farther nonbattle point wins over the battle under our feet");
+    let mut avoid = StoryBot::battles_to_avoid(&area, BATTLES_ENABLED, &target).into_iter().map(|p| p.id).collect::<Vec<_>>();
+    avoid.sort_unstable();
+    assert_eq!(avoid, [2, 3]);
+    assert!(StoryBot::battles_to_avoid(&area, &[], &target).is_empty(), "the same geometry is not a battle hazard on another progression");
+    let peaceful = bot.target(&area, &[], here).unwrap();
+    assert_eq!((peaceful.point.id, peaceful.battle), (2, false), "without the battle the nearest ordinary trigger wins");
+}
+
+#[test]
+fn the_walk_to_another_point_avoids_battles_discovered_only_from_the_current_progression() {
+    let area = DynamicBattles(RoomsAdapter::with_interactions().load_area(HALL).unwrap());
+    let points = area.story_points();
+    let press = points.iter().find(|p| p.id == 1).unwrap();
+    let battles: Vec<&StoryPoint> = points.iter().filter(|p| area.story_battle_for(BATTLES_ENABLED, p.id).is_some()).collect();
+    let mut pos = Pos::new(-350.0, 225.0, 0.0);
+    assert!(battles.iter().all(|p| area.story_battle(p.id).is_none()));
+    assert!(battles.iter().any(|b| b.is_hit_by(pos, press.center())), "the direct walk would trigger a progress-dependent battle");
+    let mut bot = StoryBot::new(true, false);
+    for _ in 0..4000 {
+        if bot.wants_press() { break; }
+        let step = bot.step(&area, pos, 0.01, 360.0, BATTLES_ENABLED);
+        assert!(battles.iter().all(|b| !b.is_hit_by(pos, step.pos)), "the step from {pos:?} to {:?} unexpectedly starts a battle", step.pos);
+        pos = step.pos;
+    }
+    assert!(bot.wants_press() && press.is_pressed_at(pos, None), "the bot reaches the nonbattle press by going around the active battle regions: {pos:?}");
+    assert_eq!(bot.take_press(), Some(Press { npc: None }));
 }
 
 /// Did any step of `bot` over `max` steps touch `point`? And where did it stand at the end?

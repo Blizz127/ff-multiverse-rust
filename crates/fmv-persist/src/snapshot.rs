@@ -18,7 +18,7 @@ use crate::fsio;
 use crate::index::{self, LogWriter, INDEX_LOG_FILE};
 use crate::legacy::{self, LegacyState, LEGACY_INDEX_FILE};
 use crate::lock::LOCK_FILE;
-use crate::model::MAX_RECORD_BYTES;
+use crate::model::{parse_game_key, MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES};
 use crate::store::{scene::INTENT_FILE, ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR, PROGRESSION_DIR};
 
 /// What a snapshot or restore copied.
@@ -98,7 +98,7 @@ fn copy_tree(src: &Path, dest: &Path, live_log: Option<&Mutex<LogWriter>>) -> Re
     for sub in [ACCOUNTS_DIR, AVATARS_DIR, CHARACTERS_DIR] {
         let (src_dir, dest_dir) = (src.join(sub), dest.join(sub));
         fsio::ensure_dir(&dest_dir)?;
-        copy_dir_files(&src_dir, &dest_dir, &mut info)?;
+        copy_dir_files(&src_dir, &dest_dir, false, &mut info)?;
     }
 
     let (src_prog, dest_prog) = (src.join(PROGRESSION_DIR), dest.join(PROGRESSION_DIR));
@@ -106,7 +106,8 @@ fn copy_tree(src: &Path, dest: &Path, live_log: Option<&Mutex<LogWriter>>) -> Re
     for account_dir in fsio::list_subdirs(&src_prog)? {
         let dest_dir = dest_prog.join(&account_dir);
         fsio::ensure_dir(&dest_dir)?;
-        copy_dir_files(&src_prog.join(&account_dir), &dest_dir, &mut info)?;
+        let in_account_progression = account_dir.parse::<u64>().is_ok_and(|id| id.to_string() == account_dir);
+        copy_dir_files(&src_prog.join(&account_dir), &dest_dir, in_account_progression, &mut info)?;
     }
     fsio::sync_dir(&dest_prog).map_err(|e| PersistError::io("fsync directory", &dest_prog, e))?;
     fsio::sync_dir(dest).map_err(|e| PersistError::io("fsync directory", dest, e))?;
@@ -169,10 +170,18 @@ fn copy_file(src: &Path, dest: &Path, limit: Option<u64>, info: &mut SnapshotInf
 /// Copy every `*.json` in `src_dir` into the fresh `dest_dir`: each file fsynced, the
 /// directory once at the end. No temp+rename is needed because the destination is new and
 /// only the final `index.log` marks the snapshot complete.
-fn copy_dir_files(src_dir: &Path, dest_dir: &Path, info: &mut SnapshotInfo) -> Result<()> {
+/// Only known character envelopes directly inside `progression/<canonical account id>/`
+/// use the character-file bound. All other JSON retains the ordinary record bound; the
+/// snapshot remains a byte-for-byte copy without reinterpreting or rewriting its records.
+fn copy_dir_files(src_dir: &Path, dest_dir: &Path, in_account_progression: bool, info: &mut SnapshotInfo) -> Result<()> {
     for name in fsio::list_json_files(src_dir)? {
         let src = src_dir.join(&name);
-        let bytes = fsio::read_capped(&src, MAX_RECORD_BYTES)?.ok_or_else(|| {
+        let max = if in_account_progression && name.strip_suffix(".character.json").and_then(parse_game_key).is_some() {
+            MAX_CHARACTER_RECORD_BYTES
+        } else {
+            MAX_RECORD_BYTES
+        };
+        let bytes = fsio::read_capped(&src, max)?.ok_or_else(|| {
             PersistError::Snapshot(format!("{} vanished while copying", src.display()))
         })?;
         let dest = dest_dir.join(&name);

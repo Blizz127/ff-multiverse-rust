@@ -528,7 +528,7 @@ struct Driven {
 
 fn stage_entity(stage: &Stage) -> Option<u8> {
     match stage {
-        Stage::Place { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
+        Stage::Place { entity, .. } | Stage::Offset { entity, .. } | Stage::OffsetMove { entity, .. } | Stage::Move { entity, .. } | Stage::Face { entity, .. } | Stage::Anim { entity, .. } | Stage::AnimSpeed { entity, .. } | Stage::Show { entity, .. } => Some(*entity),
         Stage::Sound { .. } | Stage::Camera(_) | Stage::Background(_) | Stage::Shake { .. } | Stage::Fade(_) => None,
     }
 }

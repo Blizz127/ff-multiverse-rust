@@ -25,6 +25,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use winit::keyboard::KeyCode;
 
+#[path = "offset_tests.rs"]
+mod offsets;
+
 const AREA: &str = "arena";
 const SCENE: &str = "test/arena/duel";
 const RUN: SceneRunId = SceneRunId(7);
@@ -2235,7 +2238,7 @@ fn the_window_is_anchored_to_its_speakers_head_and_feet_and_knows_who_else_is_in
     rig.client.on_message(AREA, start(RUN, SceneRole::Watcher, &[(1, 0), (2, 1)]));
     let scene = rig.client.player().unwrap();
     assert_eq!(scene.speaker(), Some(18));
-    let empty = || AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 400.0, overlay_bias: 0.0, ground: vec![], scenery: None };
+    let empty = || AvatarFrame { models: vec![], tints: vec![], identities: vec![], zoom: 400.0, field_depth: None, overlay_bias: 0.0, ground: vec![], scenery: None };
     let built = |anchors: HashMap<Who, Pos>| Built { frame: empty(), markers: vec![], anchors };
     let head = Pos::new(12.0, 34.0, 0.0);
     let (vw, vh) = (1100, 680);
