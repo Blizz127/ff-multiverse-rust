@@ -358,6 +358,104 @@ fn find<'a>(npcs: &'a [NpcSpawn], name: &str) -> Option<&'a NpcSpawn> {
     npcs.iter().find(|n| n.entity_name == name)
 }
 
+/// Invented characters on either side of Jessie's slot, each with a distinct talk point.
+fn jessie_phase_area() -> crate::area::Ff7FieldArea {
+    let mut script = SynthScript { model_count: 4, scale: 512, ..Default::default() }
+        .entity("hero", vec![(0, char_then(0, &[asm::player(0), asm::xyzi(50, 20, 70, 0), asm::ret()]))]);
+    for (index, (name, x, y)) in [("before", 10, 10), ("av_j", 30, 40), ("after", 70, 20)].into_iter().enumerate() {
+        let init = char_then(index as u8 + 1, &[asm::xyzi(x, y, x + y, 0), asm::direction(64), asm::ret()]);
+        let talk = vec![0x81, 0x20, 0, 40 + index as u8, 0, 0]; // SETWORD moment, then RET
+        script = script.entity(name, vec![(0, init), (1, talk)]);
+    }
+    let spec = FieldSpec {
+        models: vec![
+            LoaderModelSpec::new("md.hero", "AAAA.HRC", &["IDLE.aki"]),
+            LoaderModelSpec::new("md.before", "BBBB.HRC", &["IDLE.aki"]),
+            LoaderModelSpec::new("md.jessie", "AXDC.HRC", &["STAND.aki", "WALK.aki", "TURN.aki", "TRAP.aki"]),
+            LoaderModelSpec::new("md.after", "CCCC.HRC", &["IDLE.aki"]),
+        ],
+        overrides: vec![(0, script.build())],
+        ..FieldSpec::default()
+    };
+    adapter_over(&[("nmkin_3", entry(&spec))]).load_field("nmkin_3").unwrap()
+}
+
+#[test]
+fn unknown_jessie_rescue_state_withholds_only_her_npc_and_talk_point() {
+    let area = jessie_phase_area();
+    let base = area.npcs();
+    assert_eq!(base.iter().map(|npc| npc.entity_name.as_str()).collect::<Vec<_>>(), ["before", "av_j", "after"]);
+    let points = area.story_points();
+    assert_eq!(points.len(), 3, "each invented character has a talk point");
+    let mut hidden = base.clone();
+    hidden[1].unconditional = false;
+    for moment in [27u16, 33, 32767] {
+        for other_bit_known in [false, true] {
+            let [lo, hi] = moment.to_le_bytes();
+            // Promotion from a legacy state deliberately retains known tracked bits;
+            // a sparse v3 input is needed to represent a genuinely unknown rescue flag.
+            let mut unknown = StoryState::decode(&[3, lo, hi, 0, 0]).unwrap();
+            if other_bit_known { unknown.write_masked(1, 225, 1, 1).unwrap(); }
+            assert_eq!(unknown.known_bit(1, 225, 5), None);
+            for story in [unknown.clone(), unknown.into_native_party().unwrap()] {
+                let saved = story.encode();
+                let phase = area.phase_key(&saved).expect("unknown rescue is an explicit phase, not a default-phase fallback");
+                assert_eq!(area.npcs_in_phase(&phase), hidden, "only availability changes; no trapped pose or idle is invented");
+                assert_eq!(area.story_points_in_phase(&phase), [points[0].clone(), points[2].clone()], "other talk IDs and order stay intact");
+                for rescued in [false, true] {
+                    let mut known = story.clone();
+                    known.write_masked(1, 225, if rescued { 32 } else { 0 }, 32).unwrap();
+                    assert_ne!(area.phase_key(&known.encode()), Some(phase.clone()), "unknown is neither clear nor set");
+                }
+                assert_eq!(story.encode(), saved, "projection never initializes saved bits");
+                assert_eq!(area.phase_key(&StoryState::decode(&saved).unwrap().encode()), Some(phase));
+                if story.supports_native_party() { assert!(!area.supports_saved_progression(&saved), "inspection does not enable v4 admission"); }
+            }
+        }
+    }
+}
+
+#[test]
+fn jessie_rescue_projection_preserves_known_states_and_signed_moment_boundaries() {
+    let area = jessie_phase_area();
+    let base = area.npcs();
+    let points = area.story_points();
+    for moment in [0u16, 13, 14, 26, 27, 32767, 32768, u16::MAX] {
+        let [lo, hi] = moment.to_le_bytes();
+        for rescued in [None, Some(false), Some(true)] {
+            let mut story = StoryState::decode(&[3, lo, hi, 0, 0]).unwrap();
+            if let Some(rescued) = rescued { story.write_masked(1, 225, if rescued { 32 } else { 0 }, 32).unwrap(); }
+            let saved = story.encode();
+            let phase = area.phase_key(&saved).unwrap();
+            let mut expected = base.clone();
+            if (moment as i16) >= 27 && rescued.is_none() {
+                expected[1].unconditional = false;
+            } else if (moment as i16) >= 14 {
+                let trapped = (moment as i16) >= 27 && rescued == Some(false);
+                expected[1].pos = Pos::new(-183.0, 1191.0, 1643.0);
+                expected[1].facing = field_direction_to_facing(if trapped { 0 } else { 128 });
+                expected[1].unconditional = (moment as i16) < 27 || rescued != Some(true);
+                if trapped { expected[1].appearance.idle_animation = Some("trap".into()); }
+            }
+            assert_eq!(area.npcs_in_phase(&phase), expected, "moment {moment}, rescued {rescued:?}");
+            let mut expected_points = points.clone();
+            if expected[1].unconditional {
+                let fmv_adapter_api::StoryTrigger::Talk { center, .. } = &mut expected_points[1].trigger else { panic!("Jessie's talk") };
+                *center = expected[1].pos;
+            } else { expected_points.remove(1); }
+            assert_eq!(area.story_points_in_phase(&phase), expected_points);
+            assert_eq!(story.encode(), saved);
+            if let Some(rescued) = rescued {
+                let mut legacy = StoryState::at(moment);
+                legacy.set_bit(1, 225, 5, rescued);
+                let legacy_phase = area.phase_key(&legacy.encode()).unwrap();
+                assert_eq!(area.npcs_in_phase(&legacy_phase), expected, "legacy clear/set behavior is unchanged");
+                assert_eq!(area.story_points_in_phase(&legacy_phase), expected_points);
+            }
+        }
+    }
+}
+
 #[test]
 fn npcs_are_the_unconditionally_placed_visible_non_player_models() {
     let npcs = npc_area().npcs();

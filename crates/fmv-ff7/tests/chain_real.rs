@@ -1207,6 +1207,88 @@ fn jessies_saved_story_places_her_and_moves_her_talk_target() {
 
 #[test]
 #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
+fn unknown_rescue_state_withholds_jessie_without_inventing_a_pose_or_changing_other_slots() {
+    let adapter = adapter().expect("FMV_FF7_DATA");
+    let area = adapter.load_field("nmkin_3").unwrap();
+    let base = area.npcs();
+    let jessie = base.iter().position(|npc| npc.entity_name == "av_j").expect("Jessie");
+    assert!(base.len() > 1 && base[jessie].unconditional);
+    let base_points = area.story_points();
+    let jessie_points: Vec<_> = base_points.iter().filter(|point| matches!(point.trigger,
+        StoryTrigger::Talk { center, .. } if center.dist_xy(base[jessie].pos) <= fmv_adapter_api::SAME_SPOT))
+        .map(|point| point.id).collect();
+    assert_eq!(jessie_points, [0], "the owned field associates her talk with the original placement");
+
+    for moment in [0u16, 1, 13, 14, 26, 27, 28, 33, 40, 32767, 32768, u16::MAX] {
+        for lift in [None, Some(false), Some(true)] {
+            let [lo, hi] = moment.to_le_bytes();
+            // Promoting a legacy state would make its tracked rescue bit known clear. This sparse
+            // v3 state instead knows only the moment, and optionally the independent lift bit.
+            let mut unknown = StoryState::decode(&[3, lo, hi, 0, 0]).unwrap();
+            if let Some(down) = lift { assert!(unknown.set_bit(1, 225, 0, down)); }
+            assert_eq!(unknown.known_bit(1, 225, 0), lift);
+            assert_eq!(unknown.known_bit(1, 225, 5), None);
+            assert_eq!(unknown.known_mask(1, 225), u8::from(lift.is_some()));
+            let saved = unknown.encode();
+            let phase = area.phase_key(&saved).expect("unknown rescue knowledge still has a valid phase");
+            let actual = area.npcs_in_phase(&phase);
+            let points = area.story_points_in_phase(&phase);
+
+            // Resolving only this bit in either direction must retain the existing, separately
+            // checked owned-init behavior. Neither the presence nor value of the lift changes it.
+            let mut known_clear = None;
+            for rescued in [false, true] {
+                let mut known = unknown.clone();
+                assert!(known.set_bit(1, 225, 5, rescued));
+                assert_eq!(known.known_bit(1, 225, 5), Some(rescued));
+                assert_eq!(known.known_bit(1, 225, 0), lift);
+                let known_saved = known.encode();
+                let known_phase = area.phase_key(&known_saved).unwrap();
+                let mut legacy = StoryState::at(moment);
+                legacy.set_bit(1, 225, 5, rescued);
+                let legacy_phase = area.phase_key(&legacy.encode()).unwrap();
+                let known_cast = area.npcs_in_phase(&known_phase);
+                let known_points = area.story_points_in_phase(&known_phase);
+                assert_eq!(known_cast, area.npcs_in_phase(&legacy_phase), "known rescue {rescued} at {moment}/{lift:?}");
+                assert_eq!(known_points, area.story_points_in_phase(&legacy_phase), "known talk at {moment}/{lift:?}/{rescued}");
+                assert_eq!(known.encode(), known_saved, "presentation does not rewrite a resolved save");
+                if !rescued { known_clear = Some((known_cast, known_points)); }
+            }
+
+            let (expected, expected_points) = if (moment as i16) >= 27 {
+                let mut hidden = base.clone();
+                // Unknown is neither the trapped pose nor the rescued pose: withhold only this
+                // slot, without assigning a position, heading or idle clip that the save cannot prove.
+                hidden[jessie].unconditional = false;
+                let remaining = base_points.iter().filter(|point| !jessie_points.contains(&point.id)).cloned().collect::<Vec<_>>();
+                (hidden, remaining)
+            } else {
+                // Before the signed guard, including negative words, the rescued bit is irrelevant.
+                known_clear.unwrap()
+            };
+            assert_eq!(actual, expected, "only proven placement at {moment}/{lift:?}");
+            assert_eq!(points, expected_points, "no independently clickable hidden Jessie at {moment}/{lift:?}");
+            // The server derives NPC IDs from vector slots before filtering visibility. Keeping
+            // every slot and every unrelated NPC intact therefore keeps their click identities.
+            assert_eq!(actual.len(), base.len());
+            for (slot, (npc, original)) in actual.iter().zip(&base).enumerate() {
+                assert_eq!(npc.entity_name, original.entity_name, "slot identity {slot}");
+                if slot != jessie { assert_eq!(npc, original, "unrelated slot {slot} at {moment}/{lift:?}"); }
+            }
+            assert_eq!(unknown.encode(), saved, "inspection never establishes an unknown rescued bit");
+            let reloaded = StoryState::decode(&saved).unwrap();
+            assert_eq!(reloaded.encode(), saved, "canonical bytes survive reload");
+            assert_eq!(reloaded.known_bit(1, 225, 5), None);
+            let reload_phase = area.phase_key(&reloaded.encode()).unwrap();
+            assert_eq!(reload_phase, phase);
+            assert_eq!(area.npcs_in_phase(&reload_phase), actual);
+            assert_eq!(area.story_points_in_phase(&reload_phase), points);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the owner's FF7 data (FMV_FF7_DATA)"]
 fn jessies_trapped_idle_is_the_owned_compatible_45_frame_clip() {
     let dir = data_dir().expect("FMV_FF7_DATA");
     let mut fields = fmv_ff7::lgp::LgpArchive::open_path(flevel_path(&dir)).unwrap();

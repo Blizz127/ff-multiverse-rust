@@ -210,6 +210,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 const JESSIE_RESCUED_PHASE: u8 = b'J';
 const JESSIE_LOWER_PHASE: u8 = b'L';
 const JESSIE_TRAPPED_PHASE: u8 = b'T';
+const JESSIE_UNKNOWN_PHASE: u8 = b'U';
 const MATERIA_HIDDEN_PHASE: u8 = b'H';
 const RUN_AHEAD_HIDDEN_PHASE: u8 = b'R';
 const JESSIE_DESCENDED_PHASE: u8 = b'D';
@@ -1039,9 +1040,11 @@ impl AreaRuntime for Ff7FieldArea {
             let story = story::StoryState::decode(progress)?;
             let moment = story.moment as i16; // the owned init's IFSW comparisons are signed
             let marker = if moment >= 27 {
-                Some(if story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) == Some(true) {
-                    JESSIE_RESCUED_PHASE
-                } else { JESSIE_TRAPPED_PHASE })
+                Some(match story.known_bit(story::REACTOR_STATE.bank, story::REACTOR_STATE.address, story::FREED_BIT) {
+                    Some(true) => JESSIE_RESCUED_PHASE,
+                    Some(false) => JESSIE_TRAPPED_PHASE,
+                    None => JESSIE_UNKNOWN_PHASE,
+                })
             } else if moment >= 14 { Some(JESSIE_LOWER_PHASE) } else { None };
             if let Some(marker) = marker {
                 // Runtime placement only; preserve the existing interval and saved bytes.
@@ -1078,6 +1081,12 @@ impl AreaRuntime for Ff7FieldArea {
         if self.info.id.key.eq_ignore_ascii_case("nmkin_3") {
             let marker = phase.0.first().copied();
             for npc in &mut npcs {
+                if npc.entity_name.eq_ignore_ascii_case("av_j") && marker == Some(JESSIE_UNKNOWN_PHASE) {
+                    // An unknown rescue flag establishes neither pose nor availability.
+                    // Keep her slot for stable NPC IDs; the talk-point filter also withholds it.
+                    npc.unconditional = false;
+                    continue;
+                }
                 if npc.entity_name.eq_ignore_ascii_case("av_j") && matches!(marker, Some(JESSIE_LOWER_PHASE | JESSIE_TRAPPED_PHASE | JESSIE_RESCUED_PHASE)) {
                     npc.pos = Pos::new(-183.0, 1191.0, 1643.0); // owned init: lower platform, triangle 20
                     npc.facing = crate::field_direction_to_facing(if marker == Some(JESSIE_TRAPPED_PHASE) { 0 } else { 128 });
