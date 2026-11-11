@@ -84,6 +84,16 @@ const UNSUPPORTED_ENGINE_FIELDS: [(u8, u8, u8, u8); 16] = [
     (13, 104, 128, 0xFF), // MPNAM's expanded location-name buffer: field/field_dialog.c:1061-1157
 ];
 
+/// The bits of a persistent byte the engine itself keeps (clocks, counters, menu locks, minigame results...): a field
+/// runtime must not save them as story. `bank` may be any persistent selector (aliases are resolved).
+pub fn engine_owned_bits(bank: u8, address: u8) -> u8 {
+    let Some(bank) = super::canonical_persistent_bank(bank) else { return 0 };
+    UNSUPPORTED_ENGINE_FIELDS
+        .iter()
+        .filter(|(b, first, last, _)| *b == bank && (*first..=*last).contains(&address))
+        .fold(0, |bits, (_, _, _, unknown)| bits | unknown)
+}
+
 impl StoryState {
     /// The exact persistent-bank reset image, at moment zero, for an explicit fresh-game
     /// bootstrap. Every bit is known because `SysSavemapReset` writes every byte, including

@@ -30,6 +30,7 @@
 //!
 //! Differences from the original that are deliberate are listed in `docs/FIELD-RUNTIME.md`.
 
+mod cast;
 pub mod memory;
 mod ops;
 pub use ops::{is_implemented, menu, AnimState, MotionState, PartyState, StageState, WindowsState};
@@ -41,6 +42,7 @@ mod tests;
 use std::collections::BTreeMap;
 
 use crate::script::{FieldScript, ScriptError, SCRIPTS_PER_ENTITY};
+pub use cast::CastMember;
 pub use memory::{Banks, Memory, PERSISTENT_BYTES, SCRATCH_BYTES};
 
 /// Instructions an entity may execute per frame.

@@ -66,3 +66,19 @@ fn init_places_the_static_cast_where_the_static_analysis_does() {
     assert!(fields_run > 600);
     assert!(f64::from(matched) >= 0.99 * f64::from(compared), "{matched}/{compared}");
 }
+
+#[test]
+fn a_changed_story_byte_is_saved_and_an_engine_owned_one_is_not() {
+    let story = StoryState::fresh_reset();
+    let banks = Banks::from_story(&story).expect("complete");
+    // A tiny field: one entity whose init sets bank 1 address 0x40 and the play-time byte 1:16.
+    let init = [0x80, 0x10, 0x40, 0x05, 0x80, 0x10, 16, 0x09, 0x00];
+    let section = crate::script::synth::SynthScript { scale: 512, ..Default::default() }.entity("dir", vec![(0, init.to_vec())]).build();
+    let mut rt = FieldRuntime::new(&section, banks).expect("runtime");
+    rt.init();
+    let after = rt.story_after(&story).expect("writes").expect("changed");
+    assert_eq!(after.known_byte(1, 0x40), Some(5));
+    assert_eq!(after.known_byte(1, 16), story.known_byte(1, 16), "the clock mirror is the engine's, not the story's");
+    assert!(Banks::from_story(&after).is_some(), "still a complete image");
+    assert_eq!(rt.story_after(&after).expect("writes"), None, "nothing more to save");
+}

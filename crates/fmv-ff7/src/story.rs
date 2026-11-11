@@ -196,6 +196,7 @@ pub use point_exact::StoryPointError;
 mod party_visibility;
 pub use party_visibility::{party_visibility_matches, reviewed_party_visibility};
 mod fresh;
+pub use fresh::engine_owned_bits;
 pub use banks::{canonical_persistent_bank, compare_exchange_progression, StoryWriteError, BLOB_VERSION_BANKS, MAX_BANK_BLOB_BYTES};
 mod native_party;
 pub use native_party::{checked_canon_party_of, evaluate_native_party, NativePartyAssignments, NativePartyEffect, NativePartyError,
