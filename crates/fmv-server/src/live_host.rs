@@ -192,6 +192,11 @@ impl LiveField for Ff7Live {
         (self.rt.play_time_seconds(), self.rt.countdown_seconds())
     }
 
+    fn blocks(&self, from: Pos, to: Pos) -> bool {
+        let locked = |p: Pos| self.rt.triangle_at(p.x.round() as i32, p.y.round() as i32, p.z.round() as i32).is_some_and(|t| self.rt.triangle_locked(t));
+        locked(to) && !locked(from)
+    }
+
     fn map_jumps_disabled(&self) -> bool {
         self.rt.state.map_jumps_disabled
     }

@@ -678,7 +678,8 @@ impl World {
     /// budget, and facing and anim are tracked only from accepted moves.
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
         // A field script may hold the player (the original's UC, an open window, a battle or movie under way).
-        let live_locked = self.live_locked(entity);
+        let live_locked = self.live_locked(entity)
+            || self.players.get(&entity).is_some_and(|p| to.is_finite() && self.live_blocks(entity, p.snapshot.pos, to));
         // The rules are the rules of the area the player stands in (areas differ in speed).
         let (from, chord) = {
             let Some(p) = self.players.get_mut(&entity) else {
