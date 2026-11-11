@@ -198,7 +198,8 @@ pub use party_visibility::{party_visibility_matches, reviewed_party_visibility};
 mod fresh;
 pub use banks::{canonical_persistent_bank, compare_exchange_progression, StoryWriteError, BLOB_VERSION_BANKS, MAX_BANK_BLOB_BYTES};
 mod native_party;
-pub use native_party::{checked_canon_party_of, NativePartyError, NativePartyState, BLOB_VERSION_NATIVE_PARTY, MAX_NATIVE_PARTY_BLOB_BYTES, NATIVE_PARTY_BYTES};
+pub use native_party::{checked_canon_party_of, evaluate_native_party, NativePartyAssignments, NativePartyEffect, NativePartyError,
+    NativePartyImage, NativePartyOp, NativePartyOpError, NativePartyState, BLOB_VERSION_NATIVE_PARTY, MAX_NATIVE_PARTY_BLOB_BYTES, NATIVE_PARTY_BYTES};
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;

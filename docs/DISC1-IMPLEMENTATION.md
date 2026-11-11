@@ -105,6 +105,28 @@ replay before accepting the richer snapshot. Scripted battles additionally need 
 party at the exact BATTLE instruction; the original or final story can contain a
 different temporary party.
 
+An isolated native-party evaluator now models Add, Remove, Set, availability, locking
+and the reviewed `FIELD_Init` return boundary. It retains immutable before/after images
+and actual assignment masks, including writes of unchanged empty markers. Duplicate Add
+and absent Remove still reconcile the main slots; removing availability clears matching
+raw slots without changing main membership. Raw duplicates are not silently normalized:
+native operations may repair or retain them, while an unrepresentable final main tuple
+refuses atomically. Unknown required inputs also refuse, and applying a retained effect
+requires its exact party/raw predecessor. Unrelated banks remain intact; durable commits
+still require the complete story CAS. This evaluator follows the pinned PSX implementation;
+PC equivalence remains to be checked against the owned executable. Its supported operands
+are ordinary characters 0–8; flashback characters 9/10 and PHS-menu selection are deferred.
+Scene/ordinary interpreters do not call it yet, and all version-4 gameplay gates remain.
+Its 18 tests include 15,028 comparisons against the previous accepted tuple behavior,
+plus exact assignment masks, duplicate repair, ordered availability effects and stale
+knowledge refusals. All 825 FF7 unit tests and 500 server tests pass; the latter now
+round-trips the maximum 5,129-byte native-party snapshot through three opaque fixture
+battles, 125 windows and repeated store reopening, retaining index compatibility 5.
+The four owned-data targets (`scene_real`, `train_lesson_real`, `rootmap_real`,
+`train_departure_real`) also pass all 53 tests with ignored tests explicitly included.
+All-target Clippy for FF7 and the server passes with the pre-existing standing-animation
+fallback warning.
+
 `FieldScratch` provides checked 256-byte values and knowledge masks for future visit
 restoration. Selectors 5/6 alias for byte access; wide selector 5 still uses one byte,
 while selector 6 uses a little-endian word. Invalid boundary reads/writes refuse
@@ -136,7 +158,7 @@ visit-bearing snapshots until anchor reconstruction, VM scratch injection, accep
 and atomic active-continuation transitions are implemented. The train lesson remains
 unregistered, and existing accounts are not converted.
 
-Verification: the workspace run plus corrected-target reruns passed 4,180 tests;
+Storage checkpoint `075eb34`: the workspace run plus corrected-target reruns passed 4,180 tests;
 378 optional tests were ignored. The two initial failures were stale expectations:
 index version 5 is now supported, and an invalid canon member now refuses the entire
 battle instead of being dropped. The affected persistence and server targets passed
@@ -303,6 +325,9 @@ by assuming unknown flags are clear.
   282,240 samples per channel respectively (about 13.009 s and 12.800 s); stream duration
   fields are absent and audio timestamps begin at 0.011 s. Audio sample counts alone
   therefore do not define the movie's final frame or completion boundary.
+  The same install also supplies the English PE32 program at
+  `ff7/resources/ff7_1.02/ff7_en` (no `.exe` suffix, 5,997,027 bytes). Its private copy is
+  hash-verified for static PC comparison; copying it does not establish runtime behavior.
 * Station arrival has one window and writes moment 63 without inherited train scratch.
   Its final Cloud position is `(-2738,3017,101)`, triangle 9, direction 16. Original
   `UC 0` and the moment write precede Barret's window and remaining actor work. A durable

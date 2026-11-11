@@ -1,9 +1,11 @@
 //! Exercise the real replay, combat-plan, checkpoint, saver and wire types together. Fully
 //! known story banks must survive three battles without trimming their knownness masks.
+//! Native-party snapshots are exercised as opaque fixture data; FF7 runtime admission
+//! remains disabled until its interpreters and replay semantics support that schema.
 
 use super::*;
 use fmv_core::{Fingerprint, MAX_INVENTORY_STACKS};
-use fmv_ff7::story::{StoryState, MAX_BANK_BLOB_BYTES};
+use fmv_ff7::story::{NativePartyState, StoryState, MAX_BANK_BLOB_BYTES, MAX_NATIVE_PARTY_BLOB_BYTES};
 use fmv_persist::{CharacterProgress, SceneCommit, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
 use fmv_protocol::{BattleMember, BattleReward, BattleSetup};
 use fmv_protocol::battle::{BattleInitialState, StatusSet};
@@ -11,16 +13,21 @@ use crate::saver::{SceneBattleSettlement, SceneBatchJob, SceneBatchMember};
 
 const INSTANCE: [u8; 32] = [251; 32];
 
-fn known_story(value: u8) -> Vec<u8> {
+fn known_story(value: u8, native_party: bool) -> Vec<u8> {
     let mut story = StoryState::at(39).into_extended().unwrap();
     for bank in [1, 3, 7, 11, 13] {
         for address in 0..=255 {
             if bank != 1 || address > 1 { story.write_byte(bank, address, value).unwrap(); }
         }
     }
+    if native_party {
+        story = story.into_native_party().unwrap();
+        *story.native_party_mut().unwrap() = NativePartyState::from_parts(
+            [255; 3], 7, (u16::MAX, u16::MAX), (u16::MAX, u16::MAX)).unwrap();
+    }
     let bytes = story.encode();
-    assert_eq!(bytes.len(), MAX_BANK_BLOB_BYTES);
-    assert_eq!(bytes.len(), 5117);
+    assert_eq!(bytes.len(), if native_party { MAX_NATIVE_PARTY_BLOB_BYTES } else { MAX_BANK_BLOB_BYTES });
+    assert_eq!(bytes.len(), if native_party { 5129 } else { 5117 });
     assert_eq!(StoryState::decode(&bytes).unwrap().encode(), bytes);
     bytes
 }
@@ -88,10 +95,20 @@ fn fits(checkpoint: &SceneCheckpoint, payload: &Payload) {
 
 #[test]
 fn fully_known_story_survives_three_durable_battles_maximum_windows_and_reopen() {
+    full_story_round_trip(false);
+}
+
+#[test]
+fn native_party_snapshot_survives_opaque_fixture_transactions_and_replay_size_bounds() {
+    full_story_round_trip(true);
+}
+
+fn full_story_round_trip(native_party: bool) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("store");
     let mut store = Store::open(&path).unwrap();
-    let original = known_story(255);
+    if native_party { store.require_compatibility(fmv_persist::StoreCompatibility::FieldVisit).unwrap(); }
+    let original = known_story(255, native_party);
     let accounts = (0..3).map(|slot| {
         let (account, _) = store.create_account(&format!("Full banks {slot}"), 1).unwrap();
         store.put_progression(&Progression::new(account, GameId::Fixture, original.clone(), 1)).unwrap();
@@ -106,7 +123,7 @@ fn fully_known_story_survives_three_durable_battles_maximum_windows_and_reopen()
     let mut latest = original.clone();
     for ordinal in 0..3u32 {
         windows(&mut payload, if ordinal == 0 { 41 } else { 42 });
-        latest = known_story(254 - ordinal as u8);
+        latest = known_story(254 - ordinal as u8, native_party);
         let before = store.get_scene_states(&accounts, GameId::Fixture).unwrap();
         let prepared = checkpoint(&original, &payload, ScenePhase::BeforeBattle {
             ordinal, attempt: 0, formation: 300, battle_seed: u64::MAX,
@@ -157,7 +174,7 @@ fn fully_known_story_survives_three_durable_battles_maximum_windows_and_reopen()
         assert_eq!(decoded.replay, payload.replay);
         for event in &decoded.replay.events {
             if let SceneReplayEvent::Battle { progress, .. } = event {
-                assert_eq!(progress.len(), MAX_BANK_BLOB_BYTES);
+                assert_eq!(progress.len(), original.len());
                 assert_eq!(StoryState::decode(progress).unwrap().encode(), *progress);
             }
         }
@@ -165,8 +182,8 @@ fn fully_known_story_survives_three_durable_battles_maximum_windows_and_reopen()
     assert_eq!(payload.replay.events.len(), fmv_protocol::MAX_SCENE_REPLAY_EVENTS);
     let before = store.get_scene_states(&accounts, GameId::Fixture).unwrap();
     let largest = before[0].checkpoint.as_ref().unwrap();
-    eprintln!("full-known three-battle/125-window checkpoint: payload={}, compact={}, frame={}",
-        largest.replay.len(), serde_json::to_vec(largest).unwrap().len(), frame(largest, &payload).unwrap().len());
+    eprintln!("full-known v{} three-battle/125-window checkpoint: payload={}, compact={}, frame={}",
+        original[0], largest.replay.len(), serde_json::to_vec(largest).unwrap().len(), frame(largest, &payload).unwrap().len());
     assert!(largest.replay.len() > 32 * 1024 && serde_json::to_vec(largest).unwrap().len() > 64 * 1024,
         "this fixture must catch both former limits");
     let landing = Landing { field: YARD.into(), position: Pos::default(), facing: Some(0.0), hint: None };
@@ -188,6 +205,11 @@ fn fully_known_story_survives_three_durable_battles_maximum_windows_and_reopen()
     for account in &accounts[1..] {
         let state = store.get_scene_state(*account, GameId::Fixture).unwrap();
         assert!(state.reservation.is_none() && state.checkpoint.is_none());
+    }
+    if native_party {
+        let header = std::fs::read_to_string(path.join("index.log")).unwrap();
+        assert!(header.lines().next().unwrap().contains("\"schema_version\":5"),
+            "opaque story transactions must retain the caller-selected compatibility fence");
     }
 }
 

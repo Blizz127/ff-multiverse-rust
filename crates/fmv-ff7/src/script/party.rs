@@ -30,12 +30,33 @@ fn valid(slots: &[u8; 3]) -> bool {
     })
 }
 
-pub(crate) fn transition(mut bank: [u8; 3], main: [u8; 3], op: PartyOp) -> Result<PartyChange, PartyError> {
+pub(crate) fn transition(bank: [u8; 3], main: [u8; 3], op: PartyOp) -> Result<PartyChange, PartyError> {
     if !valid(&main) { return Err(PartyError::InvalidSlots); }
     // With no preserve-slot operand, PartyReplace's final three assignments are independent
     // of the old field tuple. An authoritative overwrite does not need invented input bytes.
     let replaces_all = matches!(op, PartyOp::Set(slots) if !slots.contains(&255));
     if !replaces_all && !valid(&bank) { return Err(PartyError::InvalidSlots); }
+    let change = native_transition(bank, main, op)?;
+    // The legacy wrapper retains its unique raw-tuple acceptance rule. Native writable raw
+    // bytes can temporarily disagree with it; the v4 evaluator validates its final main image.
+    if !valid(&change.bank) { return Err(PartyError::InvalidSlots); }
+    Ok(PartyChange { bank: change.bank, main: change.main, assigned: change.raw_assigned })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativePartyChange {
+    pub bank: [u8; 3],
+    pub main: [u8; 3],
+    pub raw_assigned: [bool; 3],
+    pub main_assigned: [bool; 3],
+}
+
+/// Native tuple mechanics without normalizing the raw preimage. Callers audit knowledge
+/// before entering and validate the resulting main tuple against their supported domain.
+/// In particular PartyReplace removes every occurrence of a requested member, so it can
+/// repair raw duplicates (pinned field_opcodes.c:5636–5673). The legacy wrapper stays strict.
+pub(crate) fn native_transition(mut bank: [u8; 3], main: [u8; 3], op: PartyOp) -> Result<NativePartyChange, PartyError> {
+    let replaces_all = matches!(op, PartyOp::Set(slots) if !slots.contains(&255));
     let mut assigned = [false; 3];
     match op {
         PartyOp::Add(character) => {
@@ -72,42 +93,46 @@ pub(crate) fn transition(mut bank: [u8; 3], main: [u8; 3], op: PartyOp) -> Resul
                 }
             }
             bank = requested.map(|member| if member == 254 { 255 } else { member });
-            if !valid(&bank) { return Err(PartyError::InvalidSlots); }
             assigned = [true; 3];
         }
     }
-    // PartyFromBank2ToSave removes missing members in place, then adds new members to the
-    // first empty slots. It preserves both holes and the slots of retained main-party members.
-    let mut next_main = main.map(|member| if bank.contains(&member) { member } else { 255 });
-    for member in bank.into_iter().filter(|&member| member != 255 && !main.contains(&member)) {
-        if let Some(slot) = next_main.iter_mut().find(|slot| **slot == 255) { *slot = member; }
-    }
-    Ok(PartyChange { bank, main: next_main, assigned })
+    // Duplicate PRTYP and absent PRTYM still call PartyFromBank2ToSave. Its padded 255
+    // arrays can assign unchanged empty main slots too (field_opcodes.c:5527–5531,5579).
+    let (main, main_assigned) = reconcile_slots(main, bank);
+    Ok(NativePartyChange { bank, main, raw_assigned: assigned, main_assigned })
 }
 
 /// Native FIELD_Init after a menu: reconcile physical field slots with the main party while
 /// preserving retained field-slot order. This does not use ADD_PARTY_MEMBER or change PHS bits.
-/// PartyCompare's unused result entries are255 too: PartyRemove/PartyAdd really assign those
-/// empty markers, even when the value already is255, so the assignment mask includes them.
-pub(crate) fn sync_from_main(mut bank: [u8; 3], main: [u8; 3]) -> Result<PartyChange, PartyError> {
+/// PartyCompare's unused result entries are 255 too: PartyRemove/PartyAdd really assign those
+/// empty markers, even when the value already is 255, so the assignment mask includes them.
+pub(crate) fn sync_from_main(bank: [u8; 3], main: [u8; 3]) -> Result<PartyChange, PartyError> {
     if !valid(&bank) || !valid(&main) { return Err(PartyError::InvalidSlots); }
+    let (bank, assigned) = reconcile_slots(bank, main);
+    Ok(PartyChange { bank, main, assigned })
+}
+
+/// Literal PartyCompare → PartyRemove → PartyAdd (field_opcodes.c:5677–5754), shared by
+/// main-from-raw and FIELD_Init's raw-from-main direction. Retained destination positions
+/// survive; all padded 255 entries are executed and their assignments are reported.
+pub(crate) fn reconcile_slots(mut destination: [u8; 3], source: [u8; 3]) -> ([u8; 3], [bool; 3]) {
     let mut remove = [255; 3];
     let mut add = [255; 3];
-    for (out, member) in remove.iter_mut().zip(bank.into_iter().filter(|member| !main.contains(member))) { *out = member; }
-    for (out, member) in add.iter_mut().zip(main.into_iter().filter(|member| !bank.contains(member))) { *out = member; }
+    for (out, member) in remove.iter_mut().zip(destination.into_iter().filter(|member| !source.contains(member))) { *out = member; }
+    for (out, member) in add.iter_mut().zip(source.into_iter().filter(|member| !destination.contains(member))) { *out = member; }
     let mut assigned = [false; 3];
     for member in remove {
-        for (slot, written) in bank.iter_mut().zip(assigned.iter_mut()) {
+        for (slot, written) in destination.iter_mut().zip(assigned.iter_mut()) {
             if *slot == member { *slot = 255; *written = true; }
         }
     }
     for member in add {
-        if let Some((slot, written)) = bank.iter_mut().zip(assigned.iter_mut()).find(|(slot, _)| **slot == 255) {
+        if let Some((slot, written)) = destination.iter_mut().zip(assigned.iter_mut()).find(|(slot, _)| **slot == 255) {
             *slot = member;
             *written = true;
         }
     }
-    Ok(PartyChange { bank, main, assigned })
+    (destination, assigned)
 }
 
 #[cfg(test)]

@@ -15,6 +15,9 @@
 
 use super::{StoryState, StoryWriteError, MAX_BANK_BLOB_BYTES};
 
+mod ops;
+pub use ops::{evaluate_native_party, NativePartyAssignments, NativePartyEffect, NativePartyImage, NativePartyOp, NativePartyOpError};
+
 pub const BLOB_VERSION_NATIVE_PARTY: u8 = 4;
 pub const NATIVE_PARTY_BYTES: usize = 12;
 /// All five fully known banks and the native-party suffix, within the 8 KiB wire limit.
