@@ -50,6 +50,7 @@
 //! request for a slot that is taken waits for it to be free (the engine's own rule for a taken slot is not
 //! documented; waiting loses no line).
 
+use super::play::control::{ControlOp, ControlPolicy, ControlState, ExecutedControl, VmBeat};
 use super::play::{BattleCheckpoint, WindowCheckpoint, SceneBoundary, SceneError};
 use super::data::{Given, ScriptRef, Step};
 use super::fade::{FadeOp, FadeState};
@@ -59,6 +60,8 @@ use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin
 use crate::script::{decode_at, field_wide_bytes, FieldScript, FieldScratch, FieldScratchError, FieldScratchOutcome, FieldScratchRun, Instruction};
 use crate::story::{tracked_var, NativePartyOp, NativeStoryBuilder, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(super) mod entry;
 
 /// Field frames per second (the clock of [`Timed::at`]).
 pub const FRAMES_PER_SECOND: u32 = 30;
@@ -433,6 +436,8 @@ enum State {
     WaitOffset(u8),
     /// Waiting for its entity's priority slot.
     WaitSlot,
+    /// Opt-in entry driver: only this issuer waits on a movie handshake.
+    WaitExternal,
     /// In an idle loop: runs again when anything changes (the epoch it parked at is the one stored).
     Parked(u64),
     Done,
@@ -696,6 +701,10 @@ pub struct Vm {
     /// Last actually executed UC/MENU2 instruction. This records authored state only;
     /// world control remains held until its own durable publication policy releases it.
     control_instructions: [Option<(usize, usize, u8)>; 2],
+    control_state: ControlState,
+    control_ordinal: u64,
+    control_cut: Option<ExecutedControl>,
+    entry: Option<entry::EntryVm>,
     resources: ResourceOutcome,
     stats: Stats,
 }
@@ -767,6 +776,10 @@ impl Vm {
             invalid_scratch_execution: false,
             setup_state_changed: false,
             control_instructions: [None; 2],
+            control_state: ControlState::default(),
+            control_ordinal: 0,
+            control_cut: None,
+            entry: None,
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -1628,11 +1641,17 @@ impl Vm {
     }
 
     /// The runnable thread that is earliest (ties: the one that has waited longest in the queue).
-    fn pick(&mut self) -> Option<usize> {
+    fn pick(&mut self) -> Option<usize> { self.pick_through(None) }
+
+    fn pick_through(&mut self, horizon: Option<(u32, bool)>) -> Option<usize> {
         let (epoch, clock) = (self.epoch, self.clock);
         for t in &mut self.threads {
             if let State::Parked(at) = t.state {
                 if at != epoch {
+                    let time = t.time.max(clock);
+                    if horizon.is_some_and(|(horizon, inclusive)| time > horizon || (!inclusive && time == horizon)) {
+                        continue;
+                    }
                     // Something changed: the loop looks again, from the moment of the change.
                     t.state = State::Run;
                     t.seen.clear();
@@ -1657,6 +1676,7 @@ impl Vm {
                 },
                 _ => return None,
             };
+            if horizon.is_some_and(|(horizon, inclusive)| time > horizon || (!inclusive && time == horizon)) { return None; }
             Some((i, time, t.seq))
         }).min_by_key(|(_, time, seq)| (*time, *seq))?;
         // Do not move a waiter's stored time forward until it wins: another script
@@ -1931,10 +1951,11 @@ impl Vm {
     }
 
     /// Run one instruction of script thread `idx`.
-    fn step_script(&mut self, script: &FieldScript<'_>, idx: usize) -> Flow {
+    fn step_script(&mut self, script: &FieldScript<'_>, idx: usize, control: Option<ControlPolicy>) -> Flow {
         let Some(thread) = self.threads.get_mut(idx) else { return Flow::Yield };
         let Code::Script { pc } = thread.code else { return Flow::Yield };
         let entity = thread.entity;
+        let foreground = !thread.ambient;
         // An idle loop: the same instruction again with nothing changed anywhere since this thread met it.
         if thread.seen_epoch != self.epoch {
             thread.seen.clear();
@@ -1959,6 +1980,7 @@ impl Vm {
             self.native_story.as_ref().map_or(0, |native| native.events().len()),
             self.party_main, self.party_bank, self.resources.gil_after,
         ));
+        self.observe_entry_audio(entity, &ins);
         let flow = self.exec(script, idx, entity, &ins, &mut class);
         if matches!(ins.opcode, 0x33 | 0x4A) {
             if let Some(disabled) = ins.literal("disabled").and_then(|value| u8::try_from(value).ok()) {
@@ -1966,6 +1988,13 @@ impl Vm {
                     *last = Some((entity, ins.offset, disabled));
                 }
             }
+        }
+        // Record only actual execution, including locks and quiet setup. The opt-in
+        // boundary does not finish a thread, join actors, reset time, or grant control.
+        let operation = ControlOp::from_instruction(&ins);
+        if let Some(operation) = operation {
+            self.control_state.observe(operation);
+            if control.is_some() && !self.quiet { class = Class::Handled; }
         }
         if let Some((events, main, bank, gil)) = setup_before {
             self.setup_state_changed |= main != self.party_main || bank != self.party_bank
@@ -1977,6 +2006,16 @@ impl Vm {
         if !self.scratch_valid() {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);
             return Flow::Scene(End::Broken);
+        }
+        if let Some(operation) = operation.filter(|_| control.is_some() && !self.quiet && foreground) {
+            let Some(ordinal) = self.control_ordinal.checked_add(1) else { return Flow::Scene(End::Budget) };
+            self.control_ordinal = ordinal;
+            if control.is_some_and(|policy| policy.yields(operation)) {
+                self.control_cut = Some(ExecutedControl {
+                    ordinal, entity: Self::own(entity), instruction_offset: ins.offset as u32,
+                    frame: self.clock, operation, after: self.control_state,
+                });
+            }
         }
         flow
     }
@@ -2024,6 +2063,9 @@ impl Vm {
     fn exec(&mut self, script: &FieldScript<'_>, idx: usize, entity: usize, ins: &Instruction, class: &mut Class) -> Flow {
         let me = Self::own(entity);
         let op = ins.opcode;
+        if self.entry.is_some() && matches!(op, 0xF8..=0xFA) {
+            return self.exec_entry_movie(idx, entity, ins);
+        }
         match op {
             0x00 => {
                 self.finish_thread(idx);
@@ -2782,6 +2824,8 @@ impl Vm {
         self.battle = None;
         self.battle_checkpoint = None;
         self.battle_ordinal = 0;
+        self.control_ordinal = 0;
+        self.control_cut = None;
         self.window_checkpoint = None;
         self.window_ordinal = 0;
         self.quiet = false;
@@ -2863,7 +2907,7 @@ impl Vm {
             }
             self.steps = self.steps.saturating_add(1);
             self.clock = self.clock.max(self.thread_time(idx));
-            match self.step_script(script, idx) {
+            match self.step_script(script, idx, None) {
                 Flow::Next | Flow::Yield => {}
                 Flow::Window(_) | Flow::Scene(_) => {
                     self.stats.setup_incomplete = true;
@@ -2973,9 +3017,23 @@ impl Vm {
     /// last, if that asked (the absolute line number of the choice, as a script stores it; anything else is clamped
     /// into the choices, `None` takes the cursor's starting line).
     pub fn resume(&mut self, script: &FieldScript<'_>, answer: Option<usize>) -> Beat {
-        if !self.scratch_valid() { return self.finish(End::Broken); }
+        match self.resume_inner(script, answer, None) {
+            VmBeat::Scene(beat) => beat,
+            // Only resume_control supplies a policy; no public VM API can request a cut.
+            VmBeat::Control { .. } => self.finish(End::Broken),
+        }
+    }
+
+    pub(super) fn resume_control(&mut self, script: &FieldScript<'_>, policy: ControlPolicy) -> VmBeat {
+        self.resume_inner(script, None, Some(policy))
+    }
+
+    pub(super) fn observed_control(&self) -> ControlState { self.control_state }
+
+    fn resume_inner(&mut self, script: &FieldScript<'_>, answer: Option<usize>, control: Option<ControlPolicy>) -> VmBeat {
+        if !self.scratch_valid() { return self.finish(End::Broken).into(); }
         if self.refuse_invalid_native_state() {
-            return Beat { stage: Vec::new(), then: Then::End { at: self.clock.saturating_sub(self.origin), how: End::Broken } };
+            return Beat { stage: Vec::new(), then: Then::End { at: self.clock.saturating_sub(self.origin), how: End::Broken } }.into();
         }
         self.window_checkpoint = None;
         if let Some((opener, note)) = self.queued_note.take() {
@@ -2983,10 +3041,10 @@ impl Vm {
             let window = Window { at, opener: Self::own(opener), speaker: None, id: 0, geometry: None, message: note };
             self.origin = self.clock;
             self.record_window(&window, None);
-            return Beat { stage: std::mem::take(&mut self.out), then: Then::Window(window) };
+            return Beat { stage: std::mem::take(&mut self.out), then: Then::Window(window) }.into();
         }
         if let Some(end) = self.done {
-            return Beat { stage: std::mem::take(&mut self.out), then: Then::End { at: self.clock.saturating_sub(self.origin), how: end } };
+            return Beat { stage: std::mem::take(&mut self.out), then: Then::End { at: self.clock.saturating_sub(self.origin), how: end } }.into();
         }
         if let Some(p) = self.pending.take() {
             let chosen = answer.map_or(p.cursor, |a| a.clamp(p.first, p.last.max(p.first)));
@@ -2998,9 +3056,9 @@ impl Vm {
             let Some(idx) = self.pick() else {
                 // A parked condition or slot owner cannot manufacture a RET. No runnable
                 // work is not completion unless all foreground work is demonstrably quiet.
-                return self.finish(if self.foreground_finished(script) { End::Finished } else { End::Budget });
+                return self.finish(if self.foreground_finished(script) { End::Finished } else { End::Budget }).into();
             };
-            if self.foreground_finished(script) { return self.finish(End::Finished); }
+            if self.foreground_finished(script) { return self.finish(End::Finished).into(); }
             // A background event may be next in time while the only foreground work left
             // is a proven standing-animation tail. Run background events up to that tail's
             // time, then finish there; no later actor work or waiter may be cut short.
@@ -3009,30 +3067,35 @@ impl Vm {
                 .filter(|(i, _)| self.quiescent_animation_tail(script, *i))
                 .map(|(_, t)| t.time).min() {
                 if time > self.limits.frames || self.steps >= self.limits.steps {
-                    return self.finish(End::Budget);
+                    return self.finish(End::Budget).into();
                 }
                 self.clock = self.clock.max(time);
                 self.stats.quiescent_tails = self.stats.quiescent_tails.saturating_add(1);
-                return self.finish(End::Finished);
+                return self.finish(End::Finished).into();
             }
             if self.steps >= self.limits.steps {
-                return self.finish(End::Budget);
+                return self.finish(End::Budget).into();
             }
             self.steps = self.steps.saturating_add(1);
             self.stats.steps = self.steps;
             let time = self.thread_time(idx);
             if time > self.limits.frames {
-                return self.finish(End::Budget);
+                return self.finish(End::Budget).into();
             }
             self.clock = self.clock.max(time);
             let is_root = self.threads.get(idx).is_some_and(|t| matches!(t.code, Code::Root { .. }));
-            let flow = if is_root { self.step_root(script, idx) } else { self.step_script(script, idx) };
-            if !self.scratch_valid() { return self.finish(End::Broken); }
+            let flow = if is_root { self.step_root(script, idx) } else { self.step_script(script, idx, control) };
+            if !self.scratch_valid() { return self.finish(End::Broken).into(); }
+            if let Some(checkpoint) = self.control_cut.take() {
+                let at = self.clock.saturating_sub(self.origin);
+                self.origin = self.clock;
+                return VmBeat::Control { stage: std::mem::take(&mut self.out), at, checkpoint };
+            }
             match flow {
                 Flow::Next | Flow::Yield => {}
-                Flow::Scene(end) => return self.finish(end),
+                Flow::Scene(end) => return self.finish(end).into(),
                 Flow::Window(opened) => {
-                    if self.unresolved_offset_boundary(opened.time) { return self.finish(End::Budget); }
+                    if self.unresolved_offset_boundary(opened.time) { return self.finish(End::Budget).into(); }
                     let at = opened.time.saturating_sub(self.origin);
                     let geometry = self.geometry.get(&opened.id).copied();
                     let window = Window { at, opener: Self::own(opened.opener), speaker: None, id: opened.id, geometry, message: opened.message };
@@ -3043,7 +3106,7 @@ impl Vm {
                     }
                     self.origin = opened.time;
                     self.clock = self.clock.max(opened.time);
-                    return Beat { stage: std::mem::take(&mut self.out), then: Then::Window(window) };
+                    return Beat { stage: std::mem::take(&mut self.out), then: Then::Window(window) }.into();
                 }
             }
         }

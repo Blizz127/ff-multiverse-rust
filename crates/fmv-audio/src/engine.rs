@@ -129,6 +129,30 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    /// Queue a dedicated finite movie voice alongside music and effects. Its handle
+    /// reports movie source intervals consumed by mixing, never hardware-audible time.
+    /// Gain is per movie; master/mute still apply, music/SFX gains do not. A new movie
+    /// marks the old handle Replaced. Audio Off has no clock and explicitly refuses.
+    pub fn play_movie(&self, pcm: crate::MoviePcm, gain: f32) -> Result<crate::MovieHandle, crate::MovieAudioError> {
+        let commands = self.commands.as_ref().ok_or(crate::MovieAudioError::Disabled)?;
+        let (voice, handle) = crate::movie::MovieVoice::new(pcm, gain)?;
+        commands.send(Command::PlayMovie(Box::new(voice))).map_err(|_| crate::MovieAudioError::Closed)?;
+        Ok(handle)
+    }
+
+    /// Pause/resume this exact movie when the mixer next applies its command queue.
+    /// Paused source time freezes; other voices continue. Stale/foreign handles do nothing.
+    pub fn pause_movie(&self, handle: &crate::MovieHandle, paused: bool) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::PauseMovie { handle: handle.clone(), paused });
+        }
+    }
+
+    /// Cancel this exact movie without claiming natural EOF. Stale/foreign handles do nothing.
+    pub fn cancel_movie(&self, handle: &crate::MovieHandle) {
+        if let Some(commands) = &self.commands { let _ = commands.send(Command::CancelMovie(handle.clone())); }
+    }
+
     /// Start with the machine's real output device (when `config.mode` is [`Mode::Auto`]).
     pub fn start(config: AudioConfig) -> Self {
         Self::start_with(config, default_opener())

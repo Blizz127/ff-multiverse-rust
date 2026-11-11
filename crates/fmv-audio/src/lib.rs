@@ -10,6 +10,12 @@
 //! `fmv_ff7::sound`, and the client's `audio` module that decides what plays when). No audio data is
 //! ever stored in this repository.
 //!
+//! [`MoviePcm`] plays on a dedicated finite voice alongside music and effects. A
+//! [`MovieHandle`] retains its own pause/end/cancellation identity and exact whole
+//! source-frame intervals consumed by mixing. This render clock is not decoder
+//! read-ahead, global output time or hardware-audible time; backend latency is not
+//! measured. No native movie scheduler or container timestamp validation is implied.
+//!
 //! # How it fits together
 //!
 //! ```text
@@ -73,6 +79,7 @@ pub mod device;
 mod engine;
 mod host;
 mod mixer;
+mod movie;
 mod music;
 mod source;
 mod status;
@@ -83,5 +90,6 @@ pub use convert::{fill_device, write_frames, DeviceSample};
 pub use engine::{AudioEngine, DeviceError, DeviceLink, DeviceOpener, LostReporter, OpenedDevice};
 pub use host::MixerHandle;
 pub use music::{decode_music_bytes, decode_music_file, loop_points_from_tags, DecodeError, DecodedMusic, MAX_FRAMES};
+pub use movie::{MovieAudioError, MovieAudioState, MovieAudioStatus, MovieHandle, MoviePcm, MAX_MOVIE_PCM_BYTES};
 pub use source::{LoopPoints, MusicSource, Pull, SfxClip, ToneSource};
 pub use types::{AudioStatus, Backend, PlayOptions, SfxHandle, TrackId, Volumes};

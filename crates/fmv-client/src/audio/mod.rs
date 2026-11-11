@@ -64,6 +64,7 @@ use fmv_audio::{AudioConfig, AudioEngine, DecodedMusic, Logger, Mode, PlayOption
 use fmv_core::GameId;
 use fmv_mods::echo::short_voice_name;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Decoded tracks kept at once (the playing one, the next fight's, the fanfare, and a little slack): about
@@ -235,7 +236,7 @@ impl Cache {
 }
 
 struct Live {
-    engine: AudioEngine,
+    engine: Arc<AudioEngine>,
     worker: Box<dyn Worker>,
     director: Director,
     log: Logger,
@@ -559,6 +560,16 @@ impl GameAudio {
         Self { live: None }
     }
 
+    /// The existing mixer for an explicitly prepared movie controller. Movie PCM
+    /// shares this run's output backend, master level and mute; cloning this handle
+    /// creates no device or second engine. Audio Off provides no playback clock.
+    /// This access alone does not register a movie or select its soundtrack policy.
+    #[allow(dead_code)] // The isolated movie controller has no live registration yet.
+    pub(crate) fn movie_engine(&self) -> Option<Arc<AudioEngine>> {
+        let live = self.live.as_ref()?;
+        (live.engine.status().backend != fmv_audio::Backend::Off).then(|| Arc::clone(&live.engine))
+    }
+
     /// Start the sound with the machine's own output (or the null sink; see [`AudioConfig`]) and the
     /// real worker over `tasks`. `config.mode == Off` builds nothing.
     pub fn start(config: AudioConfig, tasks: Tasks) -> Self {
@@ -590,7 +601,7 @@ impl GameAudio {
         worker.load_cues();
         Self {
             live: Some(Box::new(Live {
-                engine,
+                engine: Arc::new(engine),
                 worker,
                 director: Director::new(),
                 log,
@@ -1423,6 +1434,55 @@ mod tests {
     }
 
     #[test]
+    fn the_movie_voice_uses_the_existing_music_engine_master_and_mute_with_independent_stops() {
+        use fmv_audio::{MovieAudioState, MoviePcm};
+        let mut rig = Rig::new(&[], &[]);
+        let engine = rig.audio.movie_engine().expect("the run's existing engine");
+        let again = rig.audio.movie_engine().unwrap();
+        assert!(Arc::ptr_eq(&engine, &again));
+        assert!(Arc::ptr_eq(&engine, &rig.audio.live.as_ref().unwrap().engine));
+        assert_eq!(engine.status().backend, fmv_audio::Backend::Null);
+        let pcm = |frames| MoviePcm::from_s16le(RATE, [0, 32, 0, 32].repeat(frames)).unwrap();
+        let near = |samples: &[f32], expected: f32| {
+            assert!(samples.iter().rev().take(64).all(|sample| (*sample - expected).abs() < 0.00001),
+                "settled output should be {expected}, last sample {:?}", samples.last());
+        };
+        engine.play_music(TrackId(99), track(4096).source(), PlayOptions { fade: Duration::ZERO, repeat: true, gain: 1.0 });
+        let movie = engine.play_movie(pcm(24_000), 1.0).unwrap();
+        let mixed = 8_000.0 / 32768.0 * 0.8 + 0.25;
+        near(&rig.audio.pump(1024), mixed * 0.8);
+        assert_eq!(movie.status().consumed_frames, 1024);
+        assert_eq!(rig.audio.status().unwrap().music, Some(TrackId(99)));
+
+        // The existing game controls affect both voices through the same master.
+        for _ in 0..3 { rig.audio.change_volume(false); }
+        near(&rig.audio.pump(1024), mixed * 0.5);
+        assert_eq!(engine.status().volumes.master, 0.5);
+        rig.audio.toggle_mute();
+        let before = movie.status().consumed_frames;
+        near(&rig.audio.pump(1024), 0.0);
+        assert_eq!(movie.status().consumed_frames, before + 1024, "mute preserves the finite movie clock");
+        assert_eq!(engine.status().music, Some(TrackId(99)));
+        rig.audio.toggle_mute();
+        near(&rig.audio.pump(1024), mixed * 0.5);
+
+        // Cancelling this movie leaves the music voice and its level intact.
+        engine.cancel_movie(&movie);
+        near(&rig.audio.pump(1024), 8_000.0 / 32768.0 * 0.8 * 0.5);
+        assert_eq!(movie.status().state, MovieAudioState::Cancelled);
+        assert_eq!(engine.status().music, Some(TrackId(99)));
+        // Stopping music likewise leaves a new finite movie to reach its own EOF.
+        let finite = engine.play_movie(pcm(2048), 1.0).unwrap();
+        engine.stop_music(Duration::ZERO);
+        near(&rig.audio.pump(512), 0.25 * 0.5);
+        assert_eq!(engine.status().music, None);
+        assert_eq!((finite.status().state, finite.status().consumed_frames), (MovieAudioState::Playing, 512));
+        rig.audio.pump(1536);
+        assert_eq!((finite.status().state, finite.status().consumed_frames), (MovieAudioState::Ended, 2048));
+        near(&rig.audio.pump(1024), 0.0);
+    }
+
+    #[test]
     fn a_soundtrack_that_is_off_does_nothing_and_a_muted_start_builds_nothing() {
         let mut off = GameAudio::off();
         assert!(!off.is_on());
@@ -1431,6 +1491,7 @@ mod tests {
         assert_eq!(off.toggle_mute(), None);
         assert_eq!(off.change_volume(true), None);
         assert_eq!(off.status(), None);
+        assert!(off.movie_engine().is_none());
         assert!(off.history().is_empty());
         assert_eq!(off.now_playing(), None);
         // `--mute` and `FMV_AUDIO=off` are Mode::Off: no engine, no worker threads.
@@ -1445,7 +1506,14 @@ mod tests {
         };
         let muted = GameAudio::start(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }, tasks);
         assert!(!muted.is_on());
+        assert!(muted.movie_engine().is_none());
         assert!(GameAudio::default().live.is_none());
+        // A caller-supplied Off engine also supplies no clock through the bridge.
+        let supplied_off = GameAudio::with_parts(
+            AudioEngine::start_manual(AudioConfig { mode: Mode::Off, ..AudioConfig::default() }),
+            Box::new(Fake(Rc::new(RefCell::new(State::default())))), Arc::new(|_| {}),
+        );
+        assert!(supplied_off.movie_engine().is_none());
     }
 
     #[test]

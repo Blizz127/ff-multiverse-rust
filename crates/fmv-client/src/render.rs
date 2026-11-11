@@ -13,6 +13,10 @@
 //! * Surface side ([`Renderer`]): window surface lifecycle (resize, minimise, suboptimal,
 //!   outdated, lost) without panics.
 
+// Isolated movie GPU foundation; runtime registration is a separate reviewed change.
+#[allow(dead_code)]
+pub(crate) mod movie;
+
 use crate::backdrop::Backdrop;
 use bytemuck::{Pod, Zeroable};
 use fmv_adapter_api::Bounds;
@@ -502,6 +506,7 @@ pub struct Gpu {
     quad_buf: wgpu::Buffer,
     /// The picture currently on the GPU, replaced when a scene brings a different one.
     backdrop: Option<GpuBackdrop>,
+    movie: movie::MovieFrames,
     /// The text/panel overlay (menus, HUD), drawn over the scene by [`Gpu::draw_overlay`].
     ui: crate::ui::gpu::UiGpu,
     /// The players as models, drawn over the scene by [`Gpu::draw_field`] (see [`crate::avatar`]).
@@ -620,6 +625,7 @@ impl Gpu {
             background_filter: crate::graphics::BackgroundFilter::default(),
             quad_buf,
             backdrop: None,
+            movie: movie::MovieFrames::default(),
             ui,
             avatars,
             fxaa: None,

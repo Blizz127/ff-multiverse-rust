@@ -13,6 +13,8 @@
 //!
 //! [`run_to_end`] is the headless run the server makes to learn those writes from the answers a player gave.
 
+pub(super) mod control;
+
 use super::data::{CastMember, Look, SceneDef, Spot};
 use super::vm::{AnimHow, Beat, Limits, MoveHow, SceneVars, SceneResources, ResourceOutcome, Stage, Stats, Then, Timed, Vm, Where};
 use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
@@ -885,10 +887,18 @@ impl ScenePlay {
 
     /// Keep what concerns the cast, give every place its height, name the speaker of a window.
     fn refine(&mut self, beat: &mut Beat) {
-        let before = beat.stage.len();
-        beat.stage.retain(|t| self.cast.contains(&stage_entity(&t.what).unwrap_or(u8::MAX)) || stage_entity(&t.what).is_none());
-        self.off_cast = self.off_cast.saturating_add(u32::try_from(before - beat.stage.len()).unwrap_or(u32::MAX));
-        for Timed { what, .. } in &mut beat.stage {
+        self.refine_stage(&mut beat.stage);
+        if let Then::Window(w) = &mut beat.then {
+            let label = w.message.page_lines().first().and_then(|page| (page.len() > 1).then(|| page.first().cloned())).flatten();
+            w.speaker = label.and_then(|l| self.def.speaker_entity(&l));
+        }
+    }
+
+    fn refine_stage(&mut self, stage: &mut Vec<Timed<Stage>>) {
+        let before = stage.len();
+        stage.retain(|t| self.cast.contains(&stage_entity(&t.what).unwrap_or(u8::MAX)) || stage_entity(&t.what).is_none());
+        self.off_cast = self.off_cast.saturating_add(u32::try_from(before - stage.len()).unwrap_or(u32::MAX));
+        for Timed { what, .. } in stage {
             match what {
                 Stage::Place { entity, x, y, z, triangle } => {
                     if z.is_none() {
@@ -913,10 +923,6 @@ impl ScenePlay {
                 }
                 _ => {}
             }
-        }
-        if let Then::Window(w) = &mut beat.then {
-            let label = w.message.page_lines().first().and_then(|page| (page.len() > 1).then(|| page.first().cloned())).flatten();
-            w.speaker = label.and_then(|l| self.def.speaker_entity(&l));
         }
     }
 

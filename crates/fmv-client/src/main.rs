@@ -43,6 +43,8 @@ mod live;
 mod login;
 mod mods;
 mod model_layer;
+#[allow(dead_code)]
+mod movie;
 mod nav;
 mod net;
 mod npc;

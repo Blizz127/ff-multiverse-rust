@@ -67,3 +67,6 @@ pub use play::{BattleCheckpoint, BattleResolution, BattleResume, WindowCheckpoin
 pub use play::{replay_scene_with_scratch, replay_scene_to_with_scratch, run_to_end_with_scratch_strict, run_section_to_end_with_scratch_strict};
 pub use train_arrival::{TrainArrival, TrainArrivalEntry, TrainArrivalReady, TrainArrivalPose,
     TRAIN_ARRIVAL_LANDING, replay_train_arrival, train_arrival_ready};
+
+pub use play::control::{ControlPolicy, ControlOp, ControlState, ControlCheckpoint, ControlBoundary, ControlAck, ControlInput, ControlBeat, ControlError, ControlScenePlay};
+pub use play::control::entry::{EntryScenePlay, EntryBeat, EntryYield, EntryError, EntryInput, EntryAudio, MovieToken, MovieRequest, MovieRequestKind, MovieAsset, MovieAck, MovieCounterProfile, MovieCounterObservation};
