@@ -2,96 +2,102 @@
 //! data). The route solver behind `docs/disc1-live-route.txt`.
 //!
 //! ```text
-//! FMV_FF7_DATA=<.../data> cargo run --release -p fmv-ff7 --example runtime_explore -- [--from FIELD] [--steps N] [--moment M]
+//! FMV_FF7_DATA=<.../data> cargo run --release -p fmv-ff7 --example runtime_explore -- \
+//!     [--from FIELD] [--tri N] [--moment M] [--set SEL:ADDR=VALUE]... [--steps N] [--route-out FILE]
 //! ```
 //!
-//! From a fresh story (every bit known) in `md1stin`, it repeats:
+//! A **state** is a running field and where the player stands in it. The search keeps a queue of states, always
+//! expanding the one with the furthest story moment (then the best last action, then the most recent). Expanding a
+//! state lets the field settle and then tries every action a player could take from where it stands:
 //!
-//! 1. run the field until it settles (windows answered with their first choice, battles counted as won, movies, menus and
-//!    tutorials completed); a map jump takes it to the next field with the story as it is;
-//! 2. otherwise try every walkmesh triangle on a copy of the field: stand on its centre, then also press OK, and see
-//!    what the scripts do (the story moment moves, a map jump, a battle);
-//! 3. take the best action (a map jump that moves the story, then one that moves it at all, then any map jump) and go on.
+//! * stand on a walkmesh triangle, with and without OK held;
+//! * talk to a model (stand beside it, face it, press OK);
+//! * walk across a line either way, or stand on it holding OK;
+//! * walk through one of the field's gateways.
 //!
-//! It prints one line per action. Numbers and names only, never game text. Teleporting to a triangle's centre misses
-//! triggers that need a walk across a line; those fields stop the solver and are reported.
+//! Only what the player can **reach** counts: triangles joined to its own through the walkmesh's links without
+//! entering a triangle a script has locked (`IDLCK`), and gateways only while the scripts allow map jumps (`MPJPO`).
+//! An action is worth keeping when it moves the story moment, leaves the field, or changes the story or the field's
+//! own scratch (ignoring scratch bytes that merely follow where the player stands). Windows are answered with their
+//! first choice, battles count as won, movies, menus and tutorials complete at once.
+//!
+//! It prints one line per expansion and, at the end, the chain of actions that led to the furthest moment. Numbers
+//! and names only, never game text. Standing on a triangle's centre is a test shortcut: solid models and exact
+//! collision are not modelled, so a route it finds is a strong lead, not a proof.
 #[path = "../tests/script_common.rs"]
 mod common;
 
 use common::{data_dir, flevel_path, load_field};
-use fmv_ff7::field::FieldFile;
+use fmv_ff7::field::{FieldFile, Gateway, Walkmesh};
 use fmv_ff7::lgp::LgpArchive;
-use fmv_ff7::runtime::{Banks, Command, Event, FieldRuntime, PlayerInput};
+use fmv_ff7::runtime::{direction_of, Banks, Command, Event, FieldRuntime, PlayerInput, PERSISTENT_BYTES};
 use fmv_ff7::script::Maplist;
 use fmv_ff7::story::StoryState;
+use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 
 const SETTLE_FRAMES: u32 = 900;
-const PROBE_FRAMES: u32 = 360;
+const PROBE_FRAMES: u32 = 300;
+const FOLLOW_FRAMES: u32 = 3600;
+/// Expansions allowed per (field, moment): a field whose actions only shuffle its scratch must not eat the search.
+const PER_PLACE: u32 = 10;
+/// The pad's OK bit.
+const OK: u16 = 0x20;
 
-/// Whether the story (persistent bytes the engine does not own) differs between two runtimes.
-fn story_changed(a: &FieldRuntime, b: &FieldRuntime) -> bool {
-    (0..fmv_ff7::runtime::PERSISTENT_BYTES).any(|i| {
-        let sel = [1u8, 3, 11, 13, 15][i / 256];
-        let mask = !fmv_ff7::story::engine_owned_bits(sel, (i % 256) as u8);
-        (a.mem.banks.get(i) ^ b.mem.banks.get(i)) & mask != 0
-    })
+type Pos = (i32, i32, i32);
+
+fn moment_of(banks: &Banks) -> u16 {
+    u16::from_le_bytes([banks.get(0), banks.get(1)])
 }
 
-/// A fingerprint of the story a runtime holds (persistent bytes the engine does not own).
-fn story_key(rt: &FieldRuntime) -> u64 {
-    banks_key(&rt.mem.banks)
-}
-
-/// The story plus the field's own scratch (what a step inside one field changes).
-fn field_key(rt: &FieldRuntime) -> u64 {
-    let mut h = story_key(rt);
-    for b in rt.mem.scratch.iter() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-fn banks_key(banks: &Banks) -> u64 {
+/// A fingerprint of a story (persistent bytes the engine does not own).
+fn story_key(banks: &Banks) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for i in 0..fmv_ff7::runtime::PERSISTENT_BYTES {
+    for i in 0..PERSISTENT_BYTES {
         let sel = [1u8, 3, 11, 13, 15][i / 256];
         let b = banks.get(i) & !fmv_ff7::story::engine_owned_bits(sel, (i % 256) as u8);
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     h
-}
-
-fn moment(rt: &FieldRuntime) -> u16 {
-    u16::from_le_bytes([rt.mem.banks.get(0), rt.mem.banks.get(1)])
 }
 
 #[derive(Debug, Clone, Default)]
 struct Outcome {
-    jump: Option<(u16, i16, i16, i16, u8)>,
+    jump: Option<(u16, i16, i16, i16)>,
     battles: Vec<u16>,
-    windows: u32,
     movies: Vec<u16>,
+    windows: u32,
+    game_over: bool,
 }
 
-/// Run `frames` frames with the player at `at` (pressing OK on `ok_frame`), answering everything; stop at a map jump.
-fn run(rt: &mut FieldRuntime, frames: u32, at: Option<(i32, i32, i32)>, ok_frame: Option<u32>) -> Outcome {
-    run_path(rt, frames, &[], at, ok_frame)
+impl Outcome {
+    fn absorb(&mut self, more: Outcome) {
+        self.jump = more.jump;
+        self.battles.extend(more.battles);
+        self.movies.extend(more.movies);
+        self.windows += more.windows;
+        self.game_over |= more.game_over;
+    }
 }
 
-/// [`run`], walking through `path` first (one point per frame) and then standing at `at`.
-fn run_path(rt: &mut FieldRuntime, frames: u32, path: &[(i32, i32, i32)], at: Option<(i32, i32, i32)>, ok_frame: Option<u32>) -> Outcome {
-    run_facing(rt, frames, path, at, ok_frame, 0)
-}
-
-fn run_facing(rt: &mut FieldRuntime, frames: u32, path: &[(i32, i32, i32)], at: Option<(i32, i32, i32)>, ok_frame: Option<u32>, dir: u8) -> Outcome {
+/// Run `frames` frames. The player walks `path` (a point a frame), then stands at its end, facing `dir`, holding OK
+/// on frames 2 to 6 when `ok`. While a script holds the player, the player follows where the scripts put it. Returns
+/// what happened and where the player ends.
+fn run(rt: &mut FieldRuntime, frames: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
     let mut out = Outcome::default();
     for f in 0..frames {
-        let at = path.get(f as usize).copied().or(at);
-        let player = at.map(|(x, y, z)| PlayerInput { x, y, z, ok: ok_frame == Some(f), keys_pressed: if ok_frame == Some(f) { 0x20 } else { 0 }, keys_held: if ok_frame == Some(f) { 0x20 } else { 0 }, dir, ..Default::default() });
-        rt.tick(player);
+        if let Some(p) = path.get(f as usize) {
+            at = *p;
+        }
+        if rt.state.character_lock {
+            if let Some(m) = rt.pc_model() {
+                at = (m.x, m.y, m.z);
+            }
+        }
+        let held = ok && (2..=6).contains(&f);
+        let player = PlayerInput { x: at.0, y: at.1, z: at.2, dir, ok: ok && f == 2, keys_held: if held { OK } else { 0 }, keys_pressed: if ok && f == 2 { OK } else { 0 }, ..Default::default() };
+        rt.tick(Some(player));
         if rt.pending_tutorial().is_some() {
             rt.complete_tutorial();
         }
@@ -105,9 +111,9 @@ fn run_facing(rt: &mut FieldRuntime, frames: u32, path: &[(i32, i32, i32)], at: 
                         rt.close_window(window);
                     }
                 }
-                Event::Command(Command::MapJump { field, x, y, triangle, dir }) | Event::Command(Command::Minigame { field, x, y, triangle, dir, .. }) => {
-                    out.jump = Some((field, x, y, triangle, dir));
-                    return out;
+                Event::Command(Command::MapJump { field, x, y, triangle, .. }) | Event::Command(Command::Minigame { field, x, y, triangle, .. }) => {
+                    out.jump = Some((field, x, y, triangle));
+                    return (out, at);
                 }
                 Event::Command(Command::Battle { formation }) => {
                     out.battles.push(formation);
@@ -118,20 +124,103 @@ fn run_facing(rt: &mut FieldRuntime, frames: u32, path: &[(i32, i32, i32)], at: 
                     out.movies.push(movie);
                     rt.complete_command();
                 }
-                Event::Command(c) if c.returns_to_field() => rt.complete_command(),
-                Event::Command(Command::DiscChange { .. }) => rt.complete_command(),
-                Event::Command(Command::GameOver) => return out,
+                Event::Command(Command::GameOver) => {
+                    out.game_over = true;
+                    return (out, at);
+                }
+                Event::Command(_) => rt.complete_command(),
                 _ => {}
             }
         }
     }
+    if rt.state.character_lock {
+        if let Some(m) = rt.pc_model() {
+            at = (m.x, m.y, m.z);
+        }
+    }
+    (out, at)
+}
+
+fn centre(walk: &Walkmesh, t: usize) -> Pos {
+    let v = walk.triangles[t];
+    let s = |f: fn(&fmv_ff7::field::Vertex) -> i16| (i32::from(f(&v[0])) + i32::from(f(&v[1])) + i32::from(f(&v[2]))) / 3;
+    (s(|p| p.x), s(|p| p.y), s(|p| p.z))
+}
+
+/// The triangles the player can walk to from `from` without entering a locked one.
+fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
+    let mut seen = vec![false; walk.triangles.len()];
+    if from >= seen.len() {
+        return seen;
+    }
+    seen[from] = true;
+    let mut queue = VecDeque::from([from]);
+    while let Some(t) = queue.pop_front() {
+        for &n in &walk.access[t] {
+            let n = usize::from(n);
+            if n < seen.len() && !seen[n] && !rt.triangle_locked(n as u16) {
+                seen[n] = true;
+                queue.push_back(n);
+            }
+        }
+    }
+    seen
+}
+
+/// One step of a route.
+struct Step {
+    text: String,
+    parent: Option<Rc<Step>>,
+}
+
+fn chain(step: &Option<Rc<Step>>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = step.clone();
+    while let Some(s) = cur {
+        out.push(s.text.clone());
+        cur = s.parent.clone();
+    }
+    out.reverse();
     out
 }
 
-fn open(lgp: &mut LgpArchive<std::fs::File>, name: &str) -> Option<(FieldFile, Arc<fmv_ff7::field::Walkmesh>)> {
-    let field = load_field(lgp, name).ok()?;
-    let walk = Arc::new(field.walkmesh().ok()?);
-    Some((field, walk))
+struct State {
+    field: String,
+    /// The running field (`None`: enter `field` fresh with `banks`).
+    rt: Option<FieldRuntime>,
+    banks: Banks,
+    pos: Option<Pos>,
+    tri: Option<usize>,
+    via: Option<Rc<Step>>,
+    /// What the field carries besides the story (items, gil): taken from the field before.
+    carry: Option<(fmv_ff7::runtime::PartySaveData, Option<u32>)>,
+}
+
+struct Queued {
+    key: (u16, i32, u64),
+    state: State,
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for Queued {}
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+struct Loaded {
+    field: FieldFile,
+    walk: Arc<Walkmesh>,
 }
 
 fn main() {
@@ -140,15 +229,17 @@ fn main() {
         return;
     };
     let mut args = std::env::args().skip(1);
-    let (mut field_name, mut steps, mut start_moment) = ("md1stin".to_string(), 60u32, None::<u16>);
+    let (mut start_field, mut steps, mut start_moment, mut route_out) = ("md1stin".to_string(), 200u32, None::<u16>, None::<String>);
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
+    let mut start_tri: Option<usize> = None;
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
-            "--from" => field_name = v,
+            "--from" => start_field = v,
             "--steps" => steps = v.parse().unwrap_or(steps),
             "--moment" => start_moment = v.parse().ok(),
-            // --set SELECTOR:ADDRESS=VALUE (e.g. 3:223=7), any number of times
+            "--route-out" => route_out = Some(v),
+            "--tri" => start_tri = v.parse().ok(),
             "--set" => {
                 if let Some((sa, val)) = v.split_once('=') {
                     if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
@@ -174,288 +265,294 @@ fn main() {
             banks.set(base + usize::from(*addr), *val);
         }
     }
-    let mut arrival: Option<(i32, i32, i32)> = None;
-    let mut visited = Vec::new();
-    let mut seen: Vec<(String, u16)> = Vec::new();
-    // Untried gateway choices: (field, banks, arrival, seen, step label), most recent last.
-    let mut alternatives: Vec<(String, Banks, Option<(i32, i32, i32)>, Vec<(String, u16)>, String, Option<FieldRuntime>)> = Vec::new();
-    let mut best_moment = 0u16;
-    let mut actions: Vec<(String, u16)> = Vec::new();
-    let mut images: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
-    let mut entered: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
-    let mut carry: Option<(String, FieldRuntime)> = None;
-    for step in 0..steps {
-        // A field already entered with this very story leads where it led before: take the next alternative.
-        if carry.is_none() && !entered.insert((field_name.clone(), banks_key(&banks))) {
-            match alternatives.pop() {
-                Some((f, b, a, sn, _, keep)) => {
-                    if let Some(rt) = keep {
-                        carry = Some((f.clone(), rt));
-                    }
-                    field_name = f;
-                    banks = b;
-                    arrival = a;
-                    seen = sn;
-                    continue;
-                }
-                None => {
-                    println!("{step:>3} nothing left to try (best {best_moment})");
-                    break;
-                }
-            }
-        }
-        let Some((field, walk)) = open(&mut lgp, &field_name) else {
-            println!("STOP cannot load {field_name}");
+
+    let mut fields: BTreeMap<String, Option<Rc<Loaded>>> = BTreeMap::new();
+    let mut load = |name: &str, lgp: &mut LgpArchive<std::fs::File>| -> Option<Rc<Loaded>> {
+        fields
+            .entry(name.to_string())
+            .or_insert_with(|| {
+                let field = load_field(lgp, name).ok()?;
+                let walk = Arc::new(field.walkmesh().ok()?);
+                Some(Rc::new(Loaded { field, walk }))
+            })
+            .clone()
+    };
+
+    let mut heap: BinaryHeap<Queued> = BinaryHeap::new();
+    let mut seq = 0u64;
+    let mut push = |heap: &mut BinaryHeap<Queued>, state: State, score: i32| {
+        seq += 1;
+        heap.push(Queued { key: (moment_of(&state.banks), score, seq), state });
+    };
+    let start_pos = start_tri.and_then(|t| load(&start_field, &mut lgp).filter(|l| t < l.walk.triangles.len()).map(|l| centre(&l.walk, t)));
+    push(&mut heap, State { field: start_field, rt: None, banks, pos: start_pos, tri: start_tri, via: None, carry: None }, 9);
+
+    // (field, story, scratch-without-noise) images already expanded or queued.
+    let mut images: HashSet<(String, u64, u64)> = HashSet::new();
+    let mut entered: HashSet<(String, u64)> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut per_place: BTreeMap<(String, u16), u32> = BTreeMap::new();
+    let mut best: (u16, Option<Rc<Step>>, String) = (0, None, String::new());
+    let mut unloadable: Vec<String> = Vec::new();
+
+    let mut step = 0u32;
+    while step < steps {
+        let Some(Queued { state, .. }) = heap.pop() else {
+            println!("nothing left to try");
             break;
         };
-        let section = field.section(fmv_ff7::field::section::SCRIPT).expect("script");
-        // A step that stayed in the field goes on with the running field itself (its scratch, its scripts mid-way).
-        let mut rt = match carry.take() {
-            Some((f, rt)) if f == field_name => rt,
-            _ => {
-                let mut rt = FieldRuntime::new(section, banks.clone()).expect("runtime");
+        let State { field: field_name, rt, banks, pos, tri, via, carry } = state;
+        let Some(loaded) = load(&field_name, &mut lgp) else {
+            if !unloadable.contains(&field_name) {
+                println!("{step:>4} {field_name:<10} cannot be loaded (another game mode): {}", chain(&via).last().cloned().unwrap_or_default());
+                unloadable.push(field_name.clone());
+            }
+            continue;
+        };
+        let walk = Arc::clone(&loaded.walk);
+        let section = loaded.field.section(fmv_ff7::field::section::SCRIPT).expect("script");
+        let fresh = rt.is_none();
+        let mut rt = match rt {
+            Some(rt) => rt,
+            None => {
+                if !entered.insert((field_name.clone(), story_key(&banks))) {
+                    continue;
+                }
+                let Ok(mut rt) = FieldRuntime::new(section, banks.clone()) else { continue };
                 rt.set_walkmesh(Arc::clone(&walk));
+                if let Some((save, gil)) = &carry {
+                    rt.set_save_data(save.clone());
+                    rt.gil = *gil;
+                }
                 rt.init();
                 rt
             }
         };
-        let at = arrival.or_else(|| rt.pc_model().map(|m| (m.x, m.y, m.z)));
-        let before = moment(&rt);
-        best_moment = best_moment.max(before);
-        images.insert((field_name.clone(), story_key(&rt)));
-        images.insert((field_name.clone(), field_key(&rt)));
-        let settle = run(&mut rt, SETTLE_FRAMES, at, None);
-        visited.push(field_name.clone());
-        seen.push((field_name.clone(), before));
-        if let Some(jump) = settle.jump {
-            let to = maplist.name(jump.0).unwrap_or("?").to_string();
-            println!("{step:>3} {field_name:<10} moment {before}->{} on its own: battles {:?} movies {:?} windows {} -> {to}", moment(&rt), settle.battles, settle.movies, settle.windows);
-            banks = rt.mem.banks.clone();
-            field_name = to;
-            arrival = Some((i32::from(jump.1), i32::from(jump.2), 0));
+        let place = (field_name.clone(), moment_of(&rt.mem.banks));
+        let count = per_place.entry(place).or_insert(0);
+        if *count >= PER_PLACE {
             continue;
         }
-        // What the field does by itself over a probe's time: a probe's effect is what differs from this.
-        let mut baseline = rt.clone();
-        let _ = run(&mut baseline, PROBE_FRAMES, at, None);
-        // Scratch bytes that follow where the player stands (a script copying the player's triangle every frame) are not
-        // progress: find them by standing idle at two other places.
-        let mut noise = [false; 256];
-        for t in [0usize, walk.triangles.len() / 2, walk.triangles.len().saturating_sub(1)] {
-            if t >= walk.triangles.len() {
-                continue;
+        *count += 1;
+        step += 1;
+        visited.insert(field_name.clone());
+
+        // Where the player stands: where the state says, else where the field's own scripts put its character.
+        let mut at = pos.or_else(|| rt.pc_model().map(|m| (m.x, m.y, m.z))).unwrap_or_else(|| centre(&walk, 0));
+        // (an arrival's height is its triangle's)
+        if fresh {
+            if let Some(t) = tri.filter(|t| *t < walk.triangles.len()) {
+                at.2 = centre(&walk, t).2;
             }
-            let (x, y) = c_of(&walk, t);
+        }
+        let before = moment_of(&rt.mem.banks);
+        let settle = if fresh { run(&mut rt, SETTLE_FRAMES, &[], at, 0, false) } else { (Outcome::default(), at) };
+        let moved = settle.1 != at;
+        at = settle.1;
+        let now = moment_of(&rt.mem.banks);
+        if now > best.0 {
+            best = (now, via.clone(), field_name.clone());
+        }
+        let carry_out = Some((rt.save_data().clone(), rt.gil));
+        let enter = |to: &str, jump: (u16, i16, i16, i16), banks: Banks, via: Option<Rc<Step>>| State {
+            field: to.to_string(),
+            rt: None,
+            banks,
+            pos: Some((i32::from(jump.1), i32::from(jump.2), 0)),
+            tri: usize::try_from(jump.3).ok(),
+            via,
+            carry: carry_out.clone(),
+        };
+        if settle.0.game_over {
+            println!("{step:>4} {field_name:<10} game over on entry (moment {before})");
+            continue;
+        }
+        if let Some(jump) = settle.0.jump {
+            let to = maplist.name(jump.0).unwrap_or("?").to_string();
+            println!("{step:>4} {field_name:<10} moment {before}->{now} on its own: battles {:?} movies {:?} windows {} -> {to}", settle.0.battles, settle.0.movies, settle.0.windows);
+            let via = Some(Rc::new(Step { text: format!("{field_name}: (plays by itself, moment {before}->{now}) -> {to}"), parent: via }));
+            push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), 5);
+            continue;
+        }
+        let here = tri.filter(|_| fresh && !moved).or_else(|| rt.triangle_at(at.0, at.1, at.2).map(usize::from));
+        let Some(here) = here.filter(|t| *t < walk.triangles.len()) else {
+            println!("{step:>4} {field_name:<10} the player stands on no triangle at {at:?} (moment {now})");
+            continue;
+        };
+        let reach = reachable(&walk, &rt, here);
+        let reach_count = reach.iter().filter(|r| **r).count();
+
+        // What the field does by itself over a probe's time, and which scratch bytes only follow the player's position.
+        let mut baseline = rt.clone();
+        let _ = run(&mut baseline, PROBE_FRAMES, &[], at, 0, false);
+        let mut noise = [false; 256];
+        for t in (0..walk.triangles.len()).filter(|t| reach[*t]).step_by((reach_count / 4).max(1)).take(5) {
             let mut other = rt.clone();
-            let _ = run(&mut other, PROBE_FRAMES, Some((x, y, at.map_or(0, |a| a.2))), None);
+            let _ = run(&mut other, PROBE_FRAMES, &[], centre(&walk, t), 0, false);
             for (i, n) in noise.iter_mut().enumerate() {
                 *n |= other.mem.scratch[i] != baseline.mem.scratch[i];
             }
         }
-        let scratch_moved = |probe: &FieldRuntime| (0..256).any(|i| !noise[i] && probe.mem.scratch[i] != baseline.mem.scratch[i]);
-        // Try every triangle, standing and with OK.
-        let mut best: Option<(i32, usize, bool, FieldRuntime, Outcome)> = None;
-        // Every scored action, as a state to come back to: (score, field it leaves the player in, story, arrival).
-        let mut cands: Vec<(i32, String, Banks, Option<(i32, i32, i32)>, String, Option<FieldRuntime>)> = Vec::new();
-        for t in 0..walk.triangles.len() {
-            let v = walk.triangles[t];
-            let c = ((i32::from(v[0].x) + i32::from(v[1].x) + i32::from(v[2].x)) / 3, (i32::from(v[0].y) + i32::from(v[1].y) + i32::from(v[2].y)) / 3, (i32::from(v[0].z) + i32::from(v[1].z) + i32::from(v[2].z)) / 3);
-            for ok in [false, true] {
-                let mut probe = rt.clone();
-                let mut out = run(&mut probe, PROBE_FRAMES, Some(c), ok.then_some(2));
-                let changed = story_changed(&probe, &rt);
-                if (changed || out.windows > 0 || scratch_moved(&probe)) && out.jump.is_none() {
-                    // The scene it started may end in a map jump: let it play on.
-                    let more = run(&mut probe, 3600, Some(c), None);
-                    out.jump = more.jump;
-                    out.battles.extend(more.battles);
-                    out.movies.extend(more.movies);
-                    out.windows += more.windows;
-                }
-                let moved = moment(&probe) > moment(&rt);
-                // A new field beats a flag (a lift's ride back is a flag that undoes the ride down).
-                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) {
-                    (true, true, _) => 5,
-                    (false, true, _) => 4,
-                    (true, false, _) => 3,
-                    (false, false, true) => 2,
-                    _ if scratch_moved(&probe) => 1,
-                    _ => 0,
-                };
-                // A jump back to a field already visited at this moment is a step back.
-                let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
-                let _ = back;
-                let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
-                let score = if images.contains(&(landed, key)) { 0 } else { score };
-                if score > 0 {
-                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    let keep = out.jump.is_none().then(|| probe.clone());
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
-                }
-                if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
-                    best = Some((score, t, ok, probe, out));
+        let scratch_key = |rt: &FieldRuntime| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (i, b) in rt.mem.scratch.iter().enumerate() {
+                if !noise[i] {
+                    h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
                 }
             }
+            h
+        };
+        // Where a player is, as far as walking goes: the reachable set it stands in (its lowest triangle and its size).
+        let place_of = |rt: &FieldRuntime, at: Pos| -> (usize, usize) {
+            match rt.triangle_at(at.0, at.1, at.2).map(usize::from) {
+                Some(t) => {
+                    let r = reachable(&walk, rt, t);
+                    (r.iter().position(|x| *x).unwrap_or(t), r.iter().filter(|x| **x).count())
+                }
+                None => (usize::MAX, 0),
+            }
+        };
+        let here_place = (reach.iter().position(|x| *x).unwrap_or(here), reach_count);
+        let image_key = |rt: &FieldRuntime, place: (usize, usize)| scratch_key(rt) ^ (place.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (place.1 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        images.insert((field_name.clone(), story_key(&rt.mem.banks), image_key(&baseline, here_place)));
+
+        // The actions: (label, path, stand, dir, ok).
+        let mut actions: Vec<(String, Vec<Pos>, Pos, u8, bool)> = Vec::new();
+        for t in (0..walk.triangles.len()).filter(|t| reach[*t]) {
+            let c = centre(&walk, t);
+            actions.push((format!("tri {t}"), Vec::new(), c, 0, false));
+            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true));
         }
-        // Talk: stand beside each talkable model, facing it, and press OK.
+        let on_reach = |rt: &FieldRuntime, p: Pos| rt.triangle_at(p.0, p.1, p.2).is_some_and(|t| reach.get(usize::from(t)).copied().unwrap_or(false));
         let pc = rt.state.pc_model;
-        let talkable: Vec<(usize, i32, i32, i32)> = rt.models().iter().enumerate().filter(|(i, m)| Some(*i) != pc && !m.talk_off).map(|(i, m)| (i, m.x, m.y, m.z)).collect();
-        for (mi, mx, my, mz) in talkable {
-            for (ox, oy) in [(-40, 0), (40, 0), (0, -40), (0, 40)] {
-                let at = (mx + ox, my + oy, mz);
-                let dir = fmv_ff7::runtime::direction_of(i64::from(-ox), i64::from(-oy));
-                let mut probe = rt.clone();
-                let mut out = run_facing(&mut probe, PROBE_FRAMES, &[], Some(at), Some(2), dir);
-                if (story_changed(&probe, &rt) || out.windows > 0) && out.jump.is_none() {
-                    let more = run_facing(&mut probe, 3600, &[], Some(at), None, dir);
-                    out.jump = more.jump;
-                    out.battles.extend(more.battles);
-                    out.movies.extend(more.movies);
-                    out.windows += more.windows;
-                }
-                let moved = moment(&probe) > moment(&rt);
-                let changed = story_changed(&probe, &rt);
-                let score = match (out.jump.is_some(), moved, changed) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if scratch_moved(&probe) => 1, _ => 0 };
-                let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
-                let _ = back;
-                let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
-                let score = if images.contains(&(landed, key)) { 0 } else { score };
-                if score > 0 {
-                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    let keep = out.jump.is_none().then(|| probe.clone());
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
-                }
-                if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
-                    println!("    talk to model {mi} ({}) scores {score}", rt.entity_name(rt.models()[mi].entity).unwrap_or(""));
-                    best = Some((score, usize::MAX / 2 - mi, true, probe, out));
-                }
-                if score > 0 {
+        for (mi, m) in rt.models().iter().enumerate().filter(|(i, m)| Some(*i) != pc && !m.talk_off) {
+            for (ox, oy) in [(-40, 0), (40, 0), (0, -40), (0, 40), (-28, -28), (28, 28), (-28, 28), (28, -28)] {
+                let stand = (m.x + ox, m.y + oy, m.z);
+                if on_reach(&rt, stand) {
+                    let face = direction_of(i64::from(-ox), i64::from(-oy));
+                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true));
                     break;
                 }
             }
         }
-        // Lines: walk across each, and stand on its middle pressing OK.
-        let lines: Vec<_> = rt.lines().iter().filter(|l| l.active).map(|l| (l.a, l.b)).collect();
-        for (i, (a, b)) in lines.iter().enumerate() {
-            let (mx, my, mz) = ((i32::from(a.0) + i32::from(b.0)) / 2, (i32::from(a.1) + i32::from(b.1)) / 2, (i32::from(a.2) + i32::from(b.2)) / 2);
-            let (dx, dy) = (f64::from(b.0 - a.0), f64::from(b.1 - a.1));
+        for (li, l) in rt.lines().iter().enumerate().filter(|(_, l)| l.active) {
+            let mid = ((i32::from(l.a.0) + i32::from(l.b.0)) / 2, (i32::from(l.a.1) + i32::from(l.b.1)) / 2, (i32::from(l.a.2) + i32::from(l.b.2)) / 2);
+            let (dx, dy) = (f64::from(l.b.0 - l.a.0), f64::from(l.b.1 - l.a.1));
             let n = (dx * dx + dy * dy).sqrt().max(1.0);
             let (nx, ny) = (-dy / n, dx / n);
-            let walk: Vec<(i32, i32, i32)> = (-6..=6).map(|k| (mx + (nx * 5.0 * f64::from(k)) as i32, my + (ny * 5.0 * f64::from(k)) as i32, mz)).collect();
-            for (mode, path, ok) in [("across", walk.clone(), None), ("back across", walk.iter().rev().copied().collect(), None), ("on +ok", vec![], Some(2))] {
-                let mut probe = rt.clone();
-                let mut out = run_path(&mut probe, PROBE_FRAMES, &path, Some(*path.last().unwrap_or(&(mx, my, mz))), ok);
-                if (story_changed(&probe, &rt) || out.windows > 0) && out.jump.is_none() {
-                    let more = run(&mut probe, 3600, Some((mx, my, mz)), None);
-                    out.jump = more.jump;
-                    out.battles.extend(more.battles);
-                    out.movies.extend(more.movies);
-                    out.windows += more.windows;
-                }
-                let moved = moment(&probe) > moment(&rt);
-                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if scratch_moved(&probe) => 1, _ => 0 };
-                let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
-                let _ = back;
-                let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
-                let score = if images.contains(&(landed, key)) { 0 } else { score };
-                if score > 0 {
-                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    let keep = out.jump.is_none().then(|| probe.clone());
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
-                }
-                if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
-                    println!("    line {i} {mode} scores {score}");
-                    best = Some((score, usize::MAX - i, mode == "on +ok", probe, out));
+            let side = |k: i32| (mid.0 + (nx * 5.0 * f64::from(k)) as i32, mid.1 + (ny * 5.0 * f64::from(k)) as i32, mid.2);
+            let (a_side, b_side) = (side(-6), side(6));
+            let name = rt.entity_name(l.entity).unwrap_or("").to_string();
+            if on_reach(&rt, a_side) {
+                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false));
+            }
+            if on_reach(&rt, b_side) {
+                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false));
+            }
+            // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
+            // in front of the player), or on its middle when neither side can be stood on.
+            let mut stood = false;
+            for k in [-2, 2, -4, 4] {
+                let stand = side(k);
+                if on_reach(&rt, stand) {
+                    let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
+                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true));
+                    stood = true;
                 }
             }
-        }
-        let here = (field_name.clone(), moment(&rt));
-        let done_here = actions.iter().filter(|a| **a == here).count();
-        if done_here >= 6 {
-            best = None;
-        }
-        // The runners-up wait as alternatives (lowest score pushed first, so the best of them comes back first).
-        if let Some(b) = &best {
-            let chosen = (b.0, story_key(&b.3));
-            cands.sort_by_key(|c| c.0);
-            for c in cands {
-                if (c.0, banks_key(&c.2)) == chosen {
-                    continue;
-                }
-                let mut sn = seen.clone();
-                sn.push((field_name.clone(), moment(&rt)));
-                alternatives.push((c.1, c.2, c.3, sn, c.4, c.5));
+            if !stood && on_reach(&rt, mid) {
+                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true));
             }
         }
-        let Some((_, t, ok, probe, out)) = best else {
-            // No script moves things on: walk through a gateway of the field's data into a field not yet seen at this
-            // moment (the host's gateways, not a script's map jump).
-            let m = moment(&rt);
-            // Every gateway into a field not seen at this moment is a choice; the others wait as alternatives (a field never
-            // visited first, since the story mostly leads forward).
-            let mut choices: Vec<fmv_ff7::field::Gateway> = field.triggers().ok().map(|tr| {
-                tr.gateways.iter().filter(|g| g.target_field_id != fmv_ff7::field::Gateway::UNUSED_FIELD_ID)
-                    .filter(|g| maplist.name(g.target_field_id).is_some_and(|n| !seen.contains(&(n.to_string(), m))))
-                    .cloned().collect()
-            }).unwrap_or_default();
-            choices.sort_by_key(|g| maplist.name(g.target_field_id).is_some_and(|n| visited.iter().any(|v| v == n)));
-            let mut choices = choices.into_iter();
-            let Some(g) = choices.next() else {
-                println!("{step:>3} {field_name:<10} STUCK at moment {m} (best so far {best_moment})");
-                match alternatives.pop() {
-                    Some((f, b, a, sn, label, keep)) => {
-                        println!("    back to {label}");
-                        if let Some(rt) = keep {
-                            carry = Some((f.clone(), rt));
-                        }
-                        field_name = f;
-                        banks = b;
-                        arrival = a;
-                        seen = sn;
+
+        let mut kept = 0u32;
+        let mut line = Vec::new();
+        for (label, path, stand, face, ok) in actions {
+            let mut probe = rt.clone();
+            let (mut out, mut end) = run(&mut probe, PROBE_FRAMES, &path, stand, face, ok);
+            let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
+            let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
+            if (moved_story || moved_scratch || out.windows > 0 || probe.state.character_lock) && out.jump.is_none() && !out.game_over {
+                let (more, e) = run(&mut probe, FOLLOW_FRAMES, &[], end, face, false);
+                out.absorb(more);
+                end = e;
+            }
+            if out.game_over {
+                continue;
+            }
+            let after = moment_of(&probe.mem.banks);
+            let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
+            let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
+            // Somewhere the player could not have walked to (a jump, a ladder, a door a script opened).
+            let end_place = place_of(&probe, end);
+            let moved_place = out.jump.is_none() && end_place != here_place && end_place.1 > 0;
+            let score = match (out.jump.is_some(), after > now, moved_story) {
+                (true, true, _) => 5,
+                (false, true, _) => 4,
+                (true, false, _) => 3,
+                (false, false, true) => 2,
+                _ if moved_scratch || moved_place => 1,
+                _ => 0,
+            };
+            if score == 0 {
+                continue;
+            }
+            let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
+            match out.jump {
+                Some(jump) => {
+                    let to = maplist.name(jump.0).unwrap_or("?").to_string();
+                    if entered.contains(&(to.clone(), story_key(&probe.mem.banks))) {
                         continue;
                     }
-                    None => break,
+                    let via = Some(Rc::new(Step { text: format!("{summary} -> {to}"), parent: via.clone() }));
+                    line.push(format!("[{score}] {label} -> {to}"));
+                    push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);
                 }
-            };
-            for alt in choices.rev() {
-                let name = maplist.name(alt.target_field_id).unwrap_or("?").to_string();
-                let mut sn = seen.clone();
-                sn.push((field_name.clone(), m));
-                alternatives.push((name.clone(), rt.mem.banks.clone(), Some((i32::from(alt.destination[0]), i32::from(alt.destination[1]), 0)), sn, format!("{field_name} gateway -> {name} (moment {m})"), None));
+                None => {
+                    if !images.insert((field_name.clone(), story_key(&probe.mem.banks), image_key(&probe, end_place))) {
+                        continue;
+                    }
+                    let via = Some(Rc::new(Step { text: summary, parent: via.clone() }));
+                    line.push(format!("[{score}] {label}"));
+                    let banks = probe.mem.banks.clone();
+                    let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
+                    push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via, carry: None }, score);
+                }
             }
-            let to = maplist.name(g.target_field_id).unwrap_or("?").to_string();
-            println!("{step:>3} {field_name:<10} gateway -> {to} (moment {m})");
-            seen.push((field_name.clone(), m));
-            banks = rt.mem.banks.clone();
-            field_name = to;
-            arrival = Some((i32::from(g.destination[0]), i32::from(g.destination[1]), 0));
-            continue;
-        };
-        actions.push(here.clone());
-        let after = moment(&probe);
-        let to = out.jump.and_then(|j| maplist.name(j.0)).unwrap_or("-");
-        let what = if t > usize::MAX / 2 + 1000 { format!("line {}", usize::MAX - t) } else if t > walk.triangles.len() { format!("talk to model {}", usize::MAX / 2 - t) } else { format!("tri {t}") };
-        println!("{step:>3} {field_name:<10} {what}{} moment {}->{after}: battles {:?} movies {:?} windows {} -> {to}", if ok { " +ok" } else { "" }, moment(&rt), out.battles, out.movies, out.windows);
-        banks = probe.mem.banks.clone();
-        let probe = probe;
-        if let Some(jump) = out.jump {
-            field_name = maplist.name(jump.0).unwrap_or("?").to_string();
-            arrival = Some((i32::from(jump.1), i32::from(jump.2), 0));
-        } else {
-            // Same field: the next step goes on with this very field (its scratch and scripts as they are now).
-            arrival = if t < walk.triangles.len() { Some((c_of(&walk, t).0, c_of(&walk, t).1, 0)) } else { arrival };
-            carry = Some((field_name.clone(), probe));
+            kept += 1;
         }
+        // Gateways the player can reach, while the scripts allow map jumps.
+        let mut gates = 0;
+        if !rt.state.map_jumps_disabled {
+            let gateways: Vec<Gateway> = loaded.field.triggers().map(|t| t.gateways).unwrap_or_default();
+            for (gi, g) in gateways.iter().enumerate().filter(|(_, g)| g.target_field_id != Gateway::UNUSED_FIELD_ID) {
+                let mid = ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2, (i32::from(g.exit_a[2]) + i32::from(g.exit_b[2])) / 2);
+                let near = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().any(|(ox, oy)| on_reach(&rt, (mid.0 + ox, mid.1 + oy, mid.2)));
+                let Some(to) = maplist.name(g.target_field_id).map(str::to_string) else { continue };
+                if !near || entered.contains(&(to.clone(), story_key(&rt.mem.banks))) {
+                    continue;
+                }
+                let jump = (g.target_field_id, g.destination[0], g.destination[1], g.destination[2]);
+                let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), parent: via.clone() }));
+                let score = if visited.contains(&to) { 0 } else { 3 };
+                line.push(format!("[{score}] gate {gi} -> {to}"));
+                push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), score);
+                gates += 1;
+            }
+        }
+        line.sort_by(|a, b| b.cmp(a));
+        println!(
+            "{step:>4} {field_name:<10} moment {now} tri {here} reach {reach_count}/{}: {kept} actions, {gates} gates{}",
+            walk.triangles.len(),
+            if line.is_empty() { String::new() } else { format!(": {}", line.iter().take(4).cloned().collect::<Vec<_>>().join("; ")) }
+        );
     }
-}
-
-fn c_of(walk: &fmv_ff7::field::Walkmesh, t: usize) -> (i32, i32) {
-    let v = walk.triangles[t];
-    ((i32::from(v[0].x) + i32::from(v[1].x) + i32::from(v[2].x)) / 3, (i32::from(v[0].y) + i32::from(v[1].y) + i32::from(v[2].y)) / 3)
+    println!("\nfurthest: moment {} in {} ({} expansions; other modes met: {unloadable:?})", best.0, best.2, step);
+    let route = chain(&best.1);
+    for l in &route {
+        println!("  {l}");
+    }
+    if let Some(path) = route_out {
+        let _ = std::fs::write(path, route.join("\n") + "\n");
+    }
 }
