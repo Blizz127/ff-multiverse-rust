@@ -43,6 +43,16 @@ fn story_key(rt: &FieldRuntime) -> u64 {
     banks_key(&rt.mem.banks)
 }
 
+/// The story plus the field's own scratch (what a step inside one field changes).
+fn field_key(rt: &FieldRuntime) -> u64 {
+    let mut h = story_key(rt);
+    for b in rt.mem.scratch.iter() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 fn banks_key(banks: &Banks) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for i in 0..fmv_ff7::runtime::PERSISTENT_BYTES {
@@ -131,12 +141,23 @@ fn main() {
     };
     let mut args = std::env::args().skip(1);
     let (mut field_name, mut steps, mut start_moment) = ("md1stin".to_string(), 60u32, None::<u16>);
+    let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
             "--from" => field_name = v,
             "--steps" => steps = v.parse().unwrap_or(steps),
             "--moment" => start_moment = v.parse().ok(),
+            // --set SELECTOR:ADDRESS=VALUE (e.g. 3:223=7), any number of times
+            "--set" => {
+                if let Some((sa, val)) = v.split_once('=') {
+                    if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
+                        if let (Ok(sel), Ok(addr)) = (sel.parse::<u8>(), addr.parse::<u8>()) {
+                            sets.push((sel, addr, val));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -148,20 +169,29 @@ fn main() {
         banks.set(0, lo);
         banks.set(1, hi);
     }
+    for (sel, addr, val) in &sets {
+        if let Some(base) = fmv_ff7::runtime::memory::base_of(*sel) {
+            banks.set(base + usize::from(*addr), *val);
+        }
+    }
     let mut arrival: Option<(i32, i32, i32)> = None;
     let mut visited = Vec::new();
     let mut seen: Vec<(String, u16)> = Vec::new();
     // Untried gateway choices: (field, banks, arrival, seen, step label), most recent last.
-    let mut alternatives: Vec<(String, Banks, Option<(i32, i32, i32)>, Vec<(String, u16)>, String)> = Vec::new();
+    let mut alternatives: Vec<(String, Banks, Option<(i32, i32, i32)>, Vec<(String, u16)>, String, Option<FieldRuntime>)> = Vec::new();
     let mut best_moment = 0u16;
     let mut actions: Vec<(String, u16)> = Vec::new();
     let mut images: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
     let mut entered: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut carry: Option<(String, FieldRuntime)> = None;
     for step in 0..steps {
         // A field already entered with this very story leads where it led before: take the next alternative.
-        if !entered.insert((field_name.clone(), banks_key(&banks))) {
+        if carry.is_none() && !entered.insert((field_name.clone(), banks_key(&banks))) {
             match alternatives.pop() {
-                Some((f, b, a, sn, _)) => {
+                Some((f, b, a, sn, _, keep)) => {
+                    if let Some(rt) = keep {
+                        carry = Some((f.clone(), rt));
+                    }
                     field_name = f;
                     banks = b;
                     arrival = a;
@@ -179,13 +209,21 @@ fn main() {
             break;
         };
         let section = field.section(fmv_ff7::field::section::SCRIPT).expect("script");
-        let mut rt = FieldRuntime::new(section, banks.clone()).expect("runtime");
-        rt.set_walkmesh(Arc::clone(&walk));
-        rt.init();
+        // A step that stayed in the field goes on with the running field itself (its scratch, its scripts mid-way).
+        let mut rt = match carry.take() {
+            Some((f, rt)) if f == field_name => rt,
+            _ => {
+                let mut rt = FieldRuntime::new(section, banks.clone()).expect("runtime");
+                rt.set_walkmesh(Arc::clone(&walk));
+                rt.init();
+                rt
+            }
+        };
         let at = arrival.or_else(|| rt.pc_model().map(|m| (m.x, m.y, m.z)));
         let before = moment(&rt);
         best_moment = best_moment.max(before);
         images.insert((field_name.clone(), story_key(&rt)));
+        images.insert((field_name.clone(), field_key(&rt)));
         let settle = run(&mut rt, SETTLE_FRAMES, at, None);
         visited.push(field_name.clone());
         seen.push((field_name.clone(), before));
@@ -197,10 +235,13 @@ fn main() {
             arrival = Some((i32::from(jump.1), i32::from(jump.2), 0));
             continue;
         }
+        // What the field does by itself over a probe's time: a probe's effect is what differs from this.
+        let mut baseline = rt.clone();
+        let _ = run(&mut baseline, PROBE_FRAMES, at, None);
         // Try every triangle, standing and with OK.
         let mut best: Option<(i32, usize, bool, FieldRuntime, Outcome)> = None;
         // Every scored action, as a state to come back to: (score, field it leaves the player in, story, arrival).
-        let mut cands: Vec<(i32, String, Banks, Option<(i32, i32, i32)>, String)> = Vec::new();
+        let mut cands: Vec<(i32, String, Banks, Option<(i32, i32, i32)>, String, Option<FieldRuntime>)> = Vec::new();
         for t in 0..walk.triangles.len() {
             let v = walk.triangles[t];
             let c = ((i32::from(v[0].x) + i32::from(v[1].x) + i32::from(v[2].x)) / 3, (i32::from(v[0].y) + i32::from(v[1].y) + i32::from(v[2].y)) / 3, (i32::from(v[0].z) + i32::from(v[1].z) + i32::from(v[2].z)) / 3);
@@ -208,7 +249,7 @@ fn main() {
                 let mut probe = rt.clone();
                 let mut out = run(&mut probe, PROBE_FRAMES, Some(c), ok.then_some(2));
                 let changed = story_changed(&probe, &rt);
-                if (changed || out.windows > 0) && out.jump.is_none() {
+                if (changed || out.windows > 0 || probe.mem.scratch != baseline.mem.scratch) && out.jump.is_none() {
                     // The scene it started may end in a map jump: let it play on.
                     let more = run(&mut probe, 3600, Some(c), None);
                     out.jump = more.jump;
@@ -223,17 +264,20 @@ fn main() {
                     (false, true, _) => 4,
                     (true, false, _) => 3,
                     (false, false, true) => 2,
+                    _ if probe.mem.scratch != baseline.mem.scratch => 1,
                     _ => 0,
                 };
                 // A jump back to a field already visited at this moment is a step back.
                 let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
+                let score = if images.contains(&(landed, key)) { 0 } else { score };
                 if score > 0 {
                     let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                     let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                    let keep = out.jump.is_none().then(|| probe.clone());
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
                 }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     best = Some((score, t, ok, probe, out));
@@ -258,15 +302,17 @@ fn main() {
                 }
                 let moved = moment(&probe) > moment(&rt);
                 let changed = story_changed(&probe, &rt);
-                let score = match (out.jump.is_some(), moved, changed) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ => 0 };
+                let score = match (out.jump.is_some(), moved, changed) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if probe.mem.scratch != baseline.mem.scratch => 1, _ => 0 };
                 let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
+                let score = if images.contains(&(landed, key)) { 0 } else { score };
                 if score > 0 {
                     let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                     let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                    let keep = out.jump.is_none().then(|| probe.clone());
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
                 }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     println!("    talk to model {mi} ({}) scores {score}", rt.entity_name(rt.models()[mi].entity).unwrap_or(""));
@@ -296,15 +342,17 @@ fn main() {
                     out.windows += more.windows;
                 }
                 let moved = moment(&probe) > moment(&rt);
-                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ => 0 };
+                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if probe.mem.scratch != baseline.mem.scratch => 1, _ => 0 };
                 let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
-                let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                let key = if out.jump.is_some() { story_key(&probe) } else { field_key(&probe) };
+                let score = if images.contains(&(landed, key)) { 0 } else { score };
                 if score > 0 {
                     let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                     let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
-                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                    let keep = out.jump.is_none().then(|| probe.clone());
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe)), keep));
                 }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     println!("    line {i} {mode} scores {score}");
@@ -327,7 +375,7 @@ fn main() {
                 }
                 let mut sn = seen.clone();
                 sn.push((field_name.clone(), moment(&rt)));
-                alternatives.push((c.1, c.2, c.3, sn, c.4));
+                alternatives.push((c.1, c.2, c.3, sn, c.4, c.5));
             }
         }
         let Some((_, t, ok, probe, out)) = best else {
@@ -346,8 +394,11 @@ fn main() {
             let Some(g) = choices.next() else {
                 println!("{step:>3} {field_name:<10} STUCK at moment {m} (best so far {best_moment})");
                 match alternatives.pop() {
-                    Some((f, b, a, sn, label)) => {
+                    Some((f, b, a, sn, label, keep)) => {
                         println!("    back to {label}");
+                        if let Some(rt) = keep {
+                            carry = Some((f.clone(), rt));
+                        }
                         field_name = f;
                         banks = b;
                         arrival = a;
@@ -361,7 +412,7 @@ fn main() {
                 let name = maplist.name(alt.target_field_id).unwrap_or("?").to_string();
                 let mut sn = seen.clone();
                 sn.push((field_name.clone(), m));
-                alternatives.push((name.clone(), rt.mem.banks.clone(), Some((i32::from(alt.destination[0]), i32::from(alt.destination[1]), 0)), sn, format!("{field_name} gateway -> {name} (moment {m})")));
+                alternatives.push((name.clone(), rt.mem.banks.clone(), Some((i32::from(alt.destination[0]), i32::from(alt.destination[1]), 0)), sn, format!("{field_name} gateway -> {name} (moment {m})"), None));
             }
             let to = maplist.name(g.target_field_id).unwrap_or("?").to_string();
             println!("{step:>3} {field_name:<10} gateway -> {to} (moment {m})");
@@ -377,12 +428,14 @@ fn main() {
         let what = if t > usize::MAX / 2 + 1000 { format!("line {}", usize::MAX - t) } else if t > walk.triangles.len() { format!("talk to model {}", usize::MAX / 2 - t) } else { format!("tri {t}") };
         println!("{step:>3} {field_name:<10} {what}{} moment {}->{after}: battles {:?} movies {:?} windows {} -> {to}", if ok { " +ok" } else { "" }, moment(&rt), out.battles, out.movies, out.windows);
         banks = probe.mem.banks.clone();
+        let probe = probe;
         if let Some(jump) = out.jump {
             field_name = maplist.name(jump.0).unwrap_or("?").to_string();
             arrival = Some((i32::from(jump.1), i32::from(jump.2), 0));
         } else {
-            // Same field: run on from the probe's state in the next step (re-entering keeps the story, not the field's scratch).
+            // Same field: the next step goes on with this very field (its scratch and scripts as they are now).
             arrival = if t < walk.triangles.len() { Some((c_of(&walk, t).0, c_of(&walk, t).1, 0)) } else { arrival };
+            carry = Some((field_name.clone(), probe));
         }
     }
 }

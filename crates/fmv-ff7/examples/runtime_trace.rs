@@ -29,6 +29,7 @@ fn main() {
     };
     let (mut frames, mut every, mut at, mut ok_every, mut moment) = (600u64, 150u64, None, 0u64, None);
     let (mut after, mut then_tri) = (0u64, None::<usize>);
+    let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
@@ -38,6 +39,15 @@ fn main() {
             "--moment" => moment = v.parse::<u16>().ok(),
             "--at" => at = v.split_once(',').and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?))),
             "--after" => after = v.parse().unwrap_or(0),
+            "--set" => {
+                if let Some((sa, val)) = v.split_once('=') {
+                    if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
+                        if let (Ok(sel), Ok(addr)) = (sel.parse::<u8>(), addr.parse::<u8>()) {
+                            sets.push((sel, addr, val));
+                        }
+                    }
+                }
+            }
             "--then-tri" => then_tri = v.parse::<usize>().ok(),
             _ => {}
         }
@@ -50,6 +60,11 @@ fn main() {
         let [lo, hi] = m.to_le_bytes();
         banks.set(0, lo);
         banks.set(1, hi);
+    }
+    for (sel, addr, val) in &sets {
+        if let Some(base) = fmv_ff7::runtime::memory::base_of(*sel) {
+            banks.set(base + usize::from(*addr), *val);
+        }
     }
     let mut rt = FieldRuntime::new(section, banks).expect("runtime");
     if let Ok(w) = field.walkmesh() {
