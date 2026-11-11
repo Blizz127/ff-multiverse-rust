@@ -5,11 +5,13 @@
 # Usage: scripts/resume-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR] [--keep-logs] [-h|--help]
 #
 # WHAT IT PROVES (the owner's own files read-only, temp state only):
-#   * session 1: a new account joins in md1stin like everyone, walks through md1stin's exit into md1_1 and its client
-#     ends there; the server saves where it stood (`progression/<id>/Ff7.location.json`: md1_1, its position, its story);
+#   * session 1: a new account joins in md1stin like everyone, walks through md1_1 into md1_2 and its client ends there
+#     (moment 8: a story that stands nowhere in particular); the server saves where it stood
+#     (`progression/<id>/Ff7.location.json`: md1_2, its position, its story). (Not md1_1: at moment 7 the team talk's own
+#     MAPJUMP says the story stands in md1_2, so a spot left in md1_1 then is rightly sent on.)
 #   * the server restarts on the same state directory;
-#   * session 2: the same account logs in and is put back on that spot (`resumed account=... area=md1_1 at=(x,y,z)`,
-#     the saved position), its client ends in md1_1, not in md1stin where a login used to put everyone;
+#   * session 2: the same account logs in and is put back on that spot (`resumed account=... area=md1_2 at=(x,y,z)`,
+#     the saved position), its client ends in md1_2, not in md1stin where a login used to put everyone;
 #   * nothing but the saved spot changed in the state directory across session 2 (a login is no story step).
 # (`scripts/travel-smoke.sh --escape` is the run that proves a story whose entry is elsewhere still goes there: its
 # re-login at moment 33 lands in md8_4, not in nrthmk where its client ended.)
@@ -35,8 +37,8 @@ resume_usage() {
   cat <<'EOF'
 Usage: scripts/resume-smoke.sh [--release|--debug] [--bin-dir DIR] [--build] [--library STATE_DIR] [--keep-logs] [-h|--help]
 
-One real headless player walks from md1stin into md1_1 and stops; the server restarts; the player logs in again and
-must come back in md1_1 on the spot it saved (MMO-style saving), with nothing else of the state directory changed.
+One real headless player walks from md1stin through md1_1 into md1_2 and stops; the server restarts; the player logs in
+again and must come back in md1_2 on the spot it saved (MMO-style saving), with nothing else of the state directory changed.
 EOF
 }
 
@@ -74,16 +76,16 @@ run_resume() {
   export FMV_AUDIO=null
   [[ $(realpath -- "$WORK") == /tmp/* || $(realpath -- "$WORK") == "${TMPDIR:-/tmp}"/* ]] || fail "the work directory is not a temporary one: $WORK"
 
-  # ---- session 1: a new account walks into md1_1 and leaves there ----
+  # ---- session 1: a new account walks into md1_2 and leaves there ----
   start_resume_server "$WORK/s1-server.log" 0
   local port="${ADDR##*:}" s1="$WORK/s1-server.log"
-  start_player A r1 40 "$NAME_A" --travel md1_1 --mods off
-  wait_clients $((40 + CLIENT_GRACE))
+  start_player A r1 60 "$NAME_A" --travel md1_1,md1_2 --mods off
+  wait_clients $((60 + CLIENT_GRACE))
   judge_exit r1 A
   local smoke_line
   if smoke_line=$(last_line_with "$WORK/r1-client-A.log" "SMOKE name="); then
     smoke_line=$(strip_ansi "$smoke_line")
-    expect_equal "where the player ends session 1" "$(field "$smoke_line" area)" "Ff7/md1_1"
+    expect_equal "where the player ends session 1" "$(field "$smoke_line" area)" "Ff7/md1_2"
   else
     problem "client A printed no SMOKE line in session 1"
   fi
@@ -91,7 +93,7 @@ run_resume() {
   local spot_file spot1
   spot_file=$(find "$WORK/server-state/progression" -name 'Ff7.location.json' | head -1)
   spot1=$(saved_spot "$spot_file" || true)
-  [[ $spot1 == "md1_1 "* ]] || problem "the server saved no spot in md1_1 when the player left (got '${spot1:-nothing}' in '${spot_file:-no file}')"
+  [[ $spot1 == "md1_2 "* ]] || problem "the server saved no spot in md1_2 when the player left (got '${spot1:-nothing}' in '${spot_file:-no file}')"
   local digest_after_1
   digest_after_1=$(tree_digest "$WORK/server-state")
 
@@ -104,14 +106,14 @@ run_resume() {
   judge_exit r2 A
   local resumed
   resumed=$(strip_ansi "$(last_line_with "$s2" "resumed account=" || true)")
-  [[ $resumed == *" area=md1_1 at=("* ]] || problem "the returning account was not put back in md1_1: '${resumed:-$(last_line_with "$s2" "saved spot" || echo nothing)}'"
+  [[ $resumed == *" area=md1_2 at=("* ]] || problem "the returning account was not put back in md1_2: '${resumed:-$(last_line_with "$s2" "saved spot" || echo nothing)}'"
   # The saved spot and the one it was put back on are the same (whole units: the line prints whole units).
   local x y z
   read -r _ x y z <<<"$spot1"
   [[ $resumed == *"at=($x,$y,$z)"* ]] || problem "the account was put back at another spot than the saved ($x,$y,$z): '$resumed'"
   if smoke_line=$(last_line_with "$WORK/r2-client-A.log" "SMOKE name="); then
     smoke_line=$(strip_ansi "$smoke_line")
-    expect_equal "where the returning player stands" "$(field "$smoke_line" area)" "Ff7/md1_1"
+    expect_equal "where the returning player stands" "$(field "$smoke_line" area)" "Ff7/md1_2"
     expect_equal "moves refused after the restart (nothing is stuck)" "$(field "$smoke_line" rejected)" "0"
   else
     problem "client A printed no SMOKE line after the restart"
@@ -123,7 +125,7 @@ run_resume() {
   expect_equal "a login rewrote something other than the saved spot" "$(tree_digest "$WORK/server-state")" "$digest_after_1"
   local spot2
   spot2=$(saved_spot "$spot_file" || true)
-  [[ $spot2 == "md1_1 "* ]] || problem "after session 2 the saved spot is no longer in md1_1: '${spot2:-nothing}'"
+  [[ $spot2 == "md1_2 "* ]] || problem "after session 2 the saved spot is no longer in md1_2: '${spot2:-nothing}'"
 
   after=$(ls -A -- "$state_real" | sort | tr '\n' ' ')
   expect_equal "the contents of $state_real" "$after" "$before"
@@ -132,7 +134,7 @@ run_resume() {
     finish_failed
   fi
   RESULT=pass
-  say "RESUME-SMOKE left=md1_1 at=($x,$y,$z) restarted=yes back=md1_1 resumed=\"$resumed\""
+  say "RESUME-SMOKE left=md1_2 at=($x,$y,$z) restarted=yes back=md1_2 resumed=\"$resumed\""
   say "PASS"
 }
 
