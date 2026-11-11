@@ -7,7 +7,7 @@
 //! [`fmv_ff7::background::depth`], where the rule, `4 * id` in camera-space units, is derived and
 //! verified on the owned data). A [`Scenery`] is that picture prepared for the GPU once per field:
 //!
-//! * the pixels of every tile in **one atlas** (premultiplied, sampled with the linear filter and a
+//! * the pixels of every tile in **one atlas** (premultiplied, sampled with Linear by default or optional Nearest and a
 //!   per-tile clamp so a tile never reads its neighbour; the texels a nearer tile covers carry the
 //!   colour of what covers them, see below), plus one opaque black texel row that the *base* quad
 //!   samples;
@@ -23,8 +23,9 @@
 //!
 //! # Hidden texels
 //!
-//! A tile is drawn with the linear filter (the picture is shown at any window size, and the flat
-//! picture it replaces was filtered too) and cut out at half alpha. Where an object stands in front
+//! A tile is drawn with Linear by default (Nearest is optional) and cut out at half alpha.
+//! The picture is shown at any window size, and the flat picture it replaces uses the same choice.
+//! Where an object stands in front
 //! of the back layer, the back layer's tile still holds what is under the object: in `md1stin` 6 277
 //! pure-green key-colour pixels that the artists left there. The filter reads those texels next to
 //! the object's silhouette, so a bright green line would run round it. [`Scenery::choose`] therefore

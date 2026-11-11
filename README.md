@@ -332,8 +332,9 @@ the player at the range's corner, the team talk's scroll).
 
 *Optional graphics.* **F5**, or a controller's **left stick pressed in (L3/LS)**, opens Graphics while
 you have control in the field. Arrows or the D-pad choose a row, left/right or **Enter/A** change a
-setting, and **Esc/B** or F5/L3 close it. The panel shows edge smoothing, scene resolution, the
-resolution currently in use, and **Restore defaults** (smoothing off and native resolution). Your
+setting, and **Esc/B** or F5/L3 close it. The panel shows edge smoothing, scene resolution, background
+filtering, the resolution currently in use, and **Restore defaults** (smoothing off, native resolution
+and Linear background filtering). Your
 character stands still while it is open; the game continues. Dialogue, story scenes, battles, field
 changes and loss of window focus close the panel. Release held movement controls before moving again.
 The panel is drawn at native UI resolution, with the same sharp text as the HUD.
@@ -351,14 +352,21 @@ exceeds the GPU's texture dimension limit or 16,777,216 internal pixels, the sce
 retaining the requested setting and FXAA choice. The F4 notice distinguishes that fallback; the client log records
 it for each affected window size. This allocation bound allows 2x at 2560x1440, but falls back at 3840x2160.
 
-Both choices are saved atomically in `graphics.json` under the client state directory (`--state-dir`, else the usual
-library state directory's `client/`), for example `{"anti_aliasing":"fxaa","render_scale":"2x"}`. The defaults are
-`"off"` and `"native"`; older settings without `render_scale` stay native. Invalid settings are left untouched;
+**Background filtering** in Graphics chooses **Linear** (the existing default, which blends adjacent texels) or
+**Nearest** (which keeps individual background texels distinct when enlarged). It applies to field backgrounds,
+including tiles in front of characters, independently of model textures and the native HUD. Battle locations and
+characters are 3D models, so their texture filtering stays unchanged. FXAA and 2x can still soften the completed
+image when Nearest is selected. Switching back to Linear restores the previous sampling.
+
+All three choices are saved atomically in `graphics.json` under the client state directory (`--state-dir`, else the usual
+library state directory's `client/`), for example `{"anti_aliasing":"fxaa","render_scale":"2x","background_filter":"nearest"}`.
+The defaults are `"off"`, `"native"` and `"linear"`; older settings without a choice keep its default. Invalid settings are left untouched;
 a failure to save still changes the current session and displays a notice. GPU regressions check edge coverage,
 unchanged UI pixels and model framing, foreground depth, resizing, fallback, and exact restoration when disabled:
 `cargo test -p fmv-client offscreen_fxaa -- --ignored` and
 `cargo test -p fmv-client offscreen_supersample -- --ignored` (the real-field comparisons also need owned FF7 data).
 The panel's offscreen check is `cargo test -p fmv-client offscreen_graphics_panel -- --ignored`.
+Background filtering checks use `cargo test -p fmv-client offscreen_background_filter -- --ignored`.
 
 *Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
 it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the

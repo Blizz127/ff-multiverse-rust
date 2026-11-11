@@ -1,7 +1,7 @@
 //! Optional presentation settings, separate from game state. F3 toggles edge smoothing and F4
-//! toggles the scene's render resolution. The original render path is the default; choices persist in the client's
+//! toggles the scene's render resolution. Current defaults are preserved; choices persist in the client's
 //! `graphics.json`, using the same atomic writer as the local character notes.
-//! [`panel`] exposes those same choices and a single restore-defaults action over the running game.
+//! [`panel`] also exposes independent field-background sampling and a single restore-defaults action over the running game.
 
 pub mod fxaa;
 pub mod panel;
@@ -46,10 +46,33 @@ impl RenderScale {
     }
 }
 
+/// Field-background sampling, independent of scene edge smoothing and render resolution.
+/// Linear preserves the existing presentation when an older settings file has no choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackgroundFilter {
+    #[default]
+    Linear,
+    Nearest,
+}
+
+impl BackgroundFilter {
+    pub fn filter_mode(self) -> wgpu::FilterMode {
+        match self { Self::Linear => wgpu::FilterMode::Linear, Self::Nearest => wgpu::FilterMode::Nearest }
+    }
+
+    pub fn notice(self) -> &'static str {
+        match self {
+            Self::Linear => "Background filtering: Linear",
+            Self::Nearest => "Background filtering: Nearest",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Settings {
     pub anti_aliasing: AntiAliasing,
     pub render_scale: RenderScale,
+    pub background_filter: BackgroundFilter,
     path: Option<PathBuf>,
     // Preserve options owned by future increments when saving this one.
     values: serde_json::Map<String, serde_json::Value>,
@@ -61,7 +84,7 @@ impl Settings {
         match Self::read(&path) {
             Ok(mut settings) => { settings.path = Some(path); settings }
             Err(e) => {
-                eprintln!("graphics: {e}; using original graphics, leaving graphics.json unchanged");
+                eprintln!("graphics: {e}; using graphics defaults, leaving graphics.json unchanged");
                 Self::default()
             }
         }
@@ -91,7 +114,13 @@ impl Settings {
             Some("2x") => RenderScale::Double,
             _ => return Err("unknown render_scale option".to_string()),
         };
-        Ok(Self { anti_aliasing, render_scale, path: None, values })
+        let background_filter = match values.get("background_filter").and_then(serde_json::Value::as_str) {
+            None if !values.contains_key("background_filter") => BackgroundFilter::Linear,
+            Some("linear") => BackgroundFilter::Linear,
+            Some("nearest") => BackgroundFilter::Nearest,
+            _ => return Err("unknown background_filter option".to_string()),
+        };
+        Ok(Self { anti_aliasing, render_scale, background_filter, path: None, values })
     }
 
     /// Change the current session, then atomically remember it. An unwritable or invalid file
@@ -117,11 +146,26 @@ impl Settings {
         Ok(self.render_scale)
     }
 
-    /// Restore both original presentation choices with one atomic save, preserving unrelated
-    /// options. Both take effect for this session even when the file cannot be written.
+    /// Background sampling remains independent of FXAA and the scene's rendering resolution.
+    pub fn toggle_background_filter(&mut self) -> Result<BackgroundFilter, std::io::Error> {
+        self.set_background_filter(match self.background_filter {
+            BackgroundFilter::Linear => BackgroundFilter::Nearest,
+            BackgroundFilter::Nearest => BackgroundFilter::Linear,
+        })
+    }
+
+    pub fn set_background_filter(&mut self, filter: BackgroundFilter) -> Result<BackgroundFilter, std::io::Error> {
+        self.background_filter = filter;
+        self.save()?;
+        Ok(self.background_filter)
+    }
+
+    /// Restore all three default presentation choices with one atomic save, preserving unrelated
+    /// options. All take effect for this session even when the file cannot be written.
     pub fn restore_defaults(&mut self) -> Result<(), std::io::Error> {
         self.anti_aliasing = AntiAliasing::Off;
         self.render_scale = RenderScale::Native;
+        self.background_filter = BackgroundFilter::Linear;
         self.save()
     }
 
@@ -132,6 +176,8 @@ impl Settings {
         self.values.insert("anti_aliasing".to_string(), serde_json::Value::String(value.to_string()));
         let value = match self.render_scale { RenderScale::Native => "native", RenderScale::Double => "2x" };
         self.values.insert("render_scale".to_string(), serde_json::Value::String(value.to_string()));
+        let value = match self.background_filter { BackgroundFilter::Linear => "linear", BackgroundFilter::Nearest => "nearest" };
+        self.values.insert("background_filter".to_string(), serde_json::Value::String(value.to_string()));
         let text = serde_json::to_string(&self.values)? + "\n";
         if text.len() > 4096 {
             return Err(std::io::Error::other("graphics settings exceed 4096 bytes; changed for this session only"));
@@ -146,22 +192,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restoring_defaults_saves_both_choices_without_losing_unknown_options() {
+    fn restoring_defaults_saves_all_choices_without_losing_unknown_options() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("graphics.json");
-        std::fs::write(&path, r#"{"anti_aliasing":"fxaa","render_scale":"2x","future_option":{"value":42}}"#).unwrap();
+        std::fs::write(&path, r#"{"anti_aliasing":"fxaa","render_scale":"2x","background_filter":"nearest","future_option":{"value":42}}"#).unwrap();
         let mut settings = Settings::load(dir.path());
         settings.restore_defaults().unwrap();
         let restored = Settings::load(dir.path());
-        assert_eq!((restored.anti_aliasing, restored.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!((restored.anti_aliasing, restored.render_scale, restored.background_filter),
+            (AntiAliasing::Off, RenderScale::Native, BackgroundFilter::Linear));
         assert_eq!(restored.values["future_option"]["value"], 42);
         // Explicit assignments select the requested value rather than toggling an existing one.
         settings.set_anti_aliasing(AntiAliasing::Fxaa).unwrap();
         settings.set_anti_aliasing(AntiAliasing::Fxaa).unwrap();
         settings.set_render_scale(RenderScale::Double).unwrap();
         settings.set_render_scale(RenderScale::Double).unwrap();
+        settings.set_background_filter(BackgroundFilter::Nearest).unwrap();
+        settings.set_background_filter(BackgroundFilter::Nearest).unwrap();
         let saved = Settings::load(dir.path());
-        assert_eq!((saved.anti_aliasing, saved.render_scale), (AntiAliasing::Fxaa, RenderScale::Double));
+        assert_eq!((saved.anti_aliasing, saved.render_scale, saved.background_filter),
+            (AntiAliasing::Fxaa, RenderScale::Double, BackgroundFilter::Nearest));
         assert_eq!(saved.values["future_option"], restored.values["future_option"]);
     }
 
@@ -174,17 +224,70 @@ mod tests {
         let mut settings = Settings::load(dir.path());
         assert!(settings.set_anti_aliasing(AntiAliasing::Fxaa).is_err());
         assert!(settings.set_render_scale(RenderScale::Double).is_err());
+        assert!(settings.set_background_filter(BackgroundFilter::Nearest).is_err());
         assert!(settings.restore_defaults().is_err());
-        assert_eq!((settings.anti_aliasing, settings.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!((settings.anti_aliasing, settings.render_scale, settings.background_filter),
+            (AntiAliasing::Off, RenderScale::Native, BackgroundFilter::Linear));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), unknown);
 
         let blocked = dir.path().join("not-a-directory");
         std::fs::write(&blocked, "keep").unwrap();
         let mut settings = Settings { anti_aliasing: AntiAliasing::Fxaa, render_scale: RenderScale::Double,
+            background_filter: BackgroundFilter::Nearest,
             path: Some(blocked.join("graphics.json")), ..Settings::default() };
         assert!(settings.restore_defaults().is_err());
-        assert_eq!((settings.anti_aliasing, settings.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!((settings.anti_aliasing, settings.render_scale, settings.background_filter),
+            (AntiAliasing::Off, RenderScale::Native, BackgroundFilter::Linear));
         assert_eq!(std::fs::read_to_string(blocked).unwrap(), "keep");
+    }
+
+    #[test]
+    fn background_filtering_defaults_to_linear_and_persists_independently_of_other_choices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graphics.json");
+        assert_eq!(Settings::load(dir.path()).background_filter, BackgroundFilter::Linear);
+        assert!(!path.exists(), "loading the default does not create a file");
+        let old = r#"{"anti_aliasing":"fxaa","render_scale":"2x","future_option":[1,2]}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut settings = Settings::load(dir.path());
+        assert_eq!(settings.background_filter, BackgroundFilter::Linear, "older files keep the existing sampler");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "loading does not migrate a file");
+        assert_eq!(settings.toggle_background_filter().unwrap(), BackgroundFilter::Nearest);
+        let mut settings = Settings::load(dir.path());
+        assert_eq!((settings.anti_aliasing, settings.render_scale, settings.background_filter),
+            (AntiAliasing::Fxaa, RenderScale::Double, BackgroundFilter::Nearest));
+        settings.toggle().unwrap();
+        settings.toggle_render_scale().unwrap();
+        let mut settings = Settings::load(dir.path());
+        assert_eq!((settings.anti_aliasing, settings.render_scale, settings.background_filter),
+            (AntiAliasing::Off, RenderScale::Native, BackgroundFilter::Nearest));
+        assert_eq!(settings.values["future_option"], serde_json::json!([1, 2]));
+        assert_eq!(settings.toggle_background_filter().unwrap(), BackgroundFilter::Linear);
+        assert_eq!(Settings::load(dir.path()).background_filter, BackgroundFilter::Linear);
+    }
+
+    #[test]
+    fn invalid_filtering_settings_and_save_failures_keep_the_file_while_allowing_session_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graphics.json");
+        for value in [serde_json::json!("future"), serde_json::json!(true), serde_json::json!(2), serde_json::Value::Null] {
+            let text = serde_json::json!({"background_filter": value, "future_option": 42}).to_string();
+            std::fs::write(&path, &text).unwrap();
+            let mut settings = Settings::load(dir.path());
+            assert_eq!(settings.background_filter, BackgroundFilter::Linear);
+            assert!(settings.toggle_background_filter().is_err());
+            assert_eq!(settings.background_filter, BackgroundFilter::Nearest);
+            assert!(settings.restore_defaults().is_err());
+            assert_eq!(settings.background_filter, BackgroundFilter::Linear);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        // A readable file that cannot fit its new fields is likewise never overwritten.
+        let text = serde_json::json!({"future_option": "x".repeat(4056)}).to_string();
+        std::fs::write(&path, &text).unwrap();
+        let mut settings = Settings::load(dir.path());
+        assert!(settings.toggle_background_filter().is_err());
+        assert_eq!(settings.background_filter, BackgroundFilter::Nearest);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
     }
 
     #[test]

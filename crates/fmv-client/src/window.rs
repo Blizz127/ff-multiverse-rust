@@ -939,6 +939,7 @@ impl App {
         let notice = match action {
             GraphicsAction::AntiAliasing => renderer.toggle_anti_aliasing().to_string(),
             GraphicsAction::RenderScale => renderer.toggle_render_scale(),
+            GraphicsAction::BackgroundFilter => renderer.toggle_background_filter().to_string(),
             GraphicsAction::Defaults => renderer.restore_graphics_defaults(),
             GraphicsAction::Close => return,
         };

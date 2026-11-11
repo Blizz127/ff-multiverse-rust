@@ -1,7 +1,7 @@
 //! Local graphics controls over the running game. This panel emits presentation actions;
 //! it never changes game state, sends input to the server, or pauses the scene clock.
 
-use super::{AntiAliasing, RenderScale};
+use super::{AntiAliasing, BackgroundFilter, RenderScale};
 use crate::ui::draw::{DrawList, Rgba};
 use crate::ui::screens::ui_scale;
 use crate::ui::text::{ellipsize, text_width, wrap};
@@ -12,6 +12,7 @@ use winit::keyboard::KeyCode;
 pub enum Action {
     AntiAliasing,
     RenderScale,
+    BackgroundFilter,
     Defaults,
     Close,
 }
@@ -22,6 +23,7 @@ pub struct Status {
     pub anti_aliasing: AntiAliasing,
     pub render_scale: RenderScale,
     pub effective_scale: RenderScale,
+    pub background_filter: BackgroundFilter,
 }
 
 #[derive(Debug, Default)]
@@ -38,13 +40,13 @@ impl Panel {
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> Option<Action> {
         if !pressed { return None; }
         match code {
-            KeyCode::ArrowUp => { self.focus = (self.focus + 3) % 4; None }
-            KeyCode::ArrowDown => { self.focus = (self.focus + 1) % 4; None }
+            KeyCode::ArrowUp => { self.focus = (self.focus + 4) % 5; None }
+            KeyCode::ArrowDown => { self.focus = (self.focus + 1) % 5; None }
             _ if repeat => None,
             KeyCode::Escape | KeyCode::Backspace => Some(Action::Close),
             KeyCode::F3 => Some(Action::AntiAliasing),
             KeyCode::F4 => Some(Action::RenderScale),
-            KeyCode::ArrowLeft | KeyCode::ArrowRight if self.focus < 2 => Some(self.focused_action()),
+            KeyCode::ArrowLeft | KeyCode::ArrowRight if self.focus < 3 => Some(self.focused_action()),
             KeyCode::Enter | KeyCode::Space => Some(self.focused_action()),
             _ => None,
         }
@@ -54,7 +56,8 @@ impl Panel {
         match self.focus {
             0 => Action::AntiAliasing,
             1 => Action::RenderScale,
-            2 => Action::Defaults,
+            2 => Action::BackgroundFilter,
+            3 => Action::Defaults,
             _ => Action::Close,
         }
     }
@@ -85,13 +88,15 @@ impl Panel {
         line(&mut c, 26, DIM, "Game continues while open.");
         let smoothing = match status.anti_aliasing { AntiAliasing::Off => "Off", AntiAliasing::Fxaa => "FXAA" };
         let resolution = match status.render_scale { RenderScale::Native => "Native", RenderScale::Double => "2x" };
+        let background = match status.background_filter { BackgroundFilter::Linear => "Linear", BackgroundFilter::Nearest => "Nearest" };
         for (row, (label, value)) in [
             ("Edge smoothing", Some(smoothing)), ("Scene resolution", Some(resolution)),
+            ("Background filtering", Some(background)),
             ("Restore defaults", None), ("Close", None),
         ].into_iter().enumerate() {
-            let row_y = y + 44 + row as i32 * 22;
+            let row_y = y + 44 + row as i32 * 18;
             if row == self.focus {
-                c.fill(x + 6, row_y - 4, w - 12, 20, HILITE);
+                c.fill(x + 6, row_y - 4, w - 12, 16, HILITE);
                 c.pointer(x + 10, row_y);
             }
             let color = if row == self.focus { TEXT } else { DIM };
@@ -126,6 +131,11 @@ mod tests {
         assert_eq!(panel.key(KeyCode::ArrowLeft, true, false), Some(Action::AntiAliasing));
         assert_eq!(panel.key(KeyCode::ArrowDown, true, true), None);
         assert_eq!(panel.key(KeyCode::ArrowRight, true, false), Some(Action::RenderScale));
+        panel.key(KeyCode::ArrowDown, true, true);
+        assert_eq!(panel.key(KeyCode::ArrowLeft, true, false), Some(Action::BackgroundFilter));
+        assert_eq!(panel.key(KeyCode::ArrowRight, true, false), Some(Action::BackgroundFilter));
+        assert_eq!(panel.key(KeyCode::Enter, true, false), Some(Action::BackgroundFilter));
+        assert_eq!(panel.key(KeyCode::ArrowRight, true, true), None, "held background toggle does not flicker");
         panel.key(KeyCode::ArrowDown, true, true);
         assert_eq!(panel.key(KeyCode::ArrowLeft, true, false), None, "left cannot restore defaults accidentally");
         assert_eq!(panel.key(KeyCode::ArrowRight, true, false), None);
@@ -162,14 +172,14 @@ mod tests {
         let mut panel = Panel::new();
         panel.key(KeyCode::ArrowDown, true, false);
         let status = Status { anti_aliasing: AntiAliasing::Fxaa, render_scale: RenderScale::Double,
-            effective_scale: RenderScale::Native };
+            effective_scale: RenderScale::Native, background_filter: BackgroundFilter::Nearest };
         let out = picture(&panel, status, (1100, 680));
-        for text in ["Graphics", "Edge smoothing", "FXAA", "Scene resolution", "2x", "Restore defaults", "Close",
+        for text in ["Graphics", "Edge smoothing", "FXAA", "Scene resolution", "2x", "Background filtering", "Nearest", "Restore defaults", "Close",
             "2x requested; using native resolution"] { assert!(out.says(text), "missing {text}"); }
         assert!(out.quads().iter().any(|q| q.color == ACCENT), "the pointer marks focus without relying only on row colour");
         assert_eq!(panel.focus, 1, "drawing and fallback do not change input state");
         let normal = picture(&panel, Status::default(), (1100, 680));
-        assert!(normal.says("Off") && normal.says("Native"));
+        assert!(normal.says("Off") && normal.says("Native") && normal.says("Linear"));
         assert!(!normal.says("requested"));
     }
 
@@ -179,7 +189,7 @@ mod tests {
         panel.set_notice("Graphics changed for this session; settings could not be saved".to_string());
         for size in [(320, 240), (400, 270), (480, 270), (640, 360), (1100, 680),
             (1920, 1080), (3840, 2160), (1, 1), (0, 0), (120, 140), (160, 160)] {
-            let out = picture(&panel, Status::default(), size);
+            let out = picture(&panel, Status { background_filter: BackgroundFilter::Nearest, ..Status::default() }, size);
             for q in out.quads() {
                 assert!(q.x >= 0 && q.y >= 0 && q.x + q.w <= size.0 as i32 && q.y + q.h <= size.1 as i32,
                     "{size:?}: {q:?}");
@@ -187,7 +197,7 @@ mod tests {
             if size.0 >= 320 && size.1 >= 240 {
                 let text = out.texts().iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join(" ");
                 assert!(text.contains("could not be saved"), "{size:?}: a save failure must not be truncated away");
-                assert!(out.says("Restore defaults") && out.says("Close"));
+                assert!(out.says("Background filtering") && out.says("Nearest") && out.says("Restore defaults") && out.says("Close"));
             }
         }
     }
@@ -202,9 +212,10 @@ mod tests {
             for (name, status) in [
                 ("default", Status::default()),
                 ("fallback", Status { anti_aliasing: AntiAliasing::Fxaa, render_scale: RenderScale::Double,
-                    effective_scale: RenderScale::Native }),
+                    effective_scale: RenderScale::Native, background_filter: BackgroundFilter::Nearest }),
             ] {
                 if name == "fallback" {
+                    panel.key(KeyCode::ArrowDown, true, false);
                     panel.key(KeyCode::ArrowDown, true, false);
                     panel.set_notice("Graphics changed for this session; settings could not be saved".to_string());
                 }

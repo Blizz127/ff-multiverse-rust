@@ -403,6 +403,9 @@ pub struct AvatarGpu {
     additive: wgpu::RenderPipeline,
     ground: wgpu::RenderPipeline,
     model_sampler: wgpu::Sampler,
+    /// Field tiles have their own filter; model textures keep their existing linear sampler.
+    scenery_sampler: wgpu::Sampler,
+    background_filter: crate::graphics::BackgroundFilter,
     white: wgpu::BindGroup,
     _white_texture: wgpu::Texture,
     models: HashMap<u64, GpuModel>,
@@ -439,6 +442,17 @@ fn texture_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
             count: None,
         },
     ]
+}
+
+fn scenery_sampler(device: &wgpu::Device, filter: crate::graphics::BackgroundFilter) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("fmv-scenery-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: filter.filter_mode(),
+        min_filter: filter.filter_mode(),
+        ..wgpu::SamplerDescriptor::default()
+    })
 }
 
 impl AvatarGpu {
@@ -585,6 +599,8 @@ impl AvatarGpu {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        let background_filter = crate::graphics::BackgroundFilter::default();
+        let scenery_sampler = scenery_sampler(device, background_filter);
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fmv-avatar-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -616,6 +632,8 @@ impl AvatarGpu {
             additive,
             ground,
             model_sampler,
+            scenery_sampler,
+            background_filter,
             white,
             _white_texture: white_texture,
             models: HashMap::new(),
@@ -642,6 +660,14 @@ impl AvatarGpu {
     #[cfg(test)]
     pub fn scenery_state(&self) -> (u32, Option<u64>, usize) {
         (self.scenery.uploads(), self.scenery.current_id(), self.scenery.draw_calls())
+    }
+
+    /// Change field tile sampling while retaining the current atlas and every model texture.
+    pub fn set_background_filter(&mut self, filter: crate::graphics::BackgroundFilter) {
+        if self.background_filter == filter { return; }
+        self.background_filter = filter;
+        self.scenery_sampler = scenery_sampler(&self.device, filter);
+        self.scenery.rebind_sampler(&self.device, &self.texture_layout, &self.scenery_sampler);
     }
 
     /// Make sure `asset` is on the GPU (uploaded on first use).
@@ -707,7 +733,7 @@ impl AvatarGpu {
     /// has none or this device cannot hold its atlas: the frame is then drawn over the flat picture.
     pub fn prepare_scenery(&mut self, frame: &AvatarFrame) -> bool {
         let Some(scenery) = frame.scenery.as_deref() else { return false };
-        self.scenery.ensure(&self.device, &self.queue, self.texture_format, &self.texture_layout, &self.model_sampler, scenery)
+        self.scenery.ensure(&self.device, &self.queue, self.texture_format, &self.texture_layout, &self.scenery_sampler, scenery)
     }
 
     /// The depth buffer for a `size` target (made again when the size changes).

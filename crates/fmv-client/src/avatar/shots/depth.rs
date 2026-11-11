@@ -28,6 +28,8 @@ use crate::avatar::stage::Stage;
 use fmv_ff7::background::depth::DepthTile;
 use fmv_ff7::background::{BlendMode, ScreenRect};
 
+mod filter;
+
 // ---------------------------------------------------------------------------------------------
 // Synthetic scenes
 // ---------------------------------------------------------------------------------------------

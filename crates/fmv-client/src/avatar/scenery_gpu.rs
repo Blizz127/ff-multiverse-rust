@@ -56,7 +56,7 @@ fn vs_tile(
 
 @fragment
 fn fs_tile(in: TileOut) -> @location(0) vec4<f32> {
-    // The linear filter, but never beyond the tile's own edge texels.
+    // The selected field-background filter, never beyond the tile's own edge texels.
     let texel = textureSample(tile_tex, tile_samp, clamp(in.uv, in.bounds.xy, in.bounds.zw));
     if (texel.a < 0.5) {
         discard;
@@ -120,7 +120,7 @@ struct Uploaded {
     id: u64,
     bind_group: wgpu::BindGroup,
     /// Owns the pixels the bind group's view looks at.
-    _atlas: wgpu::Texture,
+    atlas: wgpu::Texture,
     opaque: wgpu::Buffer,
     opaque_vertices: u32,
     blended: Option<wgpu::Buffer>,
@@ -198,6 +198,14 @@ impl SceneryGpu {
         self.current.as_ref().map(|c| c.id)
     }
 
+    /// Change how the retained atlas is sampled, without uploading pixels or rebuilding tiles.
+    /// A rejected field stays rejected, and an empty cache uses the sampler on its next upload.
+    pub fn rebind_sampler(&mut self, device: &wgpu::Device, texture_layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) {
+        if let Some(current) = self.current.as_mut() {
+            current.bind_group = texture_bind_group(device, texture_layout, &current.atlas, sampler);
+        }
+    }
+
     /// Make sure `scenery` is on the GPU (uploaded on first use, replacing the last field's).
     /// `false` if this device cannot hold it: the frame is then drawn over the flat picture.
     pub fn ensure(
@@ -234,7 +242,7 @@ impl SceneryGpu {
         self.current = Some(Uploaded {
             id: scenery.id,
             bind_group,
-            _atlas: atlas,
+            atlas,
             opaque,
             opaque_vertices: u32::try_from(scenery.opaque.len()).unwrap_or(u32::MAX),
             blended,
