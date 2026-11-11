@@ -29,8 +29,11 @@
 //! shows nothing is skipped by the dialogue window and is no cue) and a [`VoiceCue::Stop`] when the conversation is dropped,
 //! whatever ended it. The audio finds the clip by Echo-S's own numbers and plays it ([`crate::audio`]).
 
+use super::echo_live::{self, Skip};
 use super::layout::is_blank;
+use super::live::{LiveText, LiveVoice};
 use super::Conversations;
+use crate::live::LiveWindowView;
 use crate::mods::{self, ModSink, VoiceCue};
 use crate::state::NpcView;
 use fmv_ff7::script::dialogue::{characters, find_character, parse_message, Beat, Character, Message, MessageOrigin, MessageSource, StartOfGame, StoryVars, TalkSession};
@@ -84,6 +87,8 @@ struct Loaded {
     original: Option<Section>,
     /// Echo-S's section for the area, when the text layer is on and the archive has it.
     echo: Option<Section>,
+    /// Echo-S's line for each message instruction of the original, made when the first live window of the area asks.
+    live_map: Option<echo_live::LiveMap>,
 }
 
 /// The conversations of this machine's own FF7 fields.
@@ -124,7 +129,7 @@ impl Ff7Conversations {
         if self.area.as_ref().is_none_or(|l| l.key != area) {
             let original = sections(area).and_then(|bytes| Section::of(Arc::new(bytes)));
             let echo = self.mods.as_ref().and_then(|m| m.script_section(area)).and_then(Section::of);
-            self.area = Some(Loaded { key: area.to_string(), original, echo });
+            self.area = Some(Loaded { key: area.to_string(), original, echo, live_map: None });
         }
         self.area.as_ref()
     }
@@ -139,6 +144,42 @@ impl Ff7Conversations {
 
     fn note(&self, line: String) {
         self.sink.note(&line);
+    }
+
+    /// The text of dialog `dialog` of `script`, as pieces under the current story.
+    fn pieces_of(&self, script: &FieldScript<'_>, dialog: usize) -> Option<Vec<fmv_ff7::script::dialogue::Piece>> {
+        let d = script.dialogs().get(dialog)?;
+        let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
+        Some(parse_message(raw, &*(self.story)()))
+    }
+
+    /// Echo-S's line for the live window `view` of `area` (found by the instruction that opened it, see [`echo_live`]), with the voice
+    /// that goes with it; `original` is the original's message of the same window.
+    fn echo_window(&mut self, area: &str, mods: &Arc<Mods>, view: &LiveWindowView, original: &Message) -> Result<LiveText, Skip> {
+        self.loaded(area).ok_or(Skip::NoSection)?;
+        let loaded = self.area.as_mut().ok_or(Skip::NoSection)?;
+        let (Some(o), Some(e)) = (loaded.original.as_ref(), loaded.echo.as_ref()) else { return Err(Skip::NoSection) };
+        let echo_bytes = Arc::clone(&e.bytes);
+        if loaded.live_map.is_none() {
+            loaded.live_map = Some(echo_live::build(&o.bytes, &e.bytes));
+        }
+        let map = loaded.live_map.as_ref().ok_or(Skip::NoSection)?;
+        let line = echo_live::lookup(map, view.entity, view.offset, view.dialog)?;
+        let script = FieldScript::parse(&echo_bytes).map_err(|_| Skip::NoSection)?;
+        let pieces = self.pieces_of(&script, line.dialog).ok_or(Skip::NoText)?;
+        let ask = line.ask.map(|(first, last)| LiveAsk { first, last });
+        let message = super::live::message_for(line.dialog, line.window, pieces, ask);
+        // The server counts the answer from the original question's first line: the same number of lines keeps each choice's place.
+        let lines = |m: &Message| m.choice.map(|c| c.last - c.first);
+        if lines(&message) != lines(original) {
+            return Err(Skip::AskDiffers);
+        }
+        let voice = mods.layers().voice.then(|| LiveVoice { field: area.to_string(), sink: Arc::clone(&self.sink) });
+        if voice.is_some() {
+            let heard = mods.voice_path(area, line.window, line.dialog, 0).map_or_else(|| "none".to_string(), |path| short_voice_name(&path));
+            self.note(format!("mods: window {area}#{} w{} voice {heard}", line.dialog, line.window));
+        }
+        Ok(LiveText { message, voice })
     }
 }
 
@@ -210,10 +251,21 @@ impl Conversations for Ff7Conversations {
         // The ORIGINAL's table, whatever the text layer: the server runs the original's scripts and names its dialogs.
         let bytes = Arc::clone(&self.loaded(area)?.original.as_ref()?.bytes);
         let script = FieldScript::parse(&bytes).ok()?;
-        let d = script.dialogs().get(dialog)?;
-        let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
-        let pieces = parse_message(raw, &*(self.story)());
+        let pieces = self.pieces_of(&script, dialog)?;
         Some(super::live::message_for(dialog, window, pieces, ask))
+    }
+
+    fn live_window(&mut self, area: &str, view: &LiveWindowView) -> Option<LiveText> {
+        let original = self.live_message(area, view.window, usize::from(view.dialog), view.ask)?;
+        // The text layer: Echo-S's line (and voice) for the instruction that opened the window, else the original's text.
+        let Some(mods) = self.mods.clone().filter(|m| m.layers().text && m.has_echo()) else { return Some(LiveText { message: original, voice: None }) };
+        match self.echo_window(area, &mods, view, &original) {
+            Ok(text) => Some(text),
+            Err(skip) => {
+                self.note(format!("mods: live {area} e{}@{} #{}: original text ({})", view.entity, view.offset, view.dialog, skip.why()));
+                Some(LiveText { message: original, voice: None })
+            }
+        }
     }
 
     fn set_story(&mut self, story: StoryFactory) {
@@ -477,6 +529,210 @@ mod tests {
         }
         println!("reactor fields: {npcs} characters; {from_echo} talk from Echo-S's section, {from_original} from the original's; {windows} windows shown; windows of Echo-S's text: {voiced} voiced, {silent} without a clip");
         assert!(from_echo > 0 && voiced > 0, "some real conversation is voiced");
+    }
+
+    // ---- live windows ------------------------------------------------------------------------------
+
+    use super::super::echo_live::tests::{ask, code, msg, offset_of, section};
+    use super::super::Talk;
+    use crate::live::LiveClient;
+    use fmv_protocol::ClientMsg;
+    use winit::keyboard::KeyCode;
+
+    /// An original with a message then a question (the question's lines are 1-2), and an Echo-S section for the same entity with
+    /// its dialogs numbered otherwise and the question's lines at 2-3.
+    fn live_sections() -> (Vec<u8>, Vec<u8>) {
+        let original = section(&[("a", vec![(1, code(&[msg(0, 0), ask(1, 1, 1, 2)]))])], &["Orig hello", "Orig go?\n\tOrig yes\n\tOrig no"]);
+        let echo = section(
+            &[("a", vec![(1, code(&[msg(2, 3), ask(3, 0, 2, 3)]))])],
+            &["Mod go?\nextra\n\tMod yes\n\tMod no", "u", "v", "Mod hello"],
+        );
+        (original, echo)
+    }
+
+    fn live_mods(echo: &[u8], voices: &[&'static str], layers: Layers) -> (tempfile::TempDir, Arc<Mods>) {
+        let mut s = EchoSpec::default();
+        s.blobs.push(("Echo-S\\flevel.lgp\\md1stin", fmv_mods::testkit::field_entry(echo)));
+        s.voices.extend_from_slice(voices);
+        mods_with(&s, layers)
+    }
+
+    fn live_loader(original: Vec<u8>) -> Option<SectionLoader> {
+        Some(Box::new(move |area| (area == "md1stin").then(|| original.clone())))
+    }
+
+    fn view(original: &[u8], k: usize, dialog: u16, ask: Option<LiveAsk>) -> LiveWindowView {
+        LiveWindowView::new(0, dialog, ask, true).opened_by(0, offset_of(original, 0, 1, k))
+    }
+
+    #[test]
+    fn a_live_message_shows_echo_s_line_found_by_its_instruction_and_cues_its_voice() {
+        let (original, echo) = live_sections();
+        let (_t, mods) = live_mods(&echo, &["VO\\Voice\\md1stin\\w2_3.ogg"], Layers::ALL);
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone());
+        let text = c.live_window("md1stin", &view(&original, 0, 0, None)).unwrap();
+        assert_eq!(plain(&text.message), "Mod hello");
+        // Echo-S's own numbers: its dialog and the window its instruction names (what its voice files are keyed by).
+        assert!(matches!(text.message.origin, MessageOrigin::Canon { dialog: 3, .. }));
+        assert_eq!(text.message.window, 2);
+        assert_eq!(text.voice.as_ref().map(|v| v.field.as_str()), Some("md1stin"));
+        assert_eq!(sink.notes(), ["mods: window md1stin#3 w2 voice md1stin/w2_3"]);
+    }
+
+    #[test]
+    fn a_live_question_keeps_the_original_s_answer_positions_over_echo_s_lines() {
+        let (original, echo) = live_sections();
+        let (_t, mods) = live_mods(&echo, &[], Layers::ALL);
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone());
+        let asked = Some(LiveAsk { first: 1, last: 2 });
+        let text = c.live_window("md1stin", &view(&original, 1, 1, asked)).unwrap();
+        assert!(matches!(text.message.origin, MessageOrigin::Canon { dialog: 0, .. }));
+        // Echo-S's question has its lines at 2-3, the original's at 1-2.
+        assert_eq!(text.message.choice.map(|c| (c.first, c.last)), Some((2, 3)));
+        // Through the window: pick the second line; the server hears position 1 (counted from the original's first line).
+        let mut talk = Talk::new(Box::new(Ff7Conversations::with_parts(live_loader(original.clone()), Some(live_mods(&echo, &[], Layers::ALL).1), sink.clone())));
+        let mut live = LiveClient::default();
+        live.on_window(view(&original, 1, 1, asked));
+        talk.sync_live(&mut live, "md1stin", || super::story_of(None));
+        assert!(talk.live_is_open());
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
+        assert!(talk.live_key(&mut live, KeyCode::Enter, true, false));
+        assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 0, choice: Some(1) }]);
+    }
+
+    #[test]
+    fn a_live_window_cues_its_voice_pages_and_choices_and_stops_when_it_goes() {
+        let (original, echo) = live_sections();
+        let (_t, mods) = live_mods(&echo, &["VO\\Voice\\md1stin\\0.ogg"], Layers::ALL);
+        let sink = Arc::new(Collect::default());
+        let mut talk = Talk::new(Box::new(Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone())));
+        let mut live = LiveClient::default();
+        live.on_window(view(&original, 1, 1, Some(LiveAsk { first: 1, last: 2 })));
+        talk.sync_live(&mut live, "md1stin", || super::story_of(None));
+        let say = VoiceCue::Say { field: "md1stin".into(), window: 3, dialog: 0, page: 0 };
+        assert_eq!(sink.cues(), vec![say.clone()]);
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
+        assert_eq!(sink.cues().last(), Some(&VoiceCue::Choice { field: "md1stin".into(), dialog: 0, line: 3 }));
+        // The server closes the window: the voice stops.
+        live.on_window_closed(0);
+        talk.sync_live(&mut live, "md1stin", || super::story_of(None));
+        assert_eq!(sink.cues().last(), Some(&VoiceCue::Stop));
+        assert!(!talk.live_is_open());
+    }
+
+    #[test]
+    fn a_live_window_without_a_counterpart_shows_the_original_text_and_says_why_in_ids() {
+        let (original, echo) = live_sections();
+        let (_t, mods) = live_mods(&echo, &[], Layers::ALL);
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone());
+        // An instruction the original does not have there, and a dialog the instruction does not open.
+        let mut v = view(&original, 0, 0, None);
+        v.offset += 1;
+        assert_eq!(plain(&c.live_window("md1stin", &v).unwrap().message), "Orig hello");
+        assert_eq!(plain(&c.live_window("md1stin", &view(&original, 0, 1, None)).unwrap().message), "Orig go? Orig yes Orig no");
+        // A question whose lines Echo-S does not have as many of.
+        let few = section(&[("a", vec![(1, code(&[msg(2, 3), ask(3, 0, 2, 2)]))])], &["Mod go?\nx\n\tMod yes", "u", "v", "Mod hello"]);
+        let (_t2, mods) = live_mods(&few, &[], Layers::ALL);
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone());
+        let asked = Some(LiveAsk { first: 1, last: 2 });
+        assert_eq!(plain(&c.live_window("md1stin", &view(&original, 1, 1, asked)).unwrap().message), "Orig go? Orig yes Orig no");
+        assert_eq!(
+            sink.notes(),
+            [
+                format!("mods: live md1stin e0@{} #0: original text (no such instruction)", v.offset),
+                format!("mods: live md1stin e0@{} #1: original text (dialog differs)", view(&original, 0, 0, None).offset),
+                format!("mods: live md1stin e0@{} #1: original text (question differs)", view(&original, 1, 1, None).offset),
+            ]
+        );
+        assert!(sink.cues().is_empty());
+    }
+
+    #[test]
+    fn the_live_text_is_the_originals_with_the_text_layer_off_or_no_echo_section() {
+        let (original, echo) = live_sections();
+        let (_t, mods) = live_mods(&echo, &[], Layers { text: false, ..Layers::ALL });
+        let sink = Arc::new(Collect::default());
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), Some(mods), sink.clone());
+        assert_eq!(plain(&c.live_window("md1stin", &view(&original, 0, 0, None)).unwrap().message), "Orig hello");
+        let mut c = Ff7Conversations::with_parts(live_loader(original.clone()), None, sink.clone());
+        assert_eq!(plain(&c.live_window("md1stin", &view(&original, 0, 0, None)).unwrap().message), "Orig hello");
+        assert!(sink.notes().is_empty() && sink.cues().is_empty(), "{:?}", sink.notes());
+        // The layer on, but Echo-S has no script for this area: the original's text, with a note.
+        let (_t, mods) = live_mods(&echo, &[], Layers::ALL);
+        let mut c = Ff7Conversations::with_parts(Some(Box::new({ let o = original.clone(); move |_| Some(o.clone()) })), Some(mods), sink.clone());
+        assert_eq!(plain(&c.live_window("elsewhere", &view(&original, 0, 0, None)).unwrap().message), "Orig hello");
+        assert_eq!(sink.notes().len(), 1);
+        assert!(sink.notes()[0].ends_with("original text (not in echo-s)"), "{:?}", sink.notes());
+    }
+
+    /// How many real message instructions of the first reactor fields (every `MESSAGE`/`ASK` of the original, as a live window the
+    /// server would open) get Echo-S's line through the client's own live path, and why the others do not. Static: not the windows a
+    /// run reaches. Read-only; only counts are printed.
+    #[test]
+    #[ignore = "needs the owner's FF7 data and Echo-S (FMV_FF7_DATA, FMV_ECHO_S_IRO)"]
+    fn the_real_live_windows_of_the_reactor_fields_find_echo_s_lines() {
+        use fmv_ff7::field::FieldFile;
+        use fmv_ff7::lgp::LgpArchive;
+        use std::collections::{BTreeMap, BTreeSet};
+        let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+        let (Some(data), Some(echo)) = (var("FMV_FF7_DATA"), var("FMV_ECHO_S_IRO")) else {
+            eprintln!("FMV_FF7_DATA and FMV_ECHO_S_IRO are needed; skipping");
+            return;
+        };
+        let lgp = Arc::new(Mutex::new(LgpArchive::open_path(data.join("field").join("flevel.lgp")).expect("flevel.lgp")));
+        let section_of = move |area: &str| -> Option<Vec<u8>> {
+            let stored = lgp.lock().unwrap().read(area).ok()?;
+            let file = FieldFile::parse(fmv_ff7::lzss::decompress(&stored).ok()?).ok()?;
+            Some(FieldScript::from_field(&file).ok()?.bytes().to_vec())
+        };
+        let mods = Arc::new(Mods::open(&ModSources { echo_s: Some(echo), ..Default::default() }, Layers::ALL));
+        let sink = Arc::new(Collect::default());
+        let loader = {
+            let section_of = section_of.clone();
+            Box::new(move |area: &str| section_of(area)) as SectionLoader
+        };
+        let mut conversations = Ff7Conversations::with_parts(Some(loader), Some(mods), sink.clone());
+        let (mut echo_lines, mut asks, mut echo_asks) = (0usize, 0usize, 0usize);
+        let mut fallbacks: BTreeMap<String, usize> = BTreeMap::new();
+        for field in ["md1stin", "md1_1", "md1_2"] {
+            let Some(bytes) = section_of(field) else { continue };
+            let script = FieldScript::parse(&bytes).expect("script");
+            let mut seen = BTreeSet::new();
+            let mut count = 0usize;
+            for entity in 0..script.entity_count() {
+                for slot in 0..32 {
+                    let Ok(d) = script.disassemble_partial(entity, slot) else { continue };
+                    for i in d.instructions.iter().filter(|i| matches!(i.opcode, 0x40 | 0x48)) {
+                        if !seen.insert((entity, i.offset)) {
+                            continue;
+                        }
+                        count += 1;
+                        let lit = |n: &str| i.literal(n).and_then(|v| u8::try_from(v).ok()).unwrap_or(0);
+                        let ask = (i.opcode == 0x48).then(|| LiveAsk { first: lit("first"), last: lit("last") });
+                        let view = LiveWindowView::new(lit("window"), u16::from(lit("dialog")), ask, true).opened_by(u16::try_from(entity).unwrap(), u32::try_from(i.offset).unwrap());
+                        let before = sink.notes().len();
+                        if conversations.live_window(field, &view).is_none() {
+                            *fallbacks.entry("no original text".into()).or_default() += 1;
+                            continue;
+                        }
+                        asks += usize::from(ask.is_some());
+                        let notes = sink.notes();
+                        match notes.get(before..).and_then(|n| n.iter().find(|l| l.starts_with("mods: live"))) {
+                            None => {
+                                echo_lines += 1;
+                                echo_asks += usize::from(ask.is_some());
+                            }
+                            Some(l) => *fallbacks.entry(l.rsplit('(').next().unwrap_or("").trim_end_matches(')').to_string()).or_default() += 1,
+                        }
+                    }
+                }
+            }
+            println!("{field}: {count} message instructions");
+        }
+        println!("message instructions: {echo_lines} get Echo-S's line ({echo_asks} of {asks} questions), the others the original's: {fallbacks:?}");
     }
 
     #[test]
