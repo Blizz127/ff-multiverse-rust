@@ -1,4 +1,5 @@
-//! Isolated movie controller; deliberately not registered with the window or VM.
+//! The movie controller. The windowed client registers it for a live field's movies (`crate::live_movie`); the
+//! script VM and the headless client do not.
 //!
 //! Loading-stage `prepare` verifies an explicitly admitted immutable asset. Frame
 //! polling never hashes a file or runs a decoder synchronously. Decode read-ahead
@@ -18,7 +19,7 @@
 mod clock;
 mod policy;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::render::{
     movie::{DisplayPolicy, MovieFrameId, MovieSubmission, MovieViewport},

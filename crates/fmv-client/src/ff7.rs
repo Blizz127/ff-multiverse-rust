@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use fmv_adapter_api::{AdapterError, AreaInfo, AreaRuntime, GameAdapter};
 use fmv_core::GameId;
 use fmv_ff7::Ff7Adapter;
-pub use fmv_library::ff7::{resolve_battle_lgp, resolve_char_lgp, resolve_flevel, Ff7Labels, Ff7ResolveError, Ff7Source};
+pub use fmv_library::ff7::{movie_file, resolve_battle_lgp, resolve_char_lgp, resolve_flevel, resolve_movies_dir, Ff7Labels, Ff7ResolveError, Ff7Source};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ff7OpenError {

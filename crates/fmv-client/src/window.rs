@@ -728,6 +728,11 @@ pub(crate) struct App {
     graphics_panel: Option<GraphicsPanel>,
     graphics_keyboard: GraphicsKeyboard,
     focused: bool,
+    /// The movie a live field's script is playing (full window, the field held), and what opens it.
+    movies: crate::live_movie::MovieStage,
+    movie_source: Box<dyn crate::live_movie::MovieSource>,
+    /// A skip key was pressed during the movie since the last tick.
+    movie_skip: bool,
 }
 
 impl App {
@@ -773,6 +778,9 @@ impl App {
             graphics_panel: None,
             graphics_keyboard: GraphicsKeyboard::default(),
             focused: true,
+            movies: crate::live_movie::MovieStage::default(),
+            movie_source: Box::new(crate::live_movie::LocalMovies::default()),
+            movie_skip: false,
         }
     }
 
@@ -801,6 +809,11 @@ impl App {
         let suppressed = source == InputSource::Keyboard && self.graphics_keyboard.event(code, pressed, repeat);
         // Releases are never lost, even if a modal consumed the associated press.
         if !pressed { self.input.set(code, false); }
+        // A movie holds the field: its OK and back keys skip it, every other key is its own business (Esc does not arm quitting).
+        if self.movies.active() {
+            if pressed && !repeat && crate::live_movie::MovieStage::skips(code) { self.movie_skip = true; }
+            return;
+        }
         let was_open = self.graphics_panel.is_some();
         self.sync_story_pending_input();
         self.sync_graphics_panel();
@@ -912,14 +925,22 @@ impl App {
         }
     }
 
-    /// What a live field asks of this frame: a movie (none can be played here yet, so it is over at once and the script goes
-    /// on) and the windows its scripts have open (shown, built from this machine's own field data).
+    /// What a live field asks of this frame: a movie (played over the whole window, the field's input held; see
+    /// [`crate::live_movie`]) and the windows its scripts have open (shown, built from this machine's own field data).
     fn live_frame(&mut self) {
-        let state = &mut self.session.state;
-        if let Some(movie) = state.live.movie {
-            eprintln!("live: movie {movie} is skipped (this client has no movie player yet)");
-            state.live.movie_done();
+        let was_playing = self.movies.active();
+        let skip = std::mem::take(&mut self.movie_skip);
+        self.movies.step(&mut self.session.state.live, self.movie_source.as_mut(), Instant::now(), skip, &self.audio);
+        for note in self.movies.take_notes() {
+            eprintln!("{note}");
         }
+        if self.movies.active() && !was_playing {
+            // The field is held: nothing pressed so far may keep walking or keep a panel open under the movie.
+            self.capture_graphics_input();
+            self.close_graphics_panel();
+            self.talk.close();
+        }
+        let state = &mut self.session.state;
         let story = &state.story;
         self.talk.sync_live(&mut state.live, &self.session.info.area_id.key, || story_of(story.state()));
     }
@@ -1261,7 +1282,22 @@ impl App {
         self.update_title();
     }
 
+    /// A frame while a live field's movie plays: the movie over the whole window. A movie that cannot be drawn is given up
+    /// (the next tick answers the server); a renderer that cannot go on ends the window as everywhere else.
+    fn redraw_movie(&mut self, el: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        if let Err(why) = self.movies.draw(renderer) {
+            self.movies.fail_draw(&why);
+        }
+        if let Some(e) = renderer.first_gpu_error() {
+            self.fail(el, format!("GPU error: {e}"));
+        }
+    }
+
     fn redraw(&mut self, el: &ActiveEventLoop) {
+        if self.movies.active() {
+            return self.redraw_movie(el);
+        }
         let notice = self.current_notice().map(str::to_owned);
         let Some(renderer) = self.renderer.as_mut() else { return };
         let now = self.session.now();

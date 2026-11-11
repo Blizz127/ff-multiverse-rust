@@ -13,9 +13,10 @@
 //! * Surface side ([`Renderer`]): window surface lifecycle (resize, minimise, suboptimal,
 //!   outdated, lost) without panics.
 
-// Isolated movie GPU foundation; runtime registration is a separate reviewed change.
+// The movie GPU foundation; the window plays a live field's movies through `movie_present`.
 #[allow(dead_code)]
 pub(crate) mod movie;
+mod movie_present;
 
 use crate::backdrop::Backdrop;
 use bytemuck::{Pod, Zeroable};
