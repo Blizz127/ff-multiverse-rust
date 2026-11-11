@@ -2,7 +2,9 @@
 //! explicitly. No game files, sockets, sleep, or live account data are involved.
 
 mod door_coop;
+mod follower_owner;
 mod retire_landing;
+mod roster_snapshot;
 mod size_bounds;
 
 use std::sync::Arc;
@@ -1059,12 +1061,21 @@ fn recovered_coop_waits_for_each_connected_players_area_handshake() {
     let group = rig.store.get_scene_group(rig.owner.account, GameId::Fixture).unwrap();
     assert_eq!(group.len(), 2, "both participants are frozen before either can recover");
     let (mut fresh, mut saves) = world_at(rig.rules, rig.formation, YARD);
+    assert!(!fresh.areas.contains_key(HALL), "the saved scene field is not the configured entry field");
+    assert!(saves.try_recv().is_err());
     let owner_state = group.iter().find(|state| state.pair.story.account_id == rig.owner.account).unwrap().clone();
     let guest_state = group.iter().find(|state| state.pair.story.account_id == guest.account).unwrap().clone();
     let mut owner = join(&mut fresh, owner_state, group.clone(), rig.now);
+    assert!(fresh.areas.contains_key(HALL), "recovery loads the checked roster's adapter before the field handshake");
     let mut guest = join(&mut fresh, guest_state, group.clone(), rig.now);
-    let owner_offer = owner.drain().into_iter().find(|message| matches!(message, ServerMsg::AreaChange { .. })).unwrap();
-    let guest_offer = guest.drain().into_iter().find(|message| matches!(message, ServerMsg::AreaChange { .. })).unwrap();
+    let owner_messages = owner.drain();
+    let guest_messages = guest.drain();
+    assert!(!owner_messages.iter().chain(&guest_messages).any(|message| matches!(message, ServerMsg::EncounterStart { .. })),
+        "loading the saved adapter cannot start either player's fight before the handshake");
+    assert!(saves.try_recv().is_err(), "checking the recovered roster never rewrites its checkpoint");
+    assert_eq!(rig.store.get_scene_group(rig.owner.account, GameId::Fixture).unwrap(), group);
+    let owner_offer = owner_messages.into_iter().find(|message| matches!(message, ServerMsg::AreaChange { .. })).unwrap();
+    let guest_offer = guest_messages.into_iter().find(|message| matches!(message, ServerMsg::AreaChange { .. })).unwrap();
     let enter = |world: &mut World, seat: &Seat, offer: ServerMsg| {
         let ServerMsg::AreaChange { area, fingerprint, provenance, .. } = offer else { unreachable!() };
         assert_eq!(world.join_area(seat.entity, &area, &fingerprint, &provenance, rig.now), crate::world::TravelReply::Done);

@@ -550,6 +550,20 @@ pub struct StoryBattlePolicy {
     pub game_over_on_defeat: bool,
 }
 
+/// One evaluation of a story action that reaches a battle. Scripts may change the
+/// canon party before the fight and restore it afterward, so the battle's roster
+/// must come from its own intermediate state. Only `victory` is a save result;
+/// `battle_progress` is never published as a committed story step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryBattleAction {
+    pub policy: StoryBattlePolicy,
+    /// An exact intermediate story for canon roster selection. `None` retains the
+    /// legacy online party leader's roster; `Some` overrides it even when that
+    /// story describes an empty canon party.
+    pub battle_progress: Option<Vec<u8>>,
+    pub victory: StoryStep,
+}
+
 /// What an area's data holds of the story (exits its scripts decide, points that move the story) that its adapter
 /// does NOT offer, and why: see [`AreaRuntime::story_withheld`]. Descriptions are the adapter's own, in words and
 /// numbers of its own (never text of the game); the server logs them once per area.
@@ -748,6 +762,19 @@ pub trait AreaRuntime: Send + Sync {
     fn story_battle_policy(&self, progress: &[u8], point: u32) -> Option<StoryBattlePolicy> {
         self.story_battle_for(progress, point).map(|formation| StoryBattlePolicy {
             formation, escape_forbidden: false, victory_fanfare: true, game_over_on_defeat: false,
+        })
+    }
+
+    /// Evaluate the policy, roster state at the battle, and final victory step
+    /// together. Exact script adapters override this to capture the intermediate
+    /// state in the same execution that produces the final step. The default
+    /// retains legacy adapters whose canon party does not change within an action.
+    /// The caller still compares and commits against the original `progress`.
+    fn story_battle_action(&self, progress: &[u8], point: u32) -> Option<StoryBattleAction> {
+        Some(StoryBattleAction {
+            policy: self.story_battle_policy(progress, point)?,
+            battle_progress: None,
+            victory: self.story_advance(progress, point)?,
         })
     }
 
@@ -1159,6 +1186,7 @@ mod tests {
         assert_eq!(area.phase_key(&[1, 2, 3]), None, "no opinion: the server uses one phase per distinct blob");
         assert!(area.story_points().is_empty());
         assert_eq!(area.story_advance(&[], 0), None);
+        assert_eq!(area.story_battle_action(&[], 0), None);
         assert!(area.npcs_in_phase(&PhaseKey(vec![9])).is_empty());
         assert!(area.story_party(&[1, 2, 3]).is_empty(), "no canon party: the players fight alone");
         assert!(area.try_story_party(&[1, 2, 3]).unwrap().is_empty());

@@ -57,7 +57,7 @@ use crate::field_direction_to_facing;
 use crate::background::{BackgroundOp, BackgroundState, PaletteOp};
 use crate::script::dialogue::{parse_message, Choice, End, Message, MessageOrigin, Piece, StoryVars, EFFECT_NOTE_LAYER};
 use crate::script::{decode_at, FieldScript, Instruction};
-use crate::story::{tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::story::{tracked_var, NativePartyOp, NativeStoryBuilder, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Field frames per second (the clock of [`Timed::at`]).
@@ -374,6 +374,24 @@ impl StoryVars for SceneVars {
     }
 }
 
+/// Dialogue substitutions read the same native main slots as GETPC, including authored
+/// changes earlier in this segment. An unknown slot is an unresolved read, never Cloud or empty.
+struct NativeMessageVars<'a> {
+    story: &'a StoryState,
+    unknown: std::cell::Cell<bool>,
+}
+
+impl StoryVars for NativeMessageVars<'_> {
+    fn byte(&self, bank: u8, address: u8) -> u8 { self.story.var(bank, address) }
+    fn party_member(&self, slot: u8) -> Option<u8> {
+        match self.story.native_party().and_then(|party| party.known_main_slot(slot).ok()).flatten() {
+            Some(255) => None,
+            Some(member) => Some(member),
+            None => { self.unknown.set(true); None }
+        }
+    }
+}
+
 /// Where an entity stands, as far as the scene knows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Where {
@@ -638,17 +656,23 @@ pub struct Vm {
     party_bank: [u8; 3],
     /// Source-validated MENU6 sites that retain the existing canonical names.
     default_name_sites: Vec<(usize, u8)>,
-    /// V4 resources are storage-only until native party execution is implemented. Once rejected,
-    /// a later begin, statistics reset or legacy battle snapshot must not restart this VM.
-    unsupported_native_party: bool,
+    /// Ordered persistent assignments and native party operations for this exact v4 segment.
+    /// The original SceneVars story remains the immutable beforeimage; scratch stays in writes.
+    native_story: Option<NativeStoryBuilder>,
+    /// A malformed or representation-changing internal rebase may never resurrect execution.
+    invalid_native_state: bool,
     resources: ResourceOutcome,
     stats: Stats,
 }
 
 impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
-        let unsupported_native_party = vars.story.supports_native_party();
-        let party = if unsupported_native_party { [255; 3] }
+        let native_story = vars.story.supports_native_party().then(|| NativeStoryBuilder::new(&vars.story)).transpose();
+        let invalid_native_state = native_story.is_err();
+        let native_story = native_story.ok().flatten();
+        // These tuples are exclusively the legacy compatibility model. Native execution reads
+        // the checked builder state and never falls back from unknown main slots to this tuple.
+        let party = if vars.story.supports_native_party() { [255; 3] }
             else { [0, 1, 2].map(|slot| vars.party_member(slot).unwrap_or(255)) };
         Self {
             jump: None,
@@ -700,7 +724,8 @@ impl Vm {
             party_main: party,
             party_bank: party,
             default_name_sites: Vec::new(),
-            unsupported_native_party,
+            native_story,
+            invalid_native_state,
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -715,11 +740,16 @@ impl Vm {
 
     pub fn resources(&self) -> &ResourceOutcome { &self.resources }
 
-    /// Refuse unsupported native-party execution before evaluating any instruction or accepting
-    /// an answer. Clear unpublished output so an invalid battle rebase cannot expose a stale
-    /// success boundary or a partial assignment. The latch survives all public resets.
-    fn refuse_native_party(&mut self) -> bool {
-        if !self.unsupported_native_party { return false; }
+    /// Native persistent state at the current instruction; no scratch or external resources.
+    pub fn current_persistent_story(&self) -> Option<&StoryState> { self.native_story.as_ref().map(NativeStoryBuilder::state) }
+
+    /// Ordered v4 assignments and native effects, including quiet setup and unchanged writes.
+    pub fn native_journal(&self) -> Option<NativeStoryJournal> { self.native_story.as_ref().map(NativeStoryBuilder::snapshot) }
+
+    /// Refuse a malformed or representation-changing internal battle rebase before executing.
+    /// Clear unpublished output; the refusal survives begin and statistics resets.
+    fn refuse_invalid_native_state(&mut self) -> bool {
+        if !self.invalid_native_state { return false; }
         self.stats.setup_incomplete = true;
         self.stats.unresolved = self.stats.unresolved.max(1);
         self.done = Some(End::Broken);
@@ -729,6 +759,7 @@ impl Vm {
         self.writes.clear();
         self.written_masks.clear();
         self.party_ops.clear();
+        self.native_story = None;
         self.resources.gil_ops.clear();
         self.resources.gil_after = self.resources.gil_before;
         self.jump = None;
@@ -745,6 +776,38 @@ impl Vm {
         self.default_name_sites = sites;
     }
 
+    /// Evaluate a native operation on the same ordered state as direct persistent writes.
+    fn change_native_party(&mut self, operation: NativePartyOp) -> bool {
+        let Some(native) = &mut self.native_story else { return false };
+        let effect = match native.party(operation) {
+            Ok(effect) => effect,
+            Err(_) => {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return false;
+            }
+        };
+        if effect.changed() { self.epoch = self.epoch.wrapping_add(1); }
+        let assigned = effect.assignments().raw_slots;
+        for (slot, (value, known)) in effect.after().raw_slots().into_iter().enumerate() {
+            if assigned & (1 << slot) != 0 { self.record_assignment_map(3, 9 + slot as u8, value, known); }
+        }
+        true
+    }
+
+    /// Resolve an U8 operand before a native operation. An unknown persistent input is never
+    /// converted to a preview/Given value and then used to mutate the native party.
+    fn native_operand_u8(&mut self, ins: &Instruction, name: &str) -> Option<u8> {
+        let operand = ins.operand(name)?;
+        if operand.bank == 0 { return u8::try_from(operand.value).ok(); }
+        let address = u8::try_from(operand.value).ok()?;
+        if !matches!(operand.bank, 5 | 6) && crate::story::canonical_persistent_bank(operand.bank).is_none() { return None; }
+        let value = self.var_byte(operand.bank, address);
+        let known = matches!(operand.bank, 5 | 6)
+            || self.native_story.as_ref()?.state().known_mask(operand.bank, address) == 255;
+        if !known { self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+        known.then_some(value)
+    }
+
     fn default_name_menu(&mut self, ins: &Instruction, class: &mut Class) {
         if !self.vars.story.supports_extended() {
             *class = Class::Ignored;
@@ -754,6 +817,10 @@ impl Vm {
         if ins.stray_banks || ins.literal("type") != Some(6)
             || !param.is_some_and(|param| param <= 1 && self.default_name_sites.contains(&(ins.offset, param))) {
             *class = Class::Ignored;
+            return;
+        }
+        if self.native_story.is_some() {
+            if !self.change_native_party(NativePartyOp::FieldSync) { *class = Class::Unknown; }
             return;
         }
         // Original OpcodeFuncMenu's completion calls FIELD_Init (field_opcodes.c6664), also
@@ -799,6 +866,13 @@ impl Vm {
     /// Apply the original field/main tuple transition. No initial physical bytes are invented:
     /// only an authored assignment becomes a write, and a full PRTYE without 255 reads no old tuple.
     fn change_party(&mut self, op: PartyOp) -> bool {
+        if self.native_story.is_some() {
+            return self.change_native_party(match op {
+                PartyOp::Add(character) => NativePartyOp::Add(character),
+                PartyOp::Remove(character) => NativePartyOp::Remove(character),
+                PartyOp::Set(slots) => NativePartyOp::Set(slots),
+            });
+        }
         use crate::script::party::transition;
         let extended = self.vars.story.supports_extended();
         let replaces_all = matches!(op, PartyOp::Set(slots) if !slots.contains(&255));
@@ -982,10 +1056,10 @@ impl Vm {
         self.set_masked(bank, address, value, u8::MAX);
     }
 
-    /// Direct mirror writes would change IFPRTYQ's physical tuple without synchronizing GETPC's
-    /// main tuple. Only authored party opcodes have a represented native transfer between them.
+    /// Version 3 cannot represent a direct raw/main divergence and refuses these writes.
+    /// Version 4 journals arbitrary raw assignments independently from its native main tuple.
     fn party_mirror_write(&self, bank: u8, address: u8, wide: bool) -> bool {
-        self.vars.story.supports_extended() && self.vars.key(bank, address).0 == 3
+        self.vars.story.supports_extended() && !self.vars.story.supports_native_party() && self.vars.key(bank, address).0 == 3
             && ((9..=11).contains(&address) || (wide && address.checked_add(1).is_some_and(|next| (9..=11).contains(&next))))
     }
 
@@ -999,6 +1073,19 @@ impl Vm {
 
     /// Record a validated generic assignment, or an authored party opcode's explicit physical write.
     fn record_assignment(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        if crate::story::canonical_persistent_bank(bank).is_some() {
+            if let Some(native) = &mut self.native_story {
+                if native.write_masked(bank, address, value, mask).is_err() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        self.record_assignment_map(bank, address, value, mask);
+    }
+
+    /// Diagnostic overlay update after a native effect has already journaled its assignments.
+    fn record_assignment_map(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
         let key = self.vars.key(bank, address);
         let old = if self.vars.story.supports_extended() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
         let old_mask = self.written_masks.get(&key).copied().unwrap_or(0);
@@ -1015,6 +1102,17 @@ impl Vm {
             return; // Refuse the whole assignment, including an otherwise valid low byte.
         }
         let [low, high] = value.to_le_bytes();
+        if crate::story::canonical_persistent_bank(bank).is_some() {
+            if let Some(native) = &mut self.native_story {
+                if native.write_word(bank, address, value).is_err() {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    return;
+                }
+                self.record_assignment_map(bank, address, low, 255);
+                self.record_assignment_map(bank, address + 1, high, 255);
+                return;
+            }
+        }
         self.set_byte(bank, address, low);
         if let Some(next) = address.checked_add(1) {
             self.set_byte(bank, next, high);
@@ -1519,12 +1617,21 @@ impl Vm {
 
     // ---- one instruction --------------------------------------------------------------------------------------
 
-    fn message(&self, script: &FieldScript<'_>, dialog: i32) -> Option<Message> {
+    fn message(&mut self, script: &FieldScript<'_>, dialog: i32) -> Option<Message> {
         let index = usize::try_from(dialog).ok()?;
         let d = script.dialogs().get(index)?;
         let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
+        let pieces = if let Some(native) = &self.native_story {
+            let vars = NativeMessageVars { story: native.state(), unknown: std::cell::Cell::new(false) };
+            let pieces = parse_message(raw, &vars);
+            if vars.unknown.get() {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                self.invalid_message = true;
+            }
+            pieces
+        } else { parse_message(raw, &self.vars) };
         // The speaker's own entity is not known here: the entity is the opener's, set by the caller.
-        Some(Message::new(MessageOrigin::Canon { entity: 0, dialog: index }, parse_message(raw, &self.vars)))
+        Some(Message::new(MessageOrigin::Canon { entity: 0, dialog: index }, pieces))
     }
 
     fn open(&mut self, idx: usize, entity: usize, instruction_offset: usize, window: i32, mut message: Message, pending: Option<Pending>) -> Flow {
@@ -1688,6 +1795,47 @@ impl Vm {
                 Flow::Yield
             }
             0x01..=0x03 => self.request(script, idx, ins),
+            0x0A if self.native_story.is_some() => {
+                // SPTYE snapshots all three operands before PartyReplace mutates any source.
+                let slots = ["character1", "character2", "character3"].map(|name| self.native_operand_u8(ins, name));
+                match slots {
+                    [Some(a), Some(b), Some(c)] if self.change_native_party(NativePartyOp::Set([a, b, c])) => {},
+                    _ => *class = Class::Unknown,
+                }
+                Flow::Next
+            }
+            0x0B if self.native_story.is_some() => {
+                // GTPYE reads each raw slot immediately before its U8 store. Stage the
+                // instruction so an unknown later read cannot publish a partial assignment.
+                let Some(mut staged) = self.native_story.clone() else {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                    return Flow::Next;
+                };
+                let mut assigned = Vec::with_capacity(3);
+                let mut valid = true;
+                for (slot, name) in ["var1", "var2", "var3"].into_iter().enumerate() {
+                    let address = 9 + slot as u8;
+                    let Some(value) = staged.state().known_byte(3, address) else {
+                        self.vars.audit_mask(3, address, !self.written_mask(3, address));
+                        valid = false;
+                        break;
+                    };
+                    let Some((bank, destination)) = Self::dest(ins, name) else { valid = false; break };
+                    if crate::story::canonical_persistent_bank(bank).is_some() {
+                        if staged.write_byte(bank, destination, value).is_err() { valid = false; break; }
+                    } else if !matches!(bank, 5 | 6) { valid = false; break; }
+                    assigned.push((bank, destination, value));
+                }
+                if valid {
+                    self.native_story = Some(staged);
+                    for (bank, address, value) in assigned { self.record_assignment_map(bank, address, value, 255); }
+                } else {
+                    self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                    *class = Class::Unknown;
+                }
+                Flow::Next
+            }
             // RETTO: carry on in another script of the same entity, in place of this one.
             0x07 => {
                 let slot = ins.literal("script").and_then(|s| usize::try_from(s).ok());
@@ -1808,7 +1956,26 @@ impl Vm {
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
-                if let Some((bank, address)) = Self::dest(ins, "var_character") {
+                if self.native_story.is_some() {
+                    // The original does nothing for an out-of-range slot. Known empty is
+                    // 255; an unknown valid slot cannot authorize an assignment.
+                    if slot < 3 {
+                        let Some((bank, address)) = Self::dest(ins, "var_character").filter(|(bank, _)|
+                            matches!(*bank, 5 | 6) || crate::story::canonical_persistent_bank(*bank).is_some()) else {
+                            self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                            *class = Class::Unknown;
+                            return Flow::Next;
+                        };
+                        match self.native_story.as_ref().and_then(|native| native.state().native_party())
+                            .and_then(|party| party.known_main_slot(slot).ok()).flatten() {
+                            Some(who) => self.set_byte(bank, address, who),
+                            None => {
+                                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                                *class = Class::Unknown;
+                            }
+                        }
+                    }
+                } else if let Some((bank, address)) = Self::dest(ins, "var_character") {
                     let who = self.party_now().get(usize::from(slot)).copied().unwrap_or(u8::MAX);
                     self.set_byte(bank, address, who);
                 }
@@ -1861,7 +2028,7 @@ impl Vm {
             0xCB | 0xCC => {
                 // Team/PHS availability is not active membership: Barret remains available after
                 // leaving the party at moment36. V3 has no authoritative input for this query yet.
-                if op == 0xCC && self.vars.story.supports_extended() {
+                if op == 0xCC && self.vars.story.supports_extended() && self.native_story.is_none() {
                     self.stats.unresolved = self.stats.unresolved.saturating_add(1);
                     *class = Class::Unknown;
                     return Flow::Next;
@@ -1871,7 +2038,12 @@ impl Vm {
                     *class = Class::Unknown;
                     return Flow::Next;
                 };
-                let holds = if op == 0xCB { self.field_party_contains(character) } else { Some(self.vars.is_member(character)) };
+                let holds = if op == 0xCB { self.field_party_contains(character) }
+                    else if let Some(native) = &self.native_story {
+                        let known = native.state().native_party().and_then(|party| party.known_available(character).ok()).flatten();
+                        if known.is_none() { self.stats.unresolved = self.stats.unresolved.saturating_add(1); }
+                        known
+                    } else { Some(self.vars.is_member(character)) };
                 match holds {
                     Some(holds) => self.branch(idx, ins, holds),
                     None => { *class = Class::Unknown; Flow::Next }
@@ -2254,6 +2426,17 @@ impl Vm {
                 }
                 Flow::Next
             }
+            0xCD..=0xCF if self.native_story.is_some() => {
+                let character = ins.literal("character").and_then(|value| u8::try_from(value).ok());
+                let operation = character.and_then(|character| match op {
+                    0xCD => ins.literal("exists").map(|value| NativePartyOp::Available { character, available: value != 0 }),
+                    0xCE => Some(NativePartyOp::Lock { character, locked: true }),
+                    0xCF => Some(NativePartyOp::Lock { character, locked: false }),
+                    _ => None,
+                });
+                if !operation.is_some_and(|operation| self.change_native_party(operation)) { *class = Class::Unknown; }
+                Flow::Next
+            }
             // ---- known, and no change to what a scene shows ---------------------------------------------------
             _ => {
                 if let Some((arith, wide, saturate)) = arith_of(op) {
@@ -2370,7 +2553,7 @@ impl Vm {
     /// other tables hold where everyone stands, and the variables hold what those scripts wrote. The threads are
     /// dropped, loops included.
     pub fn setup(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
-        if self.refuse_native_party() { return; }
+        if self.refuse_invalid_native_state() { return; }
         self.quiet = true;
         self.threads.clear();
         self.slots.clear();
@@ -2423,8 +2606,11 @@ impl Vm {
     }
 
     pub(super) fn resume_battle(&mut self, story: &StoryState, resources: SceneResources) {
-        self.unsupported_native_party |= story.supports_native_party();
-        if self.refuse_native_party() { return; }
+        self.invalid_native_state |= self.vars.story.supports_native_party() != story.supports_native_party();
+        let native = story.supports_native_party().then(|| NativeStoryBuilder::new(story)).transpose();
+        self.invalid_native_state |= native.is_err();
+        if self.refuse_invalid_native_state() { return; }
+        self.native_story = native.ok().flatten();
         // Acknowledged persistent assignments now live in the authoritative afterimage. Scratch
         // selectors (5/6) and every scheduler/actor/RNG detail stay exactly where combat paused.
         self.writes.retain(|(bank, _), _| crate::story::canonical_persistent_bank(*bank).is_none());
@@ -2437,8 +2623,10 @@ impl Vm {
         self.resources.gil_after = resources.gil;
         self.resources.gil_ops.clear();
         self.party_ops.clear();
-        self.party_main = [0, 1, 2].map(|slot| self.vars.party_member(slot).unwrap_or(255));
-        self.party_bank = self.party_main;
+        if !story.supports_native_party() {
+            self.party_main = [0, 1, 2].map(|slot| self.vars.party_member(slot).unwrap_or(255));
+            self.party_bank = self.party_main;
+        }
         self.done = None;
         self.battle = None;
         self.battle_checkpoint = None;
@@ -2475,7 +2663,7 @@ impl Vm {
     /// last, if that asked (the absolute line number of the choice, as a script stores it; anything else is clamped
     /// into the choices, `None` takes the cursor's starting line).
     pub fn resume(&mut self, script: &FieldScript<'_>, answer: Option<usize>) -> Beat {
-        if self.refuse_native_party() {
+        if self.refuse_invalid_native_state() {
             return Beat { stage: Vec::new(), then: Then::End { at: self.clock.saturating_sub(self.origin), how: End::Broken } };
         }
         self.window_checkpoint = None;

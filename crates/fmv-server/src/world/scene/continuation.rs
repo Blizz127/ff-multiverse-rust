@@ -170,6 +170,22 @@ impl Continuation {
 }
 
 impl World {
+    /// An FF7 native-party boundary names an authoritative roster snapshot. Legacy scenes keep
+    /// the existing online leader policy; an explicitly known empty native party remains
+    /// `Some(empty)`. Non-FF7 fixture hosts may use their own opaque story representation.
+    fn scene_battle_canon(&self, field: &str, progress: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        let area = self.areas.get(field).ok_or(())?;
+        // Progression is adapter-owned. Another game's opaque bytes are not FF7 merely
+        // because they happen to decode; Fixture explicitly permits synthetic FF7 stories.
+        if !matches!(area.id().game, fmv_core::GameId::Ff7 | fmv_core::GameId::Fixture) { return Ok(None); }
+        match fmv_ff7::story::StoryState::decode(progress) {
+            Some(story) if story.supports_native_party() => area.runtime().try_story_party(progress).map(Some).map_err(|_| ()),
+            Some(_) => Ok(None),
+            None if area.id().game == fmv_core::GameId::Ff7 => Err(()),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn initialize_continuation(&mut self, run: SceneRunId, record: &SceneRun) -> bool {
         if self.scenes.continuations.contains_key(&run) { return true; }
         let Some(host) = self.scenes.host.as_ref().filter(|host| host.continuation_for(&record.scene, &record.progress)) else { return true; };
@@ -271,9 +287,12 @@ impl World {
         let previous = c.payload.plan.clone();
         let carry = c.payload.carry.clone();
         let states = c.states.clone();
+        let Ok(canon) = self.scene_battle_canon(&c.payload.field, &c.boundary.progress) else {
+            self.continuation_failure(run, "the authored battle party is not fully known"); return;
+        };
         let plan = if let (Some(previous), Some(carry)) = (previous, carry) {
-            self.prepare_next_scene_battle(&previous, formation, &carry, &states)
-        } else { self.prepare_scene_battle(record.owner, run, formation, EscapePolicy::Forbidden, None) };
+            self.prepare_next_scene_battle(&previous, formation, &carry, &states, canon.as_deref())
+        } else { self.prepare_scene_battle(record.owner, run, formation, EscapePolicy::Forbidden, None, canon.as_deref()) };
         let Ok(plan) = plan else { self.continuation_failure(run, "the frozen battle roster cannot be prepared"); return; };
         self.snapshot_continuation(run, Action::Prepare { plan, ordinal });
     }
@@ -800,7 +819,12 @@ impl World {
         let Some(c) = self.scenes.continuations.get(&run) else { return; };
         let Some(context) = c.context(run) else { self.continuation_failure(run,"prepared battle checkpoint missing"); return; };
         let Some(plan) = c.payload.plan.clone() else { self.continuation_failure(run,"prepared battle setup missing"); return; };
-        if !self.validate_scene_battle_plan(&plan, &c.states) {
+        let Ok(canon) = self.scene_battle_canon(&c.payload.field, &c.boundary.progress) else {
+            self.continuation_failure(run, "the saved battle party is not fully known"); return;
+        };
+        if (c.consumed() > 0) != c.payload.carry.is_some()
+            || !self.validate_scene_battle_plan(&plan, &c.states, canon.as_deref())
+            || !self.validate_scene_battle_initial_carry(&plan, c.payload.carry.as_ref()) {
             self.continuation_failure(run, "the saved battle plan disagreed with its coherent roster"); return;
         }
         if !c.accounts.iter().any(|a| self.by_account.contains_key(a))
@@ -851,18 +875,19 @@ impl World {
         let checkpoint = owner_state.checkpoint.clone().ok_or(JoinError::StorageUnavailable)?;
         let owner = owner_state.pair.story.account_id;
         let player = self.players.get(&entity).ok_or(JoinError::StorageUnavailable)?;
+        let (player_account, player_area, player_facing) = (player.account, player.area.clone(), player.snapshot.facing);
         // ContinueLanding changes the durable instance before its acknowledgment reaches this
         // process. Fence by reserved account as well as instance so that new id cannot create a
         // second runtime while the old runtime is still committing the handoff.
-        if self.scenes.continuations.values().any(|c| c.accounts.contains(&player.account)
+        if self.scenes.continuations.values().any(|c| c.accounts.contains(&player_account)
             && (matches!(c.phase, Phase::Snapshot { .. } | Phase::Commit { .. })
                 // Terminal combat and last-player disconnect queue a handoff for the scene
                 // tick. Admission must not try to attach to the engine removed in that gap.
-                || (matches!(c.phase, Phase::Fighting { .. }) && !self.account_in_battle(player.account)))) {
+                || (matches!(c.phase, Phase::Fighting { .. }) && !self.account_in_battle(player_account)))) {
             return Err(JoinError::ProgressChanged);
         }
-        if !group.iter().any(|s|s.pair.story.account_id==player.account) { return Err(JoinError::StorageUnavailable); }
-        let host = self.scenes.host.as_ref().ok_or(JoinError::StorageUnavailable)?;
+        if !group.iter().any(|s|s.pair.story.account_id==player_account) { return Err(JoinError::StorageUnavailable); }
+        let host = self.scenes.host.clone().ok_or(JoinError::StorageUnavailable)?;
         if checkpoint.replay_version != REPLAY_VERSION || !host.continuation_for(&checkpoint.scene_key, &checkpoint.original_story)
             || !checkpoint_can_be_announced(&checkpoint) {
             return Err(JoinError::StorageUnavailable);
@@ -875,15 +900,25 @@ impl World {
         let boundary = host.evaluate_continuation(&checkpoint.scene_key,&checkpoint.original_story,checkpoint.seed,
             checkpoint.original_gil,Some(&payload.replay)).ok_or(JoinError::StorageUnavailable)?;
         if boundary.source != checkpoint.source_hash { return Err(JoinError::StorageUnavailable); }
+        // A reconnect may start in another entry field. Load the validated scene's field
+        // before asking its adapter to check the saved roster; the area handshake still
+        // controls when the player enters it and combat may start.
+        let roster_field = if matches!(checkpoint.phase, ScenePhase::BeforeBattle { .. })
+            || (matches!(checkpoint.phase, ScenePhase::Resume { .. }) && checkpoint.consumed_battles > 0) {
+            self.ensure_area(&payload.field).map_err(|_| JoinError::StorageUnavailable)?
+        } else { payload.field.clone() };
         let valid = match &checkpoint.phase {
             ScenePhase::BeforeBattle{ordinal,formation,battle_seed,..} => {
+                let canon = self.scene_battle_canon(&roster_field, &boundary.progress).map_err(|_| JoinError::StorageUnavailable)?;
                 matches!(&boundary.at,SceneBoundaryKind::Battle{ordinal: actual,formation:actual_formation,flags:Some(8),..}
                     if *actual==ordinal+1 && actual_formation==formation)
                     && boundary.progress==owner_state.pair.story.blob
                     && owner_state.pair.character.as_ref().is_some_and(|r|r.gil==boundary.gil)
+                    && (checkpoint.consumed_battles > 0) == payload.carry.is_some()
                     && payload.plan.as_ref().is_some_and(|p|p.setup.formation_id==*formation && p.setup.seed==*battle_seed
                         && p.setup.escape_policy==EscapePolicy::Forbidden && p.setup.victory_fanfare && p.setup.game_over_on_defeat
-                        && self.validate_scene_battle_plan(p, &group)
+                        && self.validate_scene_battle_plan(p, &group, canon.as_deref())
+                        && self.validate_scene_battle_initial_carry(p, payload.carry.as_ref())
                         && p.accounts().len()==group.len() && p.accounts().iter().all(|a|group.iter().any(|s|s.pair.story.account_id==*a)))
             }
             ScenePhase::Resume{segment} => {
@@ -892,8 +927,14 @@ impl World {
                         && group[0].reservation.is_none() && host.automatic(&checkpoint.scene_key)
                         && payload.landing.as_ref().is_some_and(|l| l.field.eq_ignore_ascii_case(&payload.field))
                 } else {
+                    // The retained plan describes the completed battle. The newly evaluated
+                    // boundary may already contain later authored party changes.
+                    let progress = payload.replay.events.iter().rev().find_map(|event| match event {
+                        SceneReplayEvent::Battle { progress, .. } => Some(progress.as_slice()), _ => None,
+                    }).ok_or(JoinError::StorageUnavailable)?;
+                    let canon = self.scene_battle_canon(&roster_field, progress).map_err(|_| JoinError::StorageUnavailable)?;
                     match (&payload.plan, &payload.carry) {
-                        (Some(plan), Some(carry)) => self.validate_scene_battle_resume(plan, carry, &group),
+                        (Some(plan), Some(carry)) => self.validate_scene_battle_resume(plan, carry, &group, canon.as_deref()),
                         _ => false,
                     }
                 };
@@ -919,11 +960,11 @@ impl World {
         let desired = if matches!(checkpoint.phase, ScenePhase::Landing { .. }) { payload.landing.clone() }
             else { Some(Landing { field: payload.field.clone(), position: payload.position, facing: Some(payload.facing),
                 hint: payload.replay.origin.as_ref().and_then(|origin| origin.triangle) }) };
-        let placement = desired.as_ref().filter(|d| d.field.eq_ignore_ascii_case(&player.area)).map(|d| {
-            let area = self.areas.get(&player.area).ok_or(JoinError::StorageUnavailable)?;
+        let placement = desired.as_ref().filter(|d| d.field.eq_ignore_ascii_case(&player_area)).map(|d| {
+            let area = self.areas.get(&player_area).ok_or(JoinError::StorageUnavailable)?;
             let pos = area.runtime().place_arrival(d.position, d.hint);
             if !pos.is_finite() { return Err(JoinError::StorageUnavailable); }
-            Ok((pos, d.facing.unwrap_or(player.snapshot.facing)))
+            Ok((pos, d.facing.unwrap_or(player_facing)))
         }).transpose()?;
         let existing=self.scenes.continuations.iter().find(|(_,c)|c.instance==checkpoint.instance).map(|(id,_)|*id);
         let run=if let Some(run)=existing {

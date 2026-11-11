@@ -366,7 +366,7 @@ impl Walk {
     /// Run on to the next window or the end. `answer` is the player's answer to the window this
     /// walk handed out last, if that asked (see [`MessageSource::next`]).
     pub fn resume(&mut self, script: &FieldScript<'_>, env: &dyn StoryVars, answer: Option<usize>) -> Beat {
-        if !env.execution_supported() {
+        if self.exact.is_none() && !env.execution_supported() {
             self.queued = None;
             self.pending = None;
             return self.finish(End::Broken);
@@ -442,6 +442,7 @@ impl Walk {
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
         if self.exact.is_some() && address == u8::MAX { self.invalid_exact(); return; }
+        if self.native_word(bank, address, value) { return; }
         let [low, high] = value.to_le_bytes();
         self.set_byte(bank, address, low);
         if let Some(next) = address.checked_add(1) {
@@ -602,7 +603,8 @@ impl Walk {
         let index = usize::try_from(dialog).ok()?;
         let d = script.dialogs().get(index)?;
         let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
-        let mut message = Message::new(MessageOrigin::Canon { entity, dialog: index }, parse_message(raw, env));
+        let pieces = if self.native_exact() { self.exact_message(raw, env) } else { parse_message(raw, env) };
+        let mut message = Message::new(MessageOrigin::Canon { entity, dialog: index }, pieces);
         message.window = u8::try_from(window).unwrap_or(0);
         Some(message)
     }
@@ -846,6 +848,9 @@ impl Walk {
             }
             0x72 if self.exact.is_some() => { self.exact_battle_mode(&ins); Flow::Continue },
             0xBF if self.exact.is_some() => { self.exact_control(&ins); Flow::Continue },
+            0x0A | 0x0B | 0xC8..=0xCA | 0xCD..=0xCF if self.native_exact() => {
+                self.native_party_instruction(env, &ins); Flow::Continue
+            }
             0xCA if self.exact.is_some() => { self.exact_party(&ins); Flow::Continue },
             // The movement opcodes: a character is left where the movement ends.
             0xA5..=0xA8 | 0xC0 | 0xC2 if self.track => {
@@ -864,8 +869,12 @@ impl Walk {
             0x74 => {
                 // GETPC: the character in a party slot (0xFF for none).
                 let slot = ins.literal("party").and_then(|s| u8::try_from(s).ok()).unwrap_or(u8::MAX);
+                // Pinned field_opcodes.c:6683–6694 performs no write for slot >= NUM_PARTY.
+                if self.native_exact() && slot >= 3 { return Flow::Continue; }
                 if let Some((bank, address)) = Self::dest(&ins, "var_character") {
                     self.set_byte(bank, address, self.party_member(env, slot).unwrap_or(u8::MAX));
+                } else if self.native_exact() {
+                    self.invalid_exact();
                 }
                 Flow::Continue
             }
@@ -922,7 +931,10 @@ impl Walk {
                 Flow::Continue
             }
             0xCB | 0xCC => {
-                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c| if op == 0xCB { self.in_party(env, c) } else { env.is_member(c) });
+                let holds = ins.literal("character").and_then(|c| u8::try_from(c).ok()).is_some_and(|c|
+                    if op == 0xCB { self.in_party(env, c) }
+                    else if self.native_exact() { self.native_member(c) }
+                    else { env.is_member(c) });
                 self.branch(&ins, holds)
             }
             0xFF => Flow::End(End::GameOver),

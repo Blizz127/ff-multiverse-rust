@@ -119,9 +119,13 @@ impl World {
         let area = player.area.clone();
         let before = player.progression.clone();
         let Some(runtime) = self.areas.get(&player.area).map(|area| area.runtime()) else { return false; };
-        let Some(policy) = runtime.story_battle_policy(&before, point).filter(|policy| policy.formation == formation) else { return false; };
-        let Some(step) = runtime.story_advance(&before, point) else { return false; };
-        let Ok(mut setup) = self.prepare_battle_setup_with_story_hold(entity, formation, None, true) else { return false; };
+        // One authored evaluation binds policy, the BATTLE-time roster and the eventual
+        // victory together. Its prefix is only an engine input: `before` remains the
+        // terminal transaction's exact predecessor and is never replaced by that prefix.
+        let Some(action) = runtime.story_battle_action(&before, point).filter(|action| action.policy.formation == formation) else { return false; };
+        let Ok(canon) = action.battle_progress.as_deref().map(|progress| runtime.try_story_party(progress)).transpose() else { return false; };
+        let (policy, step) = (action.policy, action.victory);
+        let Ok(mut setup) = self.prepare_battle_setup_with_canon(entity, formation, None, true, canon.as_deref()) else { return false; };
         setup.escape_policy = if policy.escape_forbidden { fmv_protocol::EscapePolicy::Forbidden } else { fmv_protocol::EscapePolicy::Formation };
         setup.victory_fanfare = policy.victory_fanfare;
         setup.game_over_on_defeat = policy.game_over_on_defeat;

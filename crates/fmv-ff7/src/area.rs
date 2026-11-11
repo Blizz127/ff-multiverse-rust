@@ -1182,6 +1182,10 @@ impl AreaRuntime for Ff7FieldArea {
         self.story.battle_policy(progress, point)
     }
 
+    fn story_battle_action(&self, progress: &[u8], point: u32) -> Option<fmv_adapter_api::StoryBattleAction> {
+        self.story.battle_action(progress, point)
+    }
+
     /// The first reactor's countdown matters while the story counter is where the step that started it left it
     /// ([`crate::story::countdown_live`]).
     fn countdown_live(&self, started: &[u8], now: &[u8]) -> bool {

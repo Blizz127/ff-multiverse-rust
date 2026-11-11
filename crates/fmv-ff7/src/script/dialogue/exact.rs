@@ -2,7 +2,7 @@
 //! No result escapes after a guessed input, skipped effect, or incomplete run.
 
 use super::*;
-use crate::story::{canonical_persistent_bank, PartyOp, StoryState};
+use crate::story::{canonical_persistent_bank, NativePartyOp, NativePartyOpError, NativeStoryBuilder, NativeStoryError, NativeStoryEvent, NativeStoryJournal, PartyOp, StoryState};
 use std::cell::{Cell, RefCell};
 
 /// Final authored assignment to the selected bits of one physical persistent byte.
@@ -28,14 +28,23 @@ pub struct ExactRun {
     /// Resolved PRTYE assignments. Every empty slot is254; original255 fill semantics have
     /// already been applied against the current party, so callers may use story::party_after.
     pub party: Vec<PartyOp>,
+    /// Ordered complete persistent afterimage for native-party execution; `writes` is only
+    /// an inspection summary in this format and must not be independently applied.
+    pub native: Option<NativeStoryJournal>,
+    /// Exact persistent state at BATTLE, before its victory suffix executes.
+    pub battle_story: Option<StoryState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExactError {
-    #[error("exact dialogue requires a version 3 story")]
+    #[error("exact dialogue requires an extended story")]
     LegacyStory,
-    #[error("native party execution is not implemented for exact dialogue")]
-    NativePartyUnsupported,
+    #[error(transparent)]
+    NativeStory(#[from] NativeStoryError),
+    #[error(transparent)]
+    NativeParty(#[from] NativePartyOpError),
+    #[error("availability of character {0} is not known")]
+    UnknownAvailability(u8),
     #[error("the field has no such entity or script")]
     MissingScript,
     #[error("the character is hidden or not talkable")]
@@ -93,12 +102,14 @@ pub struct ExactScript {
 #[derive(Debug, Clone)]
 pub(super) struct ExactState {
     story: StoryState,
+    native: Option<NativeStoryBuilder>,
     pub(super) masks: BTreeMap<(u8, u8), u8>,
     seeds: BTreeMap<(u8, u8), u8>,
     fault: RefCell<Option<ExactError>>,
     offset: Cell<usize>,
     after_battle: Option<u16>,
     battle: Option<ExactBattle>,
+    battle_story: Option<StoryState>,
     battle_flags: u16,
     triangle_sources: BTreeMap<(u8, u8), usize>,
     moved_actors: BTreeSet<usize>,
@@ -115,11 +126,6 @@ fn key(bank: u8, address: u8) -> (u8, u8) {
     (canonical_persistent_bank(bank).unwrap_or(if bank == 6 { 5 } else { bank }), address)
 }
 
-fn require_supported_party(state: &StoryState) -> Result<(), ExactError> {
-    if state.supports_native_party() { return Err(ExactError::NativePartyUnsupported); }
-    Ok(())
-}
-
 fn presentation(opcode: u8) -> bool {
     matches!(opcode,
         0x08 | 0x09 | 0x24..=0x27 | 0x29 | 0x2A | 0x2C | 0x2D | 0x2E | 0x2F | 0x33..=0x37
@@ -131,11 +137,15 @@ fn presentation(opcode: u8) -> bool {
 
 impl Walk {
     fn exact(mut self, story: &StoryState, seeds: &[((u8, u8), u8)], battle: Option<u16>) -> Result<Self, ExactError> {
-        require_supported_party(story)?;
         if !story.supports_extended() { return Err(ExactError::LegacyStory); }
+        let native = story.supports_native_party().then(|| NativeStoryBuilder::new(story)).transpose()?;
         let mut known = BTreeMap::new();
         for &((bank, address), value) in seeds {
             if canonical_persistent_bank(bank).is_none() && !matches!(bank, 5 | 6) {
+                return Err(ExactError::InvalidOperand { offset: 0 });
+            }
+            // Trigger observations are not durable raw-party initialization.
+            if native.is_some() && key(bank, address).0 == 3 && (9..=11).contains(&address) {
                 return Err(ExactError::InvalidOperand { offset: 0 });
             }
             if known.insert(key(bank, address), value).is_some_and(|old| old != value) {
@@ -143,11 +153,11 @@ impl Walk {
             }
         }
         self.exact = Some(ExactState {
-            story: story.clone(), masks: BTreeMap::new(), seeds: known,
-            fault: RefCell::new(None), offset: Cell::new(0), after_battle: battle, battle: None,
+            story: story.clone(), native, masks: BTreeMap::new(), seeds: known,
+            fault: RefCell::new(None), offset: Cell::new(0), after_battle: battle, battle: None, battle_story: None,
             // Original FieldInitDefaultValues starts the field battle mode at zero.
             battle_flags: 0, triangle_sources: BTreeMap::new(), moved_actors: BTreeSet::new(), all_positions_changed: false, root_triangle_reads: BTreeSet::new(),
-            party: (0..3).filter_map(|slot| story.party_member(slot)).collect(), party_ops: Vec::new(), party_changed: false,
+            party: if story.supports_native_party() { Vec::new() } else { (0..3).filter_map(|slot| story.party_member(slot)).collect() }, party_ops: Vec::new(), party_changed: false,
             countdown: None, countdown_seen: false,
         });
         Ok(self)
@@ -176,6 +186,15 @@ impl Walk {
 
     pub(super) fn peek_byte(&self, env: &dyn StoryVars, bank: u8, address: u8) -> u8 {
         let k = self.exact_key(bank, address);
+        if let Some(exact) = &self.exact {
+            if let Some(native) = &exact.native {
+                if canonical_persistent_bank(bank).is_some() {
+                    let value = native.state().var(k.0, k.1);
+                    let assigned = exact.masks.get(&k).copied().unwrap_or(0);
+                    return exact.seeds.get(&k).map_or(value, |seed| (value & assigned) | (seed & !assigned));
+                }
+            }
+        }
         self.writes.get(&k).copied().unwrap_or_else(|| match &self.exact {
             Some(exact) => exact.seeds.get(&k).copied().unwrap_or_else(|| exact.story.var(k.0, k.1)),
             None => env.byte(bank, address),
@@ -185,7 +204,8 @@ impl Walk {
     pub(super) fn read_masked(&self, env: &dyn StoryVars, bank: u8, address: u8, mask: u8) -> u8 {
         if let Some(exact) = &self.exact {
             let k = key(bank, address);
-            let baseline = if exact.seeds.contains_key(&k) || k.0 == 5 { 255 } else { exact.story.known_mask(k.0, k.1) };
+            let current = exact.native.as_ref().map_or(&exact.story, NativeStoryBuilder::state);
+            let baseline = if exact.seeds.contains_key(&k) || k.0 == 5 { 255 } else { current.known_mask(k.0, k.1) };
             let known = baseline | exact.masks.get(&k).copied().unwrap_or(0);
             if known & mask != mask {
                 self.fail_exact(ExactError::UnknownRead { offset: exact.offset.get(), bank: k.0, address, mask: mask & !known });
@@ -201,7 +221,7 @@ impl Walk {
 
     pub(super) fn set_byte_with_mask(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
         let k = self.exact_key(bank, address);
-        if self.exact.is_some() && k.0 == 3 && (9..=11).contains(&address) {
+        if self.exact.is_some() && !self.native_exact() && k.0 == 3 && (9..=11).contains(&address) {
             self.fail_exact(ExactError::PartyMirror { address });
             return;
         }
@@ -209,6 +229,14 @@ impl Walk {
             if canonical_persistent_bank(bank).is_none() && !matches!(bank, 5 | 6) {
                 self.invalid_exact();
                 return;
+            }
+            if let Some(native) = &mut exact.native {
+                if canonical_persistent_bank(bank).is_some() {
+                    if let Err(error) = native.write_masked(bank, address, value, mask) {
+                        self.fail_exact(error.into());
+                        return;
+                    }
+                }
             }
             let old_mask = exact.masks.get(&k).copied().unwrap_or(0);
             let old = self.writes.insert(k, value);
@@ -292,6 +320,15 @@ impl Walk {
     }
 
     pub(super) fn party_member(&self, env: &dyn StoryVars, slot: u8) -> Option<u8> {
+        if let Some(native) = self.exact.as_ref().and_then(|exact| exact.native.as_ref()) {
+            if slot >= 3 { return None; }
+            return match native.state().native_party().and_then(|party| party.known_main_slot(slot).ok().flatten()) {
+                Some(255) => None,
+                Some(member @ 0..=8) => Some(member),
+                Some(member) => { self.fail_exact(NativePartyOpError::UnsupportedSelector(member).into()); None },
+                None => { self.fail_exact(NativePartyOpError::UnknownMainSlot(slot).into()); None },
+            };
+        }
         match &self.exact {
             Some(exact) => exact.party.get(usize::from(slot)).copied(),
             None => env.party_member(slot),
@@ -299,7 +336,118 @@ impl Walk {
     }
 
     pub(super) fn in_party(&self, env: &dyn StoryVars, character: u8) -> bool {
+        if self.native_exact() {
+            if character > 8 { self.fail_exact(NativePartyOpError::UnsupportedSelector(character).into()); return false; }
+            // IFPRTYQ walks the raw field tuple in order and returns on its first match.
+            for address in 9..=11 {
+                if self.var_byte(env, 3, address) == character { return true; }
+            }
+            return false;
+        }
         match &self.exact { Some(exact) => exact.party.contains(&character), None => env.in_party(character) }
+    }
+
+    pub(super) fn native_exact(&self) -> bool {
+        self.exact.as_ref().is_some_and(|exact| exact.native.is_some())
+    }
+
+    pub(super) fn native_word(&mut self, bank: u8, address: u8, value: u16) -> bool {
+        if canonical_persistent_bank(bank).is_none() { return false; }
+        let Some(exact) = &mut self.exact else { return false };
+        let Some(native) = &mut exact.native else { return false };
+        if let Err(error) = native.write_word(bank, address, value) {
+            self.fail_exact(error.into());
+            return true;
+        }
+        for (at, byte) in [address, address + 1].into_iter().zip(value.to_le_bytes()) {
+            let k = key(bank, at);
+            let old = self.writes.insert(k, byte);
+            let old_mask = exact.masks.insert(k, 255);
+            if old != Some(byte) || old_mask != Some(255) { self.idle.clear(); }
+        }
+        true
+    }
+
+    pub(super) fn native_member(&self, character: u8) -> bool {
+        if character > 8 { self.fail_exact(NativePartyOpError::UnsupportedSelector(character).into()); return false; }
+        let available = self.exact.as_ref().and_then(|exact| exact.native.as_ref())
+            .and_then(|native| native.state().native_party())
+            .and_then(|party| party.known_available(character).ok().flatten());
+        match available {
+            Some(value) => value,
+            None => { self.fail_exact(ExactError::UnknownAvailability(character)); false },
+        }
+    }
+
+    pub(super) fn exact_message(&self, raw: &[u8], env: &dyn StoryVars) -> Vec<Piece> {
+        struct Current<'a> { walk: &'a Walk, env: &'a dyn StoryVars }
+        impl StoryVars for Current<'_> {
+            fn byte(&self, bank: u8, address: u8) -> u8 { self.walk.var_byte(self.env, bank, address) }
+            fn party_member(&self, slot: u8) -> Option<u8> { self.walk.party_member(self.env, slot) }
+        }
+        parse_message(raw, &Current { walk: self, env })
+    }
+
+    pub(super) fn native_party_instruction(&mut self, env: &dyn StoryVars, ins: &Instruction) {
+        if ins.opcode == 0x0B {
+            // Native GTPYE reads each raw source immediately before its destination write.
+            // Stage the complete instruction so a late unknown source or invalid destination
+            // cannot leave the first assignments in the live execution overlay.
+            let mut staged = self.clone();
+            for (address, name) in (9..=11).zip(["var1", "var2", "var3"]) {
+                let Some((bank, destination)) = Self::dest(ins, name) else { self.invalid_exact(); return };
+                let value = staged.var_byte(env, 3, address);
+                if staged.exact_fault().is_some() { break; }
+                staged.set_byte(bank, destination, value);
+                if staged.exact_fault().is_some() { break; }
+            }
+            if let Some(error) = staged.exact_fault() { self.fail_exact(error); }
+            else { *self = staged; }
+            return;
+        }
+        let operation = match ins.opcode {
+            0x0A | 0xCA => {
+                let mut slots = [0; 3];
+                // SPTYE snapshots all three operand values before PartyReplace starts.
+                for (out, name) in slots.iter_mut().zip(["character1", "character2", "character3"]) {
+                    if ins.operand(name).is_none() { self.invalid_exact(); return; }
+                    let value = self.num(env, ins, name, Width::U8);
+                    let Ok(value) = u8::try_from(value) else { self.invalid_exact(); return };
+                    *out = value;
+                }
+                NativePartyOp::Set(slots)
+            }
+            0xC8 | 0xC9 | 0xCD..=0xCF => {
+                let Some(character) = ins.literal("character").and_then(|value| u8::try_from(value).ok()) else { self.invalid_exact(); return };
+                match ins.opcode {
+                    0xC8 => NativePartyOp::Add(character),
+                    0xC9 => NativePartyOp::Remove(character),
+                    0xCD => {
+                        let Some(exists) = ins.literal("exists") else { self.invalid_exact(); return };
+                        NativePartyOp::Available { character, available: exists != 0 }
+                    }
+                    0xCE => NativePartyOp::Lock { character, locked: true },
+                    _ => NativePartyOp::Lock { character, locked: false },
+                }
+            }
+            _ => { self.invalid_exact(); return; },
+        };
+        if self.exact_fault().is_some() { return; }
+        let Some(exact) = &mut self.exact else { return };
+        let Some(native) = &mut exact.native else { return };
+        let effect = match native.party(operation) {
+            Ok(effect) => effect,
+            Err(error) => { self.fail_exact(error.into()); return; },
+        };
+        if effect.changed() { self.idle.clear(); }
+        // Mirror only for inspection/read masks; the effect already owns these assignments.
+        for (slot, (value, _)) in effect.after().raw_slots().into_iter().enumerate() {
+            if effect.assignments().raw_slots & (1 << slot) != 0 {
+                let k = (3, 9 + slot as u8);
+                self.writes.insert(k, value);
+                exact.masks.insert(k, 255);
+            }
+        }
     }
 
     /// CC may reassert control of the uniquely observed trigger actor, never transfer it.
@@ -332,6 +480,7 @@ impl Walk {
         if ins.stray_banks { self.invalid_exact(); return; }
         let interpreted = matches!(ins.opcode, 0x00..=0x03 | 0x07 | 0x10..=0x19 | 0x30..=0x32 | 0x38 | 0x40 | 0x48
             | 0x60 | 0x70 | 0x72 | 0x74 | 0x7E | 0x82..=0x84 | 0x99..=0x9B | 0xA4 | 0xB9 | 0xBF | 0xCA | 0xCB | 0xFF)
+            || (exact.native.is_some() && matches!(ins.opcode, 0x0A | 0x0B | 0xC8 | 0xC9 | 0xCC..=0xCF))
             || arith_of(ins.opcode).is_some();
         if !interpreted && !presentation(ins.opcode) {
             self.fail_exact(ExactError::Unsupported { offset: ins.offset, opcode: ins.opcode });
@@ -447,6 +596,7 @@ impl Walk {
         let Some(exact) = &mut self.exact else { return false };
         if exact.after_battle == Some(formation) && exact.battle.is_none() {
             exact.battle = Some(ExactBattle { formation, flags: exact.battle_flags });
+            exact.battle_story = exact.native.as_ref().map(|native| native.state().clone());
             true
         } else {
             self.fail_exact(ExactError::Battle);
@@ -467,7 +617,8 @@ impl Walk {
             let value = self.writes.get(&(bank, address)).ok_or(ExactError::InvalidOperand { offset: exact.offset.get() })?;
             writes.push(ExactWrite { bank, address, value: *value & mask, mask });
         }
-        Ok(ExactRun { writes, battle: exact.battle, party: exact.party_ops.clone() })
+        Ok(ExactRun { writes, battle: exact.battle, party: exact.party_ops.clone(),
+            native: exact.native.as_ref().map(NativeStoryBuilder::snapshot), battle_story: exact.battle_story.clone() })
     }
 }
 
@@ -589,7 +740,6 @@ fn run(walk: &mut Walk, script: &FieldScript<'_>, state: &StoryState, answers: &
 }
 
 pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32, entry: &ExactScript, answers: &[usize]) -> Result<ExactRun, ExactError> {
-    require_supported_party(state)?;
     if script.span(entry.entity, entry.slot).is_none() { return Err(ExactError::MissingScript); }
     let mut walk = Walk::script(entry.entity, entry.slot, seed, Limits::default()).pressing(entry.keys)
         .exact(state, &entry.seeds, entry.after_battle)?;
@@ -624,7 +774,6 @@ pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32,
 /// Audit setup for availability without treating talk-time setup as a new field entry. A setup
 /// assignment must already be fully known with that value; changing values or knowledge refuses.
 pub fn run_talk_exact(script: &FieldScript<'_>, entity: usize, state: &StoryState, seed: u32, answers: &[usize]) -> Result<ExactRun, ExactError> {
-    require_supported_party(state)?;
     if script.span(entity, INIT_SCRIPT).is_none() || script.span(entity, TALK_SCRIPT).is_none() { return Err(ExactError::MissingScript); }
     let setup = audited_setup(script, entity, state, true)?;
     if setup.talk_off || !setup.visible { return Err(ExactError::NotTalkable); }
@@ -641,6 +790,17 @@ fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, ma
     let mut setup = Walk::script(entity, INIT_SCRIPT, 1, Limits::default()).exact(state, &[], None)?;
     setup.quiet = main;
     let established = run(&mut setup, script, state, &[])?;
+    if let Some(native) = &established.native {
+        if let Some(event) = native.events().iter().find(|event| event.changed()) {
+            return Err(match event {
+                NativeStoryEvent::Party(_) => ExactError::SetupParty,
+                NativeStoryEvent::Assignment(write) => {
+                    let (bank, address) = write.key();
+                    ExactError::SetupWrite { bank, address }
+                }
+            });
+        }
+    }
     if setup.exact.as_ref().is_some_and(|exact| exact.party_changed) {
         return Err(ExactError::SetupParty);
     }
@@ -654,7 +814,6 @@ fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, ma
 }
 
 pub fn run_panel_exact(script: &FieldScript<'_>, entity: usize, state: &StoryState, seed: u32, triangle: u16, vars: &[(u8, u8)]) -> Result<ExactRun, ExactError> {
-    require_supported_party(state)?;
     let main = script.disassemble_partial(entity, INIT_SCRIPT).ok()
         .and_then(|listing| listing.instructions.into_iter().find(|ins| ins.opcode == 0x00).map(|ins| ins.end()))
         .ok_or(ExactError::MissingScript)?;
@@ -684,4 +843,27 @@ pub fn run_panel_exact(script: &FieldScript<'_>, entity: usize, state: &StorySta
         entry.triangle_sources.push((bank, address, source));
     }
     run_script_exact(script, state, seed, &entry, &[])
+}
+
+#[cfg(test)]
+mod native_message_tests {
+    use super::*;
+    use crate::script::synth::SynthScript;
+    use crate::story::NativePartyState;
+
+    #[test]
+    fn native_window_names_use_the_current_main_slots_after_party_operations() {
+        let mut before = StoryState::at(36).into_native_party().unwrap();
+        *before.native_party_mut().unwrap() = NativePartyState::from_parts(
+            [0, 255, 255], 7, (1, 1), (0, 0),
+        ).unwrap();
+        let bytes = SynthScript { dialogs: vec![vec![0xF3, 0xFF]], ..Default::default() }
+            .entity("npc", vec![(1, vec![0xCA, 2, 254, 254, 0x40, 0, 0, 0])]).build();
+        let script = FieldScript::parse(&bytes).unwrap();
+        let mut walk = Walk::script(0, 1, 7, Limits::default()).exact(&before, &[], None).unwrap();
+        let Beat::Message(message) = walk.resume(&script, &before, None) else { panic!("native message") };
+        assert_eq!(message.pieces, vec![Piece::Text("Tifa".into())]);
+        assert_eq!(walk.exact_fault(), None);
+        assert_eq!(before.native_party().unwrap().known_main(), Some([0, 255, 255]));
+    }
 }

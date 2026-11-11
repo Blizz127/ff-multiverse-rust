@@ -130,12 +130,13 @@ fn field_of(section: Vec<u8>) -> FieldFile {
 }
 
 #[test]
-fn native_party_stories_are_preserved_but_not_executed_by_scene_entrypoints() {
+fn native_party_scene_entrypoints_execute_without_replacing_independent_resources() {
     use crate::story::NativePartyState;
     let section = script(vec![("a", vec![(0, vec![setbyte(1, 40, 9)]), (1, vec![setword(2, 0, 5)])])], vec![]);
     let field = field_of(section.clone());
     let mut def = demo_def(vec![], start(0, 1));
     def.setup = vec![ScriptRef::new(0, 0)];
+    def.speakers.clear();
     let legacy = StoryState::at(4);
     let extended = legacy.clone().into_extended().unwrap();
     let resources = Resources { gil: Some(10) };
@@ -146,18 +147,31 @@ fn native_party_stories_are_preserved_but_not_executed_by_scene_entrypoints() {
     for (address, value) in [(9, 0), (10, 1), (11, 255)] { divergent.write_byte(3, address, value).unwrap(); }
     for state in [unknown, divergent] {
         let bytes = state.encode();
-        assert!(matches!(ScenePlay::new(&field, &def, &state, 1), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(ScenePlay::with_limits(&field, &def, &state, 1, Limits::default()), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(ScenePlay::with_resources(&field, &def, &state, 1, resources), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &section), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(ScenePlay::with_script_section_and_resources(&field, &def, &state, 1, &section, resources), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &[]), Err(SceneError::NativePartyUnsupported)),
-            "unsupported stories refuse before parsing or rebinding replacement sources");
-        assert!(matches!(run_to_end(&field, &def, &state, 1, &[]), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(run_to_end_with_resources_strict(&field, &def, &state, 1, resources, &[]), Err(SceneError::NativePartyUnsupported)));
-        assert!(matches!(replay_scene(&field, &def, &state, resources, identity, &[]), Err(SceneError::NativePartyUnsupported)));
-        assert!(trigger_npc(&field, &def, &state).is_none());
-        assert_eq!(state.encode(), bytes, "refusal never repairs or promotes the stored image");
+        for constructed in [
+            ScenePlay::new(&field, &def, &state, 1),
+            ScenePlay::with_limits(&field, &def, &state, 1, Limits::default()),
+            ScenePlay::with_resources(&field, &def, &state, 1, resources),
+            ScenePlay::with_script_section(&field, &def, &state, 1, &section),
+            ScenePlay::with_script_section_and_resources(&field, &def, &state, 1, &section, resources),
+        ] {
+            let mut play = constructed.unwrap();
+            play.next_strict(None).unwrap();
+            let after = play.current_story().expect("exact native afterimage");
+            assert_eq!(after.moment, 5);
+            assert_eq!(after.var(1, 40), 9);
+            assert_eq!(after.native_party(), state.native_party(), "no opcode selected a different party");
+            for address in 9..=11 { assert_eq!(after.known_byte(3, address), state.known_byte(3, address)); }
+        }
+        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &[]), Err(SceneError::Script(_))));
+        for outcome in [run_to_end(&field, &def, &state, 1, &[]).unwrap(),
+            run_to_end_with_resources_strict(&field, &def, &state, 1, resources, &[]).unwrap()] {
+            let mut after = state.clone();
+            assert_eq!(outcome.writes.apply_extended_to(&mut after, &state), Some(true));
+            assert!(outcome.party_is_the_storys(&state, &after));
+        }
+        let replay = replay_scene(&field, &def, &state, resources, identity, &[]).unwrap();
+        assert_eq!(replay.current_story().unwrap().moment, 5);
+        assert_eq!(state.encode(), bytes, "execution never mutates its borrowed source snapshot");
     }
     for state in [legacy, extended] {
         let outcome = run_to_end(&field, &def, &state, 1, &[]).unwrap();
@@ -2145,7 +2159,8 @@ fn the_trigger_npc_is_found_from_the_stage_script_and_the_models_record() {
     assert!((npc.talk_radius - 80.0).abs() < 1e-3, "TALKR 80 at scale 512");
     assert!((npc.heading - 0.0).abs() < 1e-5, "DIR 64 faces +x");
     let native = StoryState::at(4).into_native_party().unwrap();
-    assert!(trigger_npc(&field, &def, &native).is_none(), "v4 never runs the stage setup through the legacy party model");
+    assert!(trigger_npc(&field, &def, &native).is_none(),
+        "native trigger placement requires checked field-visit scratch and a visit-bound cache");
 }
 
 // ---- a scene plays once per story, as far as the story carries its mark ------------------------------
@@ -2929,34 +2944,28 @@ fn legacy_name_menu_keeps_its_ignored_preview_path_even_with_a_configured_site()
 }
 
 
-// ---- storage-only native-party version refuses direct VM execution ----------------------------
+// ---- native execution preserves its journal across setup and statistics boundaries ------------
 
 #[test]
-fn native_party_vm_refuses_setup_and_resume_even_after_begin_and_statistics_reset() {
+fn native_party_vm_keeps_setup_assignments_when_the_scene_begins() {
     let story = StoryState::at(33).into_native_party().unwrap();
-    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 7), visi(1), message(0, 0), mapjump(117)])])], texts(1));
+    let section = script(vec![("a", vec![(0, vec![setbyte(3, 60, 7)]), (1, vec![setbyte(3, 61, 9)])])], vec![]);
     let source = FieldScript::parse(&section).unwrap();
     for with_resources in [false, true] {
         let vars = SceneVars::new(story.clone(), &[]);
         let mut vm = if with_resources { Vm::with_resources(vars, 1, Limits::default(), SceneResources { gil: Some(77) }) }
             else { Vm::new(vars, 1, Limits::default()) };
-        vm.setup(&source, &[ScriptRef::new(0, 1)]);
-        assert_eq!(vm.stats().steps, 0);
-        assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
-        assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
-        assert!(vm.places().is_empty());
-        for _ in 0..2 {
-            vm.take_stats();
-            vm.begin(start(0, 1));
-            let beat = vm.resume(&source, Some(0));
-            assert!(matches!(beat.then, Then::End { how: End::Broken, .. }));
-            assert!(beat.stage.is_empty());
-            assert_eq!(vm.stats().steps, 0);
-            assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
-            assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
-            assert_eq!(vm.destination(), None);
-        }
-        assert_eq!(vm.vars().story, story);
+        vm.setup(&source, &[ScriptRef::new(0, 0)]);
+        assert!(!vm.stats().setup_incomplete);
+        assert_eq!(vm.native_journal().unwrap().after().known_byte(3, 60), Some(7));
+        vm.take_stats();
+        vm.begin(start(0, 1));
+        assert!(matches!(vm.resume(&source, None).then, Then::End { how: End::Finished, .. }));
+        let journal = vm.native_journal().unwrap();
+        assert_eq!(journal.before(), &story);
+        assert_eq!(journal.after().known_byte(3, 60), Some(7));
+        assert_eq!(journal.after().known_byte(3, 61), Some(9));
+        assert_eq!(vm.vars().story, story, "the immutable segment predecessor is retained");
     }
 }
 

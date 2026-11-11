@@ -17,6 +17,8 @@ use super::{StoryState, StoryWriteError, MAX_BANK_BLOB_BYTES};
 
 mod ops;
 pub use ops::{evaluate_native_party, NativePartyAssignments, NativePartyEffect, NativePartyImage, NativePartyOp, NativePartyOpError};
+mod journal;
+pub use journal::{NativeStoryAssignment, NativeStoryBuilder, NativeStoryError, NativeStoryEvent, NativeStoryJournal};
 
 pub const BLOB_VERSION_NATIVE_PARTY: u8 = 4;
 pub const NATIVE_PARTY_BYTES: usize = 12;

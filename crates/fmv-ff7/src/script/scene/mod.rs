@@ -45,6 +45,10 @@ mod background_tests;
 mod palette_tests;
 #[cfg(test)]
 mod offset_tests;
+#[cfg(test)]
+mod native_vm_tests;
+#[cfg(test)]
+mod native_outcome_tests;
 
 pub use data::*;
 pub use fade::{FadeBlend, FadeColor, FadeOp, FadeState};

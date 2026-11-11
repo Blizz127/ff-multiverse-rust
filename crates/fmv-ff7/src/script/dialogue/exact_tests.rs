@@ -46,8 +46,8 @@ fn writes(run: &ExactRun) -> Vec<(u8, u8, u8, u8)> {
 }
 
 #[test]
-fn every_exact_entry_refuses_native_party_before_using_the_legacy_party_projection() {
-    use crate::story::NativePartyState;
+fn every_exact_entry_uses_known_native_main_slots_and_refuses_unknown_ones() {
+    use crate::story::{NativePartyOpError, NativePartyState};
     let body = [vec![0x74, 3, 0, 70], set_byte(3, 71, 42), vec![0]].concat();
     let code = SynthScript::default().entity("npc", vec![
         (0, [vec![0], body.clone()].concat()), (1, body),
@@ -74,17 +74,32 @@ fn every_exact_entry_refuses_native_party_before_using_the_legacy_party_projecti
     *native.native_party_mut().unwrap() = NativePartyState::from_parts(
         [2, 255, 0], 7, (0x8004, 0x8007), (0x0200, 0x0201),
     ).unwrap();
-    for before in [legacy.into_native_party().unwrap(), native] {
-        let saved = before.encode();
-        for result in [
-            run_script_exact(&script, &before, 7, &entry, &[]),
-            run_talk_exact(&script, 0, &before, 7, &[]),
-            run_panel_exact(&script, 0, &before, 7, 8, &[]),
-        ] {
-            assert_eq!(result, Err(ExactError::NativePartyUnsupported));
-        }
-        assert_eq!(before.encode(), saved, "refusal preserves values and unknown bits");
+    // The repeated talk-time setup is established for native Tifa, independently of
+    // the raw tuple's Barret and the legacy moment table's Cloud.
+    native.write_byte(3, 70, 2).unwrap();
+    let saved = native.encode();
+    for result in [
+        run_script_exact(&script, &native, 7, &entry, &[]),
+        run_talk_exact(&script, 0, &native, 7, &[]),
+        run_panel_exact(&script, 0, &native, 7, 8, &[]),
+    ] {
+        let result = result.unwrap();
+        assert_eq!(writes(&result), vec![(3, 70, 2, 255), (3, 71, 42, 255)]);
+        assert_eq!(result.native.as_ref().unwrap().after(), &native);
     }
+    assert_eq!(native.encode(), saved, "evaluation preserves its predecessor");
+
+    let unknown = legacy.into_native_party().unwrap();
+    let saved = unknown.encode();
+    for result in [
+        run_script_exact(&script, &unknown, 7, &entry, &[]),
+        run_talk_exact(&script, 0, &unknown, 7, &[]),
+        run_panel_exact(&script, 0, &unknown, 7, 8, &[]),
+    ] {
+        assert_eq!(result, Err(ExactError::NativeParty(NativePartyOpError::UnknownMainSlot(0))),
+            "unknown native main slots never fall back to the legacy Cloud projection");
+    }
+    assert_eq!(unknown.encode(), saved, "refusal preserves values and unknown bits");
     assert_eq!(script.bytes(), code, "evaluation never changes the source");
 }
 

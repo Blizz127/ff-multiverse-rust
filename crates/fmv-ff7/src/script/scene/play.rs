@@ -19,7 +19,7 @@ use crate::field::{FieldFile, ModelLoader, Vertex, Walkmesh};
 use crate::field_direction_to_facing;
 use crate::script::dialogue::End;
 use crate::script::{parse_model_list, triangle_contains_xy, triangle_height_at, FieldScript};
-use crate::story::{canon_party, party_after, tracked_var, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
+use crate::story::{canon_party, party_after, tracked_var, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -38,8 +38,10 @@ pub enum SceneError {
     BattleBoundary,
     #[error("the scene cannot prepare its story snapshot: {0}")]
     Story(#[from] crate::story::StoryWriteError),
-    #[error("native-party stories cannot yet be executed by the scene interpreter")]
+    #[error("a battle cannot change between legacy and native-party story representations")]
     NativePartyUnsupported,
+    #[error("the battle afterimage differs from the exact story at its suspended instruction")]
+    BattleStory,
     #[error("the scene is missing the answer to question {question}")]
     MissingAnswer { question: usize },
     #[error("answer {answer} to question {question} is outside its choices {first}..={last}")]
@@ -180,11 +182,17 @@ pub struct Writes {
     /// Version 3 persistent assignments: canonical byte key to (value, assigned bits).
     /// Includes known zeroes and clears; only [`Writes::apply_extended_to`] applies these.
     pub persistent: BTreeMap<(u8, u8), (u8, u8)>,
+    /// Version 4's complete ordered persistent assignments and native party effects. This is
+    /// authoritative when present; the other fields remain summaries for inspection and legacy
+    /// consumers. Applying those summaries separately would lose interleaved raw-party writes.
+    pub native_party: Option<NativeStoryJournal>,
 }
 
 impl Writes {
-    /// Whether the scene wrote anything the story carries.
+    /// Whether the complete story is unchanged, including native party values and knownness.
+    /// A net-neutral native journal still retains its ordered effects for replacement comparison.
     pub fn is_story_neutral(&self) -> bool {
+        if let Some(journal) = &self.native_party { return !journal.changed(); }
         self.moment.is_none() && self.tracked.is_empty() && self.persistent.is_empty()
     }
 
@@ -214,9 +222,11 @@ impl Writes {
     /// compare that snapshot with durable storage atomically before publishing any resulting state.
     /// Validation is atomic: an invalid assignment changes nothing.
     pub fn apply_extended_to(&self, state: &mut StoryState, expected: &StoryState) -> Option<bool> {
-        // These outcomes carry bank assignments and the v3 party journal only. Applying one to
-        // v4 would leave its independent main party, availability and locks unevaluated.
-        if state != expected || !state.supports_extended() || state.supports_native_party() { return None; }
+        if state != expected || !state.supports_extended() { return None; }
+        if state.supports_native_party() {
+            return self.native_party.as_ref()?.apply_to(state, expected).ok();
+        }
+        if self.native_party.is_some() { return None; }
         let mut next = state.clone();
         if let Some(moment) = self.moment { next.moment = moment; }
         for (&(bank, address), &(value, mask)) in &self.persistent {
@@ -283,9 +293,20 @@ impl Outcome {
     /// applied: the story's party at `before`, with the scripts' own joins and leaves, equals the story's party at
     /// `after` ([`crate::story::canon_party`]). Extended authoritative scenes also require the actual
     /// assignments to match the reviewed unlocked-member projection, including members temporarily
-    /// added then removed. Legacy previews keep their earlier no-party-operation behavior.
+    /// added then removed. Version 4 instead validates its complete native journal against both
+    /// snapshots; no moment-derived party or PHS projection is used. Legacy previews retain their
+    /// earlier no-party-operation behavior.
     pub fn party_is_the_storys(&self, before: &StoryState, after: &StoryState) -> bool {
-        if before.supports_native_party() || after.supports_native_party() { return false; }
+        if before.supports_native_party() || after.supports_native_party() {
+            return before.supports_native_party() && after.supports_native_party()
+                && self.party.is_empty()
+                && self.writes.native_party.as_ref().is_some_and(|journal| {
+                    if journal.before() != before || journal.after() != after { return false; }
+                    let mut checked = before.clone();
+                    journal.apply_to(&mut checked, before).is_ok() && checked == *after
+                });
+        }
+        if self.writes.native_party.is_some() { return false; }
         if before.supports_extended() || after.supports_extended() {
             return party_after(&canon_party(before), &self.party) == canon_party(after)
                 && crate::story::party_visibility_matches(before, after, &self.party);
@@ -296,7 +317,9 @@ impl Outcome {
     /// Whether both runs were interpreted completely: the stage scripts and the scene met no instruction the interpreter
     /// does not know, read back no place it does not know and dropped no request.
     pub fn is_complete(&self) -> bool {
-        !self.resources.unknown_gil && [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
+        (self.writes.native_party.is_none() || self.unknown_persistent_reads.is_empty())
+            && !self.resources.unknown_gil
+            && [&self.setup_stats, &self.stats].iter().all(|s| !s.setup_incomplete && s.unknown.is_empty() && s.unresolved == 0 && s.dropped_requests == 0)
     }
 
     /// Whether this run and `other` (the same scene from another edition of the field's script) come to the same story: both
@@ -322,6 +345,7 @@ impl Outcome {
             && self.writes.moment == other.writes.moment
             && self.writes.tracked == other.writes.tracked
             && self.writes.persistent == other.writes.persistent
+            && self.writes.native_party == other.writes.native_party
             && persistent(&self.writes) == persistent(&other.writes)
             && self.resources == other.resources
             && self.party == other.party
@@ -436,14 +460,12 @@ impl ScenePlay {
     }
 
     pub fn with_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits) -> Result<Self, SceneError> {
-        if story.supports_native_party() { return Err(SceneError::NativePartyUnsupported); }
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
         Self::with_script(field, def, story, seed, limits, &script, SceneResources::default())
     }
 
     /// Play with the account's authoritative resource snapshot (or an explicitly synthetic preview).
     pub fn with_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources) -> Result<Self, SceneError> {
-        if story.supports_native_party() { return Err(SceneError::NativePartyUnsupported); }
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
         Self::with_script(field, def, story, seed, Limits::default(), &script, resources)
     }
@@ -457,7 +479,6 @@ impl ScenePlay {
 
     /// Replacement-script playback with exactly the same resource snapshot as the original.
     pub fn with_script_section_and_resources(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, section: &[u8], resources: SceneResources) -> Result<Self, SceneError> {
-        if story.supports_native_party() { return Err(SceneError::NativePartyUnsupported); }
         let original = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
         let replacement = FieldScript::parse(section).map_err(|e| SceneError::Script(e.to_string()))?;
         let rebound = def.rebind_entities(&original, &replacement).ok_or(SceneError::UnmatchedEntities)?;
@@ -465,9 +486,6 @@ impl ScenePlay {
     }
 
     fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources) -> Result<Self, SceneError> {
-        // v4 is a valid storage format, but this VM still implements the v3 party contract.
-        // Refuse before preparation/setup can derive an authoritative party from its moment.
-        if story.supports_native_party() { return Err(SceneError::NativePartyUnsupported); }
         let story = def.prepare_story(story)?;
         if usize::from(def.trigger.entity) >= script.entity_count() {
             return Err(SceneError::NoSuchEntity);
@@ -678,6 +696,23 @@ impl ScenePlay {
         })
     }
 
+    /// The complete story evaluated at the current instruction, including version 4 native
+    /// party effects. At BATTLE this is the roster source, not the scene's initial snapshot.
+    /// Unresolved execution cannot produce this afterimage. The caller must still check skipped
+    /// state operations and durably compare the complete predecessor before publishing it.
+    pub fn current_story(&self) -> Option<StoryState> {
+        if !self.vm.vars().unknown_persistent_reads().is_empty()
+            || [&self.setup, self.vm.stats()].iter().any(|stats| stats.setup_incomplete
+                || !stats.unknown.is_empty() || stats.unresolved != 0 || stats.dropped_requests != 0) {
+            return None;
+        }
+        let mut current = self.story.clone();
+        let writes = self.writes();
+        if current.supports_extended() { writes.apply_extended_to(&mut current, &self.story)?; }
+        else { writes.apply_to(&mut current); }
+        Some(current)
+    }
+
     /// Resume once at the exact pending instruction. No scheduler, scratch, or RNG state is reset.
     /// Only authored mode 8 (no escape, ordinary defeat is game over) is currently supported.
     /// This policy follows the [original PSX battle setup] and [field return handler]; the owned
@@ -689,7 +724,7 @@ impl ScenePlay {
     /// The caller must first commit the segment and verify an actual victorious battle, then supply
     /// its authoritative afterimage. This method itself performs no persistence or combat.
     pub fn resume_battle_checked(&mut self, resume: BattleResume) -> Result<(), SceneError> {
-        if self.story.supports_native_party() || resume.story.supports_native_party() {
+        if self.story.supports_native_party() != resume.story.supports_native_party() {
             return Err(SceneError::NativePartyUnsupported);
         }
         if self.unchecked || !self.strict { return Err(SceneError::UncheckedReplay); }
@@ -697,6 +732,12 @@ impl ScenePlay {
         if resume.checkpoint.flags != Some(8) { return Err(SceneError::BattleMode); }
         if !self.story.supports_extended() || !resume.story.supports_extended() || resume.resources.gil.is_none() {
             return Err(SceneError::BattleResources);
+        }
+        // The current combat engine has no authored story/party mutation. A native continuation
+        // must resume from the exact evaluated boundary, including all values and knowledge masks.
+        // Rewards are supplied separately through resources; legacy v3 rebase policy is unchanged.
+        if self.story.supports_native_party() && self.current_story().as_ref() != Some(&resume.story) {
+            return Err(SceneError::BattleStory);
         }
         self.vm.resume_battle(&resume.story, resume.resources);
         self.story = resume.story.clone();
@@ -751,7 +792,7 @@ impl ScenePlay {
             use crate::script::dialogue::StoryVars;
             if extended { base.baseline_byte(bank, address) } else { base.byte(bank, address) }
         });
-        let mut out = Writes::default();
+        let mut out = Writes { native_party: self.vm.native_journal(), ..Writes::default() };
         let lo = byte(MOMENT_BANK, MOMENT_ADDRESS);
         let hi = byte(MOMENT_BANK, MOMENT_ADDRESS.wrapping_add(1));
         let moment = u16::from_le_bytes([lo, hi]);
@@ -1084,6 +1125,9 @@ pub fn auto_witnesses_with_resources(field: &FieldFile, def: &SceneDef, story: &
 }
 
 /// The character that starts `def`, as the field stands him at the scene's story (see [`TriggerNpc`]).
+/// Native placement remains unavailable until this query receives checked field-visit scratch
+/// and its cache is bound to that visit. The scene interpreter's native journal is not permission
+/// to guess the scratch inputs of this separate read-only admission helper.
 pub fn trigger_npc(field: &FieldFile, def: &SceneDef, story: &StoryState) -> Option<TriggerNpc> {
     if story.supports_native_party() { return None; }
     let story = def.prepare_story(story).ok()?;

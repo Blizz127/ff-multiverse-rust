@@ -282,7 +282,7 @@ fn retirement_requires_the_interpreted_story_and_gil_to_match_the_saved_pair() {
 fn a_noncombat_landing_cannot_import_battle_plan_or_carried_hp() {
     for with_plan in [false, true] {
         let mut rig = terminal_rig();
-        let plan = rig.world.prepare_scene_battle(rig.owner.entity, rig.run, 3, EscapePolicy::Forbidden, None).unwrap();
+        let plan = rig.world.prepare_scene_battle(rig.owner.entity, rig.run, 3, EscapePolicy::Forbidden, None, None).unwrap();
         let landed = land(&mut rig);
         let c = rig.world.scenes.continuations.get_mut(&rig.run).unwrap();
         if with_plan { c.payload.plan = Some(plan); }

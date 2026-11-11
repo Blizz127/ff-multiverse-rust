@@ -624,14 +624,16 @@ impl World {
         }
     }
 
-    /// Select the ordinary nearby co-op roster, permitting only the explicitly named scene hold.
-    fn prepare_battle_setup(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>) -> Result<BattleSetup, BattleRejection> {
-        self.prepare_battle_setup_with_story_hold(requester, formation, scene, false)
-    }
-
     /// Only the exact story battle selected by a committed sweep may inherit its acknowledged
     /// field hold. Debug/random requests cannot borrow an unrelated pending story barrier.
     fn prepare_battle_setup_with_story_hold(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>, inherit_story_hold: bool) -> Result<BattleSetup, BattleRejection> {
+        self.prepare_battle_setup_with_canon(requester, formation, scene, inherit_story_hold, None)
+    }
+
+    /// An authored battle may supply its already checked canon roster. `None` keeps the
+    /// ordinary online leader policy; `Some(&[])` is an explicitly known empty roster.
+    fn prepare_battle_setup_with_canon(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>, inherit_story_hold: bool,
+        canon: Option<&[u8]>) -> Result<BattleSetup, BattleRejection> {
         let transferred_hold = inherit_story_hold && self.players.get(&requester).and_then(|p| p.story_pending)
             .is_some_and(|id| self.ordinary_story_barrier_acked(requester, id));
         let Some(bw) = self.battle.as_mut() else {
@@ -683,8 +685,11 @@ impl World {
         let max_limit = bw.rules().progress_limits().max_limit;
         let companion_level = bw.settings.level.unwrap_or_else(|| leader.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER)).level);
         let companion_limit = if bw.settings.debug_limit_full { max_limit } else { 0 };
-        let canon = self.areas.get(&player.area).ok_or(BattleRejection::Unsupported)?
-            .runtime().try_story_party(&leader.progression).map_err(|_| BattleRejection::Unsupported)?;
+        let canon = match canon {
+            Some(canon) => canon.to_vec(),
+            None => self.areas.get(&player.area).ok_or(BattleRejection::Unsupported)?
+                .runtime().try_story_party(&leader.progression).map_err(|_| BattleRejection::Unsupported)?,
+        };
         if canon.len() > MAX_BATTLE_PARTY.saturating_sub(entities.len())
             || canon.iter().enumerate().any(|(index, character)| canon[..index].contains(character)) {
             return Err(BattleRejection::Unsupported);
@@ -1429,6 +1434,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
+    mod roster_snapshot;
     use super::*;
     use std::collections::BTreeSet;
     use crate::world::{MoveOutcome, NewPlayer};
@@ -4755,14 +4761,14 @@ mod tests {
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
         w.players.get_mut(&b.entity).unwrap().scene = Some(run);
         w.players.get_mut(&c.entity).unwrap().scene = Some(SceneRunId(42));
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("the matching scene party");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("the matching scene party");
         assert_eq!(plan.accounts(), vec![a.account, b.account]);
         assert_eq!(plan.setup.party.iter().map(|m| m.character).collect::<Vec<_>>(), [0, 1, 0, 0]);
         assert!(plan.setup.party.iter().filter_map(BattleMember::entity).all(|entity| entity == EntityId(0)),
             "a frozen plan must survive session ids changing");
         assert_eq!(w.battle_count(), 0, "preparing does not start before the durable checkpoint acknowledgment");
         assert!(!w.in_battle(a.entity) && !w.in_battle(b.entity) && !w.in_battle(c.entity));
-        assert!(w.prepare_scene_battle(c.entity, run, 0, EscapePolicy::Forbidden, None).is_err(),
+        assert!(w.prepare_scene_battle(c.entity, run, 0, EscapePolicy::Forbidden, None, None).is_err(),
             "an unrelated held player cannot be the requester either");
     }
 
@@ -4780,7 +4786,7 @@ mod tests {
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
         let before = w.players.get(&a.entity).unwrap().progress;
         a.drain();
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [7; 32], ordinal: 0, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("checkpoint acknowledged");
         let t = until_ready(&mut w, id, ActorId(0), t0);
@@ -4825,7 +4831,7 @@ mod tests {
         let (a, b) = party_of_two(&mut w, t0);
         let run = SceneRunId(44);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 1, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 1, EscapePolicy::Forbidden, None, None).expect("prepare");
         let original = plan.clone();
         let context = SceneBattleContext { run, instance: [8; 32], ordinal: 2, attempt: 3 };
         w.start_scene_battle(context, plan, t0).expect("checkpoint acknowledged");
@@ -4855,7 +4861,7 @@ mod tests {
         let a = seat(&mut w, "A", t0);
         let run = SceneRunId(45);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let id = w.start_scene_battle(SceneBattleContext { run, instance: [9; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
         assert_eq!(w.battle_command(a.entity, id, ActorId(0), Command::Escape, t), refused(Some(id), BattleRejection::CannotEscape));
@@ -4866,7 +4872,7 @@ mod tests {
         let (mut w, mut rx) = world_with_saver(settings(SyntheticRules::default()));
         let mut a = seat(&mut w, "A", t0);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 2, EscapePolicy::Forbidden, None).expect("prepare defeat");
+        let plan = w.prepare_scene_battle(a.entity, run, 2, EscapePolicy::Forbidden, None, None).expect("prepare defeat");
         w.start_scene_battle(SceneBattleContext { run, instance: [10; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start defeat");
         a.drain();
         let mut finished = Vec::new();
@@ -4895,7 +4901,7 @@ mod tests {
         let (mut a, mut b) = party_of_two_as(&mut w, t0, seeded_with(&[(0, 3)]), ProgressSeed::default());
         let run = SceneRunId(46);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [11; 32], ordinal: 1, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
@@ -4961,7 +4967,7 @@ mod tests {
         let mut a = seat_as(&mut w, "A", t0, seeded_with(&[(20, 1)]));
         let run = SceneRunId(47);
         w.players.get_mut(&a.entity).unwrap().scene = Some(run);
-        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 3, EscapePolicy::Forbidden, None, None).expect("prepare");
         let id = w.start_scene_battle(SceneBattleContext { run, instance: [12; 32], ordinal: 0, attempt: 0 }, plan, t0).expect("start");
         let t = until_ready(&mut w, id, ActorId(0), t0);
         a.drain();
@@ -4990,7 +4996,7 @@ mod tests {
         let (a, b) = party_of_two(&mut w, t0);
         let run = SceneRunId(48);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("prepare");
+        let plan = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("prepare");
         let context = SceneBattleContext { run, instance: [13; 32], ordinal: 0, attempt: 0 };
         let id = w.start_scene_battle(context, plan, t0).expect("start");
         // Repeated zero-time updates are a valid engine log. This test exercises transport sizing
@@ -5056,7 +5062,7 @@ mod tests {
         party_up(&mut w, &a, &b, t0);
         let run = SceneRunId(49);
         for entity in [a.entity, b.entity] { w.players.get_mut(&entity).unwrap().scene = Some(run); }
-        let previous = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None).expect("first boundary");
+        let previous = w.prepare_scene_battle(a.entity, run, 0, EscapePolicy::Forbidden, None, None).expect("first boundary");
         let mut states: Vec<fmv_persist::SceneState> = [a.entity, b.entity].iter().enumerate().map(|(i, entity)| {
             let player = w.players.get(entity).unwrap();
             let mut character = player.progress.unwrap().to_record(player.account, GameId::Ff7, 0);
@@ -5072,16 +5078,16 @@ mod tests {
                 status: StatusSet::EMPTY.with(Status::Sadness), limit: 0 })
         }).collect() };
         assert!(w.leave(b.entity));
-        assert!(w.validate_scene_battle_resume(&previous, &carry, &states),
+        assert!(w.validate_scene_battle_resume(&previous, &carry, &states, None),
             "a postbattle resume validates acknowledged levels and bags instead of the prebattle values");
         let mut damaged_carry = carry.clone();
         damaged_carry.members[0].0.level += 1;
-        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states),
+        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states, None),
             "resume cannot replace a frozen actor even with otherwise valid resources");
         let mut damaged_carry = carry.clone();
         damaged_carry.members[0].1.mp = u32::MAX;
-        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states), "resume cannot invent MP");
-        let next = w.prepare_next_scene_battle(&previous, 1, &carry, &states).expect("the acknowledged next boundary");
+        assert!(!w.validate_scene_battle_resume(&previous, &damaged_carry, &states, None), "resume cannot invent MP");
+        let next = w.prepare_next_scene_battle(&previous, 1, &carry, &states, None).expect("the acknowledged next boundary");
         assert_eq!(next.accounts(), [a.account, b.account], "disconnect and party removal cannot change the frozen battle roster");
         assert_eq!(next.setup.party.iter().map(|m| m.character).collect::<Vec<_>>(), [0, 1, 0, 0]);
         assert_eq!(next.setup.party.iter().filter(|m| m.is_player()).map(|m| m.level).collect::<Vec<_>>(), [6, 7],
@@ -5092,30 +5098,30 @@ mod tests {
         assert_eq!(next.setup.escape_policy, EscapePolicy::Forbidden);
         assert_eq!(next.setup.formation_id, 1);
         assert!(next.setup.party.iter().filter_map(BattleMember::entity).all(|entity| entity == EntityId(0)));
-        assert!(w.validate_scene_battle_plan(&next, &states), "the recovered frozen input matches the complete committed group");
+        assert!(w.validate_scene_battle_plan(&next, &states, None), "the recovered frozen input matches the complete committed group");
         let mut bad = next.clone();
         bad.inventories[0].1[0].count += 1;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "a checkpoint cannot mint a staged item by replacing the durable bag");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "a checkpoint cannot mint a staged item by replacing the durable bag");
         let mut bad = next.clone();
         bad.setup.party.iter_mut().find(|m| m.account() == Some(a.account)).unwrap().level += 1;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "a checkpoint cannot invent a player level");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "a checkpoint cannot invent a player level");
         let mut bad = next.clone();
         bad.inventories[1].0 = a.account;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "every participant needs its own exact bag");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "every participant needs its own exact bag");
         let mut bad = next.clone();
         bad.setup.party.iter_mut().find(|m| m.account() == Some(a.account)).unwrap().controller =
             fmv_protocol::Controller::Player { entity: a.entity, account: a.account };
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "process-local entities cannot become durable identity");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "process-local entities cannot become durable identity");
         let mut bad = next.clone();
         bad.setup.initial_party.as_mut().unwrap()[0].hp = u32::MAX;
-        assert!(!w.validate_scene_battle_plan(&bad, &states), "carried resources still obey the shared engine's bounds");
+        assert!(!w.validate_scene_battle_plan(&bad, &states, None), "carried resources still obey the shared engine's bounds");
         let mut incomplete_carry = carry.clone();
         incomplete_carry.members.pop();
-        assert!(!w.validate_scene_battle_resume(&previous, &incomplete_carry, &states), "resume cannot omit an actor");
-        assert!(w.prepare_next_scene_battle(&previous, 1, &incomplete_carry, &states).is_err(), "missing resources cannot silently refill an actor");
+        assert!(!w.validate_scene_battle_resume(&previous, &incomplete_carry, &states, None), "resume cannot omit an actor");
+        assert!(w.prepare_next_scene_battle(&previous, 1, &incomplete_carry, &states, None).is_err(), "missing resources cannot silently refill an actor");
         states.pop();
-        assert!(!w.validate_scene_battle_resume(&previous, &carry, &states), "resume requires every participant's acknowledged record");
-        assert!(w.prepare_next_scene_battle(&previous, 1, &carry, &states).is_err(), "an absent offline baseline cannot become a fresh character");
+        assert!(!w.validate_scene_battle_resume(&previous, &carry, &states, None), "resume requires every participant's acknowledged record");
+        assert!(w.prepare_next_scene_battle(&previous, 1, &carry, &states, None).is_err(), "an absent offline baseline cannot become a fresh character");
     }
 
     // ---- ordinary exact story battles: snapshot, accepted FIFO item saves, outcome commit ----

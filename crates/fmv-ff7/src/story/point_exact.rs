@@ -1,16 +1,16 @@
 //! Full persistent assignments for the existing field points. Legacy discovery selects an
-//! authored entry and its trigger; it never defines the version-3 write set.
+//! authored entry and its trigger; it never defines the exact write set.
 
 use super::*;
 use crate::script::dialogue::{ExactBattle, ExactError, ExactRun, ExactScript};
-use fmv_adapter_api::StoryBattlePolicy;
+use fmv_adapter_api::{StoryBattleAction, StoryBattlePolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoryPointError {
-    #[error("ordinary exact story points require a supported version 3 predecessor")]
+    #[error("ordinary exact story points require a supported extended predecessor")]
     Story,
-    #[error("ordinary exact story points do not yet support native party resources")]
-    NativePartyUnsupported,
+    #[error("the native main party at BATTLE is not fully known")]
+    UnknownBattleParty,
     #[error("the script does not match the source from which these points were discovered")]
     Source,
     #[error("the point has no unambiguous authored entry or authoritative triangle input")]
@@ -29,13 +29,19 @@ pub enum StoryPointError {
     PartyVisibility,
 }
 
+struct EvaluatedPoint {
+    step: StoryStep,
+    battle: Option<ExactBattle>,
+    battle_progress: Option<Vec<u8>>,
+}
+
 impl AreaStory {
-    /// Evaluate a version-3 ordinary point without discarding unsupported state effects.
+    /// Evaluate an ordinary exact point without discarding unsupported state effects.
     /// The detailed error is available to route audits; the ordinary adapter API withholds
     /// failed points. Nothing is written here. The caller must commit the exact predecessor
     /// and the returned replacement atomically before publishing the step or its countdown.
     pub fn advance_exact_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32) -> Result<Option<StoryStep>, StoryPointError> {
-        Ok(self.evaluate_exact_with(script, blob, id)?.map(|(step, _)| step))
+        Ok(self.evaluate_exact_with(script, blob, id)?.map(|evaluated| evaluated.step))
     }
 
     /// Effective policy captured at the source's BATTLE, rather than any later BTLMD.
@@ -48,25 +54,38 @@ impl AreaStory {
                 formation, escape_forbidden: false, victory_fanfare: true, game_over_on_defeat: false,
             });
         }
+        Some(self.battle_action(blob, id)?.policy)
+    }
+
+    /// Capture the battle's roster state and the final victory result in one execution.
+    /// The intermediate native snapshot selects combatants only; the complete victory
+    /// afterimage still commits against the original bytes in the battle transaction.
+    pub fn battle_action(&self, blob: &[u8], id: u32) -> Option<StoryBattleAction> {
+        let state = StoryState::decode(blob)?;
+        if !state.supports_extended() {
+            let victory = match FieldScript::parse(&self.source.0) {
+                Ok(script) => self.advance_with(&script, blob, id)?,
+                Err(_) => self.advance(blob, id)?,
+            };
+            return Some(StoryBattleAction { policy: self.battle_policy(blob, id)?,
+                battle_progress: None, victory });
+        }
         let script = FieldScript::parse(&self.source.0).ok()?;
-        let (_, battle) = self.evaluate_exact_with(&script, blob, id).ok()??;
+        let EvaluatedPoint { step: victory, battle, battle_progress } = self.evaluate_exact_with(&script, blob, id).ok()??;
         let battle = battle?;
-        Some(StoryBattlePolicy {
+        let policy = StoryBattlePolicy {
             formation: battle.formation, escape_forbidden: battle.flags & 0x08 != 0,
             victory_fanfare: battle.flags & 0x20 == 0,
             // Accepted modes have high byte zero: original field return sends defeat
             // to GAME_OVER, never back to the pending script or ordinary field control.
             game_over_on_defeat: true,
-        })
+        };
+        Some(StoryBattleAction { policy, battle_progress, victory })
     }
 
     fn evaluate_exact_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32)
-        -> Result<Option<(StoryStep, Option<ExactBattle>)>, StoryPointError> {
+        -> Result<Option<EvaluatedPoint>, StoryPointError> {
         let state = StoryState::decode(blob).filter(StoryState::supports_extended).ok_or(StoryPointError::Story)?;
-        // The v3 evaluator checks the authored party against a moment-based profile.
-        // Native main slots, raw field slots and independent PHS masks need their own
-        // execution model; accepting the blob here would silently substitute that profile.
-        if state.supports_native_party() { return Err(StoryPointError::NativePartyUnsupported); }
         if self.source.0 != script.bytes() { return Err(StoryPointError::Source); }
         let Some(point) = usize::try_from(id).ok().and_then(|id| self.points.get(id)) else { return Ok(None) };
         let run = match &point.trigger {
@@ -109,21 +128,35 @@ impl AreaStory {
             // defeat-return modes need additional runtime support and cannot disappear.
             if battle.flags & !0x28 != 0 { return Err(StoryPointError::BattleMode(battle.flags)); }
         }
-        let party = party_after(&canon_party(&state), &run.party);
+        let battle_progress = if state.supports_native_party() && battle.is_some() {
+            let at_battle = run.battle_story.as_ref().filter(|story| story.supports_native_party())
+                .ok_or(StoryPointError::UnknownBattleParty)?;
+            let progress = at_battle.encode();
+            checked_canon_party_of(&progress).ok_or(StoryPointError::UnknownBattleParty)?;
+            Some(progress)
+        } else { None };
         let next = apply(&state, &run)?;
-        if party != canon_party(&next) { return Err(StoryPointError::Party); }
-        if !party_visibility_matches(&state, &next, &run.party) { return Err(StoryPointError::PartyVisibility); }
+        if !state.supports_native_party() {
+            let party = party_after(&canon_party(&state), &run.party);
+            if party != canon_party(&next) { return Err(StoryPointError::Party); }
+            if !party_visibility_matches(&state, &next, &run.party) { return Err(StoryPointError::PartyVisibility); }
+        }
         if next == state { return Ok(None); }
         if matches!(point.trigger, Trigger::Panel { .. }) && !is_return_ride(&state, &next) { return Ok(None); }
         let progress = next.encode();
         compare_exchange_progression(blob, blob, &progress).ok_or(StoryPointError::Replacement)?;
-        Ok(Some((StoryStep { summary: summary(&state, &next), progress, countdown: point.countdown }, battle)))
+        Ok(Some(EvaluatedPoint { step: StoryStep { summary: summary(&state, &next), progress, countdown: point.countdown }, battle, battle_progress }))
     }
 }
 
-fn apply(state: &StoryState, run: &ExactRun) -> Result<StoryState, StoryWriteError> {
+fn apply(state: &StoryState, run: &ExactRun) -> Result<StoryState, StoryPointError> {
     let mut next = state.clone();
-    for write in &run.writes { next.write_masked(write.bank, write.address, write.value, write.mask)?; }
+    if state.supports_native_party() {
+        let journal = run.native.as_ref().ok_or(StoryPointError::Replacement)?;
+        journal.apply_to(&mut next, state).map_err(ExactError::from)?;
+    } else {
+        for write in &run.writes { next.write_masked(write.bank, write.address, write.value, write.mask)?; }
+    }
     Ok(next)
 }
 
@@ -253,7 +286,22 @@ mod tests {
     }
 
     #[test]
-    fn native_party_points_refuse_before_substituting_the_legacy_party_profile() {
+    fn legacy_battle_action_keeps_the_discovered_step_when_source_cannot_be_parsed() {
+        let body = [vec![0x70, 0, 44, 1], word(2, 0, 7)].concat();
+        let bytes = SynthScript::default().entity("director", vec![(0, at_six(body))]).build();
+        let mut area = model(&bytes);
+        let before = StoryState::at(6).encode();
+        let expected = area.battle_action(&before, 0).expect("legacy battle point");
+        assert!(expected.battle_progress.is_none());
+        assert_eq!(expected.policy.formation, 300);
+        area.source.0.clear();
+        assert_eq!(area.battle_action(&before, 0), Some(expected), "legacy discovery remains its fallback");
+        let exact = StoryState::at(6).into_extended().unwrap().encode();
+        assert!(area.battle_action(&exact, 0).is_none(), "exact execution never falls back to discovery");
+    }
+
+    #[test]
+    fn native_party_battles_require_known_main_slots_without_substituting_the_legacy_profile() {
         let mode = vec![0x72, 8, 0, 0];
         let body = [word(2, 0, 7), vec![0x70, 0, 44, 1]].concat();
         let bytes = SynthScript::default().entity("director", vec![(0, [mode, at_six(body)].concat())]).build();
@@ -267,6 +315,8 @@ mod tests {
         assert_eq!(area.battle_policy(&v3_blob, 0), Some(StoryBattlePolicy {
             formation: 300, escape_forbidden: true, victory_fanfare: true, game_over_on_defeat: true,
         }), "the supported v3 point and battle are unchanged");
+        assert!(area.battle_action(&v3_blob, 0).unwrap().battle_progress.is_none(),
+            "v3 keeps the online leader's canon roster");
 
         let cases = [
             NativePartyState::unknown(),
@@ -280,15 +330,76 @@ mod tests {
             // The raw field tuple is deliberately independent of every main tuple above.
             for (address, value) in [(9, 1), (10, 0), (11, 255)] { native.write_byte(3, address, value).unwrap(); }
             let before = native.encode();
-            assert_eq!(StoryState::decode(&before).unwrap(), native, "the refused native input is valid");
-            assert_eq!(area.advance_exact_with(&script, &before, 0), Err(StoryPointError::NativePartyUnsupported));
-            assert!(area.advance(&before, 0).is_none());
-            assert!(area.advance_with(&script, &before, 0).is_none());
-            assert!(area.battle_policy(&before, 0).is_none(), "no battle policy can bypass the resource refusal");
-            assert!(area.point_source(&before, 0).is_none(), "a refused point cannot enter a scene through its source metadata");
-            assert_eq!(native.encode(), before, "refusal changes no source bytes or resource knowledge");
+            assert_eq!(StoryState::decode(&before).unwrap(), native);
+            if resources.known_main().is_none() {
+                assert_eq!(area.advance_exact_with(&script, &before, 0), Err(StoryPointError::UnknownBattleParty));
+                assert!(area.advance(&before, 0).is_none());
+                assert!(area.advance_with(&script, &before, 0).is_none());
+                assert!(area.battle_policy(&before, 0).is_none() && area.battle_action(&before, 0).is_none(),
+                    "no battle or final story can bypass an unknown battle roster");
+            } else {
+                let action = area.battle_action(&before, 0).expect("known native battle roster");
+                let at_battle = StoryState::decode(action.battle_progress.as_ref().unwrap()).unwrap();
+                assert_eq!(at_battle.native_party(), Some(&resources));
+                assert_eq!(at_battle.known_byte(3, 9), Some(1), "raw slots remain independent of main");
+                assert_eq!(area.advance_exact_with(&script, &before, 0).unwrap(), Some(action.victory.clone()));
+                let after = StoryState::decode(&action.victory.progress).unwrap();
+                assert_eq!(after.moment, 7);
+                assert_eq!(after.native_party(), Some(&resources));
+            }
+            assert!(area.point_source(&before, 0).is_none(), "scene source admission remains gated separately");
+            assert_eq!(native.encode(), before, "evaluation changes no source bytes or resource knowledge");
         }
         assert_eq!(v3.encode(), v3_blob);
+    }
+
+    #[test]
+    fn native_battle_action_keeps_its_prefix_roster_and_commits_the_joint_final_afterimage() {
+        let body = [
+            word(2, 0, 7), vec![0x80, 0x30, 70, 13],
+            vec![0xCA, CLOUD, 2, 254], vec![0x70, 0, 44, 1],
+            vec![0xCA, CLOUD, 254, 254], vec![0x80, 0x30, 10, BARRET],
+            vec![0xCE, 2], vec![0x80, 0x30, 70, 22],
+        ].concat();
+        let bytes = SynthScript::default().entity("director", vec![(0, [vec![0x72, 8, 0, 0], at_six(body)].concat())]).build();
+        let script = FieldScript::parse(&bytes).unwrap();
+        let area = model(&bytes);
+        assert_eq!(area.point_count(), 1, "the existing guarded moment transition discovers the action");
+        let mut before = StoryState::at(6).into_native_party().unwrap();
+        *before.native_party_mut().unwrap() = NativePartyState::from_parts(
+            [CLOUD, 255, 255], 7, (0x8001, 0xffff), (0x4000, 0x4000),
+        ).unwrap();
+        for (address, value) in [(9, CLOUD), (10, BARRET), (11, 255)] { before.write_byte(3, address, value).unwrap(); }
+        before.write_masked(7, 80, 1, 5).unwrap();
+        let original = before.encode();
+        let action = area.battle_action(&original, 0).expect("complete native action");
+        assert_eq!(action.policy, StoryBattlePolicy {
+            formation: 300, escape_forbidden: true, victory_fanfare: true, game_over_on_defeat: true,
+        });
+        let at_battle = StoryState::decode(action.battle_progress.as_ref().unwrap()).unwrap();
+        assert_eq!(checked_canon_party_of(action.battle_progress.as_ref().unwrap()), Some(vec![CLOUD, 2]));
+        assert_eq!(at_battle.native_party().unwrap().known_main(), Some([CLOUD, 2, 255]));
+        assert_eq!(at_battle.known_byte(3, 70), Some(13));
+        assert_eq!(at_battle.native_party().unwrap().locking_bits(), (0x4000, 0x4000));
+
+        let after = StoryState::decode(&action.victory.progress).unwrap();
+        assert_eq!(after.moment, 7);
+        assert_eq!(after.native_party().unwrap().known_main(), Some([CLOUD, 255, 255]));
+        assert_eq!([9, 10, 11].map(|address| after.known_byte(3, address)), [Some(CLOUD), Some(BARRET), Some(255)],
+            "the final raw tuple is restored without overwriting the independently synchronized main tuple");
+        assert_eq!(after.native_party().unwrap().availability_bits(), (0x8005, 0xffff),
+            "temporary party membership still grants its authored availability");
+        assert_eq!(after.native_party().unwrap().locking_bits(), (0x4004, 0x4004));
+        assert_eq!(after.known_byte(3, 70), Some(22));
+        assert_eq!((after.var(7, 80), after.known_mask(7, 80)), (1, 5));
+        assert_eq!(area.advance_exact_with(&script, &original, 0).unwrap(), Some(action.victory.clone()));
+        assert_eq!(compare_exchange_progression(&original, &original, &action.victory.progress), Some(action.victory.progress.clone()));
+        let mut stale = before.clone();
+        stale.native_party_mut().unwrap().write_locks_masked(4, 4);
+        assert!(compare_exchange_progression(&stale.encode(), &original, &action.victory.progress).is_none(),
+            "party-resource-only changes invalidate the complete predecessor");
+        assert!(area.battle_action(&action.victory.progress, 0).is_none(), "the original guard prevents repetition");
+        assert_eq!(before.encode(), original, "the battle prefix is never installed into the caller's story");
     }
 
     #[test]
