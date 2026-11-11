@@ -20,8 +20,8 @@
 //!   single 320x240 screen), not a systematic offset.
 //! * Layer order: in `bwhlin` (the Gold Saucer gondola) the scenery of layer 3 shows through the
 //!   window holes of layer 1 only when layer 3 is drawn first, so layer 3 is behind layer 1.
-//! * Transparency: palette index 0 is transparent and nothing else is (see
-//!   [`crate::field::Palette::rgba`] for the evidence); direct-colour pages decode correctly
+//! * Transparency: only palette index 0 can be transparent, and only when its page's flag
+//!   in [`crate::field::Background::palette_transparency`] enables it; direct-colour pages decode correctly
 //!   (the Gold Saucer map of `gldinfo`).
 //! * Blending: all four `type_trans` values occur (additive is by far the most common, 93 000
 //!   layer-2 tiles); the glow, glass and fog layers of `ancnt2`, `woa_1` and `cosmin2` look
@@ -77,7 +77,8 @@
 //! * Tile size is 16 for layers 1-2 and 32 for layers 3-4.
 //! * Back-to-front order follows Makou Reactor's tile ids: layer 3 (id 4096), layer 1 (4095),
 //!   layer 2 (its own `id`, larger = further away), layer 4 (id 0); ties keep file order.
-//! * Palette index 0 is transparent, other indices opaque; for 16-bit direct colour a raw
+//! * Palette index 0 is transparent when its page's background-header flag is set; all
+//!   entries are opaque when that flag is clear. For 16-bit direct colour a raw
 //!   `0x0000` is transparent.
 //! * Blended tiles (`blending != 0`, layers 2-4 only; layer 1 ignores the field) combine with
 //!   what is behind them using the PlayStation semi-transparency mode chosen by `type_trans`:
@@ -775,6 +776,18 @@ mod tests {
         assert_eq!(img.pixel(15, 15), Some([r, g, b, 255]));
         assert_eq!(img.pixel(16, 0), None);
         assert_eq!(img.pixel(0, 16), None);
+    }
+
+    #[test]
+    fn opaque_entry_zero_reaches_both_flat_and_depth_backgrounds() {
+        let field = parse(&FieldSpec {
+            palette_transparency: [false; 20],
+            ..single(TileSpec { dst_x: 0, dst_y: 0, src_x: 0, src_y: 0, palette_id: 1, ..TileSpec::default() })
+        });
+        let image = decode_background(&field).unwrap();
+        assert_eq!(image.pixel(0, 0), Some([255, 255, 255, 255]));
+        let tiles = decode_background_tiles_with_depth(&field).unwrap();
+        assert_eq!(tiles[0].pixel(0, 0), Some([255, 255, 255, 255]));
     }
 
     #[test]

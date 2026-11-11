@@ -320,6 +320,8 @@ pub(crate) struct FieldSpec {
     pub layer4: Option<LayerSpec>,
     /// `(slot, depth)` of the texture pages that exist.
     pub texture_slots: Vec<(usize, u16)>,
+    /// Per-palette index-zero transparency flags; defaults to transparent in every page.
+    pub palette_transparency: [bool; 20],
     pub corrupt_texture_tag: bool,
     pub bad_texture_depth: bool,
     /// Bytes to cut from the end of the background section.
@@ -378,6 +380,7 @@ impl Default for FieldSpec {
                 tiles: vec![TileSpec { dst_x: 32, dst_y: 32, ..TileSpec::default() }],
             }),
             texture_slots: vec![(0, 1), (3, 2)],
+            palette_transparency: [true; 20],
             corrupt_texture_tag: false,
             bad_texture_depth: false,
             truncate_background_bytes: 0,
@@ -545,8 +548,8 @@ impl FieldSpec {
         b.extend_from_slice(&1u16.to_le_bytes()); // depth
         b.push(1); // unknown
         b.extend_from_slice(b"PALETTE");
-        b.extend_from_slice(&0u32.to_le_bytes()); // size
-        b.extend(std::iter::repeat_n(0u8, 8 + 12)); // palX/palY/w/h + 6 colours
+        b.extend(self.palette_transparency.map(u8::from));
+        b.extend_from_slice(&0u32.to_le_bytes()); // blank
         b.extend_from_slice(b"BACK");
         // layer 1 (no presence flag)
         b.extend_from_slice(&self.l1_width.to_le_bytes());
