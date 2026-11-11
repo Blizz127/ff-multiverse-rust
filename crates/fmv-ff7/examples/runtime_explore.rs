@@ -81,19 +81,83 @@ impl Outcome {
     }
 }
 
-/// Run up to `frames` frames. The player walks `path` (a point a frame), then stands at its end, facing `dir`, holding OK
-/// on frames 2 to 6 when `ok`. While a script holds the player, the player follows where the scripts put it. Returns
-/// what happened and where the player ends.
-/// The same, stopping early once at least `min` frames ran and the field has been idle (no script holds the player, no
+/// Answer what the field asked since the last frame. Returns true when the field is left (a map jump) or over.
+fn pump(rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
+    if rt.pending_tutorial().is_some() {
+        rt.complete_tutorial();
+    }
+    for ev in rt.drain_events() {
+        match ev {
+            Event::Window { window, ask, .. } => {
+                out.windows += 1;
+                if ask.is_some() {
+                    rt.answer(window, 0);
+                } else {
+                    rt.close_window(window);
+                }
+            }
+            Event::Command(Command::MapJump { field, x, y, triangle, .. }) | Event::Command(Command::Minigame { field, x, y, triangle, .. }) => {
+                out.jump = Some((field, x, y, triangle));
+                return true;
+            }
+            Event::Command(Command::Battle { formation }) => {
+                out.battles.push(formation);
+                rt.set_battle_result(0);
+                rt.complete_command();
+            }
+            Event::Command(Command::Movie { movie }) => {
+                out.movies.push(movie);
+                rt.complete_command();
+            }
+            Event::Command(Command::GameOver) => {
+                out.game_over = true;
+                return true;
+            }
+            Event::Command(_) => rt.complete_command(),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn busy(rt: &FieldRuntime) -> bool {
+    rt.player_scripted() || rt.window_open() || rt.command().is_some()
+}
+
+/// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived undisturbed
+/// (`false`: a script took the player, opened a window or issued a command on the way) and where it is.
+fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
+    let mut at = from;
+    for p in approach {
+        at = *p;
+        rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
+        let before = out.windows;
+        if pump(rt, out) {
+            return (false, at);
+        }
+        if busy(rt) || out.windows != before {
+            if let Some(m) = rt.pc_model().filter(|_| rt.player_scripted()) {
+                at = (m.x, m.y, m.z);
+            }
+            return (false, at);
+        }
+    }
+    (true, at)
+}
+
+/// Run up to `frames` frames. The player walks `path` (a point a frame), then stands at `at`, facing `dir`, holding OK
+/// for five frames from the second when `ok`. While a script holds the player, the player follows where the scripts
+/// put it. Stops early once at least `min` frames ran and the field has been idle (no script holds the player, no
 /// window is open, no command is pending) for twenty frames: the story's clocks should not run while nothing happens.
+/// Returns what happened and where the player ends.
 fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
     let mut out = Outcome::default();
     let mut idle = 0u32;
     for f in 0..frames {
-        if !rt.player_scripted() && !rt.window_open() && rt.command().is_none() {
-            idle += 1;
-        } else {
+        if busy(rt) {
             idle = 0;
+        } else {
+            idle += 1;
         }
         if f >= min.max(path.len() as u32 + 8) && idle >= 20 {
             break;
@@ -109,39 +173,8 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
         let held = ok && (2..=6).contains(&f);
         let player = PlayerInput { x: at.0, y: at.1, z: at.2, dir, ok: ok && f == 2, keys_held: if held { OK } else { 0 }, keys_pressed: if ok && f == 2 { OK } else { 0 }, ..Default::default() };
         rt.tick(Some(player));
-        if rt.pending_tutorial().is_some() {
-            rt.complete_tutorial();
-        }
-        for ev in rt.drain_events() {
-            match ev {
-                Event::Window { window, ask, .. } => {
-                    out.windows += 1;
-                    if ask.is_some() {
-                        rt.answer(window, 0);
-                    } else {
-                        rt.close_window(window);
-                    }
-                }
-                Event::Command(Command::MapJump { field, x, y, triangle, .. }) | Event::Command(Command::Minigame { field, x, y, triangle, .. }) => {
-                    out.jump = Some((field, x, y, triangle));
-                    return (out, at);
-                }
-                Event::Command(Command::Battle { formation }) => {
-                    out.battles.push(formation);
-                    rt.set_battle_result(0);
-                    rt.complete_command();
-                }
-                Event::Command(Command::Movie { movie }) => {
-                    out.movies.push(movie);
-                    rt.complete_command();
-                }
-                Event::Command(Command::GameOver) => {
-                    out.game_over = true;
-                    return (out, at);
-                }
-                Event::Command(_) => rt.complete_command(),
-                _ => {}
-            }
+        if pump(rt, &mut out) {
+            return (out, at);
         }
     }
     if rt.player_scripted() {
@@ -176,6 +209,59 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
         }
     }
     seen
+}
+
+/// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
+/// walkmesh's links, never into a locked triangle, as points at most `STRIDE` units apart (one per frame).
+fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize) -> Option<Vec<Pos>> {
+    const STRIDE: f64 = 24.0;
+    let n = walk.triangles.len();
+    if from_tri >= n || to_tri >= n {
+        return None;
+    }
+    let mut prev: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut seen = vec![false; n];
+    seen[from_tri] = true;
+    let mut queue = VecDeque::from([from_tri]);
+    while let Some(t) = queue.pop_front() {
+        if t == to_tri {
+            break;
+        }
+        for (e, &next) in walk.access[t].iter().enumerate() {
+            let next = usize::from(next);
+            if next < n && !seen[next] && !rt.triangle_locked(next as u16) {
+                seen[next] = true;
+                prev[next] = Some((t, e));
+                queue.push_back(next);
+            }
+        }
+    }
+    if !seen[to_tri] {
+        return None;
+    }
+    let mut corners = vec![to];
+    let mut t = to_tri;
+    while let Some((p, e)) = prev[t] {
+        let (a, b) = (walk.triangles[p][e], walk.triangles[p][(e + 1) % 3]);
+        if t != to_tri {
+            corners.push(centre(walk, t));
+        }
+        corners.push(((i32::from(a.x) + i32::from(b.x)) / 2, (i32::from(a.y) + i32::from(b.y)) / 2, (i32::from(a.z) + i32::from(b.z)) / 2));
+        t = p;
+    }
+    corners.reverse();
+    let mut out = Vec::new();
+    let mut cur = from;
+    for c in corners {
+        let (dx, dy, dz) = (f64::from(c.0 - cur.0), f64::from(c.1 - cur.1), f64::from(c.2 - cur.2));
+        let steps = ((dx * dx + dy * dy).sqrt() / STRIDE).ceil().max(1.0) as i32;
+        for k in 1..=steps {
+            let f = f64::from(k) / f64::from(steps);
+            out.push((cur.0 + (dx * f) as i32, cur.1 + (dy * f) as i32, cur.2 + (dz * f) as i32));
+        }
+        cur = c;
+    }
+    Some(out)
 }
 
 /// One step of a route.
@@ -523,6 +609,48 @@ fn main() {
             if score == 0 {
                 continue;
             }
+            // The probe stood there out of nowhere. Now do it the way a player does: walk there from where the player
+            // stands, and take whatever happens on the way instead if something does.
+            let first = path.first().copied().unwrap_or(stand);
+            let Some(first_tri) = rt.triangle_at(first.0, first.1, first.2).map(usize::from) else { continue };
+            let Some(approach) = way(&walk, &rt, at, here, first, first_tri) else { continue };
+            let mut probe = rt.clone();
+            let mut out = Outcome::default();
+            let (arrived, mut end) = walk_to(&mut probe, &approach, at, &mut out);
+            let mut label = label;
+            let mut cmds = cmds;
+            if arrived {
+                let (more, e) = run_idle(&mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
+                out.absorb(more);
+                end = e;
+            } else {
+                label = format!("walking towards [{label}], stopped at {},{}", end.0, end.1);
+                cmds = format!("xy {} {} {}", first.0, first.1, first.2);
+            }
+            if out.jump.is_none() && !out.game_over && (busy(&probe) || !arrived || out.windows > 0 || story_key(&probe.mem.banks) != story_key(&rt.mem.banks) || scratch_key(&probe) != scratch_key(&baseline)) {
+                let (more, e) = run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
+                out.absorb(more);
+                end = e;
+            }
+            if out.game_over {
+                continue;
+            }
+            let after = moment_of(&probe.mem.banks);
+            let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
+            let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
+            let end_place = place_of(&probe, end);
+            let moved_place = out.jump.is_none() && end_place != here_place && end_place.1 > 0;
+            let score = match (out.jump.is_some(), after > now, moved_story) {
+                (true, true, _) => 5,
+                (false, true, _) => 4,
+                (true, false, _) => 3,
+                (false, false, true) => 2,
+                _ if moved_scratch || moved_place => 1,
+                _ => 0,
+            };
+            if score == 0 {
+                continue;
+            }
             let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
             match out.jump {
                 Some(jump) => {
@@ -558,11 +686,51 @@ fn main() {
                 if !near || entered.contains(&(to.clone(), story_key(&rt.mem.banks))) {
                     continue;
                 }
+                // Walk to the gate; if a script steps in on the way, that is what happens instead of the gate.
+                let spot = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().map(|(ox, oy)| (mid.0 + ox, mid.1 + oy, mid.2)).find(|p| on_reach(&rt, *p));
+                let Some(spot) = spot else { continue };
+                let Some(spot_tri) = rt.triangle_at(spot.0, spot.1, spot.2).map(usize::from) else { continue };
+                let Some(mut approach) = way(&walk, &rt, at, here, spot, spot_tri) else { continue };
+                approach.push(mid);
+                let mut probe = rt.clone();
+                let mut out = Outcome::default();
+                let (arrived, end) = walk_to(&mut probe, &approach, at, &mut out);
+                if !arrived {
+                    let (more, end) = if out.jump.is_none() && !out.game_over { run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, 0, false) } else { (Outcome::default(), end) };
+                    out.absorb(more);
+                    if out.game_over {
+                        continue;
+                    }
+                    let after = moment_of(&probe.mem.banks);
+                    let label = format!("walking towards gate {gi}, stopped at {},{}", end.0, end.1);
+                    let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
+                    let cmds = format!("{field_name}: xy {} {} {}", spot.0, spot.1, spot.2);
+                    let score = if after > now { 4 } else { 2 };
+                    match out.jump {
+                        Some(jump) => {
+                            let to = maplist.name(jump.0).unwrap_or("?").to_string();
+                            if !entered.contains(&(to.clone(), story_key(&probe.mem.banks))) {
+                                line.push(format!("[{score}] {label} -> {to}"));
+                                push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), Some(Rc::new(Step { text: format!("{summary} -> {to}"), cmds, parent: via.clone() }))), score + 1);
+                            }
+                        }
+                        None => {
+                            let end_place = place_of(&probe, end);
+                            if images.insert((field_name.clone(), story_key(&probe.mem.banks), image_key(&probe, end_place))) {
+                                line.push(format!("[{score}] {label}"));
+                                let banks = probe.mem.banks.clone();
+                                let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
+                                push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via: Some(Rc::new(Step { text: summary, cmds, parent: via.clone() })), carry: None }, score);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let jump = (g.target_field_id, g.destination[0], g.destination[1], g.destination[2]);
                 let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), cmds: format!("{field_name}: gate {gi}"), parent: via.clone() }));
                 let score = if visited.contains(&to) { 0 } else { 3 };
                 line.push(format!("[{score}] gate {gi} -> {to}"));
-                push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), score);
+                push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);
                 gates += 1;
             }
         }
