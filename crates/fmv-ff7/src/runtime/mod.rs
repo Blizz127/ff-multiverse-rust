@@ -33,6 +33,7 @@
 pub mod memory;
 mod ops;
 pub use ops::{is_implemented, menu, AnimState, MotionState, PartyState, StageState, WindowsState};
+pub use ops::{number_kind, NumberDisplay, ReplaceParam, WindowContents, DEFAULT_MENU_COLORS};
 #[cfg(test)]
 mod tests;
 
@@ -379,7 +380,7 @@ impl FieldRuntime {
             })
             .collect();
         let mem = Memory { banks, scratch: [0; SCRATCH_BYTES] };
-        Ok(FieldRuntime {
+        let mut runtime = FieldRuntime {
             code: section.to_vec(),
             names: layout.entities.iter().map(|e| e.name.clone()).collect(),
             scale,
@@ -406,7 +407,9 @@ impl FieldRuntime {
             windows_ext: WindowsState::default(),
             party_ext: PartyState::default(),
             gil: None,
-        })
+        };
+        runtime.reset_all_windows();
+        Ok(runtime)
     }
 
     /// Run every entity's init part to its first `RET` (in entity order, as the original), leaving each entity at
