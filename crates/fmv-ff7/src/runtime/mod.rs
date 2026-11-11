@@ -899,14 +899,15 @@ enum Flow {
     Broken,
 }
 
-/// The field direction (0-255) of the vector `(dx, dy)`, as the original measures it for talk and lines: 0 along
-/// +x, 64 along +y, 128 along -x, 192 along -y.
+/// The field direction (0-255) of the vector `(dx, dy)`, as the original measures it for talk and lines: 64 along
+/// +x, 128 along +y, 192 along -x, 0 along -y (the original's angle plus a quarter turn). This is the same convention
+/// as [`crate::field_direction_to_facing`]'s, where direction 64 faces heading 0 (+x).
 pub fn direction_of(dx: i64, dy: i64) -> u8 {
     if dx == 0 && dy == 0 {
         return 0;
     }
     let turns = (dy as f64).atan2(dx as f64) / std::f64::consts::TAU;
-    ((turns * 256.0).round() as i64).rem_euclid(256) as u8
+    ((turns * 256.0).round() as i64 + 64).rem_euclid(256) as u8
 }
 
 /// The squared distance from `p` to its nearest point on line `a`-`b` and that point, when the projection falls

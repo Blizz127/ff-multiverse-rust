@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v22.
+//! FF Multiverse wire protocol v23.
+//!
+//! v23 adds the live field runtime's messages: [`ServerMsg::LiveCast`], [`ServerMsg::LiveWindow`],
+//! [`ServerMsg::LiveWindowClosed`], [`ServerMsg::LiveControl`], [`ServerMsg::LivePlace`], [`ServerMsg::LiveMovie`],
+//! [`ClientMsg::LiveAnswer`] and [`ClientMsg::LiveMovieDone`]. A live field runs the field's original scripts on the
+//! server; its cast moves and its windows are the scripts' own (the client shows each window's text from its own copy
+//! of the field).
 //!
 //! v22 adds the required nullable `presentation_origin` to [`ServerMsg::SceneStart`]. An ordinary
 //! point cutscene can bind its actors to the server-accepted trigger pose without pretending to be
@@ -494,7 +500,7 @@ pub use fmv_party::{
 };
 
 // Older peers cannot bind an ordinary point cutscene to its accepted activation pose.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -707,6 +713,18 @@ pub enum ClientMsg {
     /// player in the field of scene `scene` at the scene's own story moment, on a made-up story that is never saved.
     /// See [`scene`].
     SceneDebugPreview { scene: String },
+    /// New in v23. The party leader's answer to live window `window`: `None` dismisses a message, `Some(line)` answers a
+    /// question with the line counted from its first choice. Ignored from anyone but the leader.
+    LiveAnswer { window: u8, choice: Option<u8> },
+    /// New in v23. The client finished (or could not play) live movie `movie`.
+    LiveMovieDone { movie: u16 },
+}
+
+/// A live window's question: the choice lines, counted in the window's last page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveAsk {
+    pub first: u8,
+    pub last: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -929,6 +947,28 @@ pub enum ServerMsg {
     SceneEnded { run: SceneRunId, outcome: SceneOutcome },
     /// A scene request of this client was refused (`SceneDebugPreview`, or an OK on a trigger that cannot start now).
     SceneRefused { reason: SceneRefusal },
+    /// New in v23. The live field's cast for this player's instance, which replaces the area's static NPCs: every
+    /// visible model the field's scripts placed, where they are now. Sent when it changes.
+    LiveCast { area: AreaId, tick: u64, npcs: Vec<NpcSnapshot> },
+    /// New in v23. A field script opened window `window` showing dialog `dialog` of the area's field. `answerable` is
+    /// true for the player whose answer counts (the party leader); everyone else watches.
+    LiveWindow {
+        area: AreaId,
+        window: u8,
+        dialog: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ask: Option<LiveAsk>,
+        answerable: bool,
+    },
+    /// New in v23. Live window `window` is closed.
+    LiveWindowClosed { area: AreaId, window: u8 },
+    /// New in v23. Whether a field script holds the player still (the original's `UC`).
+    LiveControl { locked: bool },
+    /// New in v23. A field script moved this player's character: stand here.
+    LivePlace { pos: Pos, facing: f32 },
+    /// New in v23. The field plays movie `movie`; answer `LiveMovieDone` when it is over (or at once when it cannot
+    /// be played).
+    LiveMovie { movie: u16 },
 }
 
 /// What a [`ServerMsg::Countdown`] says.
@@ -1077,7 +1117,7 @@ mod tests {
 
     #[test]
     fn the_version_is_twenty_two() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1161,6 +1201,8 @@ mod tests {
         // The OK button (v14, see `ClientMsg::Interact`): the character addressed, or nobody.
         golden(ClientMsg::Interact { npc: Some(3) }, r#"{"Interact":{"npc":3}}"#);
         golden(ClientMsg::Interact { npc: None }, r#"{"Interact":{}}"#);
+        golden(ClientMsg::LiveAnswer { window: 1, choice: Some(2) }, r#"{"LiveAnswer":{"window":1,"choice":2}}"#);
+        golden(ClientMsg::LiveMovieDone { movie: 7 }, r#"{"LiveMovieDone":{"movie":7}}"#);
         // a sender that writes the absent character as null is read the same
         assert_eq!(serde_json::from_str::<ClientMsg>(r#"{"Interact":{"npc":null}}"#).unwrap(), ClientMsg::Interact { npc: None });
         // Deleting the character of a login (v16): the token travels, and never prints.

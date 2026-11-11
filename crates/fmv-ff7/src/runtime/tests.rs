@@ -149,8 +149,8 @@ fn talking_to_a_model_runs_its_talk_script_at_priority_one() {
     let s = SynthScript::default().entity("npc", npc);
     let mut rt = runtime(s);
     rt.tick(None);
-    // The player stands at (60, 0) facing +x (direction 0) with the model 40 units ahead.
-    let player = PlayerInput { x: 60, y: 0, dir: 0, ok: true, ..Default::default() };
+    // The player stands at (60, 0) facing +x (direction 64) with the model 40 units ahead.
+    let player = PlayerInput { x: 60, y: 0, dir: 64, ok: true, ..Default::default() };
     rt.tick(Some(player));
     rt.tick(Some(PlayerInput { ok: false, ..player }));
     assert_eq!(rt.mem.banks.get(0x80), 1);
@@ -178,22 +178,27 @@ fn talk_needs_the_model_in_front_and_within_reach() {
     let npc = vec![script0(&init, IDLE), (1, [&set_byte(1, 0x80, 1)[..], &[0x00]].concat())];
     let mut rt = runtime(SynthScript::default().entity("npc", npc));
     rt.tick(None);
-    // Facing away (direction 128, -x): nothing.
-    rt.tick(Some(PlayerInput { x: 60, y: 0, dir: 128, ok: true, ..Default::default() }));
+    // Facing away (direction 192, -x): nothing.
+    rt.tick(Some(PlayerInput { x: 60, y: 0, dir: 192, ok: true, ..Default::default() }));
     rt.tick(None);
     assert_eq!(rt.mem.banks.get(0x80), 0);
     // Too far: 80 + 34 = 114 is the reach.
-    rt.tick(Some(PlayerInput { x: -20, y: 0, dir: 0, ok: true, ..Default::default() }));
+    rt.tick(Some(PlayerInput { x: -20, y: 0, dir: 64, ok: true, ..Default::default() }));
     rt.tick(None);
     assert_eq!(rt.mem.banks.get(0x80), 0);
 }
 
 #[test]
 fn directions_follow_the_original() {
-    assert_eq!(direction_of(10, 0), 0);
-    assert_eq!(direction_of(0, 10), 64);
-    assert_eq!(direction_of(-10, 0), 128);
-    assert_eq!(direction_of(0, -10), 192);
+    assert_eq!(direction_of(10, 0), 64);
+    assert_eq!(direction_of(0, 10), 128);
+    assert_eq!(direction_of(-10, 0), 192);
+    assert_eq!(direction_of(0, -10), 0);
+    for d in [0u8, 37, 64, 200] {
+        let facing = crate::field_direction_to_facing(d);
+        let (dx, dy) = ((f64::from(facing).cos() * 1000.0) as i64, (f64::from(facing).sin() * 1000.0) as i64);
+        assert_eq!(direction_of(dx, dy), d, "a model facing direction {d} faces along the vector direction_of reads as {d}");
+    }
 }
 
 #[test]
