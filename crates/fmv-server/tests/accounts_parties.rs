@@ -427,7 +427,8 @@ fn account_of(names: &[PartyName], entity: EntityId) -> AccountId {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_party_forms_grows_to_three_refuses_a_fourth_and_follows_disconnects() {
-    let server = TestServer::start(ServerConfig::default()).await;
+    // The party mechanics with three members (the server's own default is two players per party: see the next test).
+    let server = TestServer::start(ServerConfig { party: fmv_party::PartyConfig::new(3, fmv_party::DEFAULT_INVITE_TTL).unwrap(), ..ServerConfig::default() }).await;
     let mut a = join(server.addr, &uniq("Pa")).await;
     let mut b = join(server.addr, &uniq("Pb")).await;
     let mut c = join(server.addr, &uniq("Pc")).await;
@@ -541,8 +542,27 @@ async fn a_party_forms_grows_to_three_refuses_a_fourth_and_follows_disconnects()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decline_kick_and_promote_work_over_the_wire() {
+async fn the_default_party_is_two_players_and_a_third_is_refused() {
     let server = TestServer::start(ServerConfig::default()).await;
+    let mut a = join(server.addr, &uniq("Ta")).await;
+    let mut b = join(server.addr, &uniq("Tb")).await;
+    let c = join(server.addr, &uniq("Tc")).await;
+    let (mut ea, mut eb) = (Events::new(), Events::new());
+    a.client.send(&ClientMsg::PartyInvite { target: b.entity }).await;
+    let invite = eb.invite(&mut b.client).await;
+    let _ = ea.next(&mut a.client, "A's InviteSent").await;
+    b.client.send(&ClientMsg::PartyAccept { invite }).await;
+    let _ = ea.next(&mut a.client, "A's PartyFormed").await;
+    // Two players is a full party: the leader cannot invite a third.
+    a.client.send(&ClientMsg::PartyInvite { target: c.entity }).await;
+    assert!(matches!(party_rejected(&mut a.client, "the third player").await, PartyFailure::Rules(PartyError::PartyFull { max_size: 2, .. })));
+    drop(c);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn decline_kick_and_promote_work_over_the_wire() {
+    let server = TestServer::start(ServerConfig { party: fmv_party::PartyConfig::new(3, fmv_party::DEFAULT_INVITE_TTL).unwrap(), ..ServerConfig::default() }).await;
     let mut a = join(server.addr, &uniq("Ka")).await;
     let mut b = join(server.addr, &uniq("Kb")).await;
     let mut c = join(server.addr, &uniq("Kc")).await;

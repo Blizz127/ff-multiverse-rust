@@ -12,6 +12,13 @@ use fmv_fixture::FIXTURE_AREA_KEY;
 use fmv_party::PartyConfig;
 use fmv_protocol::{BattleRules, DEFAULT_DEV_PORT};
 
+/// Players per party (a "link"): two. The owner suggested it on 2026-11-11 ("maybe two?") and this lane set it under his
+/// standing order to make reversible calls (to be confirmed by him; undo: 3). The canon party (Cloud, Barret, ...) fights
+/// and plays its scenes beside the players, so FF7's three battle slots are already the story's; more players would
+/// crowd its battles and scenes ("can't flood a 3 person party game with 8 people"). The world holds any number of
+/// players; they group in pairs. (`fmv_party`'s own default stays its generic three.)
+pub const PLAYERS_PER_PARTY: usize = 2;
+
 /// Highest accepted tick rate (`--tick-hz`).
 pub const MAX_TICK_HZ: u32 = 240;
 
@@ -267,7 +274,7 @@ pub struct ServerConfig {
     /// `registrations_per_minute` and lock everybody else out of registering. `None` lifts the limit.
     pub registrations_per_ip: Option<u32>,
     /// Party rules. The party clock is milliseconds of server monotonic time, so
-    /// `party.invite_ttl()` is in milliseconds; the default is 3 members and 60 s.
+    /// `party.invite_ttl()` is in milliseconds; the default is [`PLAYERS_PER_PARTY`] members and 60 s.
     pub party: PartyConfig,
     /// Identity of the game adapter, appended to the build string as `<version>+<suffix>`
     /// (`Welcome::server_build` and the READY line). A real-game adapter names itself here so that
@@ -311,7 +318,7 @@ impl Default for ServerConfig {
             max_accounts: fmv_persist::DEFAULT_MAX_ACCOUNTS,
             registrations_per_minute: DEFAULT_REGISTRATIONS_PER_MINUTE,
             registrations_per_ip: Some(DEFAULT_REGISTRATIONS_PER_IP),
-            party: PartyConfig::default(),
+            party: PartyConfig::new(PLAYERS_PER_PARTY, fmv_party::DEFAULT_INVITE_TTL).expect("two players is a valid party"),
             build_suffix: None,
             battle: None,
             debug_encounters: false,
@@ -467,7 +474,7 @@ mod tests {
         // FIXTURE keeps the plain version as its build string.
         assert_eq!(c.build_suffix, None);
         assert_eq!(c.build_string(), crate::SERVER_BUILD);
-        // Accounts: an ephemeral store, open registration, a three-member party with 60 s invites
+        // Accounts: an ephemeral store, open registration, a two-player party with 60 s invites
         // (the party clock is in milliseconds).
         assert_eq!(c.state_dir, None);
         assert!(c.allow_registration);
@@ -475,7 +482,7 @@ mod tests {
         assert_eq!(c.registrations_per_ip, Some(DEFAULT_REGISTRATIONS_PER_IP));
         assert_eq!(c.max_connections_per_ip, Some(DEFAULT_MAX_CONNECTIONS_PER_IP));
         assert_eq!(c.max_accounts, fmv_persist::DEFAULT_MAX_ACCOUNTS);
-        assert_eq!((c.party.max_size(), c.party.invite_ttl()), (3, 60_000));
+        assert_eq!((c.party.max_size(), c.party.invite_ttl()), (2, 60_000));
         // Battles: unsupported without battle data, and debug encounters are off.
         assert!(c.battle.is_none());
         assert!(!c.debug_encounters);

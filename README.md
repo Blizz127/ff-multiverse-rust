@@ -801,7 +801,7 @@ A second account on the same server and machine gets its own file (the first fil
 which name it belongs to). A token that stops working (the server's accounts were reset) is
 reported with the file to delete. One session per account at a time.
 
-**Parties.** Up to three players; the leader invites (solo players may invite too), anyone
+**Parties.** Up to two players (the owner's suggestion, pending his confirmation: the canon party already fills FF7's three battle slots, so a party is a pair of players beside it; the server's `PLAYERS_PER_PARTY`); the leader invites (solo players may invite too), anyone
 invited can accept or decline within a minute, the leader can kick or promote, anyone can
 leave, and a player who disconnects leaves. The server decides everything and tells each client
 exactly the changes that concern it; a client mirror replays them. The party chooses where the
