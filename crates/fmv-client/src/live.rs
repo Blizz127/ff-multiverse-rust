@@ -138,6 +138,7 @@ impl LiveClient {
         self.windows.values()
     }
 
+    #[allow(dead_code)]
     pub fn has_windows(&self) -> bool {
         !self.windows.is_empty()
     }

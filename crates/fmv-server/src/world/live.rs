@@ -83,7 +83,8 @@ pub struct LiveInput {
 /// What a frame did that the world must carry out or tell.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveEvent {
-    Window { window: u8, dialog: u16, ask: Option<(u8, u8)>, entity: u16, offset: u32 },
+    /// A window opened. `passive`: one the player cannot close (the countdown's clock, a standing notice).
+    Window { window: u8, dialog: u16, ask: Option<(u8, u8)>, entity: u16, offset: u32, passive: bool },
     WindowClosed { window: u8 },
     /// Go to another area (`target` is `None` when the field id names no area the adapter has).
     MapJump { target: Option<AreaKey>, field_id: u16, arrival: Pos, facing: f32, hint: Option<u32> },
@@ -121,6 +122,8 @@ pub trait LiveField: Send {
     fn idle(&self) -> bool;
     /// The game clocks now (play time, story countdown; seconds).
     fn clocks(&self) -> (u32, u32);
+    /// The seconds left on the story countdown while the field shows its clock (`None`: no countdown is shown).
+    fn countdown(&self) -> Option<u32>;
     fn map_jumps_disabled(&self) -> bool;
     /// Whether a script closed the way from `from` to `to` (FF7: `to` lies on a walkmesh triangle a script locked and
     /// `from` does not, so a player already inside can still walk out).
@@ -154,6 +157,8 @@ struct LiveRun {
     windows: BTreeSet<u8>,
     /// Frames the governor's last OK press is still held for.
     ok_hold: u8,
+    /// The countdown last told to the instance: the seconds left, how long it was when it started, when it was told.
+    countdown: Option<(u32, u32, Instant)>,
     /// The run cannot go on (its save failed): it stops advancing and the instance keeps its last state.
     halted: bool,
 }
@@ -242,7 +247,7 @@ impl World {
         let Some(account) = self.players.get(&entity).map(|p| p.account) else { return false };
         self.live_run_of(entity)
             .and_then(|id| self.live.runs.get(&id))
-            .is_some_and(|r| r.governor == account && (r.locked || !r.windows.is_empty() || r.waiting.is_some()))
+            .is_some_and(|r| r.governor == account && (r.locked || r.waiting.is_some()))
     }
 
     /// Whether the live field `entity` stands in closes the way from `from` to `to`.
@@ -343,6 +348,7 @@ impl World {
                             waiting: None,
                             windows: BTreeSet::new(),
                             ok_hold: 0,
+                            countdown: None,
                             halted: false,
                         },
                     );
@@ -432,7 +438,8 @@ impl World {
         let mut jump = None;
         for event in events {
             match event {
-                LiveEvent::Window { window, dialog, ask, entity: opener, offset } => {
+                LiveEvent::Window { passive: true, .. } => {}
+                LiveEvent::Window { window, dialog, ask, entity: opener, offset, passive: false } => {
                     run.windows.insert(window);
                     if let Some(area) = &area_id {
                         for (entity, governor) in self.instance_members(id, run.governor) {
@@ -496,6 +503,21 @@ impl World {
                 self.tell_instance(id, Arc::new(ServerMsg::LiveStage { area: area.clone(), masks: stage.0.clone(), fade }), &mut failed);
             }
             run.stage = stage;
+        }
+        // The story countdown, while the field shows its clock: told when it starts, every ten seconds, and when it ends.
+        match (run.field.countdown(), run.countdown) {
+            (Some(left), told) if told.is_none_or(|(_, _, at)| now.saturating_duration_since(at) >= Duration::from_secs(10)) => {
+                let total = told.map_or(left, |(_, total, _)| total.max(left));
+                run.countdown = Some((left, total, now));
+                let state = fmv_protocol::CountdownState::Running { remaining_ms: left.saturating_mul(1000), total_ms: total.saturating_mul(1000) };
+                self.tell_instance(id, Arc::new(ServerMsg::Countdown { state }), &mut failed);
+            }
+            (None, Some(_)) => {
+                run.countdown = None;
+                let state = fmv_protocol::CountdownState::Over { reason: fmv_protocol::CountdownEnd::Cleared };
+                self.tell_instance(id, Arc::new(ServerMsg::Countdown { state }), &mut failed);
+            }
+            _ => {}
         }
         // Control and the scripted player position.
         let locked = run.field.control_locked();

@@ -570,7 +570,7 @@ impl ClientState {
 
     /// Field input remains held through a story transaction or an ordinary authored Game Over.
     pub fn field_controls_held(&self) -> bool {
-        self.is_story_pending() || self.ordinary_game_over() || self.live.locked || self.live.has_windows() || self.live.movie.is_some()
+        self.is_story_pending() || self.ordinary_game_over() || self.live.locked || self.live.movie.is_some()
     }
 
     pub fn story_pending_id(&self) -> Option<u64> { self.story_hold.as_ref().map(|h| h.id) }

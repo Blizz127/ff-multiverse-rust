@@ -563,9 +563,34 @@ impl FieldRuntime {
         &self.windows
     }
 
-    /// Whether any window is open (the player cannot move while one is).
+    /// Whether any window is open.
     pub fn window_open(&self) -> bool {
         self.windows.iter().any(|w| w.open.as_ref().is_some_and(|o| !o.closed))
+    }
+
+    /// Whether a window is open that waits for the player (one the player may dismiss or must answer). A window a
+    /// script keeps up itself (`WMODE`'s "cannot be closed": the countdown clock, a standing notice) does not.
+    pub fn window_waiting(&self) -> bool {
+        self.windows.iter().any(|w| !w.prevent_close && w.open.as_ref().is_some_and(|o| !o.closed))
+    }
+
+    /// Whether window `window` is one the player cannot close.
+    pub fn window_passive(&self, window: u8) -> bool {
+        self.windows.get(usize::from(window)).is_some_and(|w| w.prevent_close)
+    }
+
+    /// Whether a question is open (the original holds the player still while one is, and only then: a plain message
+    /// does not stop the player by itself, the scripts lock control around the ones that should).
+    pub fn question_open(&self) -> bool {
+        self.windows.iter().any(|w| w.open.as_ref().is_some_and(|o| !o.closed && o.ask.is_some()))
+    }
+
+    /// Whether any script other than the entities' main loops is running: an entity above its main priority that is
+    /// not merely holding up a window the player cannot close (the countdown's clock sits in one for minutes).
+    pub fn scripts_running(&self) -> bool {
+        self.ents.iter().enumerate().any(|(e, ent)| {
+            !ent.broken && ent.priority < MAIN_PRIORITY && !self.windows.iter().any(|w| w.prevent_close && w.open.as_ref().is_some_and(|o| o.entity == e))
+        })
     }
 
     /// Events since the last call, in order.
@@ -596,7 +621,12 @@ impl FieldRuntime {
 
     /// The player dismissed window `window` (a message).
     pub fn close_window(&mut self, window: u8) {
-        if let Some(open) = self.windows.get_mut(usize::from(window)).and_then(|w| w.open.as_mut()) {
+        let Some(w) = self.windows.get_mut(usize::from(window)) else { return };
+        // A window the script marked "cannot be closed" stays until the script closes it.
+        if w.prevent_close {
+            return;
+        }
+        if let Some(open) = w.open.as_mut() {
             open.closed = true;
         }
     }
@@ -627,7 +657,7 @@ impl FieldRuntime {
     /// Whether the scripts, not the player, place the player's character now: control is locked (`UC`) or its model is
     /// in a scripted move (a walk, jump or ladder). The host then follows [`FieldRuntime::pc_model`].
     pub fn player_scripted(&self) -> bool {
-        self.state.character_lock || self.pc_model().is_some_and(|m| m.move_mode != MoveMode::None)
+        self.state.character_lock || self.question_open() || self.pc_model().is_some_and(|m| m.move_mode != MoveMode::None)
     }
 
     /// The entity a model belongs to and its talk script, for a host that resolves talking itself.

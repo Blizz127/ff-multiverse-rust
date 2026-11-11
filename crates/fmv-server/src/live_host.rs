@@ -106,6 +106,7 @@ impl LiveField for Ff7Live {
         for event in self.rt.drain_events() {
             match event {
                 Event::Window { window, dialog, ask, entity, offset } => out.push(LiveEvent::Window {
+                    passive: self.rt.window_passive(window),
                     window,
                     dialog: u16::from(dialog),
                     ask,
@@ -185,7 +186,12 @@ impl LiveField for Ff7Live {
     }
 
     fn idle(&self) -> bool {
-        self.rt.command().is_none() && !self.rt.window_open() && !self.rt.player_scripted()
+        self.rt.command().is_none() && !self.rt.window_waiting() && !self.rt.player_scripted()
+    }
+
+    fn countdown(&self) -> Option<u32> {
+        let shown = (0..4u8).any(|w| self.rt.window_passive(w) && self.rt.windows()[usize::from(w)].open.is_some());
+        (shown && self.rt.countdown_seconds() > 0).then(|| self.rt.countdown_seconds())
     }
 
     fn clocks(&self) -> (u32, u32) {

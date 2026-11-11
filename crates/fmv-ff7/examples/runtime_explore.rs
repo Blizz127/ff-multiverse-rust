@@ -120,14 +120,17 @@ fn pump(rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
     false
 }
 
+/// Whether the field holds the player or waits for it.
 fn busy(rt: &FieldRuntime) -> bool {
-    rt.player_scripted() || rt.window_open() || rt.command().is_some()
+    rt.player_scripted() || rt.window_waiting() || rt.command().is_some()
 }
 
-/// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived undisturbed
-/// (`false`: a script took the player, opened a window or issued a command on the way) and where it is.
+/// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived (`false`: a
+/// script took over on the way and changed something: the story, the field's scratch or where the player stands) and
+/// where it is. A script that only says something on the way (bumping into someone) is heard out and the walk goes on.
 fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
     let mut at = from;
+    let mut chats = 0;
     for p in approach {
         at = *p;
         rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
@@ -136,10 +139,15 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
             return (false, at);
         }
         if busy(rt) || out.windows != before {
-            if let Some(m) = rt.pc_model().filter(|_| rt.player_scripted()) {
-                at = (m.x, m.y, m.z);
+            let (story, scratch) = (story_key(&rt.mem.banks), rt.mem.scratch);
+            let (more, end) = run_idle(rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
+            let over = more.jump.is_some() || more.game_over;
+            out.absorb(more);
+            let moved = (end.0 - at.0).abs() + (end.1 - at.1).abs() > 8;
+            chats += 1;
+            if over || moved || chats > 6 || story != story_key(&rt.mem.banks) || scratch != rt.mem.scratch {
+                return (false, end);
             }
-            return (false, at);
         }
     }
     (true, at)
@@ -152,10 +160,16 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
 /// Returns what happened and where the player ends.
 fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
     let mut out = Outcome::default();
-    let mut idle = 0u32;
+    let (mut idle, mut settling) = (0u32, 0u32);
     for f in 0..frames {
+        // A script still running without holding the player (someone walking to a door to open it) is waited for, but
+        // not for ever: some run as long as the field does.
         if busy(rt) {
             idle = 0;
+            settling = 0;
+        } else if rt.scripts_running() && settling < 300 {
+            idle = 0;
+            settling += 1;
         } else {
             idle += 1;
         }
@@ -611,9 +625,16 @@ fn main() {
             }
             // The probe stood there out of nowhere. Now do it the way a player does: walk there from where the player
             // stands, and take whatever happens on the way instead if something does.
+            let debug = std::env::var_os("FMV_EXPLORE_DEBUG").is_some();
             let first = path.first().copied().unwrap_or(stand);
-            let Some(first_tri) = rt.triangle_at(first.0, first.1, first.2).map(usize::from) else { continue };
-            let Some(approach) = way(&walk, &rt, at, here, first, first_tri) else { continue };
+            let Some(first_tri) = rt.triangle_at(first.0, first.1, first.2).map(usize::from) else {
+                if debug { println!("      drop [{label}]: its start is on no triangle"); }
+                continue;
+            };
+            let Some(approach) = way(&walk, &rt, at, here, first, first_tri) else {
+                if debug { println!("      drop [{label}]: no way from tri {here} to tri {first_tri}"); }
+                continue;
+            };
             let mut probe = rt.clone();
             let mut out = Outcome::default();
             let (arrived, mut end) = walk_to(&mut probe, &approach, at, &mut out);
@@ -649,6 +670,7 @@ fn main() {
                 _ => 0,
             };
             if score == 0 {
+                if debug { println!("      drop [{label}]: walked (arrived {arrived}), nothing changed; ends {end:?}"); }
                 continue;
             }
             let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);

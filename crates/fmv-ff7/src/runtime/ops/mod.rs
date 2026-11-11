@@ -189,7 +189,8 @@ impl FieldRuntime {
             0x52 => {
                 let w = usize::from(self.p8(1)) % super::WINDOWS;
                 self.windows[w].mode = self.p8(2);
-                self.windows[w].prevent_close = self.p8(3) != 0;
+                // (bit 0: the player cannot close it; the script closes it itself)
+                self.windows[w].prevent_close = self.p8(3) & 1 != 0;
                 self.advance(4);
                 Flow::Continue
             }
