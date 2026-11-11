@@ -82,3 +82,21 @@ FMV_FF7_DATA=<data> cargo run -p fmv-ff7 --release --example runtime_trace -- md
 
 Scripted movement, animation, background, camera and fades are being implemented, one instruction family per file.
 The curated scene route stays the default until the live route reaches further.
+
+## The headless solver (`examples/runtime_explore.rs`)
+
+The solver plays the story on the runtime alone, with no server or client involved. From a fresh story it settles each
+field, then probes every walkmesh triangle (standing, and with OK), every talkable model (facing it, with OK) and every
+line (walking across it, and standing on it with OK). It takes the action that best advances the story or leaves the
+field, carrying the story into the next field. Gateway choices are backtracked, and a probe that returns to a story
+already seen in a field gets no credit.
+
+**2026-11-11:** it reaches **story moment 51**, the passenger train into Sector 7, the same point the curated scene
+route reaches. On the way it plays, from the original scripts alone:
+- the opening and battle 300;
+- the first reactor (door, lift, Jessie, bomb, Guard Scorpion 324, the countdown);
+- the escape (md8_4 at 33, md8_1 at 36, md8_2 at 39);
+- the bridge battles, the cargo car (48) and the train (51).
+
+Teleporting the player to a triangle's centre is a test shortcut, not how a player moves. The live server path is
+checked separately with `scripts/live-route.py`.

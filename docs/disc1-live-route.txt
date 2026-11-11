@@ -1,0 +1,5 @@
+# The Disc 1 route for scripts/live-route.py (live fields). One line per field; steps run each visit.
+# Positions are walkmesh triangles and gateway slots of the owner's data, worked out with
+# crates/fmv-ff7/examples/runtime_trace.rs and walkmesh_json.rs (numbers only, no game text).
+md1stin: wait 2; tri 12; wait 3; gate 0
+md1_1: tri 62
