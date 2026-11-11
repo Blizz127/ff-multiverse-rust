@@ -560,6 +560,7 @@ impl ClientState {
     /// and the counters are ours, not the area's, and stay. `forward` is false for the way back
     /// after a transfer we refused (it is not a change).
     pub fn change_area(&mut self, area: AreaId, arrival: Pos, facing: f32, forward: bool) {
+        crate::adventurer_lines::set_field(&area.key);
         self.area = area;
         self.remotes.clear();
         self.npcs.clear();

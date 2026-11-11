@@ -369,7 +369,10 @@ fn pull(source: &mut dyn MessageSource, answer: Option<usize>) -> Option<Message
     for _ in 0..MAX_BLANKS {
         match source.next(answer.take()) {
             Beat::Message(m) if layout::is_blank(&m) => {}
-            Beat::Message(m) => return Some(m),
+            Beat::Message(mut m) => {
+                crate::adventurer_lines::adopt(&mut m);
+                return Some(m);
+            }
             Beat::End(_) => return None,
         }
     }

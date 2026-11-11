@@ -23,6 +23,7 @@
 //! files, no login; the same deleting is what `Del` then `Y` does in the character menu.
 
 mod accounts;
+mod adventurer_lines;
 mod audio;
 mod avatar;
 mod backdrop;
