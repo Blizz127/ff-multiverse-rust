@@ -22,7 +22,7 @@ use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::scene::{self, SceneRoute};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
-use crate::ui::dialogue::{field_key, Talk};
+use crate::ui::dialogue::{dialogue_key, ff7::story_of, field_key, Talk};
 use crate::ui::draw::DrawList;
 use crate::ui::hud::{self, Subject};
 use fmv_core::{AnimState, GameId, Pos};
@@ -835,6 +835,12 @@ impl App {
             self.talk.close();
             // Key releases must survive every hold, even when the associated press was ignored.
             if !pressed { self.input.set(code, false); }
+            // A window the server's script opened takes the OK and arrow keys: that is how the leader answers it.
+            if let Some(key) = dialogue_key(code, pressed, repeat) {
+                if self.talk.live_key(&mut self.session.state.live, key) {
+                    return;
+                }
+            }
             let battle_menu = self.session.state.battle.in_battle() || self.session.state.battle.lingering(now);
             story_pending_route(code, pressed, repeat, battle_menu)
         } else {
@@ -906,6 +912,18 @@ impl App {
             }
             KeyRoute::Ignored => {}
         }
+    }
+
+    /// What a live field asks of this frame: a movie (none can be played here yet, so it is over at once and the script goes
+    /// on) and the windows its scripts have open (shown, built from this machine's own field data).
+    fn live_frame(&mut self) {
+        let state = &mut self.session.state;
+        if let Some(movie) = state.live.movie {
+            eprintln!("live: movie {movie} is skipped (this client has no movie player yet)");
+            state.live.movie_done();
+        }
+        let story = &state.story;
+        self.talk.sync_live(&mut state.live, &self.session.info.area_id.key, || story_of(story.state()));
     }
 
     fn sync_story_pending_input(&mut self) {
@@ -1200,6 +1218,7 @@ impl App {
         let scene_visible = !self.session.state.field_controls_held() && !self.session.state.battle.in_battle() && !self.session.state.battle.lingering(self.session.now());
         self.session.state.scene.advance_visible(dt, scene_visible);
         self.session.flush_scene();
+        self.live_frame();
         self.session.flush_live();
         self.session.log_scene_notes();
         self.scene_notice();
@@ -1428,7 +1447,9 @@ pub(crate) fn field_draw(
     // While a story scene runs the cast stands among the area's characters (its trigger is not drawn: the cast member that
     // plays its part is) and the players that take part are drawn on their witness spots (see `crate::scene::draw`).
     let story = state.scene.player();
-    let npcs = scene::visible_npcs(state.npc_views(), story);
+    // (the characters of a live field glide between casts: they are drawn where they are NOW)
+    let drawn_npcs = state.npc_views_at(render_t);
+    let npcs = scene::visible_npcs(&drawn_npcs, story);
     let mut players: Vec<AvatarPlayer<'_>> = npc_players(&npcs);
     if let Some(story) = story {
         players.extend(scene::cast_players(story));

@@ -42,6 +42,8 @@ use std::time::Duration;
 pub const MIN_INTENT_INTERVAL_S: f64 = 0.05;
 /// Tolerance so a 3-frame cadence at 60 fps is not defeated by floating point rounding.
 const RATE_EPS_S: f64 = 1e-6;
+/// How often the server casts a live field (20 a second).
+const CAST_PERIOD_S: f64 = 0.05;
 /// Remote entities tracked for rendering (extra ones are ignored).
 pub const MAX_REMOTES: usize = 256;
 /// Distinct peer ids remembered for the SMOKE `peers_seen` counter.
@@ -422,6 +424,9 @@ pub struct ClientState {
     /// Counts the times the NPC list was replaced (a snapshot, a change of area): a renderer that
     /// keeps something per set of NPCs knows by it when to rebuild.
     npc_epoch: u64,
+    /// Where each NPC of a live field was told to be, by id: a cast keeps the same NPCs and moves them, and they are
+    /// drawn gliding between the casts ([`ClientState::npc_views_at`]) instead of being rebuilt. Empty on a static area.
+    npc_tracks: BTreeMap<u32, SnapshotBuffer>,
     /// Peers seen in the CURRENT area (cleared when the area changes).
     peers_seen: BTreeSet<EntityId>,
     updates: u64,
@@ -469,6 +474,7 @@ impl ClientState {
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
+            npc_tracks: BTreeMap::new(),
             peers_seen: BTreeSet::new(),
             updates: 0,
             rejected: 0,
@@ -499,9 +505,61 @@ impl ClientState {
     pub fn npc_views(&self) -> &[NpcView] {
         &self.npcs
     }
-    /// Changes whenever the list [`ClientState::npc_views`] answers was replaced.
+    /// Changes whenever the list [`ClientState::npc_views`] answers was replaced: a snapshot, a change of area, or a
+    /// live cast whose characters (their ids, names, models or standing clips) differ from the last list. A cast that only
+    /// moves the same characters leaves it alone (see [`ClientState::npc_views_at`]).
     pub fn npc_epoch(&self) -> u64 {
         self.npc_epoch
+    }
+
+    /// The area's NPCs as they are DRAWN at `render_t` (the same clock as [`ClientState::remote_views`]): on a live field
+    /// each glides from where the last cast had it to where the newest does; anywhere else this is
+    /// [`ClientState::npc_views`] as it is. Talking and triggers use the authoritative list, drawing and labels this one.
+    pub fn npc_views_at(&self, render_t: f64) -> std::borrow::Cow<'_, [NpcView]> {
+        if self.npc_tracks.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.npcs);
+        }
+        std::borrow::Cow::Owned(
+            self.npcs
+                .iter()
+                .map(|n| {
+                    let mut n = n.clone();
+                    if let Some(pose) = self.npc_tracks.get(&n.id).and_then(|t| t.sample(render_t)) {
+                        n.pos = pose.pos;
+                        n.facing = pose.facing;
+                    }
+                    n
+                })
+                .collect(),
+        )
+    }
+
+    /// A live cast at `now`: the same characters moved (no rebuild), or a new set.
+    fn apply_cast(&mut self, now: f64, npcs: Vec<NpcView>) {
+        let same_set = npcs.len() == self.npcs.len()
+            && npcs.iter().zip(&self.npcs).all(|(a, b)| (a.id, &a.name, &a.model, &a.idle_animation) == (b.id, &b.name, &b.model, &b.idle_animation));
+        let pose = |n: &NpcView| Pose { pos: n.pos, facing: n.facing, anim: AnimState::Idle };
+        if same_set {
+            for (new, old) in npcs.iter().zip(&self.npcs) {
+                let track = self.npc_tracks.entry(new.id).or_default();
+                if track.sample(now).is_none() {
+                    // The first cast of this list: glide from where the list had the character (a cast is 1/20 s).
+                    track.push(Sample { t: now - CAST_PERIOD_S, pose: pose(old) });
+                }
+                track.push(Sample { t: now, pose: pose(new) });
+            }
+        } else {
+            self.npc_tracks = npcs
+                .iter()
+                .map(|n| {
+                    let mut track = SnapshotBuffer::default();
+                    track.push(Sample { t: now, pose: pose(n) });
+                    (n.id, track)
+                })
+                .collect();
+            self.npc_epoch += 1;
+        }
+        self.npcs = npcs;
     }
 
     /// A story write is held until both its durable commit and ordered input fence are acknowledged.
@@ -569,6 +627,7 @@ impl ClientState {
         self.live.reset();
         self.remotes.clear();
         self.npcs.clear();
+        self.npc_tracks.clear();
         self.npc_epoch += 1;
         self.peers_seen.clear();
         self.peer_looks.clear();
@@ -660,6 +719,7 @@ impl ClientState {
                     self.upsert(now, e);
                 }
                 self.npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
+                self.npc_tracks.clear();
                 self.npc_epoch += 1;
             }
             // Handled before it gets here: the session answers it (JoinArea / CannotJoin) and then
@@ -755,13 +815,14 @@ impl ClientState {
             // A live field (protocol 23, see `crate::live`): its cast replaces the area's NPCs.
             ServerMsg::LiveCast { area, npcs, .. } => {
                 if area == self.area {
-                    self.npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
-                    self.npc_epoch += 1;
+                    self.live.on_cast();
+                    let npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
+                    self.apply_cast(now, npcs);
                 }
             }
             ServerMsg::LiveWindow { area, window, dialog, ask, answerable } => {
                 if area == self.area {
-                    self.live.on_window(crate::live::LiveWindowView { window, dialog, ask, answerable });
+                    self.live.on_window(crate::live::LiveWindowView::new(window, dialog, ask, answerable));
                 }
             }
             ServerMsg::LiveWindowClosed { area, window } => {
@@ -1690,6 +1751,62 @@ mod tests {
         s.change_area(plaza(), Pos::default(), 0.0, true);
         assert_ne!(s.npc_epoch(), second);
         assert!(s.npc_views().is_empty());
+    }
+
+    fn cast(npcs: Vec<NpcSnapshot>) -> ServerMsg {
+        ServerMsg::LiveCast { area: plaza(), tick: 2, npcs }
+    }
+
+    fn at_x(mut n: NpcSnapshot, x: f32, facing: f32) -> NpcSnapshot {
+        n.pos = Pos::new(x, 5.0, 0.0);
+        n.facing = facing;
+        n
+    }
+
+    /// A live cast that keeps the same characters MOVES them (no rebuild of their models: the epoch stays) and they are drawn
+    /// gliding between the casts; a different set of characters, or another model, is a rebuild.
+    #[test]
+    fn a_cast_of_the_same_characters_glides_them_and_only_a_new_set_rebuilds() {
+        let mut s = state(Pos::default());
+        assert!(!s.live.live_area);
+        s.apply(0.0, snapshot_of(plaza(), vec![], vec![at_x(npc_snapshot(0, "a"), 0.0, 0.0), at_x(npc_snapshot(1, "b"), 100.0, 0.0)]));
+        // A static area draws the list as it is.
+        assert!(matches!(s.npc_views_at(0.0), std::borrow::Cow::Borrowed(_)));
+        let epoch = s.npc_epoch();
+        // The first cast: the same two, `a` moved. Not a rebuild.
+        s.apply(1.0, cast(vec![at_x(npc_snapshot(0, "a"), 10.0, 0.0), at_x(npc_snapshot(1, "b"), 100.0, 0.0)]));
+        assert!(s.live.live_area);
+        assert_eq!(s.npc_epoch(), epoch);
+        assert_eq!(s.npc_views()[0].pos.x, 10.0, "the authoritative list is the newest cast (talk and triggers use it)");
+        // Next cast 1/20 s later: drawn between the two casts, once the render clock is there.
+        s.apply(1.05, cast(vec![at_x(npc_snapshot(0, "a"), 20.0, 1.0), at_x(npc_snapshot(1, "b"), 100.0, 0.0)]));
+        assert_eq!(s.npc_epoch(), epoch);
+        let mid = s.npc_views_at(1.025);
+        assert!((mid[0].pos.x - 15.0).abs() < 1e-3, "halfway between the casts: {}", mid[0].pos.x);
+        assert!((mid[0].facing - 0.5).abs() < 1e-3);
+        assert_eq!(mid[1].pos.x, 100.0, "the one that did not move stays");
+        assert_eq!(s.npc_views_at(1.05)[0].pos.x, 20.0);
+        assert_eq!(s.npc_views_at(9.0)[0].pos.x, 20.0, "held at the newest");
+        assert_eq!(s.npc_views_at(1.025)[0].name, "a");
+        // Another model of the same character, or a character fewer: new models.
+        let mut other = at_x(npc_snapshot(0, "a"), 20.0, 1.0);
+        other.model = "bbbb".into();
+        s.apply(1.1, cast(vec![other, at_x(npc_snapshot(1, "b"), 100.0, 0.0)]));
+        assert_ne!(s.npc_epoch(), epoch);
+        let epoch = s.npc_epoch();
+        s.apply(1.15, cast(vec![at_x(npc_snapshot(1, "b"), 100.0, 0.0)]));
+        assert_ne!(s.npc_epoch(), epoch);
+        // Leaving the area drops it all.
+        s.change_area(plaza(), Pos::default(), 0.0, true);
+        assert!(s.npc_views_at(2.0).is_empty() && !s.live.live_area);
+    }
+
+    #[test]
+    fn a_cast_for_another_area_changes_nothing() {
+        let mut s = state(Pos::default());
+        let epoch = s.npc_epoch();
+        s.apply(0.0, ServerMsg::LiveCast { area: AreaId { game: GameId::Fixture, key: "elsewhere".into() }, tick: 1, npcs: vec![npc_snapshot(0, "a")] });
+        assert_eq!((s.npc_epoch(), s.npc_views().len(), s.live.live_area), (epoch, 0, false));
     }
 
     #[test]

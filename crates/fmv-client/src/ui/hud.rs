@@ -136,9 +136,9 @@ pub fn gather_anchored(
     anchor: &dyn Fn(Subject, Pos) -> Option<Pos>,
 ) -> HudInput {
     let mut labels = Vec::new();
-    // The area's NPCs (static: they are named where they stand; one that cannot be drawn has no
+    // The area's NPCs (named where they are drawn, which on a live field moves; one that cannot be drawn has no
     // label either).
-    for npc in state.npc_views() {
+    for npc in state.npc_views_at(render_t).iter() {
         if let Some(p) = anchor(Subject::Npc(npc.id), npc.pos) {
             labels.push(Label { x: p.x, y: p.y, text: npc.name.clone(), kind: LabelKind::Npc });
         }
