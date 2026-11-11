@@ -75,6 +75,24 @@ impl Banks {
     }
 }
 
+/// The persistent selectors in flat-image order: bank `i` of the image is selector `PERSISTENT_SELECTORS[i]`.
+pub const PERSISTENT_SELECTORS: [u8; 5] = [1, 3, 11, 13, 15];
+
+impl Banks {
+    /// The image of a story whose every persistent bit is known; `None` if any bit is unknown (a runtime must
+    /// never guess one: an unknown bit read as zero can send a script down the wrong branch and the save would
+    /// then record that branch's writes as fact).
+    pub fn from_story(story: &crate::story::StoryState) -> Option<Self> {
+        let mut out = Banks::default();
+        for (i, selector) in PERSISTENT_SELECTORS.iter().enumerate() {
+            for address in 0..=u8::MAX {
+                out.set(i * 256 + usize::from(address), story.known_byte(*selector, address)?);
+            }
+        }
+        Some(out)
+    }
+}
+
 /// Where a selector's storage lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {

@@ -34,6 +34,8 @@ pub mod memory;
 mod ops;
 pub use ops::{is_implemented, menu, AnimState, MotionState, PartyState, StageState, WindowsState};
 #[cfg(test)]
+mod owned_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::BTreeMap;
