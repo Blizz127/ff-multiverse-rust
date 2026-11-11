@@ -1552,7 +1552,7 @@ mod tests {
                 Msg::Save(job) => jobs.push(job),
                 // Story saves are `saved_story`'s business (world/story.rs tests), not a payment.
                 Msg::Story(_) => {}
-                Msg::Scene { .. } | Msg::StoryCas { .. } | Msg::StoryBattle { .. } | Msg::StoryBattleSnapshot { .. } =>
+                Msg::Scene { .. } | Msg::StoryCas { .. } | Msg::StoryBattle { .. } | Msg::StoryBattleSnapshot { .. } | Msg::FieldVisit { .. } =>
                     panic!("a legacy battle test did not request a story transaction"),
                 Msg::SceneBatch { .. } | Msg::SceneSnapshot { .. } => panic!("an ordinary battle test did not request a continuation transaction"),
                 Msg::Stop(_) => panic!("nobody asked the saver to stop"),

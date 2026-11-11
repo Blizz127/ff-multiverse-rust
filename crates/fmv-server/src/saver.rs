@@ -56,6 +56,11 @@
 //! battle's rewards, gauges and owner story together. Such battles keep ordinary accepted item
 //! saves; their terminal snapshot follows those saves in this FIFO and never debits them again.
 //! A checked baseline before combat ensures every member has room for the outcome receipt.
+//!
+//! [`FieldVisitSaveJob`] carries an idle account's exact story, resources and visit together.
+//! Its complete before/after images and timestamps are frozen before enqueueing. The returned
+//! [`fmv_persist::FieldVisitCommitted`] includes the actual current state, even on a duplicate
+//! after later rewards; an uncertain failure is never retried by this queue.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,6 +80,8 @@ mod continuation;
 pub(crate) use continuation::{persist_scene_batch, preview_scene_settlement, SceneBatchJob, SceneBatchMember, SceneBattleSettlement, MAX_SCENE_BATTLE_ITEM_USES};
 mod ordinary;
 pub(crate) use ordinary::{persist_story_battle, persist_story_cas, StoryBattleJob, StoryBattleMember, StoryCasJob};
+mod field_visit;
+pub(crate) use field_visit::{persist_field_visit, FieldVisitSaveJob};
 
 /// How long to wait before each further attempt at a write that failed with an I/O error.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
@@ -218,6 +225,9 @@ pub(crate) enum Msg {
     StoryBattleSnapshot { accounts: Vec<AccountId>, done: oneshot::Sender<Result<Vec<fmv_persist::SceneState>, SceneSaveError>> },
     /// Ordered with rewards and ordinary saves, acknowledged only after a durable transaction.
     Scene { job: SceneSaveJob, done: oneshot::Sender<Result<SceneSaved, SceneSaveError>> },
+    /// An idle visit, story and resources, with one exact receipt and full-state acknowledgment.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged until field-visit runtime admission exists.
+    FieldVisit { job: Box<FieldVisitSaveJob>, done: oneshot::Sender<Result<fmv_persist::FieldVisitCommitted, SceneSaveError>> },
     /// Every participant's checkpoint, costs and earned resources commit in one durable operation.
     SceneBatch { job: SceneBatchJob, done: oneshot::Sender<Result<fmv_persist::SceneBatchCommitted, SceneSaveError>> },
     /// A coherent baseline after all earlier queued rewards/story writes, without holding the world lock.
@@ -277,6 +287,17 @@ impl SaverHandle {
         job.selected_result()?;
         let (done, finished) = oneshot::channel();
         self.tx.send(Msg::Scene { job, done }).map_err(|_| SceneSaveError::Stopped)?;
+        Ok(finished)
+    }
+
+    /// Queue an immutable idle visit decision. Use an ordered singleton `snapshot_scene_batch`
+    /// for its predecessor. Dropping the receiver never cancels a queued commit; a closed
+    /// acknowledgment is uncertain, and only the returned current state may be published.
+    #[cfg_attr(not(test), allow(dead_code))] // Staged until field-visit runtime admission exists.
+    pub(crate) fn save_field_visit(&self, job: FieldVisitSaveJob) -> Result<oneshot::Receiver<Result<fmv_persist::FieldVisitCommitted, SceneSaveError>>, SceneSaveError> {
+        job.validate()?;
+        let (done, finished) = oneshot::channel();
+        self.tx.send(Msg::FieldVisit { job: Box::new(job), done }).map_err(|_| SceneSaveError::Stopped)?;
         Ok(finished)
     }
 
@@ -495,6 +516,15 @@ async fn run(
                 // No story bytes, selected choices, or request Debug representation enter logs.
                 if result.is_ok() { info!(account = account.0, "scene transaction acknowledged"); }
                 else { error!(account = account.0, "scene transaction not acknowledged; player progress must remain held"); }
+                let _ = done.send(result);
+            }
+            Msg::FieldVisit { job, done } => {
+                let account = job.account();
+                let (store, adapter) = (Arc::clone(&store), Arc::clone(&adapter));
+                let result = tokio::task::spawn_blocking(move || persist_field_visit(&store, game, adapter.as_ref(), &job))
+                    .await.unwrap_or(Err(SceneSaveError::WorkerFailed));
+                if result.is_ok() { info!(account = account.0, "field visit transaction acknowledged"); }
+                else { error!(account = account.0, "field visit transaction not acknowledged; progress must remain held"); }
                 let _ = done.send(result);
             }
             Msg::SceneBatch { job, done } => {

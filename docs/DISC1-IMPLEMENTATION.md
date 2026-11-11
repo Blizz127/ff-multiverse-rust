@@ -182,8 +182,9 @@ sticky faults and immutable before/after images separate from persistent writes.
 visit setup must change neither values nor knowledge, even temporarily. Checked replay
 identity binds the initial scratch image and mode. Ordinary execution also retains the
 scratch image at the exact BATTLE instruction, separately from its victory afterimage.
-Server result and continuation consumers reject all checked outcomes until they can commit
-the visit atomically, including checked outcomes that changed nothing. See the
+Legacy server result and continuation consumers reject all checked outcomes, including
+checked outcomes that changed nothing. A separate staged idle evaluator now connects
+checked execution to an atomic visit save without activating those gameplay consumers. See the
 [field-visit contract](FIELD-TIMELINE-DESIGN.md#field-visit-state-contract-runtime-unimplemented)
 for lifetime, continuation and reconstruction requirements.
 
@@ -194,10 +195,10 @@ The repeat talk does not deduct affection again, while an explicit new entry res
 choice. Unknown or partially unknown latch bytes refuse. The full scene keeps its original
 setup, which must be neutral against the supplied visit image. These checks establish the
 reviewed setup and conversation contract, not continuous ambient, RNG, model or scheduler
-restoration. All 961 FF7 unit tests and all 56 owned tests across `scene_real`,
-`train_lesson_real`, `rootmap_real` and `train_departure_real` pass for this increment.
-The complete workspace run passes 4,356 tests across 108 targets, with no failures and
-384 optional tests ignored. Workspace Clippy with all targets passes; its only warnings
+restoration. At checkpoint `b716963`, all 961 FF7 unit tests and all 56 owned tests across
+`scene_real`, `train_lesson_real`, `rootmap_real` and `train_departure_real` passed.
+The complete workspace run passed 4,356 tests across 108 targets, with no failures and
+384 optional tests ignored. Workspace Clippy with all targets passed; its only warnings
 are the existing audio-test chunking, standing-animation fallback and avatar-test type ones.
 
 Static inspection of the owned PC executable also verifies selector widths across all
@@ -214,6 +215,30 @@ operation receipt acknowledges an identical retry using the current state, prese
 later rewards. Advance retains known scratch bits and increments revision without wrapping;
 actual entry replaces the visit identity, including same-field travel. Existing story,
 character and battle writes preserve visits rather than defaulting them to absent.
+
+The idle evaluator runs a trusted scene or exact talk itself against the stored predecessor;
+publicly constructible interpreter outputs are not accepted as execution evidence. It binds
+the source bytes and explicit initializer profile, applies story/resources/scratch together,
+and retains unrelated resources and opaque entry/anchor metadata. Existing-visit setup now
+refuses temporary persistent, party, gil or knowledge changes even if later restored.
+`FieldVisitSaveJob` freezes timestamps and both images once, then submits the exact operation
+through the real saver FIFO. Its acknowledgment returns the current full state on duplicates,
+preserving later rewards. Only completed idle operations are supported: battle/travel,
+active continuation metadata and unknown or skipped state effects refuse. Gameplay admission,
+anchor reconstruction and active-continuation transactions remain unimplemented.
+
+The idle-bridge checkpoint passes 4,385 workspace tests across 108 targets, with no failures
+and 386 optional tests ignored. This includes 968 FF7 unit tests, 14 synthetic semantic
+bridge tests and eight saver tests covering FIFO ordering, exact retry identity, stale
+predecessors, dropped acknowledgments and recovery-error fencing. Explicit owned-data
+runs pass all 56 route tests plus two new server tests: both Jessie answers at affection
+0, 2 and 30 through both scene and exact-talk evaluation, atomic commit/reopen, a later
+reward followed by an identical retry, repeat-talk latch retention and explicit re-entry.
+Unknown/partial latch fixtures refuse without changing their temporary stores. One initial
+synthetic ASK fixture lacked its existing cursor value; supplying that single known input
+fixed the fixture while preserving unknown-read refusal. The final server rerun passes
+all 542 tests. Workspace Clippy with all targets passes with only the three pre-existing
+audio-test, standing-animation and avatar-test warnings.
 
 The first visit write requires character envelope 4 and index compatibility 5. Opening or
 compacting an older store does not select that format. Explicit compatibility selection is

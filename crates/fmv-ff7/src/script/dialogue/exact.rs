@@ -119,6 +119,7 @@ pub(super) struct ExactState {
     story: StoryState,
     native: Option<NativeStoryBuilder>,
     scratch: Option<FieldScratchRun>,
+    persistent_change: Option<(u8, u8)>,
     pub(super) masks: BTreeMap<(u8, u8), u8>,
     seeds: BTreeMap<(u8, u8), u8>,
     fault: RefCell<Option<ExactError>>,
@@ -138,6 +139,21 @@ pub(super) struct ExactState {
     party_changed: bool,
     countdown: Option<u32>,
     countdown_seen: bool,
+}
+
+impl ExactState {
+    /// Until the first change, every earlier assignment was already known and identical
+    /// to the predecessor. Comparing against that predecessor therefore detects the first
+    /// value or knowledge change without needing another full persistent overlay. Once set,
+    /// the marker survives restoration and cannot be inferred from the final write map.
+    fn record_persistent_assignment(&mut self, bank: u8, address: u8, value: u8, mask: u8) {
+        let Some(bank) = canonical_persistent_bank(bank) else { return };
+        if self.persistent_change.is_none()
+            && (self.story.known_mask(bank, address) & mask != mask
+                || (self.story.var(bank, address) ^ value) & mask != 0) {
+            self.persistent_change = Some((bank, address));
+        }
+    }
 }
 
 fn key(bank: u8, address: u8) -> (u8, u8) {
@@ -171,7 +187,7 @@ impl Walk {
             }
         }
         self.exact = Some(ExactState {
-            story: story.clone(), native, scratch: None, masks: BTreeMap::new(), seeds: known,
+            story: story.clone(), native, scratch: None, persistent_change: None, masks: BTreeMap::new(), seeds: known,
             fault: RefCell::new(None), offset: Cell::new(0), after_battle: battle, battle: None, battle_story: None, battle_scratch: None,
             // Original FieldInitDefaultValues starts the field battle mode at zero.
             battle_flags: 0, triangle_sources: BTreeMap::new(), triangle_selectors: BTreeMap::new(), moved_actors: BTreeSet::new(), all_positions_changed: false, root_triangle_reads: BTreeSet::new(),
@@ -325,6 +341,7 @@ impl Walk {
                 self.invalid_exact();
                 return;
             }
+            exact.record_persistent_assignment(bank, address, value, mask);
             if let Some(scratch) = &mut exact.scratch {
                 if matches!(bank, 5 | 6) {
                     match scratch.write_masked_u8(bank, usize::from(address), value, mask) {
@@ -430,6 +447,7 @@ impl Walk {
         // GETPC uses the same resolved tuple, and direct bank3/4 reads use this exact journal.
         for (address, member) in (9..=11).zip(resolved) {
             let value = if member == 254 { 255 } else { member };
+            exact.record_persistent_assignment(3, address, value, 255);
             let old = self.writes.insert((3, address), value);
             let old_mask = exact.masks.insert((3, address), 255);
             if old != Some(value) || old_mask != Some(255) { self.idle.clear(); }
@@ -478,6 +496,7 @@ impl Walk {
         }
         for (at, byte) in [address, address + 1].into_iter().zip(value.to_le_bytes()) {
             let k = key(bank, at);
+            exact.record_persistent_assignment(bank, at, byte, 255);
             let old = self.writes.insert(k, byte);
             let old_mask = exact.masks.insert(k, 255);
             if old != Some(byte) || old_mask != Some(255) { self.idle.clear(); }
@@ -561,6 +580,7 @@ impl Walk {
         for (slot, (value, _)) in effect.after().raw_slots().into_iter().enumerate() {
             if effect.assignments().raw_slots & (1 << slot) != 0 {
                 let k = (3, 9 + slot as u8);
+                exact.record_persistent_assignment(k.0, k.1, value, 255);
                 self.writes.insert(k, value);
                 exact.masks.insert(k, 255);
             }
@@ -966,6 +986,9 @@ fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, ma
     }
     if setup.exact.as_ref().is_some_and(|exact| exact.party_changed) {
         return Err(ExactError::SetupParty);
+    }
+    if let Some((bank, address)) = setup.exact.as_ref().and_then(|exact| exact.persistent_change) {
+        return Err(ExactError::SetupWrite { bank, address });
     }
     for write in established.writes {
         if state.known_mask(write.bank, write.address) & write.mask != write.mask

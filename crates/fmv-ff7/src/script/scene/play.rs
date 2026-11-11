@@ -48,6 +48,8 @@ pub enum SceneError {
     ScratchGiven { bank: u8, address: u8 },
     #[error("existing-visit setup changed field scratch values or knowledge")]
     ScratchSetup,
+    #[error("existing-visit setup changed persistent story, party state, or resources")]
+    SetupState,
     #[error("checked field scratch access failed: {0}")]
     Scratch(#[from] FieldScratchError),
     #[error("the checked scene read unknown persistent story bytes")]
@@ -488,8 +490,9 @@ impl ScenePlay {
     }
 
     /// Interpret against an explicit existing field-visit scratch image. Unknown input remains
-    /// unknown; this never performs an entry clear. Setup may read scratch but cannot change it,
-    /// even temporarily. Field visit persistence and admission remain the caller's responsibility.
+    /// unknown; this never performs an entry clear. Setup may read state but cannot change
+    /// scratch, persistent story, party state, or resources, even temporarily. Field visit
+    /// persistence and admission remain the caller's responsibility.
     pub fn with_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, scratch: &FieldScratch) -> Result<Self, SceneError> {
         Self::check_scratch_inputs(story, def)?;
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
@@ -552,6 +555,7 @@ impl ScenePlay {
             return Err(SceneError::UnknownPersistentRead);
         }
         if let Some(Err(error)) = vm.scratch_outcome() { return Err(SceneError::Scratch(error)); }
+        if vm.checked_scratch() && !vm.setup_is_state_neutral() { return Err(SceneError::SetupState); }
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
         for m in &def.cast {

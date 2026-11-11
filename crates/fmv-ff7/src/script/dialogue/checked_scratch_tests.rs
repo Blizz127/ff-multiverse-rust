@@ -1,7 +1,7 @@
 //! Opt-in exact scratch execution. A supplied visit image is never implicitly cleared,
 //! and its afterimage remains separate from persistent story assignments.
 
-use super::{run_script_exact, run_script_exact_with_scratch, run_talk_exact_with_scratch,
+use super::{run_script_exact, run_script_exact_with_scratch, run_talk_exact, run_talk_exact_with_scratch,
     ExactBattle, ExactError, ExactRun, ExactScript};
 use crate::script::{synth::{dialog, SynthScript}, FieldScratch, FieldScratchError, FieldScript};
 use crate::story::{NativePartyState, StoryState};
@@ -241,6 +241,63 @@ fn existing_visit_setup_refuses_value_or_knowledge_changes_even_when_restored() 
     let bytes = section(&[], &byte(5, 20, 1), &byte(3, 70, 1));
     assert!(run_talk_exact_with_scratch(&FieldScript::parse(&bytes).unwrap(), 0, &story,
         &FieldScratch::cleared_for_entry(), 7, &[]).is_err(), "the quiet main prelude is also an audit");
+}
+
+#[test]
+fn exact_setup_remembers_v3_persistent_changes_after_aliases_restore_the_final_image() {
+    let mut story = state();
+    story.write_byte(3, 70, 0).unwrap();
+    story.write_word(4, 80, 0x1234).unwrap();
+    story.write_masked(3, 90, 0, 2).unwrap();
+    let scratch = FieldScratch::unknown();
+    for (init, address) in [
+        ([byte(3, 70, 1), byte(4, 70, 0)].concat(), 70),
+        ([word(4, 80, 0x1235), word(4, 80, 0x1234)].concat(), 80),
+        (vec![0x82, 0x30, 90, 1, 0x83, 0x40, 90, 1], 90),
+    ] {
+        let bytes = section(&init, &[], &byte(3, 71, 9));
+        let script = FieldScript::parse(&bytes).unwrap();
+        let entry = ExactScript { entity: 0, slot: 1, setup: true, ..ExactScript::default() };
+        let expected = Err(ExactError::SetupWrite { bank: 3, address });
+        assert_eq!(run_script_exact(&script, &story, 7, &entry, &[]), expected);
+        assert_eq!(run_talk_exact(&script, 0, &story, 7, &[]), expected);
+        assert_eq!(run_script_exact_with_scratch(&script, &story, &scratch, 7, &entry, &[]), expected);
+        assert_eq!(run_talk_exact_with_scratch(&script, 0, &story, &scratch, 7, &[]), expected);
+        assert!(super::run_talk(&script, 0, &story, 7).is_ok(), "permissive preview keeps its prior behavior");
+
+        let authored_entry = ExactScript { entity: 0, slot: 0, through_init: true, ..ExactScript::default() };
+        let result = run_script_exact_with_scratch(&script, &story, &scratch, 7, &authored_entry, &[]).unwrap();
+        assert_eq!(story_after(&story, &result), story, "an explicit root may author changes; setup is only an audit");
+    }
+    let bytes = section(&[], &[byte(3, 70, 1), byte(4, 70, 0)].concat(), &byte(3, 71, 9));
+    let script = FieldScript::parse(&bytes).unwrap();
+    assert_eq!(run_talk_exact_with_scratch(&script, 0, &story, &scratch, 7, &[]),
+        Err(ExactError::SetupWrite { bank: 3, address: 70 }), "the talk-time main audit also remembers transient changes");
+    assert_eq!(scratch, FieldScratch::unknown());
+}
+
+#[test]
+fn exact_setup_accepts_known_persistent_no_ops_but_refuses_new_knowledge() {
+    let mut story = state();
+    story.write_byte(3, 70, 5).unwrap();
+    story.write_word(4, 80, 0xAB34).unwrap();
+    story.write_masked(3, 90, 2, 2).unwrap();
+    let scratch = FieldScratch::unknown();
+    let init = [byte(4, 70, 5), word(4, 80, 0xAB34), vec![0x82, 0x30, 90, 1]].concat();
+    let bytes = section(&init, &[], &byte(3, 71, 9));
+    let script = FieldScript::parse(&bytes).unwrap();
+    for result in [run_talk_exact(&script, 0, &story, 7, &[]),
+        run_talk_exact_with_scratch(&script, 0, &story, &scratch, 7, &[])] {
+        assert_eq!(writes(&result.unwrap()), vec![(3, 71, 9, 255)]);
+    }
+    assert_eq!(story.known_mask(3, 90), 2, "unrelated unknown bits are not required or established");
+    for init in [byte(3, 91, 0), vec![0x83, 0x30, 91, 1]] {
+        let bytes = section(&init, &[], &byte(3, 71, 9));
+        let script = FieldScript::parse(&bytes).unwrap();
+        assert_eq!(run_talk_exact_with_scratch(&script, 0, &story, &scratch, 7, &[]),
+            Err(ExactError::SetupWrite { bank: 3, address: 91 }));
+    }
+    assert_eq!(story.known_mask(3, 91), 0);
 }
 
 #[test]

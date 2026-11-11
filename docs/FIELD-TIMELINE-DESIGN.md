@@ -395,18 +395,50 @@ changes that it restores; entry initialization is a separate authored execution.
 persistent storage must retain the executed instruction's original selector and supply its
 actual width. Canonicalized legacy panel metadata cannot prove that provenance; there is
 no checked panel API. Checked replay identity includes mode and initial values/masks.
-Legacy server result/continuation consumers reject every checked scratch result, including
-unchanged images and faults, until story/resources/visit can commit atomically. This work
-does not enable registration, scene admission, visit persistence or reconnect restoration.
+Legacy server result/continuation consumers still reject every checked scratch result,
+including unchanged images and faults. Their gameplay path has no visit transaction or
+restoration contract; the separate idle bridge below does not enable registration,
+scene admission or reconnect restoration.
 
-The next integration boundary is an idle checked-result commit bridge. Validate the
-complete story/resources/visit predecessor, apply the scratch outcome against its exact
-beforeimage, and submit one existing `Store::commit_field_visit(Advance, expected, next)`
-operation through the saver queue. Preserve the exact request across retries and publish
-the store's returned current state. The immutable field/init source identity is distinct
-from a replay fingerprint that also binds initial scratch. Active scenes need a later
-atomic batch extension: current standalone visit commits reject checkpoints/reservations,
-while scene batches forbid changing visits. No split commit can safely join these paths.
+The staged idle bridge (`fmv-server::scene_host::field_visit`) evaluates a trusted scene
+definition or exact talk directly against the complete stored story/resources/visit
+predecessor. It does not accept a publicly constructible interpreter result as proof of
+execution. Its source digest binds the canonical field key, full field bytes, script
+bytes, ordered initializer roots, explicit profile descriptor and checked execution
+version. Story, scratch, revision and RNG seed are not source identity; replay identity
+separately binds execution inputs. No production reconstruction profile is selected.
+
+Only a complete supported idle result can produce a `FieldVisitSaveJob`. Battle, travel,
+unknown reads, skipped state effects, active metadata and stale source identities refuse.
+Existing-visit setup must also be neutral in persistent story, party state and gil,
+including temporary changes that it later restores. The bridge applies the scratch
+outcome against its exact beforeimage, increments the revision once, and preserves all
+unrelated resources and opaque entry/anchor bytes. Preservation is not restoration proof.
+
+The immutable job freezes both images and timestamps before enqueueing one existing
+`Store::commit_field_visit(Advance, expected, next)` operation through the real saver FIFO.
+An ordered singleton scene snapshot supplies its predecessor. Exact retries reuse that
+job; the Store checks its receipt before comparing current state and returns the current
+full image, including later rewards. No worker-side pre-read or timestamp regeneration
+may invalidate that guarantee. Only transaction conflicts become stale refusals; I/O and
+recovery failures retain their fatal storage errors. Runtime callers must still hold the
+account and publish only after durable confirmation and the required playback ACK.
+
+The bridge is exercised through tests while `World::join` continues to reject stored
+visits. Active scenes need a later atomic batch extension: current standalone visit
+commits reject checkpoints/reservations, while scene batches forbid changing visits.
+No split commit can safely join these paths. Accepted entry, anchor reconstruction and
+the continuous field runtime remain prerequisites for gameplay activation.
+
+The next bounded transaction step is a singleton owner attachment/completion pair for a
+same-field, noncombat scene: atomically attach a Resume-0 checkpoint and matching visit
+link, then atomically commit the checked result and clear both. Each advances the visit
+revision once. Witness visits remain independent; this must not enable checked battle
+prefixes, shared travel or map transfers. Keep existing link validation and receipt-before-CAS
+ordering. New optional batch fields must omit absent values when serialized, preserving
+existing selected-result receipt hashes. A duplicate attachment after completion returns
+the newer idle state and must never reattach the old checkpoint. This extension is planned,
+not implemented by the idle bridge.
 
 Checked wide accesses preserve the original selector before aliasing: `1,3,5,11,13,15`
 read/write one byte; `2,4,6,7,12,14` use two little-endian bytes. PC helpers `0x60FD6C`

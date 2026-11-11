@@ -204,6 +204,125 @@ fn checked_scene_setup_must_be_neutral_in_values_knowledge_and_every_intermediat
 }
 
 #[test]
+fn checked_setup_refuses_persistent_changes_restoration_and_new_knowledge_in_both_editions() {
+    let scratch = FieldScratch::cleared_for_entry();
+    let mut def = definition();
+    def.setup = vec![ScriptRef::new(0, 0)];
+    for before in [story(), story().into_native_party().unwrap()] {
+        for setup in [
+            vec![set_byte(1, 4, 11)],
+            vec![set_byte(1, 4, 11), set_byte(1, 4, 10)],
+            vec![set_byte(1, 100, 0)],
+        ] {
+            let held = before.clone();
+            let (field, section) = source(setup, vec![]);
+            assert!(matches!(ScenePlay::with_scratch(&field, &def, &before, 123, resources(), &scratch),
+                Err(SceneError::SetupState)));
+            assert!(matches!(ScenePlay::with_script_section_and_scratch(&field, &def, &before, 123, &section, resources(), &scratch),
+                Err(SceneError::SetupState)));
+            assert!(ScenePlay::with_resources(&field, &def, &before, 123, resources()).is_ok(),
+                "legacy setup keeps its existing effects");
+            assert_eq!(before, held);
+        }
+        let (field, _) = source(vec![set_byte(1, 4, 10)], vec![set_byte(1, 4, 7)]);
+        let outcome = checked(&field, &def, &before, &scratch);
+        assert_eq!(applied(&outcome, &before).known_byte(1, 4), Some(7),
+            "an unchanged setup assignment is allowed and ordinary root changes remain meaningful");
+    }
+}
+
+#[test]
+fn checked_setup_refuses_temporary_gil_changes_but_allows_true_resource_noops() {
+    let gold = |opcode: u8, amount: u32| [vec![opcode, 0], amount.to_le_bytes().to_vec()].concat();
+    let before = story();
+    let scratch = FieldScratch::cleared_for_entry();
+    let mut def = definition();
+    def.setup = vec![ScriptRef::new(0, 0)];
+    for setup in [vec![gold(0x39, 1)], vec![gold(0x39, 1), gold(0x3A, 1)]] {
+        let (field, section) = source(setup, vec![]);
+        assert!(matches!(ScenePlay::with_scratch(&field, &def, &before, 123, resources(), &scratch),
+            Err(SceneError::SetupState)));
+        assert!(matches!(ScenePlay::with_script_section_and_scratch(&field, &def, &before, 123, &section, resources(), &scratch),
+            Err(SceneError::SetupState)));
+        assert!(ScenePlay::with_resources(&field, &def, &before, 123, resources()).is_ok());
+    }
+    let (field, _) = source(vec![gold(0x39, 0), gold(0x3A, 0)], vec![gold(0x3A, 1)]);
+    let outcome = checked(&field, &def, &before, &scratch);
+    assert_eq!((outcome.resources.gil_before, outcome.resources.gil_after), (Some(100), Some(99)),
+        "only quiet setup is constrained; the root's actual debit remains in the outcome");
+}
+
+#[test]
+fn checked_setup_refuses_native_party_and_knowledge_changes_even_when_restored() {
+    use crate::story::NativePartyState;
+    let mut before = story().into_native_party().unwrap();
+    *before.native_party_mut().unwrap() = NativePartyState::from_parts(
+        [0, 255, 255], 7, (1, u16::MAX), (0, u16::MAX),
+    ).unwrap();
+    for (address, value) in [(9, 0), (10, 255), (11, 255)] { before.write_byte(3, address, value).unwrap(); }
+    let scratch = FieldScratch::cleared_for_entry();
+    let mut def = definition();
+    def.setup = vec![ScriptRef::new(0, 0)];
+    for setup in [
+        vec![vec![0xCA, 1, 254, 254]],
+        vec![vec![0xCD, 1, 1], vec![0xCD, 0, 1]],
+        vec![vec![0xCE, 0], vec![0xCF, 0]],
+    ] {
+        let (field, _) = source(setup, vec![]);
+        assert!(matches!(ScenePlay::with_scratch(&field, &def, &before, 123, resources(), &scratch),
+            Err(SceneError::SetupState)));
+    }
+    let (field, _) = source(vec![vec![0xCA, 0, 254, 254], vec![0xCD, 1, 0], vec![0xCF, 0]], vec![]);
+    let outcome = checked(&field, &def, &before, &scratch);
+    assert_eq!(applied(&outcome, &before), before, "unchanged native assignments are safe to repeat");
+
+    let mut partial = before.clone();
+    *partial.native_party_mut().unwrap() = NativePartyState::from_parts(
+        [0, 255, 255], 7, (1, 1), (0, 0),
+    ).unwrap();
+    for setup in [vec![vec![0xCD, 0, 1]], vec![vec![0xCF, 0]]] {
+        let (field, _) = source(setup, vec![]);
+        assert!(matches!(ScenePlay::with_scratch(&field, &def, &partial, 123, resources(), &scratch),
+            Err(SceneError::SetupState)), "establishing a known zero is a setup change");
+    }
+}
+
+#[test]
+fn checked_setup_cannot_change_v3_main_party_even_when_raw_bytes_already_match() {
+    let mut before = StoryState::at(33).into_extended().unwrap();
+    for (address, value) in [(9, 0), (10, 255), (11, 255)] { before.write_byte(3, address, value).unwrap(); }
+    let scratch = FieldScratch::cleared_for_entry();
+    let mut def = definition();
+    def.setup = vec![ScriptRef::new(0, 0)];
+    let (field, _) = source(vec![vec![0xCA, 0, 254, 254]], vec![]);
+    assert!(matches!(ScenePlay::with_scratch(&field, &def, &before, 123, resources(), &scratch),
+        Err(SceneError::SetupState)), "a native-style raw/main divergence cannot hide a v3 setup party change");
+}
+
+#[test]
+fn the_setup_state_audit_survives_statistics_scene_and_battle_resets() {
+    use crate::script::FieldScript;
+    let before = story();
+    let scratch = FieldScratch::cleared_for_entry();
+    let (_, section) = source(vec![set_byte(1, 4, 11), set_byte(1, 4, 10)], vec![vec![0x72, 8, 0], battle()]);
+    let script = FieldScript::parse(&section).unwrap();
+    let vars = SceneVars::with_scratch(before.clone(), &[], scratch).unwrap();
+    let mut vm = Vm::with_resources(vars, 123, Limits::default(), resources());
+    vm.setup(&script, &[ScriptRef::new(0, 0)]);
+    assert!(!vm.setup_is_state_neutral());
+    assert_eq!(vm.writes().get(&(1, 4)), Some(&10), "the final value alone hides the temporary change");
+    vm.take_stats();
+    vm.begin(vec![Step::Await(ScriptRef::new(0, 1))]);
+    assert!(!vm.setup_is_state_neutral());
+    assert!(matches!(vm.resume(&script, None).then, Then::End { how: End::Battle, .. }));
+    vm.resume_battle(&before, resources());
+    assert!(!vm.setup_is_state_neutral());
+    vm.take_stats();
+    vm.begin(Vec::new());
+    assert!(!vm.setup_is_state_neutral(), "no reset can turn replayed setup into an existing-visit proof");
+}
+
+#[test]
 fn checked_constructors_refuse_legacy_stories_and_scratch_given_overrides_in_both_script_editions() {
     let (field, section) = source(vec![], vec![]);
     let scratch = FieldScratch::cleared_for_entry();

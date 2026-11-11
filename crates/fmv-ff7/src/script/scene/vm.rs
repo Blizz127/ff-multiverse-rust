@@ -690,6 +690,9 @@ pub struct Vm {
     /// A checked instruction whose native result is undefined/unrepresentable cannot later
     /// become a valid visit outcome merely because transient statistics were reset.
     invalid_scratch_execution: bool,
+    /// Checked quiet setup changed persistent knowledge/value, party state or resources at
+    /// some point. Restoring the original image and resetting counters never clear this audit.
+    setup_state_changed: bool,
     resources: ResourceOutcome,
     stats: Stats,
 }
@@ -759,6 +762,7 @@ impl Vm {
             invalid_native_state,
             invalid_scratch_setup,
             invalid_scratch_execution: false,
+            setup_state_changed: false,
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -777,6 +781,11 @@ impl Vm {
     pub fn scratch_before(&self) -> Option<&FieldScratch> { self.vars.scratch.as_ref().map(FieldScratchRun::before) }
     pub fn scratch_current(&self) -> Option<&FieldScratch> { self.vars.scratch.as_ref().map(FieldScratchRun::current) }
     pub fn scratch_setup_changed(&self) -> bool { self.invalid_scratch_setup }
+    /// Whether checked quiet setup left all persistent, party, resource and scratch state
+    /// untouched throughout its execution. Unchanged assignments are allowed; a transient
+    /// change followed by restoration is not neutral. This audit survives every VM reset.
+    /// Unchecked constructors retain their previous behavior and do not perform this audit.
+    pub fn setup_is_state_neutral(&self) -> bool { !self.setup_state_changed && !self.invalid_scratch_setup }
     fn checked_execution_refused(&self) -> bool {
         self.checked_scratch() && (self.stats.setup_incomplete || self.stats.unresolved != 0
             || self.stats.dropped_requests != 0 || !self.stats.unknown.is_empty()
@@ -1181,6 +1190,11 @@ impl Vm {
         let key = self.vars.key(bank, address);
         let old = if self.vars.story.supports_extended() || self.checked_scratch() { self.peek_byte(bank, address) } else { self.var_byte(bank, address) };
         let old_mask = self.written_masks.get(&key).copied().unwrap_or(0);
+        if self.quiet && self.checked_scratch() && self.native_story.is_none()
+            && crate::story::canonical_persistent_bank(bank).is_some() {
+            let known = self.vars.story.known_mask(bank, address) | old_mask;
+            self.setup_state_changed |= (old ^ value) & mask != 0 || known & mask != mask;
+        }
         if old != value || (self.vars.story.supports_extended() && old_mask & mask != mask) {
             self.epoch = self.epoch.wrapping_add(1);
         }
@@ -1934,7 +1948,17 @@ impl Vm {
         let Ok(ins) = decode_at(code, pc, 0) else { return Flow::Scene(End::Broken) };
         self.set_pc(idx, ins.end());
         let mut class = Class::Handled;
+        let setup_before = (self.quiet && self.checked_scratch()).then(|| (
+            self.native_story.as_ref().map_or(0, |native| native.events().len()),
+            self.party_main, self.party_bank, self.resources.gil_after,
+        ));
         let flow = self.exec(script, idx, entity, &ins, &mut class);
+        if let Some((events, main, bank, gil)) = setup_before {
+            self.setup_state_changed |= main != self.party_main || bank != self.party_bank
+                || gil != self.resources.gil_after
+                || self.native_story.as_ref().is_some_and(|native|
+                    native.events().iter().skip(events).any(|event| event.changed()));
+        }
         self.stats.note(class, ins.mnemonic);
         if !self.scratch_valid() {
             self.stats.unresolved = self.stats.unresolved.saturating_add(1);

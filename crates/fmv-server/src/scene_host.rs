@@ -20,6 +20,10 @@ use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerI
 
 mod continuation;
 mod points;
+// This checked evaluator is staged behind the existing field-visit admission fence.
+// It is exercised through the real saver in tests; runtime reconstruction is still required.
+#[cfg_attr(not(test), allow(dead_code))]
+mod field_visit;
 
 /// Decoding the native-party envelope is not yet permission to execute it through the
 /// legacy moment-derived party model. Keep all scene entry and replay paths closed until
