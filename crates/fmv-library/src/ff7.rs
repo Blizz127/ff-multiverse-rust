@@ -729,6 +729,48 @@ pub fn resolve_audio(source: &Ff7Source) -> Result<ResolvedAudio, Ff7ResolveErro
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Movies
+// ---------------------------------------------------------------------------------------------
+
+/// The folder of the install's movie files (`movies/<name>.avi`) that sits with a direct
+/// `flevel.lgp`, read-only; `None` when there is none.
+///
+/// The library importer does not carry movies, so an imported set has none: a client plays movies
+/// from a directory named explicitly (`FMV_MOVIES_DIR`, see the client) or from the install a
+/// `flevel.lgp` was read from in place. Like [`resolve_audio`]: `field/flevel.lgp` and `movies/` are
+/// siblings (of the install's `data` directory), for a `lang-xx/field/flevel.lgp` the language
+/// folder's own `movies/` first, then the one above it; names in any letter case. The files in the
+/// folder are not read here (presentation only; the client checks a file's identity before it
+/// plays one).
+pub fn resolve_movies_dir(source: &Ff7Source) -> Option<PathBuf> {
+    let Ff7Source::Flevel { path, .. } = source else {
+        return None;
+    };
+    let field_dir = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    if !field_dir.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("field")) {
+        return None;
+    }
+    let install = field_dir.parent()?;
+    let mut roots = vec![or_here(install)];
+    if install.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("lang-")) {
+        if let Some(up) = install.parent() {
+            roots.push(or_here(up));
+        }
+    }
+    roots.into_iter().find_map(|root| child_ignoring_case(&root, "movies", true))
+}
+
+/// The movie file `<name>.avi` inside `dir` (any letter case), a regular non-empty file with a plain name.
+pub fn movie_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !plain {
+        return None;
+    }
+    let path = child_ignoring_case(dir, &format!("{name}.avi"), false)?;
+    std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,5 +1719,33 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    #[test]
+    fn movies_are_found_beside_a_direct_install_and_nowhere_else() {
+        let install = tempfile::tempdir().unwrap();
+        let data = install.path().join("data");
+        fs::create_dir_all(data.join("lang-en").join("field")).unwrap();
+        fs::create_dir_all(data.join("Movies")).unwrap();
+        fs::write(data.join("Movies").join("MainPlr.AVI"), b"x").unwrap();
+        fs::write(data.join("Movies").join("empty.avi"), b"").unwrap();
+        let flevel = data.join("lang-en").join("field").join("flevel.lgp");
+        fs::write(&flevel, b"field").unwrap();
+        let dir = resolve_movies_dir(&direct(&flevel)).expect("the movies folder one level above the language folder");
+        assert_eq!(dir, data.join("Movies"));
+        assert!(movie_file(&dir, "mainplr").is_some(), "any letter case");
+        assert!(movie_file(&dir, "empty").is_none(), "an empty file is not a movie");
+        assert!(movie_file(&dir, "ontrain").is_none());
+        for bad in ["", "../x", "a/b", "a.b", "a b"] {
+            assert!(movie_file(&dir, bad).is_none(), "{bad:?}");
+        }
+        // the language folder's own movies come first
+        fs::create_dir_all(data.join("lang-en").join("movies")).unwrap();
+        assert_eq!(resolve_movies_dir(&direct(&flevel)).unwrap(), data.join("lang-en").join("movies"));
+        // an imported library set carries none, and a flevel outside a field folder says nothing
+        let lib = Ff7Source::Library { state_dir: Some(install.path().to_path_buf()), set: None };
+        assert!(resolve_movies_dir(&lib).is_none());
+        assert!(resolve_movies_dir(&direct(Path::new("/definitely/not/here/flevel.lgp"))).is_none());
+        assert!(resolve_movies_dir(&direct(Path::new("flevel.lgp"))).is_none());
     }
 }

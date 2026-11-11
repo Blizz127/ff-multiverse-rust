@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 
 const RATE: u32 = 22_050;
 
-struct Fixture {
+pub(crate) struct Fixture {
     _dir: tempfile::TempDir,
-    request: Request,
-    digest: blake3::Hash,
+    pub(crate) request: Request,
+    pub(crate) digest: blake3::Hash,
 }
 
 impl Fixture {
-    fn new(audio_frames: u32, timings: &[(u32, u32)], video_body: Option<&str>) -> Option<Self> {
+    pub(crate) fn new(audio_frames: u32, timings: &[(u32, u32)], video_body: Option<&str>) -> Option<Self> {
         let python = ["/usr/bin/python3", "/bin/python3"].into_iter().find(|p| Path::new(p).is_file())?;
         let dir = tempfile::tempdir().expect("synthetic movie directory");
         let tool = dir.path().join("fixture-decoder");
@@ -57,9 +57,9 @@ impl Fixture {
         Some(Self { _dir: dir, request, digest: blake3::hash(bytes) })
     }
 
-    fn normal() -> Option<Self> { Self::new(8_820, &[(0, 100), (100, 150), (250, 100)], None) }
+    pub(crate) fn normal() -> Option<Self> { Self::new(8_820, &[(0, 100), (100, 150), (250, 100)], None) }
 
-    fn controller(&self, stream: u64) -> MovieController {
+    pub(crate) fn controller(&self, stream: u64) -> MovieController {
         MovieController::prepare(stream, self.request.clone(), Admission::Synthetic { digest: self.digest }).unwrap()
     }
 }
