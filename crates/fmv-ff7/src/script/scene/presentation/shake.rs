@@ -320,7 +320,7 @@ const FIELD_COS: [i16; 256] = [
 
 // The fixed algorithm table, independent of the script RANDOM cursor.
 // https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/field/field_rand.c#L5
-const RANDOM: [u8; 256] = [
+pub(crate) const RANDOM: [u8; 256] = [
     177, 202, 238, 108, 90, 113, 46, 85, 214, 0, 204, 153, 144, 107, 125, 235, 79, 160, 7, 172, 223, 138,
     86, 158, 241, 154, 99, 117, 17, 145, 163, 184, 148, 115, 247, 84, 217, 110, 114, 192, 244, 128, 222, 185,
     187, 141, 102, 38, 208, 54, 225, 233, 112, 220, 205, 47, 74, 103, 93, 210, 96, 181, 157, 127, 69, 55,

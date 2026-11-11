@@ -104,6 +104,7 @@ pub mod model;
 pub mod movie_camera;
 pub mod music;
 pub mod playable;
+pub mod runtime;
 pub mod pmodel;
 pub mod rsd;
 pub mod script;
