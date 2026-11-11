@@ -51,6 +51,7 @@ fn main() {
     let (mut fields, mut failed, mut windows, mut broken_entities) = (0u32, 0u32, 0u64, 0u64);
     let mut commands: BTreeMap<String, u64> = BTreeMap::new();
     let mut per_field: Vec<(String, u64)> = Vec::new();
+    let mut waiting: BTreeMap<&'static str, (u64, Vec<String>)> = BTreeMap::new();
 
     for name in &names {
         let Ok(field) = load_field(&mut lgp, name) else {
@@ -120,6 +121,19 @@ fn main() {
             }
         }
         broken_entities += (0..rt.entity_count()).filter(|&e| rt.entity_broken(e)).count() as u64;
+        // A script left above its main loop at the end of the run is waiting on something: a lead for a hang.
+        for e in 0..rt.entity_count() {
+            if let Some((prio, pc)) = rt.entity_state(e) {
+                if prio < 7 && !rt.entity_broken(e) {
+                    let op = fmv_ff7::script::decode_at(section, pc, 0).map(|i| i.mnemonic).unwrap_or("?");
+                    let entry = waiting.entry(op).or_insert((0u64, Vec::new()));
+                    entry.0 += 1;
+                    if entry.1.len() < 4 {
+                        entry.1.push(format!("{name}/{}", rt.entity_name(e).unwrap_or("")));
+                    }
+                }
+            }
+        }
         total.merge(rt.coverage());
     }
 
@@ -140,6 +154,12 @@ fn main() {
     let mut u: Vec<_> = total.unsupported.iter().collect();
     u.sort_by(|a, b| b.1.cmp(a.1));
     println!("top skipped at run time: {:?}", u.iter().take(25).collect::<Vec<_>>());
+    let mut w: Vec<_> = waiting.iter().collect();
+    w.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    println!("scripts still above their main loop at the end (instruction: count, e.g.):");
+    for (op, (n, eg)) in w.iter().take(15) {
+        println!("  {op:<10} {n:>5}  {eg:?}");
+    }
     per_field.sort_by(|a, b| b.1.cmp(&a.1));
     println!("fields with the most unimplemented instructions: {:?}", per_field.iter().take(10).collect::<Vec<_>>());
 }
