@@ -7,6 +7,7 @@ use super::super::draw::{camera_shot_from, cast_players_from};
 use super::super::player::{PresentationRef, Run, SceneCmd, SceneKey, ScenePlayer, TrainReadyPresentation};
 use crate::camera::{CameraInput, FieldCamera};
 use fmv_ff7::script::scene::{SceneResources, TrainArrival, TRAIN_ARRIVAL_LANDING};
+use fmv_ff7::script::scene::train_arrival::presentation::validate_train_presentation;
 use fmv_protocol::SceneReplay;
 
 const CADENCE: [f32; 4] = [0.0173, 0.0117, 0.0391, 0.0256];
@@ -137,13 +138,31 @@ fn offscreen_real_ff7_train_ready_restores_actual_window_dwell_and_terminal_phas
     let captured = live.capture_train_ready().expect("capture the actual held ready boundary");
     let entry = captured.entry_record().to_vec();
     let bytes = captured.encode().expect("lossless bounded presentation record");
-    let mut restored = TrainReadyPresentation::reconstruct(field, &entry, &bytes).expect("restore the same checked entry");
+    validate_train_presentation(field, &entry, [53, 201], &bytes)
+        .expect("the shared server-side validator accepts this actual displayed phase");
+    let immutable_entry = captured.encode_entry().expect("retain original entry and its initial effect stream");
+    let mut restored = TrainReadyPresentation::reconstruct_entry(field, &immutable_entry, &bytes)
+        .expect("restore the same checked entry after its active checkpoint is gone");
     assert_eq!(restored.encode().unwrap(), bytes, "every retained phase bit survives reconstruction");
     assert_eq!(restored.background_ops(), live.background_ops(), "the journal comes from exact source replay");
     assert!(live.take_commands().is_empty() && live.take_sounds().is_empty());
     assert!(crate::mods::take_voices().is_empty(), "reconstruction emits no historical voice cue or stop");
     eprintln!("train ready: entry {} bytes, presentation {} bytes, combined {} bytes; dialogue ticks {:?}",
         entry.len(), bytes.len(), entry.len() + bytes.len(), held);
+    // Private cross-layer fixtures come from this actual displayed run. A server test can
+    // validate the same input and clocks without inventing a canonical no-dwell snapshot.
+    let output = crate::ui::testkit::shot_dir();
+    std::fs::create_dir_all(&output).expect("private screenshot/fixture directory");
+    std::fs::write(output.join("train-ready-entry.bin"), &entry).expect("retained original input fixture");
+    std::fs::write(output.join("train-ready-immutable-entry.bin"), &immutable_entry)
+        .expect("durable original input and initial shake metadata fixture");
+    std::fs::write(output.join("train-ready-presentation.bin"), &bytes).expect("actual retained presentation fixture");
+    std::fs::write(output.join("train-ready-initial-shake.bin"), [53, 201]).expect("immutable initial shake cursor fixture");
+    std::fs::write(output.join("train-ready-fixture.txt"), format!(
+        "private owned-source test fixture; no live visit admission\nentry_bytes={}\npresentation_bytes={}\ninitial_shake=53,201\nwindow_hold_updates={},{}\nentry_blake3={}\npresentation_blake3={}\n",
+        entry.len(), bytes.len(), held[0], held[1], blake3::hash(&entry).to_hex(), blake3::hash(&bytes).to_hex(),
+    )).expect("fixture receipt");
+    eprintln!("retained train-ready fixtures in {}", output.display());
 
     let mut restored_camera = FieldCamera::default();
     let mut restored_view = FieldView::ff7_with(&real.adapter, "tin_1", true).unwrap();
@@ -162,19 +181,23 @@ fn offscreen_real_ff7_train_ready_restores_actual_window_dwell_and_terminal_phas
     let uninterrupted = picture(&real, &mut gpu, live.presentation(), live.background_ops(), &mut live_camera, "train-ready-uninterrupted-later");
     let rebuilt = picture(&real, &mut gpu, restored.presentation(), restored.background_ops(), &mut restored_camera, "train-ready-restored-later");
     assert_eq!(uninterrupted, rebuilt, "the next retained effect samples stay visually identical");
+    std::fs::write(output.join("train-ready-presentation-later.bin"), restored.encode().unwrap())
+        .expect("later displayed phase fixture");
     assert!(live.take_commands().is_empty() && live.take_sounds().is_empty());
     assert!(crate::mods::take_voices().is_empty());
 
     // These are rejected before they can become a passive picture. A changed source is
     // checked against the same complete retained entry, not merely a matching scene id.
     for length in [0, 1, 8, bytes.len() / 2, bytes.len() - 1] {
-        assert!(TrainReadyPresentation::reconstruct(field, &entry, &bytes[..length]).is_err());
+        assert!(TrainReadyPresentation::reconstruct(field, &entry, [53, 201], &bytes[..length]).is_err());
     }
     let mut changed = bytes.clone();
     let at = changed.len() / 2;
     changed[at] ^= 1;
-    assert!(TrainReadyPresentation::reconstruct(field, &entry, &changed).is_err());
+    assert!(TrainReadyPresentation::reconstruct(field, &entry, [53, 201], &changed).is_err());
+    assert!(TrainReadyPresentation::reconstruct(field, &entry, [53, 200], &bytes).is_err(),
+        "the saved entry's initial shake cursors cannot be replaced");
     let cargo = real.adapter.load_field("cargoin").unwrap();
-    assert!(TrainReadyPresentation::reconstruct(cargo.field_file(), &entry, &bytes).is_err());
+    assert!(TrainReadyPresentation::reconstruct(cargo.field_file(), &entry, [53, 201], &bytes).is_err());
     assert!(crate::mods::take_voices().is_empty(), "refusal is silent too");
 }

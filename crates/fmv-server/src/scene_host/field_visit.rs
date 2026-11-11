@@ -195,6 +195,7 @@ fn next_state(expected: &SceneState, before_scratch: &FieldScratch, effect: &Fie
 }
 
 mod active;
+mod arrival;
 #[cfg(test)]
 pub(crate) use active::ActiveVisitBoundary;
 

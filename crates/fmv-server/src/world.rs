@@ -123,6 +123,7 @@ pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
 pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
+pub(crate) use scene::saved_landing_evidence;
 
 /// A message queued for one or more connections. Broadcasts share one allocation.
 pub type Outbound = Arc<ServerMsg>;

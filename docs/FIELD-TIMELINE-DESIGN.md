@@ -407,7 +407,9 @@ predecessor. It does not accept a publicly constructible interpreter result as p
 execution. Its source digest binds the canonical field key, full field bytes, script
 bytes, ordered initializer roots, explicit profile descriptor and checked execution
 version. Story, scratch, revision and RNG seed are not source identity; replay identity
-separately binds execution inputs. No production reconstruction profile is selected.
+separately binds execution inputs. This generic constructor selects no reconstruction
+profile; the checked train bridge below supplies a fixed reviewed profile behind closed
+runtime admission.
 
 Only a complete supported idle result can produce a `FieldVisitSaveJob`. Battle, travel,
 unknown reads, skipped state effects, active metadata and stale source identities refuse.
@@ -537,6 +539,10 @@ party data and partial knowledge masks, authoritative gil, seed, landing and bot
 window acknowledgments. Its bound is 5,385 bytes. Checksums detect corruption; the containing
 transaction must still establish accepted-entry provenance. Strict replay must execute the
 real control/menu release and reach the terminal pose, not merely reproduce moment 51.
+The immutable ready-entry envelope adds the independently chosen initial effect RNG and
+bounded versioned framing (5,433 bytes maximum). The anchor still binds the exact original
+train record. Restoration obtains its expected RNG from the immutable entry, never from
+the anchor being validated.
 
 A separate client presentation payload, at most 7,714 bytes, binds that entire input record.
 It retains the actual terminal clocks and float bits rather than trying to derive them from
@@ -556,15 +562,38 @@ intent publication, and recovery checks both images. Detached index-6 archives u
 4 and preserve that minimum after rekey, removal and restore. These are conditional format
 fences, not automatic conversions of existing saves.
 
-Production admission remains closed. Existing arrival checkpoints use a legacy replay
-fingerprint and cannot be relabeled as checked-entry evidence. A gated ContinueLanding path
-must first persist the reviewed entry profile and its identity, or supply an independently
-audited conversion. Its completion must establish the ready visit atomically, including the
-exact presentation record. Ordinary Complete followed by standalone Enter is not sufficient. Account ownership,
-current-state retries, ordered client ACKs and save epochs must hold through this transition.
-Full field audio, concurrent scheduling and native movie timing remain separate requirements.
+The staged server bridge now implements these ordered writes for one unreserved owner:
 
-Validation for this checkpoint passes the full 4,482-test workspace, 59 explicit owned
+| Operation | Durable result |
+| --- | --- |
+| `BeginArrival` | Replays the actual saved cargo-door source, accepted origin and exact MAPJUMP, then creates a fresh checked checkpoint. It binds original story/gil/seed, initial effect RNG, source identities and stable visit/entry IDs. |
+| `AdvanceArrival` 1 and 2 | Accepts each exact train window identity separately. The complete progress pair stays unchanged; after ACK 2 the checkpoint explicitly awaits presentation. |
+| `AdvanceArrival` 3 | Seals the validated terminal presentation against the independently replayed train record and initial RNG. |
+| `CompleteArrivalVisit` | Consumes the already saved two-ACK prefix and seal, atomically writes story 51 and checked scratch, creates the idle visit and its entry receipt, and clears the checkpoint. It returns the authored control pose separately for publication after acknowledgment. |
+
+The shared pure presentation reducer validates source-defined actors, clips, camera,
+background operations and effect configuration. It retains bounded captured phases; it
+does not authenticate historical wall-clock time or prove what was physically displayed.
+The entry-source, checked replay and fixed idle-profile hashes have distinct domains.
+Completion accepts no new outcome, ACK or replacement anchor. An unsealed restart remains
+awaiting presentation; it cannot invent a no-dwell capture. Under the writer lock, Begin
+requires room for all five receipts and each later step checks its remaining budget.
+Receipt retries return current state, including later rewards, before capacity checks.
+
+**Live checked-visit and native-party v4 admission remain closed.** Existing legacy train
+checkpoints cannot be relabeled as checked evidence; their `ContinueLanding` path is unchanged.
+Ordinary Complete followed by standalone Enter cannot replace the atomic operation above.
+Runtime account holds, owner/run fencing, ordered ACK delivery and save epochs still need
+integration. Full field audio, concurrent scheduling and native movie timing remain separate
+requirements. Regression coverage includes source tampering, every durable prefix and seal
+across restart, captured effect dwell, completion and retries after rewards on temporary stores.
+
+The atomic bridge and reducer extraction pass 4,507 workspace tests across 122 targets
+(396 tests ignored). The explicit owned train restart test and terminal
+GPU reconstruction test pass; all four terminal/effect images are byte-identical to
+the preceding checkpoint. Clippy reports only the two pre-existing warnings.
+
+The preceding payload/presentation checkpoint passed the full 4,482-test workspace, 59 explicit owned
 FF7 route/arrival checks, all three owned server visit checks and six offscreen GPU tests.
 The train image and subsequent effect updates match uninterrupted port playback exactly.
 Persistence's 387 tests include maximum payloads, all six visit journal interruption stages,

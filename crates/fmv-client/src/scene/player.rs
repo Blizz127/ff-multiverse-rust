@@ -49,7 +49,7 @@ use crate::mods::{Global, ModSink, VoiceCue};
 use fmv_core::{EntityId, Pos};
 use fmv_ff7::field_direction_to_facing;
 use fmv_ff7::script::dialogue::{End, MessageOrigin};
-use fmv_ff7::script::scene::{AnimHow, BattleCheckpoint, Look, MoveHow, SceneBoundary, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
+use fmv_ff7::script::scene::{BattleCheckpoint, Look, MoveHow, SceneBoundary, SceneDef, Stage, Then, Timed, Window, FRAMES_PER_SECOND};
 use fmv_ff7::story::StoryState;
 use fmv_protocol::{BattleId, ClientMsg, SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneReplayEvent, SceneRole, SceneRunId, MAX_SCENE_STEPS};
 use std::cell::Cell;
@@ -710,51 +710,10 @@ impl ScenePlayer {
     }
 
     fn apply_stage(cast: &mut Cast, source: &dyn SceneSource, event: &Stage, late: f32, movement_phase: f32) {
-        // Presentation uses the script's own field model and loaded clip bounds: normal-rate
-        // Holds/Once, plus full loops and fresh full Holds at normal or doubled speed.
-        // Other forms clear an old override; the stage handles supported standing-loop rate changes.
-        if let Stage::Anim { entity, animation, how: AnimHow::Loop, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_loop(*entity, *animation, clip, late, *speed == 32);
-                return;
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                cast.apply_hold_full(*entity, clip, late, *speed == 32);
-                return;
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Hold, first: Some(first), last: Some(last), speed: speed @ (16 | 32), divisor: 1 } = event {
-            if first <= last {
-                if let Some(clip) = source.animation_clip(*entity, *animation) {
-                    if first == last { cast.apply_hold(*entity, clip, *first); }
-                    else if *speed == 32 { cast.apply_hold_range_doubled(*entity, clip, *first, *last, late); }
-                    else { cast.apply_hold_range(*entity, clip, *first, *last, late); }
-                    return;
-                }
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: None, last: None, speed: speed @ (16 | 32), divisor: 1 } = event {
-            if let Some(clip) = source.animation_clip(*entity, *animation) {
-                let applied = if *speed == 32 { cast.apply_once_full_doubled(*entity, *animation, clip, late) }
-                    else { cast.apply_once_full(*entity, *animation, clip, late) };
-                if applied { return; }
-            }
-        }
-        if let Stage::Anim { entity, animation, how: AnimHow::Once, first: Some(first), last: Some(last), speed: 16, divisor: 1 } = event {
-            if first <= last {
-                if let Some(clip) = source.animation_clip(*entity, *animation) {
-                    if cast.apply_once(*entity, *animation, clip, *first, *last, late) { return; }
-                }
-            }
-        }
-        cast.apply(event, late, &|x, y, triangle| source.height_at(x, y, triangle));
-        if let Stage::Move { entity, how: MoveHow::Walk, animation: Some(slot @ (1 | 2)), .. } = event {
-            if let Some(clip) = source.animation_clip(*entity, *slot) {
-                cast.apply_move_animation(*entity, clip, movement_phase);
-            }
-        }
+        let clip = fmv_ff7::script::scene::presentation::animation_slot(event)
+            .and_then(|(entity, slot)| source.animation_clip(entity, slot));
+        fmv_ff7::script::scene::presentation::apply_stage(cast, event, late, movement_phase,
+            clip, &|x, y, triangle| source.height_at(x, y, triangle));
     }
 
     /// Go on as far as the clock allows: pull the next beat, play what is due, open the window or end the scene. Stops at

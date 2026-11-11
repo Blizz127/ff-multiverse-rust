@@ -31,7 +31,7 @@ mod batch;
 #[cfg(test)]
 mod character_write_tests;
 pub use batch::{SceneBatchCommitted, SceneCheckpoint, SceneOperation, SceneOperationKind, ScenePhase, SceneReservation, SceneState,
-    MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
+    MAX_ARRIVAL_METADATA_STEPS, MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
 
 pub(crate) const INTENT_FILE: &str = "pending-scene.json";
 const INTENT_VERSION: u32 = 1;

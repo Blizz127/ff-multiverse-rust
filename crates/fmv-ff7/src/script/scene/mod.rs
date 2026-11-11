@@ -34,6 +34,7 @@ mod fade;
 mod jump;
 mod offset;
 mod play;
+pub mod presentation;
 mod replay_identity;
 pub mod train_arrival;
 mod vm;

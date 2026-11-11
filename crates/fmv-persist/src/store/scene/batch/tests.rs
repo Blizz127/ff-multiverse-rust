@@ -3,6 +3,9 @@ mod battle_outcome;
 mod format_compatibility;
 mod terminal_landing;
 mod visit_lifecycle;
+mod arrival_visit;
+mod arrival_advance;
+mod arrival_capacity;
 
 use super::*;
 use crate::{CharacterProgress, Progression};

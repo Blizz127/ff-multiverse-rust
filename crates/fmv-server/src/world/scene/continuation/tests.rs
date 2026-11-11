@@ -6,6 +6,7 @@ mod follower_owner;
 mod retire_landing;
 mod roster_snapshot;
 mod size_bounds;
+mod landing_evidence;
 
 use std::sync::Arc;
 use std::time::Duration;

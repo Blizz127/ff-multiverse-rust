@@ -48,6 +48,9 @@ impl Cast {
 }
 
 impl CastCheckpoint {
+    /// Read-only decoded presentation state; syntax validation alone grants no source authority.
+    pub fn cast(&self) -> &Cast { &self.cast }
+
     /// Versioned little-endian bytes. Float fields use their exact IEEE bits, including -0.
     pub fn encode(&self) -> Vec<u8> { self.encoded() }
 
@@ -125,16 +128,14 @@ fn phase(value: f32) -> bool { value.is_finite() && value >= 0.0 }
 fn same_float(a: f32, b: f32) -> bool { a.to_bits() == b.to_bits() }
 
 fn same_effect_configuration(a: &Cast, b: &Cast) -> bool {
-    // These offsets are part of the embedded version-one effect encodings. Enablement,
-    // amplitude and segment duration are authored; active state, endpoints, offset, RNG,
-    // signed step and the shared fraction describe the actual phase of that instruction.
-    let (a_shake, b_shake) = (a.shake.checkpoint_bytes(), b.shake.checkpoint_bytes());
-    let shake = [0, 13].into_iter().all(|base|
-        [0, 4, 9, 10].into_iter().all(|offset| a_shake[base + offset] == b_shake[base + offset]));
+    // Train uses one constant authored amplitude/duration. The shared effect helper
+    // checks both that configuration and the attainable segment range, retaining phase.
+    let shake = a.shake.matches_constant_configuration(&b.shake);
     // Train's default fade can accumulate a fractional clock but has no authored fade
     // instruction. Refuse any changed mode, colour/history, speed or counter. This is
     // intentionally narrower than generic FADE/NFADE phase restoration.
-    shake && a.fade.checkpoint_bytes()[..14] == b.fade.checkpoint_bytes()[..14]
+    let (a_fade, b_fade) = (a.fade.checkpoint_bytes(), b.fade.checkpoint_bytes());
+    shake && a_fade.get(..14).zip(b_fade.get(..14)).is_some_and(|(a, b)| a == b)
 }
 
 fn validate_cast(cast: &Cast) -> Result<(), String> {
@@ -251,11 +252,14 @@ impl<'a> Reader<'a> {
         self.at = end;
         Ok(bytes)
     }
-    fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        self.take(N)?.try_into().map_err(|_| "invalid terminal cast field width".into())
+    }
+    fn u8(&mut self) -> Result<u8, String> { let [byte] = self.array()?; Ok(byte) }
     fn bool(&mut self) -> Result<bool, String> { match self.u8()? { 0 => Ok(false), 1 => Ok(true), _ => Err("invalid terminal cast boolean".into()) } }
-    fn u16(&mut self) -> Result<u16, String> { Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes"))) }
-    fn i16(&mut self) -> Result<i16, String> { Ok(i16::from_le_bytes(self.take(2)?.try_into().expect("two bytes"))) }
-    fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes"))) }
+    fn u16(&mut self) -> Result<u16, String> { Ok(u16::from_le_bytes(self.array()?)) }
+    fn i16(&mut self) -> Result<i16, String> { Ok(i16::from_le_bytes(self.array()?)) }
+    fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.array()?)) }
     fn f32(&mut self) -> Result<f32, String> { Ok(f32::from_bits(self.u32()?)) }
     fn clip(&mut self) -> Result<String, String> {
         let count = usize::from(self.u16()?);
@@ -298,7 +302,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fmv_ff7::script::scene::FadeOp;
+    use crate::script::scene::FadeOp;
 
     fn terminal() -> Cast {
         let mut cast = Cast::new([1, 2, 3]);
@@ -388,7 +392,7 @@ mod tests {
         assert!(cast.checkpoint().is_err());
         assert!(terminal().checkpoint().unwrap().restore_against(&cast).is_err());
         let mut cast = terminal();
-        cast.actors.get_mut(&1).unwrap().offset_motion = Some((fmv_ff7::script::scene::OffsetMotion::new([0; 3], [1; 3], 10).unwrap(), 4.0));
+        cast.actors.get_mut(&1).unwrap().offset_motion = Some((crate::script::scene::OffsetMotion::new([0; 3], [1; 3], 10).unwrap(), 4.0));
         assert!(cast.checkpoint().is_err());
         for bad in [f32::NAN, f32::INFINITY, -0.25] {
             let mut cast = terminal();

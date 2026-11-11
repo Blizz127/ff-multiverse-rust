@@ -61,6 +61,7 @@ use super::{is_full, normalize_facing, Player, World};
 
 mod continuation;
 pub use continuation::{SceneBoundary, SceneBoundaryKind};
+pub(crate) use continuation::saved_landing_evidence;
 
 /// How long a scene may go without the owner moving past a window before the server ends it.
 pub const SCENE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);

@@ -1,6 +1,7 @@
 //! Synthetic co-op checkpoints through the ordered saver and the real durable store.
 
 mod visit;
+mod arrival;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

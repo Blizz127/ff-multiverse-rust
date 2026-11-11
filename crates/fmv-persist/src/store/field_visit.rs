@@ -1,7 +1,7 @@
 //! Explicit, adapter-validated field visits. This storage foundation does not run entry
 //! scripts, infer cleared scratch, interpret native party state, or enable runtime use.
 //! A visit and its opaque story/resource result are one exact transaction. Ordinary saves
-//! preserve the visit; no existing scene operation is allowed to edit it.
+//! preserve the visit; only explicit visit and arrival operations may edit it.
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use fmv_core::{AccountId, GameId};
 use serde::{Deserialize, Serialize};
 
-use super::scene::{Images, SceneCheckpoint, SceneReservation, SceneState, SceneCommit,
+use super::scene::{Images, SceneCheckpoint, SceneReservation, SceneState, SceneCommit, SceneOperation,
     digest, encoded, is_digest, INTENT_FILE};
 use super::Store;
 use crate::{PersistError, Result};
@@ -91,6 +91,8 @@ pub struct FieldVisitCommitted {
 /// A single replaceable receipt, not a permanently growing history of field entries.
 /// Its digest binds the exact supplied operation and complete expected/next SceneState,
 /// including timestamps, caller schema, opaque story/resources and continuation metadata.
+/// An atomic arrival completion uses a separate domain and the stored, stamped snapshots;
+/// it cannot acknowledge a standalone Enter with the same entry-operation id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct VisitReceipt {
@@ -105,6 +107,17 @@ impl VisitReceipt {
         }
         Ok(())
     }
+}
+
+/// Bind an entry installed by scene completion to that exact batch result and its public
+/// stored before/after images. Private receipts are excluded to avoid a circular digest.
+/// Both creation and recovery call this only after stamping the character schema.
+pub(super) fn arrival_receipt(operation: &SceneOperation, selected_digest: &str, before: &SceneState, after: &SceneState) -> Result<VisitReceipt> {
+    let visit = after.field_visit.as_ref().ok_or_else(|| invalid("arrival receipt has no entry visit"))?;
+    let receipt = VisitReceipt { operation: visit.entry.operation,
+        request: digest(&("fmv-scene-arrival-visit-v1", operation, selected_digest, before, after))? };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 fn invalid(reason: &str) -> PersistError { PersistError::InvalidField { field: "field_visit", reason: reason.into() } }

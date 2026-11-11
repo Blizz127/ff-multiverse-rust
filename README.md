@@ -1502,6 +1502,13 @@ Continuation replay contract 3 includes authored model offsets, palette operatio
 in addition to the earlier jump/effect execution. Older contract-1/2 checkpoints are refused without changing the
 save; they are not reinterpreted under the new execution rules. The proposed native field timeline remains separate work.
 
+The staged checked train-entry bridge now saves the accepted cargo landing, both exact window ACKs,
+and a separately validated terminal presentation before atomically creating the ready field visit at moment 51.
+Its immutable entry retains the original train record and initial effect RNG; the shared presentation reducer
+checks source-defined state while preserving captured cosmetic phases. This does not prove what was physically
+displayed. **Live checked-visit and native-party v4 admission remain closed**; existing train continuations are
+unchanged. See [the checked train-entry contract](docs/FIELD-TIMELINE-DESIGN.md#checked-train-entry-and-retained-presentation).
+
 The flower encounter prepares a known-bit v3 story in memory when reading a supported legacy save. Unknown bits remain
 unknown; the original stored bytes remain the transaction's expected predecessor. Only successful completion stores the
 new format. The bridge-to-train continuations also prepare a known-bit snapshot against their original saved predecessor; unrelated

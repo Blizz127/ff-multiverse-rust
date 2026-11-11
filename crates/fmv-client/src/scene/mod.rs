@@ -53,7 +53,6 @@ mod keys;
 mod panel;
 mod player;
 mod source;
-mod shake;
 mod stage;
 mod trigger;
 

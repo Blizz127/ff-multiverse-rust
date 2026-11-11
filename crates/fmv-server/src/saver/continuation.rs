@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use fmv_core::{AccountId, GameId};
 use fmv_persist::{FieldVisitV1, SceneBatchCommitted, SceneCheckpoint, SceneCommit, SceneOperation, SceneOperationKind,
     ScenePhase, SceneReservation, SceneState, Store, MAX_FIELD_VISIT_ANCHOR_BYTES, MAX_FIELD_VISIT_BYTES,
-    MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, MAX_SCENE_BATCH_ACCOUNTS,
+    MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, MAX_ARRIVAL_METADATA_STEPS, MAX_SCENE_BATCH_ACCOUNTS,
     MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};
 use fmv_protocol::{BattleReward, BattleRules};
 use serde::Serialize;
@@ -41,7 +41,7 @@ pub(crate) struct SceneBatchMember {
     pub checkpoint: Option<SceneCheckpoint>,
     pub reservation: Option<SceneReservation>,
     pub battle: Option<SceneBattleSettlement>,
-    /// Only explicit visit-link operations replace this metadata. Absence preserves it and
+    /// Only explicit visit-link or arrival-completion operations replace this metadata. Absence preserves it and
     /// omits the field from the decision encoding, retaining every pre-visit receipt hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_visit: Option<FieldVisitV1>,
@@ -71,10 +71,17 @@ impl SceneBatchJob {
         validate_accounts(&self.members.iter().map(|m| m.expected.pair.story.account_id).collect::<Vec<_>>())?;
         let visit_operation = matches!(self.operation.kind,
             SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit);
-        let valid_visit_ordinal = if self.operation.kind == SceneOperationKind::AdvanceVisit {
-            (1..=fmv_protocol::MAX_SCENE_REPLAY_EVENTS as u32).contains(&self.operation.ordinal)
-        } else { self.operation.ordinal == 0 };
-        if visit_operation && (self.members.len() != 1 || self.operation.instance == [0; 32]
+        let arrival_operation = matches!(self.operation.kind,
+            SceneOperationKind::BeginArrival | SceneOperationKind::AdvanceArrival | SceneOperationKind::CompleteArrivalVisit);
+        let valid_visit_ordinal = match self.operation.kind {
+            SceneOperationKind::AdvanceVisit => (1..=fmv_protocol::MAX_SCENE_REPLAY_EVENTS as u32).contains(&self.operation.ordinal),
+            // Two reviewed train windows, then the adapter-validated terminal presentation seal.
+            SceneOperationKind::AdvanceArrival => (1..=MAX_ARRIVAL_METADATA_STEPS).contains(&self.operation.ordinal),
+            // Beginning names the predecessor landing's consumed battle boundary, checked below.
+            SceneOperationKind::BeginArrival => true,
+            _ => self.operation.ordinal == 0,
+        };
+        if (visit_operation || arrival_operation) && (self.members.len() != 1 || self.operation.instance == [0; 32]
             || !valid_visit_ordinal || self.operation.attempt != 0) {
             return Err(SceneSaveError::InvalidRequest);
         }
@@ -94,7 +101,8 @@ impl SceneBatchJob {
         for member in &self.members {
             if let Some(visit) = &member.expected.field_visit { validate_visit(visit)?; }
             if let Some(visit) = &member.next_visit { validate_visit(visit)?; }
-            if visit_operation { self.validate_visit_transition(member)?; }
+            if arrival_operation { self.validate_arrival_transition(member)?; }
+            else if visit_operation { self.validate_visit_transition(member)?; }
             else if member.next_visit.is_some() { return Err(SceneSaveError::InvalidRequest); }
             let owner = member.expected.checkpoint.is_some() || member.checkpoint.is_some();
             if member.expected.pair.story.blob.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
@@ -180,6 +188,54 @@ impl SceneBatchJob {
             || checkpoint.consumed_battles != 0 || checkpoint.original_story != member.expected.pair.story.blob
             || checkpoint.original_gil != character.gil {
             return Err(SceneSaveError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    /// Arrivals start from a durable landing continuation, before any field visit exists.
+    /// Window acknowledgements publish only replay; completion creates the first idle visit.
+    /// Source, transcript and scratch semantics belong to the checked adapter, not this queue.
+    fn validate_arrival_transition(&self, member: &SceneBatchMember) -> Result<(), SceneSaveError> {
+        let before = member.expected.checkpoint.as_ref().ok_or(SceneSaveError::InvalidRequest)?;
+        let character = member.expected.pair.character.as_ref().ok_or(SceneSaveError::MissingCharacter)?;
+        if member.expected.field_visit.is_some() || member.expected.reservation.is_some()
+            || member.reservation.is_some() || member.battle.is_some() || before.instance != self.operation.instance {
+            return Err(SceneSaveError::InvalidRequest);
+        }
+        if self.operation.kind == SceneOperationKind::BeginArrival {
+            let after = member.checkpoint.as_ref().ok_or(SceneSaveError::InvalidRequest)?;
+            if member.next_story.is_some() || member.next_gil.is_some() || member.next_visit.is_some()
+                || !matches!(before.phase, ScenePhase::Landing { .. }) || self.operation.ordinal != before.consumed_battles
+                || after.instance == [0; 32] || after.instance == before.instance || after.source_hash == [0; 32]
+                || after.replay_version == 0 || after.phase != (ScenePhase::Resume { segment: 0 }) || after.consumed_battles != 0
+                || after.original_story != member.expected.pair.story.blob || after.original_gil != character.gil {
+                return Err(SceneSaveError::InvalidRequest);
+            }
+            return Ok(());
+        }
+        if before.source_hash == [0; 32]
+            || before.replay_version == 0 || before.phase != (ScenePhase::Resume { segment: 0 })
+            || before.consumed_battles != 0 || before.original_story != member.expected.pair.story.blob
+            || before.original_gil != character.gil {
+            return Err(SceneSaveError::InvalidRequest);
+        }
+        match self.operation.kind {
+            SceneOperationKind::AdvanceArrival => {
+                if member.next_story.is_some() || member.next_gil.is_some() || member.next_visit.is_some() {
+                    return Err(SceneSaveError::InvalidRequest);
+                }
+                let after = member.checkpoint.as_ref().ok_or(SceneSaveError::InvalidRequest)?;
+                let mut allowed = before.clone();
+                allowed.replay.clone_from(&after.replay);
+                if *after != allowed || before.replay == after.replay { return Err(SceneSaveError::InvalidRequest); }
+            }
+            SceneOperationKind::CompleteArrivalVisit => {
+                let visit = member.next_visit.as_ref().ok_or(SceneSaveError::InvalidRequest)?;
+                if member.checkpoint.is_some() || visit.revision != 0 || visit.active_continuation.is_some() {
+                    return Err(SceneSaveError::InvalidRequest);
+                }
+            }
+            _ => return Err(SceneSaveError::InvalidRequest),
         }
         Ok(())
     }

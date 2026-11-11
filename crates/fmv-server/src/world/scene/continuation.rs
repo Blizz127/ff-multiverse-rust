@@ -72,6 +72,39 @@ impl Landing {
     }
 }
 
+/// Read the original retained landing carrier without authorizing its script effects.
+/// The adapter must independently replay the recorded scene/original story/gil/seed,
+/// verify the current pair and authored MAPJUMP, and bind the accepted entry operation.
+/// In particular this never substitutes a checked-entry source identity for the legacy one.
+pub(crate) fn saved_landing_evidence(state: &SceneState, expected_source_field: &str) -> Option<(SceneReplay, Exit)> {
+    let checkpoint = state.checkpoint.as_ref()?;
+    let ScenePhase::Landing { destination } = &checkpoint.phase else { return None };
+    let field_name = |name: &str| !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control);
+    if state.reservation.is_some() || state.field_visit.is_some() || checkpoint.replay_version != REPLAY_VERSION
+        || checkpoint.instance == [0; 32] || checkpoint.source_hash == [0; 32]
+        || checkpoint.scene_key.is_empty() || checkpoint.scene_key.len() > 256 || checkpoint.scene_key.chars().any(char::is_control)
+        || checkpoint.original_story.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
+        || destination.len() > fmv_protocol::MAX_STORY_PROGRESS_BYTES
+        || !field_name(expected_source_field) || !checkpoint_can_be_announced(checkpoint) {
+        return None;
+    }
+    let payload: Payload = serde_json::from_slice(&checkpoint.replay).ok()?;
+    let landing = payload.landing.as_ref()?;
+    if payload.field != expected_source_field || !field_name(&payload.field) || !field_name(&landing.field)
+        || !payload.position.is_finite() || !payload.facing.is_finite()
+        || !landing.position.is_finite() || landing.facing.is_some_and(|facing| !facing.is_finite())
+        || payload.plan.is_some() || payload.carry.is_some() || payload.game_over
+        || payload.replay.source != checkpoint.source_hash || payload.replay.validate().is_err()
+        || serde_json::from_slice::<Landing>(destination).ok().as_ref() != Some(landing) {
+        return None;
+    }
+    let consumed = payload.replay.events.iter().rev().find_map(|event| match event {
+        SceneReplayEvent::Battle { ordinal, .. } => Some(*ordinal), _ => None,
+    }).unwrap_or(0);
+    if consumed != checkpoint.consumed_battles { return None; }
+    Some((payload.replay, landing.exit()))
+}
+
 pub(super) struct Continuation {
     owner: AccountId,
     instance: [u8; 32],

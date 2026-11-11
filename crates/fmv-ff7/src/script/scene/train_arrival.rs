@@ -17,6 +17,7 @@ use crate::script::{triangle_contains_xy, FieldScratch, FieldScratchOutcome, Fie
 use crate::story::StoryState;
 
 pub mod codec;
+pub mod presentation;
 
 const PROFILE: &[u8] = b"fmv-ff7/tin_1-arrival\0v1\0same-vm-zero-time-entry\0";
 
