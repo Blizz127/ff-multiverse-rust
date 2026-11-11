@@ -626,6 +626,7 @@ impl World {
 
     /// Only the exact story battle selected by a committed sweep may inherit its acknowledged
     /// field hold. Debug/random requests cannot borrow an unrelated pending story barrier.
+    #[allow(dead_code)]
     fn prepare_battle_setup_with_story_hold(&mut self, requester: EntityId, formation: u16, scene: Option<fmv_protocol::SceneRunId>, inherit_story_hold: bool) -> Result<BattleSetup, BattleRejection> {
         self.prepare_battle_setup_with_canon(requester, formation, scene, inherit_story_hold, None)
     }
@@ -755,11 +756,20 @@ impl World {
 
     /// Start an ordinary encounter or the existing presentation-only story fight.
     fn begin_battle(&mut self, requester: EntityId, formation: u16, now: Instant, then: Option<StoryThen>) -> Result<BattleId, BattleRejection> {
+        self.begin_battle_with_canon(requester, formation, now, then, None)
+    }
+
+    /// A live field's `BATTLE`: the field's own party fights beside the players (see `live`).
+    pub(super) fn begin_live_battle(&mut self, requester: EntityId, formation: u16, party: &[u8], now: Instant) -> Result<BattleId, BattleRejection> {
+        self.begin_battle_with_canon(requester, formation, now, None, Some(party))
+    }
+
+    fn begin_battle_with_canon(&mut self, requester: EntityId, formation: u16, now: Instant, then: Option<StoryThen>, canon: Option<&[u8]>) -> Result<BattleId, BattleRejection> {
         // Only synchronous continuation of an already acknowledged story sweep may hand its
         // field hold to the random fight selected by that accepted move. Raw debug requests
         // have no resuming context, even when their client ACKed an outstanding CAS.
         let inherit = self.ordinary_story_resuming(requester);
-        let setup = self.prepare_battle_setup_with_story_hold(requester, formation, None, inherit)?;
+        let setup = self.prepare_battle_setup_with_canon(requester, formation, None, inherit, canon)?;
         let bw = self.battle.as_mut().ok_or(BattleRejection::Unsupported)?;
         let info = bw.settings.rules.formation(formation).ok_or(BattleRejection::UnknownFormation)?;
         let (party, seed) = (setup.party.clone(), setup.seed);
@@ -1196,6 +1206,8 @@ impl World {
         for (entity, msg) in told {
             self.fan_to(&[entity], msg);
         }
+        // A live field waiting on this battle goes on (its scripts read the result themselves).
+        self.live_battle_finished(id, outcome != Outcome::Defeat);
         // A battle a story point started is the price of the point's step: paid when it is won, never when it is lost
         // or fled (the story stays where it was, and the point can be reached again).
         if outcome == Outcome::Victory {

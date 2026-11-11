@@ -255,6 +255,13 @@ struct Cli {
     #[arg(long)]
     story_extended_save: bool,
 
+    /// Run every FF7 field's original scripts on the server (the live field runtime, protocol 23): the cast moves, the
+    /// scripts' own windows, lines, battles, movies and map jumps drive the story instead of the curated scenes. New
+    /// accounts start from the complete new-game story; an account whose story has unknown bits keeps the curated
+    /// path (its story is never guessed). Implies --story-extended-save for the live fields' exact story saves.
+    #[arg(long)]
+    field_runtime: bool,
+
     /// DEBUG, needs an explicit --state-dir (or --ephemeral): an account with no story yet starts at story moment N instead of
     /// the new game's (1). A smoke test's way to a later part of the story without playing through everything before it:
     /// with 33, a new account comes in right after the escape from the first reactor. Refused on the default state
@@ -442,6 +449,8 @@ struct Hosted {
     battle: Option<BattleSettings>,
     /// Story scenes (`None`: this game has none, FIXTURE).
     scenes: Option<SceneSettings>,
+    /// Live fields (`None`: off, or this game has none).
+    live: Option<std::sync::Arc<dyn fmv_server::LiveFieldHost>>,
 }
 
 impl Cli {
@@ -510,6 +519,7 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             build_suffix: None,
             battle: None,
             scenes: None,
+            live: None,
         }),
         GameKind::FixtureRooms => Ok(Hosted {
             adapter: Box::new(fmv_fixture::rooms::RoomsAdapter::new()),
@@ -517,6 +527,7 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             build_suffix: None,
             battle: None,
             scenes: None,
+            live: None,
         }),
         GameKind::Ff7 => {
             let opened = ff7::open_ff7(&cli.ff7_source())?;
@@ -542,11 +553,18 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             };
             // FF7's story scenes read the same field archive; the debug preview is off unless asked for.
             let scenes = SceneSettings {
-                host: std::sync::Arc::new(fmv_server::scene_host::Ff7SceneHost::with_extended_save(std::sync::Arc::clone(&opened.adapter), cli.story_extended_save)),
+                host: std::sync::Arc::new(
+                    fmv_server::scene_host::Ff7SceneHost::with_extended_save(std::sync::Arc::clone(&opened.adapter), cli.story_extended_save || cli.field_runtime)
+                        .with_field_runtime(cli.field_runtime),
+                ),
                 debug_preview: cli.debug_scene_preview,
                 debug_new_story: cli.debug_start_moment.map(|moment| fmv_ff7::story::StoryState::at(moment).encode()),
             };
+            let live: Option<std::sync::Arc<dyn fmv_server::LiveFieldHost>> = cli
+                .field_runtime
+                .then(|| std::sync::Arc::new(fmv_server::live_host::Ff7LiveHost::new(std::sync::Arc::clone(&opened.adapter))) as std::sync::Arc<dyn fmv_server::LiveFieldHost>);
             Ok(Hosted {
+                live,
                 adapter: Box::new(SharedFf7(opened.adapter)),
                 area: cli.area.clone().unwrap_or_else(|| DEFAULT_FF7_AREA.to_string()),
                 build_suffix: Some(ff7::build_tag()),
@@ -648,6 +666,7 @@ async fn real_main(cli: Cli) -> Result<(), String> {
         battle: hosted.battle,
         debug_encounters: cli.debug_encounters,
         scenes: hosted.scenes,
+        live: hosted.live,
         ..ServerConfig::default()
     });
     let shutdown = shutdown_signal().map_err(|e| format!("cannot install signal handlers: {e}"))?;

@@ -345,6 +345,8 @@ pub struct FieldRuntime {
     previous_player: Option<PlayerInput>,
     /// The field's walkmesh, when the host supplied one (movement needs it; without it moves go straight).
     walkmesh: Option<std::sync::Arc<crate::field::Walkmesh>>,
+    /// The walkmesh as a navigable surface (point location for the player's triangle).
+    surface: Option<std::sync::Arc<crate::walk::Surface>>,
     /// Instruction families' own state.
     pub(crate) motion: MotionState,
     pub(crate) anim: AnimState,
@@ -404,6 +406,7 @@ impl FieldRuntime {
             player: None,
             previous_player: None,
             walkmesh: None,
+            surface: None,
             motion: MotionState::default(),
             anim: AnimState::default(),
             stage: StageState::default(),
@@ -492,7 +495,15 @@ impl FieldRuntime {
 
     /// Give the runtime the field's walkmesh (scripted movement follows it).
     pub fn set_walkmesh(&mut self, walkmesh: std::sync::Arc<crate::field::Walkmesh>) {
+        self.surface = Some(std::sync::Arc::new(crate::walk::Surface::new(&walkmesh)));
         self.walkmesh = Some(walkmesh);
+    }
+
+    /// The walkmesh triangle under `(x, y)` nearest the height `z`, when the field has a walkmesh.
+    pub fn triangle_at(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        let surface = self.surface.as_ref()?;
+        let (t, _) = surface.locate(f64::from(x), f64::from(y), Some(f64::from(z)))?;
+        u16::try_from(t).ok()
     }
 
     pub fn walkmesh(&self) -> Option<&crate::field::Walkmesh> {
@@ -621,7 +632,11 @@ impl FieldRuntime {
     ///   closer than the player's solid range; crossing it (the side changes between the previous and the current
     ///   position) while touching is "across"; facing it within an eighth of a turn and pressing OK is talk.
     fn detect_player_events(&mut self) {
-        let Some(p) = self.player else { return };
+        let Some(mut p) = self.player else { return };
+        if let Some(t) = self.triangle_at(p.x, p.y, p.z) {
+            p.triangle = t;
+            self.player = Some(p);
+        }
         let pc_model = self.state.pc_model;
         if !self.state.character_lock {
             if let Some(m) = pc_model.and_then(|m| self.models.get_mut(m)) {

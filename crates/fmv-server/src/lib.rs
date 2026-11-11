@@ -148,10 +148,11 @@ mod limits;
 mod progress;
 mod location_saver;
 mod saver;
+pub mod live_host;
 pub mod scene_host;
 mod world;
 
-pub use world::{SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
+pub use world::{LiveEvent, LiveField, LiveFieldHost, LiveInput, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 
 pub use accounts::MAX_APPEARANCE_REF;
 
@@ -322,6 +323,9 @@ impl Server {
         world.set_travel_timeout(config.join_timeout);
         world.configure_battle(config.battle.clone(), config.debug_encounters);
         world.configure_scenes(config.scenes.clone());
+        if let Some(host) = config.live.clone() {
+            world.set_live_host(host);
+        }
         let (store, ephemeral_state) = open_store(&config).await?;
         // Every server saves, off the world lock (see `saver`): what battles pay (a server that runs
         // them) and the story steps players make (any server whose adapter has a story).
@@ -655,6 +659,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.advance_battles(now);
                     world.advance_scenes(now);
                     world.advance_countdowns(now);
+                    world.advance_live(now);
                     world.manage_areas(now);
                     world.save_locations(now);
                 });

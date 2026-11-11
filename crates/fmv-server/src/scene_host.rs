@@ -104,6 +104,8 @@ pub struct Ff7SceneHost {
     /// ([`saves_only_what_was_always_saved`]). Off unless the server is started with `--story-extended-save`.
     /// Scenes needing an exact transaction and already extended stories are not offered while it is off.
     extended_save: bool,
+    /// New accounts start from the complete new-game story the live field runtime needs (`--field-runtime`).
+    field_runtime: bool,
 }
 
 impl Ff7SceneHost {
@@ -114,7 +116,13 @@ impl Ff7SceneHost {
     /// The host of a server that may (or may not) save story variables beyond the long-saved ones (see
     /// [`Ff7SceneHost::extended_save`]).
     pub fn with_extended_save(adapter: Arc<Ff7Adapter>, extended_save: bool) -> Self {
-        Self { adapter, defs: scenes(), fields: Mutex::new(BTreeMap::new()), extended_save }
+        Self { adapter, defs: scenes(), fields: Mutex::new(BTreeMap::new()), extended_save, field_runtime: false }
+    }
+
+    /// New accounts start from the complete reset story, every bit known (`--field-runtime`).
+    pub fn with_field_runtime(mut self, on: bool) -> Self {
+        self.field_runtime = on;
+        self
     }
 
     fn def(&self, id: &str) -> Option<&SceneDef> {
@@ -201,6 +209,9 @@ impl Ff7SceneHost {
 
 impl SceneHost for Ff7SceneHost {
     fn fresh_story(&self) -> Option<Vec<u8>> {
+        if self.field_runtime {
+            return Some(StoryState::fresh_reset().encode());
+        }
         self.extended_save.then(|| StoryState::fresh_first_control().encode())
     }
 

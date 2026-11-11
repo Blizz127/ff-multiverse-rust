@@ -58,11 +58,11 @@ impl World {
         let party = self.parties.party_of(player.account).cloned();
         let mut phases = PhaseMap::new();
         // (a previewing player's phase is made up and its own: see `scene`)
-        phases.insert(player.account, Self::player_phase(area, player));
+        phases.insert(player.account, self.effective_phase(area, player));
         if let Some(party) = &party {
             // The leader's phase for THIS area, wherever the leader stands.
             if let Some(leader) = self.by_account.get(&party.leader).and_then(|e| self.players.get(e)) {
-                phases.insert(party.leader, Self::player_phase(area, leader));
+                phases.insert(party.leader, self.effective_phase(area, leader));
             }
         }
         InstanceSelector::select(area.id(), player.account, party.as_ref(), &phases).map(Some)
@@ -189,9 +189,10 @@ impl World {
         }
 
         // The triggers of the story scenes on offer here join the cast (see `scene`).
-        let scene_npcs = self.scene_npcs(entity, &placement.key.area.key);
+        let live = self.live_cast(new);
+        let scene_npcs = if live.is_some() { Vec::new() } else { self.scene_npcs(entity, &placement.key.area.key) };
         let Some(area) = self.areas.get(&placement.key.area.key) else { return };
-        let mut npcs = area.cast(&placement.key.phase);
+        let mut npcs = live.unwrap_or_else(|| area.cast(&placement.key.phase));
         npcs.extend(scene_npcs);
         let snapshot = Arc::new(ServerMsg::AreaSnapshot { area: area.id().clone(), tick: self.tick, entities: self.instance_entities(new), npcs });
         let Some(me) = self.players.get(&entity) else { return };
@@ -246,9 +247,10 @@ impl World {
             let Some(player) = self.players.get(&entity).filter(|player| player.transit.is_none() && player.area == key.area.key) else { continue };
             if player.placement.as_ref().is_none_or(|placement| placement.key != key) { continue; }
             // Eligibility follows this recipient's phase owner, not necessarily its own story.
-            let scene_npcs = self.scene_npcs(entity, &key.area.key);
+            let live = self.live_cast(instance);
+            let scene_npcs = if live.is_some() { Vec::new() } else { self.scene_npcs(entity, &key.area.key) };
             let Some(area) = self.areas.get(&key.area.key) else { continue };
-            let mut npcs = area.cast(&key.phase);
+            let mut npcs = live.unwrap_or_else(|| area.cast(&key.phase));
             npcs.extend(scene_npcs);
             let snapshot = Arc::new(ServerMsg::AreaSnapshot {
                 area: area.id().clone(), tick: self.tick, entities: self.instance_entities(instance), npcs,

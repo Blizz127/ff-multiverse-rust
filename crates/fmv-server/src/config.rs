@@ -291,6 +291,8 @@ pub struct ServerConfig {
     /// Story scenes (see `world::scene`): the game's scenes and the debug preview switch. `None` (the FIXTURE default): no scene
     /// is offered and every scene message is refused.
     pub scenes: Option<crate::world::SceneSettings>,
+    /// Live fields (`--field-runtime`): areas whose original scripts run on the server. `None`: off.
+    pub live: Option<std::sync::Arc<dyn crate::world::LiveFieldHost>>,
 }
 
 /// Longest accepted `ServerConfig::build_suffix` (bytes).
@@ -323,6 +325,7 @@ impl Default for ServerConfig {
             battle: None,
             debug_encounters: false,
             scenes: None,
+            live: None,
         }
     }
 }

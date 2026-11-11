@@ -141,6 +141,10 @@ impl World {
             }
             (p.snapshot.pos, p.area.clone(), p.placement.as_ref().map(|p| p.key.phase.clone()).unwrap_or_default())
         };
+        // In a live field the field's own scripts decide what OK does (see `live`).
+        if self.live_press(entity) {
+            return PressOutcome::Nothing;
+        }
         // OK next to a scene's trigger starts the scene (see `scene`): the trigger is no character of the area's own.
         if let Some(npc) = npc.filter(|n| super::scene::scene_index(*n).is_some()) {
             self.press_scene(entity, npc, now);

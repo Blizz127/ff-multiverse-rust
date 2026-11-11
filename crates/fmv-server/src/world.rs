@@ -96,7 +96,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, GameAdapter, LinkArming, MoveResult};
+use fmv_adapter_api::{AreaKey, AreaRuntime, Exit, ExitKind, GameAdapter, LinkArming, MoveResult};
 use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, EntitySnapshot, Pos, SessionId};
 use fmv_party::{InstanceRegistry, Invite, PartyConfig, PartyEvent, PartyManager, Placement, Tick};
 use fmv_protocol::{BattleId, PartyName, ServerMsg};
@@ -114,6 +114,7 @@ mod battle;
 mod countdown;
 mod follow;
 mod instances;
+mod live;
 mod party;
 mod press;
 mod resume;
@@ -125,6 +126,7 @@ pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
+pub use live::{LiveEvent, LiveField, LiveFieldHost, LiveInput};
 pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 pub(crate) use scene::saved_landing_evidence;
 
@@ -371,6 +373,8 @@ pub struct World {
     clock: Instant,
     /// MMO-style saving: where players stand, saved constantly, and the spots logins put them back on (see `resume`).
     resume: resume::Resume,
+    /// Live fields: areas whose original scripts run here (see `live`). Off unless a host is set.
+    live: live::LiveWorld,
 }
 
 impl World {
@@ -412,6 +416,7 @@ impl World {
             countdowns: BTreeMap::new(),
             clock: Instant::now(),
             resume: resume::Resume::default(),
+            live: live::LiveWorld::default(),
         })
     }
 
@@ -669,6 +674,8 @@ impl World {
     /// check, speed budget, walking the chord through the adapter. Only an accepted move spends
     /// budget, and facing and anim are tracked only from accepted moves.
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
+        // A field script may hold the player (the original's UC, an open window, a battle or movie under way).
+        let live_locked = self.live_locked(entity);
         // The rules are the rules of the area the player stands in (areas differ in speed).
         let (from, chord) = {
             let Some(p) = self.players.get_mut(&entity) else {
@@ -682,6 +689,9 @@ impl World {
                 return MoveOutcome::Gone;
             };
             let from = p.snapshot.pos;
+            if live_locked {
+                return MoveOutcome::Rejected { corrected: from, reason: Rejection::Blocked };
+            }
             if !to.is_finite() || !facing.is_finite() {
                 return MoveOutcome::Rejected { corrected: from, reason: Rejection::NonFinite };
             }
@@ -730,6 +740,24 @@ impl World {
                 p.snapshot.anim = anim;
                 p.budget.tokens -= dist;
                 p.dirty |= changed;
+                // A live field's scripts own its lines, story and script exits; only the data's gateways (unless a
+                // script closed them) and random encounters (unless a script turned them off) act on the move here.
+                if self.in_live_field(entity) {
+                    if !self.live_map_jumps_disabled(entity) {
+                        if let Some(exit) = crossed.iter().find(|e| e.kind == ExitKind::Gateway).cloned() {
+                            if self.start_travel(entity, &exit, from, facing, now) {
+                                if let Some(transit) = self.players.get_mut(&entity).and_then(|p| p.transit.as_mut()) {
+                                    transit.from_facing = from_facing;
+                                }
+                                return MoveOutcome::Applied;
+                            }
+                        }
+                    }
+                    if !self.live_battles_disabled(entity) {
+                        self.roll_encounter(entity, dist, now);
+                    }
+                    return MoveOutcome::Applied;
+                }
                 // An original scripted line owns its accepted crossing before exits, story
                 // points, local links or random encounters can act on the same move.
                 if self.check_scene_line(entity, from, accepted, now) {

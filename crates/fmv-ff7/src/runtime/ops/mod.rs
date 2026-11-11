@@ -411,7 +411,7 @@ impl FieldRuntime {
             }
             0x72 => {
                 self.state.battle_mode = self.p16(1);
-                self.advance(5);
+                self.advance(3);
                 Flow::Continue
             }
             0x4B => {

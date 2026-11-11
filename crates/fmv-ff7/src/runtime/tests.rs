@@ -201,6 +201,39 @@ fn directions_follow_the_original() {
     }
 }
 
+/// Opcodes whose next PC is a jump target or a script switch rather than the instruction's end.
+fn transfers_control(op: u8) -> bool {
+    matches!(op, 0x00..=0x07 | 0x10..=0x19 | 0x30..=0x32 | 0xCB | 0xCC)
+}
+
+#[test]
+fn every_implemented_opcode_advances_exactly_its_decoded_length_or_waits() {
+    for op in 0u8..=255 {
+        if crate::script::mnemonic(op).is_none() || !is_implemented(op) || transfers_control(op) || matches!(op, 0x28 | 0x0F) {
+            continue;
+        }
+        let zeros = [0u8; 24];
+        let mut probe = vec![op];
+        probe.extend_from_slice(&zeros);
+        let Ok(len) = crate::script::decode_at(&probe, 0, 0).map(|i| i.len) else { continue };
+        let mut code = probe[..len].to_vec();
+        code.extend_from_slice(IDLE);
+        let s = SynthScript::default().entity("x", vec![script0(&[], &code)]);
+        let mut rt = runtime(s);
+        let (_, start) = rt.entity_state(0).unwrap();
+        // One visit of the instruction alone: bound the entity to that single instruction by inspecting after
+        // the first frame (an instruction that waits leaves the PC where it was).
+        rt.tick(None);
+        let (_, pc) = rt.entity_state(0).unwrap();
+        let name = crate::script::mnemonic(op).unwrap();
+        assert!(pc == start || pc >= start + len, "{name} (0x{op:02X}) moved the PC by {} but is {len} bytes long", pc - start);
+        if pc != start {
+            // It completed: the PC must have landed on the instruction after it (the idle loop's WAIT1 or JMPB).
+            assert!(pc == start + len || pc == start + len + 1, "{name} (0x{op:02X}) moved the PC by {} but is {len} bytes long", pc - start);
+        }
+    }
+}
+
 #[test]
 fn every_implemented_opcode_is_counted_as_executed() {
     // An unimplemented opcode is skipped and counted; an implemented one is not counted as unsupported.
