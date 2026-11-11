@@ -14,8 +14,10 @@
 //! The initial bounded profile requires one video and one stereo audio stream, both
 //! starting at timestamp zero. Other layouts fail explicitly; they are not normalized.
 //! Timestamps come from the selected decoder, not an inferred constant frame duration.
-//! Raw PCM does not retain internal audio timestamp gaps/overlaps; continuity must be
-//! validated before its consumed sample position becomes an authoritative movie clock.
+//! Every decoded audio frame retains its source PTS and exact PCM range. A separate
+//! one-source-tick observation test classifies compatibility with a continuous clock;
+//! valid discontinuous media still decodes, but simple-clock admission refuses it.
+//! No timestamp is normalized and no silence is inserted to conceal gaps or overlaps.
 //! Presentation completion here is video-only; a future movie controller must also
 //! require successful audio playback completion. Limits bound our buffers, not total
 //! memory inside the external codec process. The subprocess reader currently requires Unix.
@@ -27,7 +29,10 @@ mod process;
 mod timeline;
 mod worker;
 
-pub use metadata::{AudioMetadata, FrameTiming, MediaMetadata, TimeBase, VideoMetadata};
+pub use metadata::{
+    AudioContinuity, AudioFrameTiming, AudioMetadata, FrameTiming, MediaMetadata, TimeBase,
+    VideoMetadata,
+};
 pub use timeline::PlaybackTimeline;
 pub use worker::{DecodedAudio, DecodedFrame, Event, MovieWorker, Request, Tools};
 
@@ -41,6 +46,7 @@ pub struct Limits {
     pub max_width: u32,
     pub max_height: u32,
     pub max_frames: usize,
+    pub max_audio_frames: usize,
     pub max_frame_bytes: usize,
     pub max_audio_bytes: usize,
     pub max_metadata_bytes: usize,
@@ -59,6 +65,7 @@ impl Default for Limits {
             max_width: 2048,
             max_height: 2048,
             max_frames: 20_000,
+            max_audio_frames: 40_000,
             max_frame_bytes: 16 * 1024 * 1024,
             max_audio_bytes: 32 * 1024 * 1024,
             max_metadata_bytes: 4 * 1024 * 1024,
@@ -79,6 +86,8 @@ impl Limits {
             || self.max_height > 4096
             || self.max_frames == 0
             || self.max_frames > 100_000
+            || self.max_audio_frames == 0
+            || self.max_audio_frames > 100_000
             || self.max_frame_bytes == 0
             || self.max_frame_bytes > 64 * 1024 * 1024
             || self.max_audio_bytes == 0

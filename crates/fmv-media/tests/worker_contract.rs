@@ -18,7 +18,9 @@ args=sys.argv[1:]
 if '-show_streams' in args:
  print(json.dumps({{'streams':[
  {{'index':0,'codec_type':'video','codec_name':'vp8','width':1,'height':1,'time_base':'1/1000','start_pts':0}},
- {{'index':1,'codec_type':'audio','codec_name':'vorbis','sample_rate':'22050','channels':2,'start_pts':0}}]}}))
+ {{'index':1,'codec_type':'audio','codec_name':'vorbis','sample_rate':'22050','channels':2,'time_base':'1/22050','start_pts':0}}]}}))
+elif '-show_frames' in args and 'a:0' in args:
+ print(json.dumps({{'frames':[{{'pts':0,'nb_samples':1,'stream_index':1,'channels':2}}]}}))
 elif '-show_frames' in args:
  print(json.dumps({{'frames':[
  {{'pts':0,'duration':37,'width':1,'height':1}},{{'pts':37,'duration':51,'width':1,'height':1}}]}}))
@@ -78,6 +80,13 @@ fn public_worker_preserves_pts_and_reports_only_verified_decoder_eof() {
     let (events, result) = drain(&mut worker);
     assert_eq!(result, Ok(()));
     assert!(matches!(events.first(), Some(Event::Prepared { .. })));
+    if let Some(Event::Prepared { metadata, audio }) = events.first() {
+        assert!(std::sync::Arc::ptr_eq(&metadata.audio, &audio.metadata));
+        assert_eq!((audio.frames(), audio.metadata.samples()), (1, 1));
+        assert_eq!(audio.chunk(0).unwrap().1, [0, 0, 1, 0]);
+        assert!(audio.chunk(1).is_none());
+        assert!(audio.require_contiguous().is_ok());
+    }
     assert_eq!(
         events
             .iter()
@@ -158,4 +167,101 @@ fn relative_tool_paths_are_never_resolved_through_path() {
         MovieWorker::start(request),
         Err(MediaError::Invalid(_))
     ));
+}
+
+fn replace_tool(request: &Request, before: &str, after: &str) {
+    let original = std::fs::read_to_string(&request.tools.ffprobe).unwrap();
+    assert!(original.contains(before), "fixture replacement exists");
+    std::fs::write(&request.tools.ffprobe, original.replace(before, after)).unwrap();
+}
+
+#[test]
+fn timestamped_discontinuous_audio_decodes_but_simple_clock_admission_refuses() {
+    let Some((_dir, request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else {
+        return;
+    };
+    replace_tool(&request, "'time_base':'1/22050'", "'time_base':'1/1000'");
+    replace_tool(&request, "{'pts':0,'nb_samples':1,'stream_index':1,'channels':2}",
+        "{'pts':11,'nb_samples':256,'stream_index':1,'channels':2},{'pts':27,'nb_samples':256,'stream_index':1,'channels':2}");
+    replace_tool(&request, "bytes([0,0,1,0])", "bytes([0,0,1,0])*512");
+    let mut worker = MovieWorker::start(request).unwrap();
+    let (events, result) = drain(&mut worker);
+    assert_eq!(
+        result,
+        Ok(()),
+        "noncontiguity does not discard a successful decode"
+    );
+    let Some(Event::Prepared { audio, .. }) = events.first() else {
+        panic!("prepared audio")
+    };
+    assert_eq!(audio.metadata.initial_pts(), 11);
+    assert_eq!(audio.frames(), 512);
+    let (first, a) = audio.chunk(0).unwrap();
+    let (second, b) = audio.chunk(1).unwrap();
+    assert_eq!((first.pts, first.sample_offset, a.len()), (11, 0, 1024));
+    assert_eq!((second.pts, second.sample_offset, b.len()), (27, 256, 1024));
+    assert!(audio.require_contiguous().is_err());
+    assert!(matches!(
+        events.last(),
+        Some(Event::DecodedEof { frames: 2 })
+    ));
+}
+
+#[test]
+fn pcm_count_must_exactly_match_decoded_audio_inventory_before_preparation() {
+    for output in ["bytes()", "bytes(3)", "bytes(8)"] {
+        let Some((_dir, request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else {
+            return;
+        };
+        replace_tool(&request, "bytes([0,0,1,0])", output);
+        let mut worker = MovieWorker::start(request).unwrap();
+        let (events, result) = drain(&mut worker);
+        assert!(
+            matches!(result, Err(MediaError::Invalid(_))),
+            "{output}: {result:?}"
+        );
+        assert!(
+            events.is_empty(),
+            "{output} must fail before Prepared/decoded EOF"
+        );
+    }
+    let Some((_dir, request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else {
+        return;
+    };
+    replace_tool(&request, "'nb_samples':1", "'nb_samples':2");
+    let mut worker = MovieWorker::start(request).unwrap();
+    let (events, result) = drain(&mut worker);
+    assert!(matches!(result, Err(MediaError::Invalid(_))));
+    assert!(
+        events.is_empty(),
+        "a short whole-sample decode is not accepted either"
+    );
+}
+
+#[test]
+fn audio_frame_limits_and_malformed_timestamps_refuse_before_pcm_decode() {
+    for frame in [
+        "{'nb_samples':1,'stream_index':1,'channels':2}",
+        "{'pts':0,'nb_samples':0,'stream_index':1,'channels':2}",
+        "{'pts':0,'nb_samples':1,'stream_index':1,'channels':2},{'pts':1,'nb_samples':1,'stream_index':1,'channels':2}",
+    ] {
+        let Some((_dir, mut request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else { return };
+        replace_tool(&request, "{'pts':0,'nb_samples':1,'stream_index':1,'channels':2}", frame);
+        replace_tool(&request, "sys.stdout.buffer.write(bytes([0,0,1,0]))", "sys.stderr.write('PCM decoder must not run');sys.exit(9)");
+        request.limits.max_audio_frames = 1;
+        let mut worker = MovieWorker::start(request).unwrap();
+        let (events, result) = drain(&mut worker);
+        assert!(matches!(result, Err(MediaError::Invalid(_))), "{frame}: {result:?}");
+        assert!(events.is_empty());
+    }
+    for max in [0, 100_001] {
+        let Some((_dir, mut request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else {
+            return;
+        };
+        request.limits.max_audio_frames = max;
+        assert!(matches!(
+            MovieWorker::start(request),
+            Err(MediaError::Invalid(_))
+        ));
+    }
 }

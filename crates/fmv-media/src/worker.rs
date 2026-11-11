@@ -1,4 +1,7 @@
-use crate::{metadata, process, FrameTiming, Limits, MediaError, MediaMetadata};
+use crate::{
+    metadata, process, AudioContinuity, AudioFrameTiming, AudioMetadata, FrameTiming, Limits,
+    MediaError, MediaMetadata,
+};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
@@ -26,16 +29,40 @@ pub struct Request {
 #[derive(Debug)]
 pub struct DecodedAudio {
     pub sample_rate: u32,
+    /// Source PTS and exact sample ranges, shared with Event::Prepared metadata.
+    pub metadata: Arc<AudioMetadata>,
     /// Interleaved stereo signed 16-bit little-endian PCM, no synthetic loop region.
     /// Retaining bytes avoids an extra full-sized allocation/conversion on the worker.
-    /// Audio frame PTS continuity is not yet validated: this payload alone must not
-    /// be promoted to an authoritative movie playback clock.
+    /// Frames are concatenated without timestamp repair. Successful decoding does not
+    /// imply continuity: consult metadata or explicitly request simple-clock admission.
     pub pcm_le: Vec<u8>,
 }
 
 impl DecodedAudio {
     pub fn frames(&self) -> usize {
         self.pcm_le.len() / 4
+    }
+
+    /// A decoded frame's exact timestamp and PCM range. No audio is inserted or dropped
+    /// between these chunks, even when their timestamps are incompatible with continuity.
+    pub fn chunk(&self, ordinal: usize) -> Option<(&AudioFrameTiming, &[u8])> {
+        let frame = self.metadata.frames().get(ordinal)?;
+        let start = usize::try_from(frame.sample_offset.checked_mul(4)?).ok()?;
+        let bytes = usize::try_from(u64::from(frame.samples).checked_mul(4)?).ok()?;
+        Some((frame, self.pcm_le.get(start..start.checked_add(bytes)?)?))
+    }
+
+    /// Explicit simple-clock admission only. This leaves the source origin and its
+    /// quantization uncertainty intact; it is not an audio-device or native-game clock.
+    pub fn require_contiguous(&self) -> Result<AudioContinuity, MediaError> {
+        if self.sample_rate != self.metadata.sample_rate()
+            || self.pcm_le.len() != self.metadata.pcm_bytes()?
+        {
+            return Err(MediaError::Invalid(
+                "decoded PCM differs from its sample inventory".into(),
+            ));
+        }
+        self.metadata.require_contiguous()
     }
 }
 
@@ -227,14 +254,42 @@ fn decode(
     let frames = process::capture(
         &request.tools.ffprobe,
         &frames,
-        limits.max_metadata_bytes,
+        limits.max_metadata_bytes.saturating_sub(streams.len()),
         limits.max_stderr_bytes,
         Arc::clone(&cancel),
         deadline,
     )?;
-    let metadata = Arc::new(metadata::parse(&streams, &frames, limits)?);
+    let mut audio_frames = words(&[
+        "-v",
+        "error",
+        "-threads",
+        "2",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-select_streams",
+        "a:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=pts,best_effort_timestamp,nb_samples,sample_rate,channels,stream_index,media_type",
+        "-of",
+        "json",
+    ]);
+    audio_frames.push(path.as_os_str().into());
+    let audio_frames = process::capture(
+        &request.tools.ffprobe,
+        &audio_frames,
+        limits
+            .max_metadata_bytes
+            .saturating_sub(streams.len())
+            .saturating_sub(frames.len()),
+        limits.max_stderr_bytes,
+        Arc::clone(&cancel),
+        deadline,
+    )?;
+    let metadata = Arc::new(metadata::parse(&streams, &frames, &audio_frames, limits)?);
     drop(streams);
     drop(frames);
+    drop(audio_frames);
     let mut audio = words(&[
         "-nostdin",
         "-v",
@@ -252,7 +307,7 @@ fn decode(
     audio.extend(words(&[
         "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar",
     ]));
-    audio.push(metadata.audio.sample_rate.to_string().into());
+    audio.push(metadata.audio.sample_rate().to_string().into());
     audio.extend(words(&["-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]));
     let pcm_le = process::capture(
         &request.tools.ffmpeg,
@@ -267,12 +322,18 @@ fn decode(
             "decoded stereo PCM is empty or has a partial sample frame".into(),
         ));
     }
+    if pcm_le.len() != metadata.audio.pcm_bytes()? {
+        return Err(MediaError::Invalid(
+            "decoded PCM sample count disagrees with the decoded-frame inventory".into(),
+        ));
+    }
     emit(
         send,
         Event::Prepared {
             metadata: Arc::clone(&metadata),
             audio: DecodedAudio {
-                sample_rate: metadata.audio.sample_rate,
+                sample_rate: metadata.audio.sample_rate(),
+                metadata: Arc::clone(&metadata.audio),
                 pcm_le,
             },
         },
@@ -364,33 +425,14 @@ fn read_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AudioMetadata, TimeBase, VideoMetadata};
 
     fn metadata() -> MediaMetadata {
-        MediaMetadata {
-            video: VideoMetadata {
-                width: 1,
-                height: 1,
-                time_base: TimeBase {
-                    numerator: 1,
-                    denominator: 1000,
-                },
-                frames: vec![
-                    FrameTiming {
-                        pts: 0,
-                        duration: 33,
-                    },
-                    FrameTiming {
-                        pts: 37,
-                        duration: 51,
-                    },
-                ],
-            },
-            audio: AudioMetadata {
-                sample_rate: 22_050,
-                channels: 2,
-            },
-        }
+        metadata::parse(
+            br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"vp8","width":1,"height":1,"time_base":"1/1000","start_pts":0},{"index":1,"codec_type":"audio","codec_name":"vorbis","sample_rate":22050,"channels":2,"time_base":"1/22050","start_pts":0}]}"#,
+            br#"{"frames":[{"pts":0,"duration":33,"width":1,"height":1},{"pts":37,"duration":51,"width":1,"height":1}]}"#,
+            br#"{"frames":[{"pts":0,"nb_samples":1,"stream_index":1,"channels":2}]}"#,
+            &Limits::default(),
+        ).expect("complete fixture metadata")
     }
 
     #[test]
@@ -429,5 +471,24 @@ mod tests {
             ),
             Err(MediaError::Cancelled)
         );
+    }
+
+    #[test]
+    fn public_pcm_mutation_cannot_reuse_verified_inventory_for_simple_clock_admission() {
+        let metadata = metadata();
+        let mut audio = DecodedAudio {
+            sample_rate: 22_050,
+            metadata: metadata.audio,
+            pcm_le: vec![0; 4],
+        };
+        assert!(audio.require_contiguous().is_ok());
+        audio.sample_rate = 44_100;
+        assert!(audio.require_contiguous().is_err());
+        audio.sample_rate = 22_050;
+        audio.pcm_le.push(0);
+        assert!(audio.require_contiguous().is_err());
+        audio.pcm_le.clear();
+        assert!(audio.chunk(0).is_none());
+        assert!(audio.require_contiguous().is_err());
     }
 }

@@ -4,6 +4,10 @@
 
 use crate::{Limits, MediaError};
 use serde_json::{Map, Value};
+use std::sync::Arc;
+
+mod audio;
+pub use audio::{AudioContinuity, AudioFrameTiming, AudioMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeBase {
@@ -67,16 +71,11 @@ impl VideoMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioMetadata {
-    pub sample_rate: u32,
-    pub channels: u16,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaMetadata {
     pub video: VideoMetadata,
-    pub audio: AudioMetadata,
+    /// Shared with the decoded PCM; decoded sample ranges retain their source PTS.
+    pub audio: Arc<AudioMetadata>,
 }
 
 fn invalid(message: impl Into<String>) -> MediaError {
@@ -159,7 +158,7 @@ pub fn validate_streams(stream_json: &[u8], limits: &Limits) -> Result<(), Media
 fn parse_streams(
     stream_json: &[u8],
     limits: &Limits,
-) -> Result<(VideoMetadata, AudioMetadata, u32), MediaError> {
+) -> Result<(VideoMetadata, audio::AudioStream, u32), MediaError> {
     if stream_json.len() > limits.max_metadata_bytes {
         return Err(invalid("metadata exceeds its byte limit"));
     }
@@ -224,9 +223,10 @@ fn parse_streams(
                 if required_integer(stream, "channels")? != 2 {
                     return Err(invalid("audio must have two channels"));
                 }
-                audio = Some(AudioMetadata {
+                audio = Some(audio::AudioStream {
+                    index,
                     sample_rate,
-                    channels: 2,
+                    time_base: time_base(stream.get("time_base"))?,
                 });
             }
             _ => {
@@ -242,18 +242,20 @@ fn parse_streams(
     Ok((video, audio, video_index))
 }
 
-/// Parse separate stream and selected-video-frame probe results. The byte budget covers
-/// both JSON documents together. Audio decode size is bounded independently by the worker;
-/// video timing is not evidence of the audio stream's length. Each decoded frame must report
+/// Parse stream and separately selected video/audio decoded-frame results. The byte budget
+/// covers all three documents. Audio sample ranges are checked against the PCM byte budget;
+/// video timing is not evidence of the audio stream's length. Each video frame must report
 /// the declared dimensions; this initial profile does not support changing frame geometry.
 pub fn parse(
     stream_json: &[u8],
     frames_json: &[u8],
+    audio_json: &[u8],
     limits: &Limits,
 ) -> Result<MediaMetadata, MediaError> {
     if stream_json
         .len()
         .checked_add(frames_json.len())
+        .and_then(|bytes| bytes.checked_add(audio_json.len()))
         .is_none_or(|bytes| bytes > limits.max_metadata_bytes)
     {
         return Err(invalid("metadata exceeds its byte limit"));
@@ -295,6 +297,7 @@ pub fn parse(
         });
     }
     video.validate_timing()?;
+    let audio = Arc::new(audio::parse(audio, audio_json, limits)?);
     Ok(MediaMetadata { video, audio })
 }
 
@@ -319,7 +322,7 @@ mod tests {
         (
             json!({"streams": [
                 {"index": 0, "codec_type": "video", "codec_name": "vp8", "width": 1280, "height": 896, "time_base": "1/90000", "start_pts": 0},
-                {"index": 1, "codec_type": "audio", "codec_name": "vorbis", "sample_rate": "44100", "channels": 2, "start_pts": 0}
+                {"index": 1, "codec_type": "audio", "codec_name": "vorbis", "sample_rate": "44100", "channels": 2, "time_base": "1/44100", "start_pts": 0}
             ]}),
             json!({"frames": [
                 {"width": 1280, "height": 896, "pts": 0, "best_effort_timestamp": 0, "duration": 3000, "pkt_duration": 3000},
@@ -333,6 +336,10 @@ mod tests {
         parse(
             &serde_json::to_vec(streams).unwrap(),
             &serde_json::to_vec(frames).unwrap(),
+            &serde_json::to_vec(
+                &json!({"frames":[{"pts":0,"nb_samples":2,"stream_index":1,"channels":2}]}),
+            )
+            .unwrap(),
             limits,
         )
     }
@@ -368,12 +375,11 @@ mod tests {
         );
         assert_eq!(media.video.frame_bytes().unwrap(), 4_587_520);
         assert_eq!(
-            media.audio,
-            AudioMetadata {
-                sample_rate: 44_100,
-                channels: 2
-            }
+            (media.audio.sample_rate(), media.audio.channels()),
+            (44_100, 2)
         );
+        assert_eq!(media.audio.samples(), 2);
+        assert_eq!(media.audio.initial_pts(), 0);
     }
 
     #[test]
@@ -398,6 +404,8 @@ mod tests {
             (0, "time_base", json!("1/0")),
             (0, "time_base", json!("1.0/15")),
             (0, "time_base", json!("1/4294967296")),
+            (1, "time_base", json!("0/1")),
+            (1, "time_base", json!("1/0")),
         ] {
             let mut changed = streams.clone();
             changed["streams"][index][name] = value;
@@ -515,7 +523,14 @@ mod tests {
             + serde_json::to_vec(&frames).unwrap().len()
             - 1;
         assert!(read(&streams, &frames, &small).is_err());
-        assert!(parse(b"{", b"{}", &limits()).is_err());
+        let mut small = limits();
+        small.max_metadata_bytes = serde_json::to_vec(&streams).unwrap().len()
+            + serde_json::to_vec(&frames).unwrap().len();
+        assert!(
+            read(&streams, &frames, &small).is_err(),
+            "the audio document shares the aggregate metadata limit"
+        );
+        assert!(parse(b"{", b"{}", b"{}", &limits()).is_err());
         assert!(read(&streams, &json!({"frames": []}), &limits()).is_err());
         let huge = VideoMetadata {
             width: u32::MAX,

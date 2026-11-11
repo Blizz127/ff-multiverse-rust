@@ -59,9 +59,55 @@ fn opening_movie_decodes_its_actual_timestamps_audio_and_all_frames_before_eof()
                     [0, 67, 133, 200, 267]
                 );
                 assert_eq!(audio.sample_rate, 22_050);
-                assert!(audio.frames() > 2_600_000 && audio.frames() < 2_700_000);
+                assert_eq!(audio.frames(), 2_632_960);
+                assert_eq!(audio.metadata.samples(), 2_632_960);
+                assert_eq!(audio.pcm_le.len(), 10_531_840);
+                assert_eq!(audio.metadata.frames().len(), 5299);
+                assert_eq!(audio.metadata.stream_start_pts(), 0);
+                assert_eq!(audio.metadata.initial_pts(), 11);
+                assert_eq!(
+                    audio.metadata.time_base(),
+                    fmv_media::TimeBase {
+                        numerator: 1,
+                        denominator: 1000
+                    }
+                );
+                let last = audio.metadata.frames().last().unwrap();
+                assert_eq!(
+                    (last.pts, last.samples, last.sample_offset),
+                    (119401, 256, 2_632_704)
+                );
+                let mut samples = 0u64;
+                for (ordinal, frame) in audio.metadata.frames().iter().enumerate() {
+                    assert_eq!(frame.sample_offset, samples);
+                    assert_eq!(
+                        audio.chunk(ordinal).unwrap().1.len(),
+                        frame.samples as usize * 4
+                    );
+                    samples += u64::from(frame.samples);
+                }
+                assert_eq!(samples, 2_632_960);
+                // These are decoder7.0.2 observations, not a native audio-origin policy.
+                // Matroska lace timestamps are synthesized with truncated packet durations.
+                let timing = audio.metadata.continuity();
+                assert_eq!(
+                    (
+                        timing.minimum_origin_numerator,
+                        timing.maximum_origin_numerator
+                    ),
+                    (32_200, 242_550)
+                );
+                assert_eq!(
+                    (timing.origin_denominator, timing.one_tick_numerator),
+                    (22_050_000, 22_050)
+                );
+                assert!(!timing.is_compatible());
+                assert!(
+                    audio.require_contiguous().is_err(),
+                    "successful chunked decode does not authorize a simple sample clock"
+                );
                 eprintln!(
-                    "actual owned PCM frames={} rate={}; video frames={}",
+                    "actual owned PCM frames={} rate={}; video frames={}; audio PTS continuity={timing:?}",
                     audio.frames(),
                     audio.sample_rate,
                     metadata.video.frames.len()
