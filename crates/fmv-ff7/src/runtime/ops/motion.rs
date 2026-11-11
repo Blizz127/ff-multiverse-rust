@@ -151,6 +151,8 @@ struct ModelMotion {
     jump: Option<JumpMotion>,
     /// A walk speed that overrides the model's (`SPLIT`/`JOIN` time their walks).
     speed_override: Option<i32>,
+    /// The model's animation speed when the first ladder armed on it (`LADER` divides the base, not the last result).
+    base_anim_speed: Option<u16>,
     turn: Turn,
     offset: Offset,
 }
@@ -1016,7 +1018,8 @@ impl FieldRuntime {
         mm.end_tri = tri;
         model.anim = anim;
         let divisor = if speed == 0 { None } else { Some(speed) };
-        model.anim_speed = divisor.map_or(model.anim_speed, |d| (i32::from(model.anim_speed) / d) as u16);
+        let base = *mm.base_anim_speed.get_or_insert(model.anim_speed);
+        model.anim_speed = divisor.map_or(base, |d| (i32::from(base) / d) as u16);
         model.anim_status = AnimStatus::DefaultLoop;
         model.dir = dir;
         mm.arm(model, phase);
@@ -1231,7 +1234,9 @@ impl FieldRuntime {
 
     fn split_join_end_walk(&mut self, mi: usize) -> bool {
         let Some((model, mm)) = self.model_pair(mi) else { return true };
-        if mm.state != 2 || mm.phase != Phase::Walk {
+        // A walk the model no longer has (a higher-priority script preempted it) counts as over: waiting for it
+        // would hold the split, and the player's control, for good.
+        if mm.phase == Phase::Walk && mm.state != 2 {
             return false;
         }
         mm.disarm(model);
