@@ -595,6 +595,11 @@ impl Ff7Adapter {
         listed_key(&archive, name)
     }
 
+    /// The maplist id of the field `key` names (the inverse of [`Ff7Adapter::field_key_for_id`]).
+    pub fn field_id_for_key(&self, key: &str) -> Option<u16> {
+        self.maplist()?.id_of(key)
+    }
+
     /// The gateway exits of `field` (see the module docs).
     fn gateway_exits(&self, field: &FieldFile) -> Vec<Exit> {
         let Some(maplist) = self.maplist() else { return Vec::new() };

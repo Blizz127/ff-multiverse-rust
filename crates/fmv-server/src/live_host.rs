@@ -1,6 +1,7 @@
 //! FF7's live fields (`--field-runtime`): the world's [`LiveFieldHost`] over the owner's own field archive, running
 //! [`fmv_ff7::runtime::FieldRuntime`] for every field a governor with a complete story enters.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use fmv_adapter_api::AreaKey;
@@ -11,11 +12,16 @@ use fmv_ff7::story::StoryState;
 use fmv_ff7::{facing_to_field_direction, field_direction_to_facing, Ff7Adapter};
 use fmv_protocol::NpcSnapshot;
 
-use crate::{LiveEvent, LiveField, LiveFieldHost, LiveInput};
+use crate::{LiveBattleOutcome, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
+
+/// The pad bit of the OK button (circle) in the original's key words (`KEY`, `KEYON`, `KEYOF`).
+const PAD_OK: u16 = 0x0020;
 
 /// The live fields of FF7 over an opened adapter.
 pub struct Ff7LiveHost {
     adapter: Arc<Ff7Adapter>,
+    /// The owner's `char.lgp`, for every field animation's length (scripted timing waits on them).
+    char_lgp: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Ff7LiveHost {
@@ -25,8 +31,8 @@ impl std::fmt::Debug for Ff7LiveHost {
 }
 
 impl Ff7LiveHost {
-    pub fn new(adapter: Arc<Ff7Adapter>) -> Self {
-        Self { adapter }
+    pub fn new(adapter: Arc<Ff7Adapter>, char_lgp: Option<PathBuf>) -> Self {
+        Self { adapter, char_lgp }
     }
 }
 
@@ -35,15 +41,36 @@ impl LiveFieldHost for Ff7LiveHost {
         StoryState::decode(progression).is_some_and(|s| Banks::from_story(&s).is_some())
     }
 
-    fn start(&self, area: &AreaKey, progression: &[u8]) -> Option<Box<dyn LiveField>> {
+    fn start(&self, area: &AreaKey, progression: &[u8], seed: &LiveSeed) -> Option<Box<dyn LiveField>> {
         let story = StoryState::decode(progression)?;
         let banks = Banks::from_story(&story)?;
         let field = self.adapter.load_field(area).ok()?;
         let script = field.field_file().section(section::SCRIPT).ok()?;
         let mut rt = FieldRuntime::new(script, banks).ok()?;
         rt.set_walkmesh(Arc::new(field.walkmesh().clone()));
-        rt.init();
         let loader = field.field_file().model_loader().ok();
+        if let (Some(path), Some(loader)) = (&self.char_lgp, &loader) {
+            if let Ok(mut lgp) = fmv_ff7::lgp::LgpArchive::open_path(path) {
+                rt.set_animation_frame_counts(&fmv_ff7::runtime::AnimState::frame_counts_from(&mut lgp, loader));
+            }
+        }
+        // What the governor carries, as the original's save would hold it.
+        rt.gil = seed.gil;
+        let mut save = rt.save_data().clone();
+        for (item, count) in &seed.items {
+            save.items.insert(*item, u8::try_from(*count).unwrap_or(99).min(99));
+        }
+        rt.set_save_data(save);
+        if let Some(t) = seed.play_time {
+            rt.set_play_time_seconds(t);
+        }
+        if let Some(t) = seed.countdown {
+            rt.set_countdown_seconds(t);
+        }
+        if let Some(previous) = seed.previous_area.as_deref().and_then(|k| self.adapter.field_id_for_key(k)) {
+            rt.set_previous_field(previous);
+        }
+        rt.init();
         Some(Box::new(Ff7Live { rt, loader, adapter: Arc::clone(&self.adapter) }))
     }
 }
@@ -67,10 +94,14 @@ impl LiveField for Ff7Live {
             triangle: 0,
             dir: facing_to_field_direction(i.facing),
             ok: i.ok,
-            keys_held: 0,
-            keys_pressed: 0,
+            keys_held: if i.ok { PAD_OK } else { 0 },
+            keys_pressed: if i.ok { PAD_OK } else { 0 },
         });
         self.rt.tick(player);
+        // Tutorials are not shown yet: the field goes on as if the player read it.
+        if self.rt.pending_tutorial().is_some() {
+            self.rt.complete_tutorial();
+        }
         let mut out = Vec::new();
         for event in self.rt.drain_events() {
             match event {
@@ -78,6 +109,8 @@ impl LiveField for Ff7Live {
                 Event::WindowDone { window } | Event::WindowClosedByScript { window } => out.push(LiveEvent::WindowClosed { window }),
                 Event::Command(command) => out.push(self.command(command)),
                 Event::Control { locked } => out.push(LiveEvent::Note(format!("control locked={locked}"))),
+                Event::Gil { delta } => out.push(LiveEvent::Gil { delta }),
+                Event::Item { item, delta } => out.push(LiveEvent::Item { item, delta }),
                 _ => {}
             }
         }
@@ -119,6 +152,24 @@ impl LiveField for Ff7Live {
 
     fn complete_command(&mut self) {
         self.rt.complete_command();
+    }
+
+    fn battle_over(&mut self, outcome: LiveBattleOutcome) {
+        // BTRLD reads it: 0 won, 1 escaped, 2 lost (the port's encoding; the original's values are not verified).
+        self.rt.set_battle_result(match outcome {
+            LiveBattleOutcome::Victory => 0,
+            LiveBattleOutcome::Escaped => 1,
+            LiveBattleOutcome::Defeat => 2,
+        });
+        self.rt.complete_command();
+    }
+
+    fn idle(&self) -> bool {
+        self.rt.command().is_none() && !self.rt.window_open() && !self.rt.state.character_lock
+    }
+
+    fn clocks(&self) -> (u32, u32) {
+        (self.rt.play_time_seconds(), self.rt.countdown_seconds())
     }
 
     fn map_jumps_disabled(&self) -> bool {

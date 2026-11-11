@@ -126,7 +126,7 @@ pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
-pub use live::{LiveEvent, LiveField, LiveFieldHost, LiveInput};
+pub use live::{LiveBattleOutcome, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
 pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 pub(crate) use scene::saved_landing_evidence;
 

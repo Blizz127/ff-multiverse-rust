@@ -562,7 +562,10 @@ async fn build_adapter(cli: &Cli) -> Result<Hosted, SetupError> {
             };
             let live: Option<std::sync::Arc<dyn fmv_server::LiveFieldHost>> = cli
                 .field_runtime
-                .then(|| std::sync::Arc::new(fmv_server::live_host::Ff7LiveHost::new(std::sync::Arc::clone(&opened.adapter))) as std::sync::Arc<dyn fmv_server::LiveFieldHost>);
+                .then(|| {
+                    let char_lgp = fmv_library::ff7::resolve_char_lgp(&cli.ff7_source()).ok().flatten();
+                    std::sync::Arc::new(fmv_server::live_host::Ff7LiveHost::new(std::sync::Arc::clone(&opened.adapter), char_lgp)) as std::sync::Arc<dyn fmv_server::LiveFieldHost>
+                });
             Ok(Hosted {
                 live,
                 adapter: Box::new(SharedFf7(opened.adapter)),

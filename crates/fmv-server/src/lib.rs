@@ -152,7 +152,7 @@ pub mod live_host;
 pub mod scene_host;
 mod world;
 
-pub use world::{LiveEvent, LiveField, LiveFieldHost, LiveInput, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
+pub use world::{LiveBattleOutcome, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 
 pub use accounts::MAX_APPEARANCE_REF;
 

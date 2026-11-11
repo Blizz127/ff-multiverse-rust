@@ -44,8 +44,27 @@ pub trait LiveFieldHost: Send + Sync + std::fmt::Debug {
     /// Whether `area` can run live for a governor with story `progression` (a story the field could misread, one
     /// with unknown bits, never runs).
     fn runs(&self, area: &AreaKey, progression: &[u8]) -> bool;
-    /// Start `area` for the story `progression`.
-    fn start(&self, area: &AreaKey, progression: &[u8]) -> Option<Box<dyn LiveField>>;
+    /// Start `area` for the story `progression`, with what the governor carries and the clocks it brings.
+    fn start(&self, area: &AreaKey, progression: &[u8], seed: &LiveSeed) -> Option<Box<dyn LiveField>>;
+}
+
+/// What a field starts with besides the story: the governor's gil and items, the game clocks it carries from the field
+/// before (play time and the story countdown, seconds) and the field it came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveSeed {
+    pub gil: Option<u32>,
+    pub items: Vec<(u16, u16)>,
+    pub play_time: Option<u32>,
+    pub countdown: Option<u32>,
+    pub previous_area: Option<AreaKey>,
+}
+
+/// How a battle a field started ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveBattleOutcome {
+    Victory,
+    Escaped,
+    Defeat,
 }
 
 /// What the governor does this frame.
@@ -68,6 +87,9 @@ pub enum LiveEvent {
     Movie { movie: u16 },
     Menu { kind: u8, param: u8 },
     GameOver,
+    /// A script gave (positive) or took (negative) gil or items.
+    Gil { delta: i64 },
+    Item { item: u16, delta: i32 },
     /// Something worth a log line.
     Note(String),
 }
@@ -86,6 +108,13 @@ pub trait LiveField: Send {
     fn answer(&mut self, window: u8, choice: Option<u8>) -> bool;
     /// The pending command was carried out.
     fn complete_command(&mut self);
+    /// The battle the field started ended (the command is then complete).
+    fn battle_over(&mut self, outcome: LiveBattleOutcome);
+    /// Whether the field is between scenes: no script holds the player, no window is open and no command is pending.
+    /// Only then is its story saved (a save in the middle of a scene could store a state the original never could).
+    fn idle(&self) -> bool;
+    /// The game clocks now (play time, story countdown; seconds).
+    fn clocks(&self) -> (u32, u32);
     fn map_jumps_disabled(&self) -> bool;
     fn battles_disabled(&self) -> bool;
     /// The progression to save over `saved` (which this field started from or last saved), if the field changed it.
@@ -127,7 +156,9 @@ pub(super) struct LiveWorld {
     answers: Vec<(AccountId, u8, Option<u8>)>,
     movies_done: BTreeSet<AccountId>,
     /// Battles a run is waiting on, and how they ended.
-    battle_results: BTreeMap<BattleId, bool>,
+    battle_results: BTreeMap<BattleId, LiveBattleOutcome>,
+    /// The clocks and the last area each governor left a live field with (carried into the next one).
+    carried: BTreeMap<AccountId, (u32, u32, AreaKey)>,
 }
 
 /// The phase of a live instance governed by `account`.
@@ -226,9 +257,9 @@ impl World {
     }
 
     /// A battle ended: a run waiting on it goes on.
-    pub(super) fn live_battle_finished(&mut self, id: BattleId, victory: bool) {
+    pub(super) fn live_battle_finished(&mut self, id: BattleId, outcome: LiveBattleOutcome) {
         if self.live.runs.values().any(|r| r.waiting == Some(Waiting::Battle(id))) {
-            self.live.battle_results.insert(id, victory);
+            self.live.battle_results.insert(id, outcome);
         }
     }
 
@@ -245,6 +276,8 @@ impl World {
         let gone: Vec<InstanceId> = self.live.runs.keys().filter(|id| !alive.contains(id)).copied().collect();
         for id in gone {
             if let Some(run) = self.live.runs.remove(&id) {
+                let (play, countdown) = run.field.clocks();
+                self.live.carried.insert(run.governor, (play, countdown, run.area.clone()));
                 self.save_live_story(&run, true);
                 self.logs.info(format!("live field stopped area={} governor={} frames={}", run.area, run.governor.0, run.frames));
             }
@@ -253,8 +286,17 @@ impl World {
             if self.live.runs.contains_key(&id) {
                 continue;
             }
-            let Some(progression) = self.by_account.get(&governor).and_then(|e| self.players.get(e)).map(|p| p.progression.clone()) else { continue };
-            match host.start(&area, &progression) {
+            let Some(player) = self.by_account.get(&governor).and_then(|e| self.players.get(e)) else { continue };
+            let progression = player.progression.clone();
+            let carried = self.live.carried.get(&governor).cloned();
+            let seed = LiveSeed {
+                gil: player.progress.map(|p| p.gil),
+                items: player.inventory.as_ref().map(|i| i.entries().iter().map(|e| (e.item, e.count)).collect()).unwrap_or_default(),
+                play_time: carried.as_ref().map(|c| c.0),
+                countdown: carried.as_ref().map(|c| c.1),
+                previous_area: carried.map(|c| c.2),
+            };
+            match host.start(&area, &progression, &seed) {
                 Some(field) => {
                     self.logs.info(format!("live field started area={area} governor={}", governor.0));
                     self.live.runs.insert(
@@ -307,10 +349,17 @@ impl World {
         }
         match run.waiting.clone() {
             Some(Waiting::Battle(battle)) => {
-                if let Some(victory) = self.live.battle_results.remove(&battle) {
+                if let Some(outcome) = self.live.battle_results.remove(&battle) {
                     run.waiting = None;
-                    run.field.complete_command();
-                    self.logs.info(format!("live battle over area={} battle={} victory={victory}", run.area, battle.0));
+                    self.logs.info(format!("live battle over area={} battle={} outcome={outcome:?}", run.area, battle.0));
+                    if outcome == LiveBattleOutcome::Defeat {
+                        // Game over: the field stops; the story keeps its last save between scenes, where the governor comes
+                        // back (MMO-style) the next time it logs in.
+                        self.logs.warn(format!("live game over (battle lost) area={} governor={}", run.area, run.governor.0));
+                        run.halted = true;
+                    } else {
+                        run.field.battle_over(outcome);
+                    }
                 }
             }
             Some(Waiting::Movie { movie, since }) => {
@@ -393,6 +442,8 @@ impl World {
                     jump = Some((target, field_id, arrival, facing, hint));
                 }
                 LiveEvent::Note(note) => self.logs.info(format!("live note area={} {note}", run.area)),
+                LiveEvent::Gil { delta } => self.live_resources(run.governor, delta, None),
+                LiveEvent::Item { item, delta } => self.live_resources(run.governor, 0, Some((item, delta))),
             }
         }
         // The cast, when it changed.
@@ -423,14 +474,38 @@ impl World {
         }
         // The story.
         let jumping = jump.is_some();
-        if jumping || now.saturating_duration_since(run.last_save) >= SAVE_EVERY {
+        if jumping || (run.field.idle() && run.waiting.is_none() && now.saturating_duration_since(run.last_save) >= SAVE_EVERY) {
             self.save_live_story_run(&mut run, now);
+        }
+        if jumping {
+            let (play, countdown) = run.field.clocks();
+            self.live.carried.insert(run.governor, (play, countdown, run.area.clone()));
         }
         self.live.runs.insert(id, run);
         self.drop_failed(failed);
         if let Some((target, field_id, arrival, facing, hint)) = jump {
             self.live_map_jump(id, target, field_id, arrival, facing, hint, now);
         }
+    }
+
+    /// A script gave or took gil or an item. Gains are paid like a battle's reward (saved through the same path, so a
+    /// gift is never lost); losses are not saved yet and are logged (the original takes them in shops, inns and a few
+    /// scripted payments, all still to be carried by the saver).
+    fn live_resources(&mut self, governor: AccountId, gil: i64, item: Option<(u16, i32)>) {
+        let gil_gain = u32::try_from(gil.max(0)).unwrap_or(u32::MAX);
+        let items: Vec<fmv_core::InventoryEntry> = match item {
+            Some((item, delta)) if delta > 0 && item < 128 => vec![fmv_core::InventoryEntry { item, count: u16::try_from(delta).unwrap_or(u16::MAX) }],
+            _ => Vec::new(),
+        };
+        if gil < 0 || item.is_some_and(|(id, d)| d < 0 || id >= 128) {
+            self.logs.warn(format!("live resource change not saved yet account={} gil={gil} item={item:?}", governor.0));
+        }
+        if gil_gain == 0 && items.is_empty() {
+            return;
+        }
+        let mut reward = fmv_protocol::BattleReward::new(governor, 0, gil_gain, 0);
+        reward.items = items;
+        self.pay_live_reward(governor, reward);
     }
 
     /// The entities of instance `id` and whether each is its governor.

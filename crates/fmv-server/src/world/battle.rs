@@ -1207,7 +1207,11 @@ impl World {
             self.fan_to(&[entity], msg);
         }
         // A live field waiting on this battle goes on (its scripts read the result themselves).
-        self.live_battle_finished(id, outcome != Outcome::Defeat);
+        self.live_battle_finished(id, match outcome {
+            Outcome::Victory => super::live::LiveBattleOutcome::Victory,
+            Outcome::Escaped => super::live::LiveBattleOutcome::Escaped,
+            Outcome::Defeat => super::live::LiveBattleOutcome::Defeat,
+        });
         // A battle a story point started is the price of the point's step: paid when it is won, never when it is lost
         // or fled (the story stays where it was, and the point can be reached again).
         if outcome == Outcome::Victory {
@@ -1271,6 +1275,36 @@ impl World {
     /// that was dead at the end) changes nothing: it is not queued and the mirror stays as it is, but
     /// the member that is online is still told where it stands (`leveled_up: false`), so that after a
     /// win every online member of the roster gets `BattleEnd` and then `CharacterProgress`.
+    /// A live field's script gave `account` gil or items: paid and saved like a battle's reward.
+    pub(super) fn pay_live_reward(&mut self, account: AccountId, reward: BattleReward) {
+        let Some(rules) = self.battle.as_ref().map(|bw| Arc::clone(&bw.settings.rules)) else {
+            self.logs.warn(format!("live field gift not paid (this server runs no battle rules) account={} gil={} items={:?}", account.0, reward.gil, reward.items));
+            return;
+        };
+        let entity = self.by_account.get(&account).copied();
+        let character = entity.and_then(|e| self.players.get(&e)).and_then(|p| p.progress.map(|own| own.character)).unwrap_or(0);
+        let queued = self.saver.as_ref().map(|saver| saver.save(SaveJob::reward(account, character, reward.clone())));
+        let mut told: Vec<Outbound> = Vec::new();
+        if let Some(player) = entity.and_then(|e| self.players.get_mut(&e)) {
+            if let Some(own) = player.progress.as_mut() {
+                let leveled_up = progress::apply_reward(rules.as_ref(), own, &reward);
+                told.push(Arc::new(progress::message(rules.as_ref(), own, leveled_up)));
+            }
+            if !reward.items.is_empty() {
+                if let Some(inventory) = player.inventory.as_mut() {
+                    inventory.apply(&Change::Found(reward.items.clone()), rules.max_item_stack());
+                    told.push(Arc::new(inventory.message()));
+                }
+            }
+        }
+        self.logs.info(format!("live field gift account={} gil={} items={:?} saving={queued:?}", account.0, reward.gil, reward.items));
+        if let Some(entity) = entity {
+            for msg in told {
+                self.fan_to(&[entity], msg);
+            }
+        }
+    }
+
     fn pay_members(&mut self, id: BattleId, members: &[Member], rewards: &[BattleReward]) -> Vec<(EntityId, Outbound)> {
         let mut told = Vec::new();
         let Some(rules) = self.battle.as_ref().map(|bw| Arc::clone(&bw.settings.rules)) else { return told };
