@@ -58,8 +58,8 @@ full one turns Attack into the character's limit break, and any character may tr
 per-game appearance binding (a generic placeholder body in FF7), a fighting style (the stat curve of a
 canon party member, separate from the canon story roles) and pointers to its progress, and
 **the story's own party fights beside the players (protocol v9)**: Cloud starts alone and Barret joins at the reactor
-door. These canon companions are commanded by a PLAYER, as in FF7 (the party's leader; the server
-commands them only with `--companions-player-commanded=false`), and each player's character is ADDED
+door. Each player plays only their own new character: the COMPUTER runs these canon companions (the owner's
+direction of 2026-11-11; `--companions-player-commanded` hands them to the party's leader, as in FF7), and each player's character is ADDED
 after them, in its own body, replacing nobody, and **a spell, an item or a limit can hit a whole side (protocol
 v10)**: an ALL place for the target pointer, FF7's All materia rule and the 2/3 split, and **battles have status
 effects (protocol v12)**: Poison, Regen, Sleep, Stop, Paralysis, Silence, Haste, Slow, Barrier, MBarrier,
@@ -74,7 +74,7 @@ as a labelled test area; it says nothing about FF7 support.
 | M2-b | Parties (invite, accept, leave, kick, promote), phase-key instance placement | done (single phase) |
 | M2-c/d | Shared battle, battle return, per-player rewards | done (battle subset; rewards paid into each account's own character progress and saved) |
 | M2-e | Player characters: identity, per-game binding, fighting style (a stat curve) separate from canon roles, pointers to progress (protocol v8) | done for the slice (FF7: generic placeholder bodies, fixed styles; `scripts/slice-smoke.sh`) |
-| M2-f | The story's canon party fights beside the players as companions that the party's leader commands (the server's `--companions-player-commanded`, on by default; the server commands them with it off); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (Cloud, then Cloud and Barret after the door join; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
+| M2-f | The story's canon party fights beside the players as computer-run companions (by default since 2026-11-11; the server's `--companions-player-commanded` lets the party's leader command them); players are added after them (protocol v9, the commander v17) | done for the first reactor mission (Cloud, then Cloud and Barret after the door join; `scripts/battle-smoke.sh`, `scripts/slice-smoke.sh`) |
 | M2-g | Whole-side targeting: spells, items and limits can hit one target or a whole side, the party side being the canon companions and the players (protocol v10) | done for spells, items and limits (FF7: the All materia rule, the 2/3 split; the enemies' own AI still picks one party member; `scripts/battle-smoke.sh --commands`) |
 | M2-h | Status effects: the statuses of the game's own spells, items and enemy attacks, their clocks, what they do to turns, damage and hit rate, cures, panels and body cues (protocol v12) | done for 13 statuses (the engine's `status` module lists what is left out: Confusion, Berserk, Reflect, Petrify, Frog, ...; `scripts/battle-smoke.sh --status`) |
 | Later | FF8, FF9, FF10 and FF12 adapters on the same core, in that order (the owner's roadmap; FF13 maybe later) | planned |

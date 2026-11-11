@@ -97,12 +97,12 @@ CHARACTER PROGRESS:
   pace, level, seed and fight for reproducible runs; --no-random-encounters turns the rolls off.
 
   The canon companions (Cloud and Barret in the first reactor mission) fight beside every player's own
-  character and, as in FF7, are commanded by a PLAYER: --companions-player-commanded (on by default)
-  lets the party's leader give their commands (a solo player commands Cloud, Barret and their own
-  character, each when its gauge is full, and the client's menu moves to whichever of them is ready
-  next); every other player of a party commands only their own character. A full gauge waits for its
-  command. --companions-player-commanded=false is the earlier behaviour: the server commands them on
-  their own gauges (--companion-turn-wait-ms and --companion-max-wait-ms pace that).
+  character, and the COMPUTER commands them by default: each player plays only their own new character
+  (the owner's direction of 2026-11-11), and the server commands the canon heroes on their own gauges
+  (--companion-turn-wait-ms and --companion-max-wait-ms pace that). --companions-player-commanded lets
+  the party's leader give their commands instead, as in FF7 (a solo player then commands Cloud, Barret
+  and their own character, each when its gauge is full, and the client's menu moves to whichever of
+  them is ready next; every other player of a party commands only their own character).
 
 DEBUG FLAGS (smoke-test aids; leave them off on a server real players use):
   --debug-encounters lets a player start a battle on request. --debug-limit-full (refused unless
@@ -331,14 +331,16 @@ struct Cli {
     #[arg(long, value_name = "MS", default_value_t = fmv_server::companion::DEFAULT_MAX_WAIT_MS)]
     companion_max_wait_ms: u32,
 
-    /// Who commands the canon companions (Cloud and Barret in the first reactor mission). true (the default): a player
-    /// does, as in FF7 where the player commands every member of the party. The party LEADER commands them (the first
+    /// Who commands the canon companions (Cloud and Barret in the first reactor mission). false (the default, the owner's
+    /// direction of 2026-11-11: a player plays only their own new character, the canon heroes are computer-run): the
+    /// server commands them with its own rule, each on its own gauge, and nobody may. true: a player does, as in FF7
+    /// where the player commands every member of the party. The party LEADER commands them (the first
     /// player that fights when the leader does not; the one player of a solo battle) and every other player commands only
     /// their own character; a companion whose gauge is full WAITS for its command, and the server commands none of them
     /// while their commander is in the battle (it takes them back if that player leaves). false: the server commands the
     /// companions with its own rule, each on its own gauge, and nobody may (the behaviour of protocol v9 to v16). A bare
     /// flag means true.
-    #[arg(long, value_name = "BOOL", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    #[arg(long, value_name = "BOOL", default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     companions_player_commanded: bool,
 }
 
@@ -851,15 +853,16 @@ mod tests {
         assert!(parse(&["--max-connections", "0"]).is_err());
     }
 
-    /// The switch that hands the canon companions to the players: ON for the server binary (the owner's build), OFF in the
-    /// library's own `BattleSettings::new` (code that builds its settings itself keeps the earlier behaviour until it asks).
+    /// The switch that hands the canon companions to a player: OFF by default (the owner's direction of 2026-11-11: each
+    /// player plays only their own new character and the computer runs the canon heroes), as in the library's own
+    /// `BattleSettings::new`.
     #[test]
-    fn the_companions_are_player_commanded_by_default_and_the_switch_turns_it_off() {
+    fn the_companions_are_computer_commanded_by_default_and_the_switch_hands_them_to_a_player() {
         use fmv_protocol::SyntheticRules;
         let settings = |args: &[&str]| {
             parse(args).unwrap().battle_settings(std::sync::Arc::new(SyntheticRules::default())).companions_player_commanded
         };
-        assert!(settings(&[]), "the server binary lets the players command the companions unless told otherwise");
+        assert!(!settings(&[]), "the server commands the canon companions unless told otherwise (players play their own characters)");
         // A bare flag is true, and a value goes after it either way.
         assert!(settings(&["--companions-player-commanded"]));
         assert!(settings(&["--companions-player-commanded", "true"]));
@@ -872,7 +875,7 @@ mod tests {
         assert!(both.no_random_encounters && both.companions_player_commanded);
         // Anything that is not a boolean is a usage error, not a silent default.
         assert!(parse(&["--companions-player-commanded=maybe"]).is_err());
-        // The library's own default is the earlier behaviour: the server commands them.
+        // The library's own default agrees: the server commands them.
         assert!(!BattleSettings::new(std::sync::Arc::new(SyntheticRules::default())).companions_player_commanded);
     }
 
