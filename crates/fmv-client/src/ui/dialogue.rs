@@ -557,6 +557,7 @@ impl Talk {
         }
         self.live = None;
         self.live_failed = None;
+        self.armed.clear();
         self.conversations.set_story(story());
         let message = self.conversations.live_message(area, view.window, usize::from(view.dialog), view.ask);
         let outcome = Rc::new(Cell::new(live::Outcome::Open));
@@ -574,16 +575,28 @@ impl Talk {
         }
     }
 
-    /// A dialogue key for the live window on show. Returns whether it took the key. Only this player's own window (the leader's)
-    /// answers; a window of another leader is read (paged) and never sends anything.
-    pub fn live_key(&mut self, live: &mut LiveClient, key: DialogueKey) -> bool {
-        let Some(shown) = self.live.as_mut() else { return false };
-        // Leaving is the player's menu's business (Esc, Backspace): a script's window cannot be closed from here.
-        if key == DialogueKey::Back {
+    /// A key event for the live window on show. Returns whether it took the key. Only this player's own window (the leader's)
+    /// answers; a window of another leader is read (paged) and never sends anything. Like a conversation's window, only an arrow
+    /// key pressed while the window is open moves the pointer and repeats (a direction held while walking in does not spin it).
+    pub fn live_key(&mut self, live: &mut LiveClient, code: KeyCode, pressed: bool, repeat: bool) -> bool {
+        if !pressed {
+            self.armed.retain(|k| *k != code);
             return false;
         }
-        let answered = live.windows().find(|w| w.window == shown.window).is_none_or(|w| w.answered);
-        if answered {
+        let Some(shown) = self.live.as_mut() else { return false };
+        // Leaving is the player's menu's business (Esc, Backspace): a script's window cannot be closed from here.
+        let Some(key) = dialogue_key(code, pressed, repeat).filter(|k| *k != DialogueKey::Back) else { return false };
+        if matches!(key, DialogueKey::Up | DialogueKey::Down) {
+            match (repeat, self.armed.contains(&code)) {
+                (false, false) => self.armed.push(code),
+                (true, false) => return false,
+                _ => {}
+            }
+        }
+        // The window the server has now may be another one under the same number (closed and reopened since the last
+        // frame): this one is stale and answers nothing.
+        let current = live.windows().find(|w| w.window == shown.window && w.serial == shown.serial);
+        if current.is_none_or(|w| w.answered) {
             return true;
         }
         // The window stays shown whatever it answers with: the server closes it.

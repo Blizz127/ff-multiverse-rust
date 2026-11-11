@@ -859,10 +859,10 @@ mod live_windows {
         live.on_window(LiveWindowView::new(0, 0, None, true));
         talk.sync_live(&mut live, "md1stin", story);
         assert!(talk.live_is_open() && shows(&talk, "Hello there"));
-        assert!(talk.live_key(&mut live, DialogueKey::Confirm));
+        assert!(talk.live_key(&mut live, KeyCode::Enter, true, false));
         assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 0, choice: None }]);
         // More presses before the server's close change nothing and send nothing; the text stays.
-        assert!(talk.live_key(&mut live, DialogueKey::Confirm));
+        assert!(talk.live_key(&mut live, KeyCode::Enter, true, false));
         assert!(live.take_outbox().is_empty());
         talk.sync_live(&mut live, "md1stin", story);
         assert!(shows(&talk, "Hello there"));
@@ -877,10 +877,10 @@ mod live_windows {
         live.on_window(LiveWindowView::new(2, 1, Some(LiveAsk { first: 1, last: 3 }), true));
         talk.sync_live(&mut live, "md1stin", story);
         assert!(shows(&talk, "Go?") && shows(&talk, "Maybe"));
-        assert!(talk.live_key(&mut live, DialogueKey::Down));
-        assert!(talk.live_key(&mut live, DialogueKey::Down));
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
         assert!(live.take_outbox().is_empty(), "moving the pointer answers nothing");
-        assert!(talk.live_key(&mut live, DialogueKey::Confirm));
+        assert!(talk.live_key(&mut live, KeyCode::Enter, true, false));
         assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 2, choice: Some(2) }]);
     }
 
@@ -890,12 +890,12 @@ mod live_windows {
         live.on_window(LiveWindowView::new(0, 1, Some(LiveAsk { first: 1, last: 3 }), false));
         talk.sync_live(&mut live, "md1stin", story);
         assert!(shows(&talk, "Go?"));
-        for key in [DialogueKey::Down, DialogueKey::Confirm, DialogueKey::Confirm] {
-            assert!(talk.live_key(&mut live, key));
+        for key in [KeyCode::ArrowDown, KeyCode::Enter, KeyCode::Enter] {
+            assert!(talk.live_key(&mut live, key, true, false));
         }
         assert!(live.take_outbox().is_empty());
         assert!(shows(&talk, "Go?"), "it stays until the server closes it");
-        assert!(!talk.live_key(&mut live, DialogueKey::Back), "leaving is the menu's");
+        assert!(!talk.live_key(&mut live, KeyCode::Escape, true, false), "leaving is the menu's");
     }
 
     #[test]
@@ -926,12 +926,52 @@ mod live_windows {
         let (mut talk, mut live) = rig();
         live.on_window(LiveWindowView::new(0, 0, None, true));
         talk.sync_live(&mut live, "md1stin", story);
-        talk.live_key(&mut live, DialogueKey::Confirm);
+        talk.live_key(&mut live, KeyCode::Enter, true, false);
         assert_eq!(live.take_outbox().len(), 1);
         live.on_window(LiveWindowView::new(0, 0, None, true));
         talk.sync_live(&mut live, "md1stin", story);
-        talk.live_key(&mut live, DialogueKey::Confirm);
+        talk.live_key(&mut live, KeyCode::Enter, true, false);
         assert_eq!(live.take_outbox().len(), 1, "answerable again");
+        // Closed and reopened between two frames: the press meets the OLD window and answers nothing for the new one.
+        live.on_window_closed(0);
+        live.on_window(LiveWindowView::new(0, 1, Some(LiveAsk { first: 1, last: 3 }), true));
+        assert!(talk.live_key(&mut live, KeyCode::Enter, true, false), "taken, so that it does not walk");
+        assert!(live.take_outbox().is_empty());
+        talk.sync_live(&mut live, "md1stin", story);
+        assert!(shows(&talk, "Go?"), "and the new window shows next frame");
+    }
+
+    #[test]
+    fn a_direction_held_from_before_the_window_opened_does_not_spin_its_pointer() {
+        let (mut talk, mut live) = rig();
+        live.on_window(LiveWindowView::new(0, 1, Some(LiveAsk { first: 1, last: 3 }), true));
+        talk.sync_live(&mut live, "md1stin", story);
+        // A repeat of a key pressed before the window: not ours (the walk's).
+        assert!(!talk.live_key(&mut live, KeyCode::ArrowDown, true, true));
+        // A fresh press is, and then its repeats are; a release ends the claim.
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, true));
+        assert!(!talk.live_key(&mut live, KeyCode::ArrowDown, false, false));
+        assert!(!talk.live_key(&mut live, KeyCode::ArrowDown, true, true));
+        // The pointer has gone 0 -> 1 -> 2 so far; one fresh press and one repeat of it wrap it round to 1.
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, false));
+        assert!(talk.live_key(&mut live, KeyCode::ArrowDown, true, true));
+        talk.live_key(&mut live, KeyCode::Enter, true, false);
+        assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 0, choice: Some(1) }]);
+    }
+
+    #[test]
+    fn a_cast_makes_the_field_live_for_field_key_too() {
+        use fmv_core::{AccountId, AreaId, EntityId, GameId};
+        let area = AreaId { game: GameId::Fixture, key: "plaza".into() };
+        let mut state = ClientState::new(EntityId(1), AccountId(1), Pos::default(), area.clone());
+        let (mut talk, _) = rig();
+        let key = |talk: &mut Talk, state: &ClientState| field_key(talk, state, "plaza", 0.0, KeyCode::Enter, true, false);
+        // Before any cast this is a static field: OK with nobody near is still a press, from the controller's own scan.
+        assert_eq!(key(&mut talk, &state).interact, Some(None));
+        state.apply(0.0, fmv_protocol::ServerMsg::LiveCast { area, tick: 1, npcs: vec![] });
+        let live_key = key(&mut talk, &state);
+        assert_eq!((live_key.consumed, live_key.interact), (false, Some(None)));
     }
 
     #[test]

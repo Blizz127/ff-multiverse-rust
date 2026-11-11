@@ -22,7 +22,7 @@ use crate::render::{FrameResult, PlayerSprite, Renderer, Scene};
 use crate::scene::{self, SceneRoute};
 use crate::session::{Session, SessionInfo};
 use crate::state::ClientState;
-use crate::ui::dialogue::{dialogue_key, ff7::story_of, field_key, Talk};
+use crate::ui::dialogue::{ff7::story_of, field_key, Talk};
 use crate::ui::draw::DrawList;
 use crate::ui::hud::{self, Subject};
 use fmv_core::{AnimState, GameId, Pos};
@@ -836,10 +836,8 @@ impl App {
             // Key releases must survive every hold, even when the associated press was ignored.
             if !pressed { self.input.set(code, false); }
             // A window the server's script opened takes the OK and arrow keys: that is how the leader answers it.
-            if let Some(key) = dialogue_key(code, pressed, repeat) {
-                if self.talk.live_key(&mut self.session.state.live, key) {
-                    return;
-                }
+            if self.talk.live_key(&mut self.session.state.live, code, pressed, repeat) {
+                return;
             }
             let battle_menu = self.session.state.battle.in_battle() || self.session.state.battle.lingering(now);
             story_pending_route(code, pressed, repeat, battle_menu)
