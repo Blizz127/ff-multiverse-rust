@@ -605,7 +605,17 @@ impl FieldRuntime {
 
     // ---- event requests ------------------------------------------------------------------------------------
 
-    /// Find what the player touched, crossed or talked to this frame.
+    /// Find what the player touched, crossed or talked to this frame, by the original's rules:
+    ///
+    /// * **talk** (OK went down): among the models other than the player's whose talk is on, at a different x/y
+    ///   and within 256 units of height, the one whose direction from the player differs least from the player's
+    ///   facing, if that difference is under a quarter turn and its distance is under its talk range plus the
+    ///   player's solid range. Visibility does not matter, as in the original.
+    /// * **push** (the player moved): every solid model within 128 units of height whose centre is closer than
+    ///   half the two solid ranges.
+    /// * **lines**: a line is touched while the player's nearest point on it (projected inside the segment) is
+    ///   closer than the player's solid range; crossing it (the side changes between the previous and the current
+    ///   position) while touching is "across"; facing it within an eighth of a turn and pressing OK is talk.
     fn detect_player_events(&mut self) {
         let Some(p) = self.player else { return };
         let pc_model = self.state.pc_model;
@@ -618,63 +628,99 @@ impl FieldRuntime {
                 m.dir = p.dir;
             }
         }
-        let window_open = self.window_open();
-        // Talk: the nearest talkable visible model within its talk range in front of the player.
-        if p.ok && !self.state.character_lock && !window_open {
+        let solid = i64::from(self.player_solid_range());
+        let prev = self.previous_player.unwrap_or(p);
+        let moved = (prev.x, prev.y) != (p.x, p.y);
+        let here = (i64::from(p.x), i64::from(p.y), i64::from(p.z));
+
+        if p.ok && !self.state.character_lock {
             let mut best: Option<(i64, usize)> = None;
             for (i, m) in self.models.iter().enumerate() {
-                if Some(i) == pc_model || !m.visible || m.talk_off {
+                if Some(i) == pc_model || m.talk_off {
                     continue;
                 }
-                let (dx, dy) = (i64::from(m.x - p.x), i64::from(m.y - p.y));
-                let d2 = dx * dx + dy * dy;
-                let r = i64::from(m.talk_range);
-                if d2 <= r * r && facing(p.dir, dx, dy) && best.is_none_or(|(bd, _)| d2 < bd) {
-                    best = Some((d2, i));
+                let (dx, dy, dz) = (i64::from(m.x) - here.0, i64::from(m.y) - here.1, here.2 - i64::from(m.z));
+                if (dx == 0 && dy == 0) || dz <= -256 || dz >= 256 {
+                    continue;
+                }
+                let distance = ((dx * dx + dy * dy) as f64).sqrt() as i64;
+                if distance >= i64::from(m.talk_range) + solid {
+                    continue;
+                }
+                let mut diff = i64::from(p.dir.wrapping_sub(direction_of(dx, dy)));
+                if diff > 128 {
+                    diff = 256 - diff;
+                }
+                if diff < 64 && best.is_none_or(|(b, _)| diff < b) {
+                    best = Some((diff, i));
                 }
             }
             if let Some((_, i)) = best {
                 self.models[i].request_talk = true;
             }
         }
-        // Push: touching a solid model's collision circle.
-        for (i, m) in self.models.iter_mut().enumerate() {
-            if Some(i) == pc_model || !m.visible || m.solid_off {
-                continue;
-            }
-            let (dx, dy) = (i64::from(m.x - p.x), i64::from(m.y - p.y));
-            let r = i64::from(m.solid_range) * 2;
-            if dx * dx + dy * dy <= r * r {
-                m.request_push = true;
+        if moved {
+            for (i, m) in self.models.iter_mut().enumerate() {
+                if Some(i) == pc_model || m.solid_off {
+                    continue;
+                }
+                let dz = i64::from(m.z) - here.2;
+                if dz <= -127 || dz >= 128 {
+                    continue;
+                }
+                let (dx, dy) = (i64::from(m.x) - here.0, i64::from(m.y) - here.1);
+                let threshold = (solid + i64::from(m.solid_range)) / 2;
+                if dx * dx + dy * dy < threshold * threshold {
+                    m.request_push = true;
+                }
             }
         }
-        // Lines.
-        let prev = self.previous_player.map(|q| (q.x, q.y)).unwrap_or((p.x, p.y));
-        let range = i64::from(30 * u32::from(self.scale) / 512).max(1);
+        let from = (i64::from(prev.x), i64::from(prev.y), i64::from(prev.z));
+        let to = here;
+        let move_dir = if moved { direction_of(to.0 - from.0, to.1 - from.1) } else { p.dir };
         for l in &mut self.lines {
             if !l.active {
-                l.touching = false;
                 continue;
             }
-            let (ax, ay) = (i64::from(l.a.0), i64::from(l.a.1));
-            let (bx, by) = (i64::from(l.b.0), i64::from(l.b.1));
-            let touching = segment_distance2((ax, ay), (bx, by), (i64::from(p.x), i64::from(p.y))) <= range * range;
-            if touching {
-                l.touch = true;
-                if !l.touching {
-                    l.touch_on = true;
+            let a = (i64::from(l.a.0), i64::from(l.a.1), i64::from(l.a.2));
+            let b = (i64::from(l.b.0), i64::from(l.b.1), i64::from(l.b.2));
+            let probe = if moved { from } else { to };
+            match nearest_on_line(a, b, probe) {
+                Some((d2, nearest)) if d2 < solid * solid => {
+                    if !l.touching {
+                        l.touch_on = true;
+                    }
+                    l.touching = true;
+                    l.touch = true;
+                    let on_line = (probe.0, probe.1) == (nearest.0, nearest.1);
+                    let toward = if on_line { 0 } else { i64::from(direction_of(nearest.0 - probe.0, nearest.1 - probe.1)) };
+                    if moved {
+                        let side = |q: (i64, i64, i64)| (b.0 - a.0) * (q.1 - a.1) - (q.0 - a.0) * (b.1 - a.1);
+                        let (sf, st) = (side(from), side(to));
+                        if (sf >= 0 && st < 0) || (st >= 0 && sf < 0) || (sf > 0 && st <= 0) || (st > 0 && sf <= 0) {
+                            l.across = true;
+                        }
+                        if on_line || (toward - i64::from(move_dir) + 64).rem_euclid(256) < 128 {
+                            l.request_push = true;
+                        }
+                    } else if p.ok && !self.state.character_lock && (on_line || (toward - i64::from(p.dir) + 32).rem_euclid(256) < 64) {
+                        l.request_talk = true;
+                    }
                 }
-                if p.ok && !self.state.character_lock && !window_open {
-                    l.request_talk = true;
+                _ => {
+                    if l.touching {
+                        l.touch_off = true;
+                    }
+                    l.touching = false;
+                    l.touch = false;
                 }
-            } else if l.touching {
-                l.touch_off = true;
             }
-            if segments_cross((ax, ay), (bx, by), (i64::from(prev.0), i64::from(prev.1)), (i64::from(p.x), i64::from(p.y))) {
-                l.across = true;
-            }
-            l.touching = touching;
         }
+    }
+
+    /// The player model's solid range: the original gives the player 34 units at scale 512.
+    fn player_solid_range(&self) -> u16 {
+        (34 * u32::from(self.scale) / 512) as u16
     }
 
     /// Start the scripts the requests raised since the last frame ask for.
@@ -704,7 +750,6 @@ impl FieldRuntime {
             flags.across = false;
             flags.touch_on = false;
             flags.touch_off = false;
-            flags.touch = false;
             if l.request_talk && !self.state.character_lock {
                 self.request_run(l.entity, EVENT_PRIORITY, event_script::TALK);
             }
@@ -852,35 +897,32 @@ enum Flow {
     Broken,
 }
 
-/// Whether a point at `(dx, dy)` from the player is in front of a player facing field direction `dir`
-/// (a 180° half-plane; the original's exact talk cone is not modelled).
-fn facing(dir: u8, dx: i64, dy: i64) -> bool {
-    let angle = f64::from(dir) / 256.0 * std::f64::consts::TAU;
-    // Field direction 0 faces down the screen (+y), increasing clockwise.
-    let (fx, fy) = (-angle.sin(), angle.cos());
-    (dx as f64) * fx + (dy as f64) * fy >= 0.0
+/// The field direction (0-255) of the vector `(dx, dy)`, as the original measures it for talk and lines: 0 along
+/// +x, 64 along +y, 128 along -x, 192 along -y.
+pub fn direction_of(dx: i64, dy: i64) -> u8 {
+    if dx == 0 && dy == 0 {
+        return 0;
+    }
+    let turns = (dy as f64).atan2(dx as f64) / std::f64::consts::TAU;
+    ((turns * 256.0).round() as i64).rem_euclid(256) as u8
 }
 
-fn segment_distance2(a: (i64, i64), b: (i64, i64), p: (i64, i64)) -> i64 {
-    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
-    let (apx, apy) = (p.0 - a.0, p.1 - a.1);
-    let len2 = abx * abx + aby * aby;
+/// The squared distance from `p` to its nearest point on line `a`-`b` and that point, when the projection falls
+/// within the segment's extent in both x and y (the original's test); `None` otherwise.
+fn nearest_on_line(a: (i64, i64, i64), b: (i64, i64, i64), p: (i64, i64, i64)) -> Option<(i64, (i64, i64, i64))> {
+    let d = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+    let len2 = d.0 * d.0 + d.1 * d.1 + d.2 * d.2;
     if len2 == 0 {
-        return apx * apx + apy * apy;
+        return None;
     }
-    let t = (apx * abx + apy * aby).clamp(0, len2);
-    // Closest point a + ab * t / len2, kept in integers by scaling.
-    let cx = a.0 * len2 + abx * t;
-    let cy = a.1 * len2 + aby * t;
-    let (dx, dy) = ((p.0 * len2 - cx) as f64 / len2 as f64, (p.1 * len2 - cy) as f64 / len2 as f64);
-    (dx * dx + dy * dy) as i64
-}
-
-fn segments_cross(a: (i64, i64), b: (i64, i64), c: (i64, i64), d: (i64, i64)) -> bool {
-    if c == d {
-        return false;
+    // Position along the line in 1/256ths, as the original computes it.
+    let t = -256 * ((a.0 - p.0) * d.0 + (a.1 - p.1) * d.1 + (a.2 - p.2) * d.2) / len2;
+    let n = (((t * d.0) >> 8) + a.0, ((t * d.1) >> 8) + a.1, ((t * d.2) >> 8) + a.2);
+    let within = |lo: i64, hi: i64, v: i64| (lo - v >= 0 && hi - v <= 0) || (lo - v <= 0 && hi - v >= 0);
+    if within(a.0, b.0, n.0) && within(a.1, b.1, n.1) {
+        let (ex, ey, ez) = (n.0 - p.0, n.1 - p.1, n.2 - p.2);
+        Some((ex * ex + ey * ey + ez * ez, n))
+    } else {
+        None
     }
-    let orient = |p: (i64, i64), q: (i64, i64), r: (i64, i64)| ((q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)).signum();
-    let (o1, o2, o3, o4) = (orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b));
-    o1 != o2 && o3 != o4 && o1 != 0 && o2 != 0
 }

@@ -149,8 +149,8 @@ fn talking_to_a_model_runs_its_talk_script_at_priority_one() {
     let s = SynthScript::default().entity("npc", npc);
     let mut rt = runtime(s);
     rt.tick(None);
-    // The player stands at (60, 0) facing +x... field direction 192 faces +x under this convention.
-    let player = PlayerInput { x: 60, y: 0, dir: 192, ok: true, ..Default::default() };
+    // The player stands at (60, 0) facing +x (direction 0) with the model 40 units ahead.
+    let player = PlayerInput { x: 60, y: 0, dir: 0, ok: true, ..Default::default() };
     rt.tick(Some(player));
     rt.tick(Some(PlayerInput { ok: false, ..player }));
     assert_eq!(rt.mem.banks.get(0x80), 1);
@@ -166,10 +166,34 @@ fn crossing_a_line_runs_its_across_script() {
     let ent = vec![script0(&line, IDLE), (3, [&set_byte(1, 0x90, 1)[..], &[0x00]].concat())];
     let s = SynthScript::default().entity("line", ent);
     let mut rt = runtime(s);
-    rt.tick(Some(PlayerInput { x: -100, y: 0, ..Default::default() }));
-    rt.tick(Some(PlayerInput { x: 100, y: 0, ..Default::default() }));
-    rt.tick(Some(PlayerInput { x: 100, y: 0, ..Default::default() }));
+    for x in [-40, -20, -5, 5, 20, 40, 40] {
+        rt.tick(Some(PlayerInput { x, y: 0, ..Default::default() }));
+    }
     assert_eq!(rt.mem.banks.get(0x90), 1);
+}
+
+#[test]
+fn talk_needs_the_model_in_front_and_within_reach() {
+    let init = [&[0xA1, 0x00][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
+    let npc = vec![script0(&init, IDLE), (1, [&set_byte(1, 0x80, 1)[..], &[0x00]].concat())];
+    let mut rt = runtime(SynthScript::default().entity("npc", npc));
+    rt.tick(None);
+    // Facing away (direction 128, -x): nothing.
+    rt.tick(Some(PlayerInput { x: 60, y: 0, dir: 128, ok: true, ..Default::default() }));
+    rt.tick(None);
+    assert_eq!(rt.mem.banks.get(0x80), 0);
+    // Too far: 80 + 34 = 114 is the reach.
+    rt.tick(Some(PlayerInput { x: -20, y: 0, dir: 0, ok: true, ..Default::default() }));
+    rt.tick(None);
+    assert_eq!(rt.mem.banks.get(0x80), 0);
+}
+
+#[test]
+fn directions_follow_the_original() {
+    assert_eq!(direction_of(10, 0), 0);
+    assert_eq!(direction_of(0, 10), 64);
+    assert_eq!(direction_of(-10, 0), 128);
+    assert_eq!(direction_of(0, -10), 192);
 }
 
 #[test]
