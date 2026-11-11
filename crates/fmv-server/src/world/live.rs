@@ -402,11 +402,11 @@ impl World {
         let mut jump = None;
         for event in events {
             match event {
-                LiveEvent::Window { window, dialog, ask, entity, offset } => {
+                LiveEvent::Window { window, dialog, ask, entity: opener, offset } => {
                     run.windows.insert(window);
                     if let Some(area) = &area_id {
                         for (entity, governor) in self.instance_members(id, run.governor) {
-                            let msg = ServerMsg::LiveWindow { area: area.clone(), window, dialog, ask: ask.map(|(first, last)| LiveAsk { first, last }), answerable: governor, entity, offset };
+                            let msg = ServerMsg::LiveWindow { area: area.clone(), window, dialog, ask: ask.map(|(first, last)| LiveAsk { first, last }), answerable: governor, entity: opener, offset };
                             self.send_to(entity, msg, &mut failed);
                         }
                     }
