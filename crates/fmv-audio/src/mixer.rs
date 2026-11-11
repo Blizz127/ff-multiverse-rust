@@ -17,6 +17,7 @@
 //!   decoder) is written as silence.
 
 use crate::source::{LoopPoints, MusicSource, Pull, SfxClip};
+use crate::movie::{MovieAudioState, MovieHandle, MovieVoice};
 use crate::status::Shared;
 use crate::types::{PlayOptions, TrackId};
 use std::sync::Arc;
@@ -38,6 +39,9 @@ const GAIN_RAMP_SECONDS: f32 = 0.02;
 
 /// What the engine asks of the mixer. Voices are built by the caller, on its own thread.
 pub(crate) enum Command {
+    PlayMovie(Box<MovieVoice>),
+    PauseMovie { handle: MovieHandle, paused: bool },
+    CancelMovie(MovieHandle),
     PlayMusic { voice: Box<MusicVoice>, fade: Duration },
     StopMusic { fade: Duration },
     PlaySfx(SfxVoice),
@@ -500,6 +504,11 @@ pub(crate) struct Mixer {
     rate: u32,
     shared: Arc<Shared>,
     music: Option<Box<MusicVoice>>,
+    movie: Option<Box<MovieVoice>>,
+    /// A movie that rendered during this callback, including one that ended in an
+    /// earlier block. If another source later panics, the host discards the whole
+    /// callback and this handle must not retain a successful movie EOF.
+    movie_rendered: Option<MovieHandle>,
     fading: Vec<MusicVoice>,
     sfx: Vec<SfxVoice>,
     /// The looping effects, apart from the one-shots so that a burst of those cannot cut an ambience.
@@ -522,6 +531,8 @@ impl Mixer {
         Self {
             rate,
             music: None,
+            movie: None,
+            movie_rendered: None,
             fading: Vec::with_capacity(MAX_FADING_MUSIC),
             sfx: Vec::with_capacity(MAX_SFX_VOICES),
             loops: Vec::with_capacity(MAX_LOOP_VOICES),
@@ -562,6 +573,20 @@ impl Mixer {
 
     pub(crate) fn apply(&mut self, command: Command) {
         match command {
+            Command::PlayMovie(mut voice) => {
+                if let Some(old) = self.movie.as_mut() { old.finish(MovieAudioState::Replaced); }
+                voice.start();
+                self.movie = Some(voice);
+            }
+            Command::PauseMovie { handle, paused } => {
+                if let Some(voice) = self.movie.as_mut().filter(|voice| voice.is(&handle)) { voice.pause(paused); }
+            }
+            Command::CancelMovie(handle) => {
+                if self.movie.as_ref().is_some_and(|voice| voice.is(&handle)) {
+                    if let Some(voice) = self.movie.as_mut() { voice.finish(MovieAudioState::Cancelled); }
+                    self.movie = None;
+                }
+            }
             Command::PlayMusic { mut voice, fade } => {
                 let frames = self.fade_frames(fade);
                 self.retire_music(frames);
@@ -615,6 +640,7 @@ impl Mixer {
 
     /// Fill `out` with interleaved stereo frames (an odd trailing sample is zeroed).
     pub(crate) fn render(&mut self, out: &mut [f32]) {
+        self.movie_rendered = None;
         let levels = self.shared.volumes();
         self.master.target = if self.shared.muted() { 0.0 } else { levels.master };
         self.music_gain.target = levels.music;
@@ -628,11 +654,13 @@ impl Mixer {
         }
         out[frames * 2..].fill(0.0);
         self.shared.count_frames(frames);
+        if let Some(handle) = self.movie_rendered.take() { handle.complete_rendered_callback(); }
     }
 
     fn render_block(&mut self, out: &mut [f32], n: usize) {
         let mut music = [0.0f32; BLOCK_FRAMES * 2];
         let mut sfx = [0.0f32; BLOCK_FRAMES * 2];
+        let mut movie = [0.0f32; BLOCK_FRAMES * 2];
         let (music_acc, sfx_acc) = (&mut music[..n * 2], &mut sfx[..n * 2]);
         let rate = self.rate;
         let mut underrun = false;
@@ -666,6 +694,11 @@ impl Mixer {
             self.shared.set_loops(self.loops.len());
         }
 
+        if let Some(voice) = self.movie.as_mut() {
+            self.movie_rendered = Some(voice.handle());
+            if voice.render(rate, &mut movie[..n * 2]) { self.movie = None; }
+        }
+
         let max_step = n as f32 / (GAIN_RAMP_SECONDS * rate as f32);
         let (m0, m1) = self.music_gain.advance(max_step);
         let (s0, s1) = self.sfx_gain.advance(max_step);
@@ -677,10 +710,17 @@ impl Mixer {
             let sfx_gain = s0 + (s1 - s0) * k;
             let master = g0 + (g1 - g0) * k;
             for ch in 0..2 {
-                let v = (music_acc[i * 2 + ch] * music_gain + sfx_acc[i * 2 + ch] * sfx_gain) * master;
+                let v = (music_acc[i * 2 + ch] * music_gain + sfx_acc[i * 2 + ch] * sfx_gain + movie[i * 2 + ch]) * master;
                 out[i * 2 + ch] = if v.is_finite() { v.clamp(-1.0, 1.0) } else { 0.0 };
             }
         }
+    }
+
+    /// A callback fault discards this mixer. Publish failure before its voice is dropped,
+    /// so a retained movie handle cannot report cancellation or successful completion.
+    pub(crate) fn fault_movie(&mut self) {
+        if let Some(voice) = self.movie.as_mut() { voice.finish(MovieAudioState::Faulted); }
+        if let Some(handle) = self.movie_rendered.take() { handle.fault_rendered_callback(); }
     }
 
     #[cfg(test)]

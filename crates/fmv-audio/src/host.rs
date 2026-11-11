@@ -36,6 +36,7 @@ impl RenderHost {
             Ok(result) => Some(result),
             Err(_) => {
                 self.shared.count_fault();
+                self.mixer.fault_movie();
                 self.mixer = Mixer::new(self.mixer.rate(), self.shared.clone());
                 None
             }
@@ -193,5 +194,29 @@ mod tests {
         assert_eq!((status.music, status.frames_rendered), (Some(TrackId(9)), 0));
         handle.set_output_rate(44_100);
         assert_eq!(shared.snapshot().sample_rate, 44_100);
+    }
+
+    #[test]
+    fn movie_clock_freezes_on_callback_contention_and_retains_phase_when_device_rate_changes() {
+        use crate::movie::{MovieAudioState, MoviePcm, MovieVoice};
+        let (mixer, tx, _shared) = handle();
+        let pcm = MoviePcm::from_s16le(3, vec![0; 40]).expect("ten source frames");
+        let (voice, movie) = MovieVoice::new(pcm, 1.0).expect("movie");
+        tx.send(Command::PlayMovie(Box::new(voice))).expect("queue");
+        mixer.drain_commands();
+        assert_eq!((movie.status().state, movie.status().consumed_frames), (MovieAudioState::Playing, 0));
+        mixer.set_output_rate(2);
+        mixer.render_stereo(&mut [0.0; 2]); // 1.5 source frames
+        assert_eq!(movie.status().consumed_frames, 1);
+        {
+            let _held = mixer.inner.lock().expect("hold callback mutex");
+            let mut out = [1.0; 20];
+            mixer.render_stereo(&mut out);
+            assert_eq!(out, [0.0; 20]);
+            assert_eq!(movie.status().consumed_frames, 1, "silent contended callback consumes nothing");
+        }
+        mixer.set_output_rate(4);
+        mixer.render_stereo(&mut [0.0; 4]); // +1.5 source frames, no phase reset
+        assert_eq!(movie.status().consumed_frames, 3);
     }
 }
