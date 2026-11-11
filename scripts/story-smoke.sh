@@ -147,7 +147,9 @@ run_story() {
   fi
 
   # what the server saw
-  log_has "$sl" "starts with the debug story" || problem "the server never gave the new account the debug story"
+  # Registration persists the initial story before joining the world, so assert the
+  # bytes delivered to the client rather than the old world-side seeding log.
+  log_has "$la" "joined with progress 012100" || problem "the new account did not receive the debug story at moment 33"
   log_has "$sl" "to=md8_4 (where its story stands)" || problem "the account was not sent to md8_4 at login: $(last_line_with "$sl" "story entry" || true)"
   expect_equal "the server's scene starts" "$(count_lines_with "$sl" "scene started run=")" "2"
   expect_equal "the server's scene ends" "$(count_lines_with "$sl" "scene ended run=")" "2"
