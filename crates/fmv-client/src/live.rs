@@ -12,7 +12,7 @@ use fmv_ff7::background::BackgroundOp;
 use fmv_protocol::{ClientMsg, LiveAsk, LiveFade};
 
 /// A window a field script opened.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveWindowView {
     pub window: u8,
     /// The dialog's index in the area's field script.
@@ -20,6 +20,17 @@ pub struct LiveWindowView {
     pub ask: Option<LiveAsk>,
     /// Whether this player's answer is the one that counts.
     pub answerable: bool,
+    /// Which opening of a window this is (counts up in [`LiveClient::on_window`]): a script that opens the same dialog
+    /// twice in a row still gets a fresh window each time.
+    pub serial: u64,
+    /// This window's answer (or dismissal) has been queued for the server; it stays shown until the server closes it.
+    pub answered: bool,
+}
+
+impl LiveWindowView {
+    pub fn new(window: u8, dialog: u16, ask: Option<LiveAsk>, answerable: bool) -> Self {
+        Self { window, dialog, ask, answerable, serial: 0, answered: false }
+    }
 }
 
 /// The live field's state on this side.
@@ -30,6 +41,9 @@ pub struct LiveClient {
     pub locked: bool,
     /// The movie the server asked for, while it plays.
     pub movie: Option<u16>,
+    /// The server's field scripts run this area (a `LiveCast` has come since the area was entered): the scripts own talking.
+    pub live_area: bool,
+    opened: u64,
     outbox: Vec<ClientMsg>,
     notes: Vec<String>,
     /// The background masks last applied, and the operations that bring the shown background to the server's.
@@ -40,7 +54,15 @@ pub struct LiveClient {
 }
 
 impl LiveClient {
-    pub fn on_window(&mut self, view: LiveWindowView) {
+    /// A `LiveCast` arrived: this area is a live field.
+    pub fn on_cast(&mut self) {
+        self.live_area = true;
+    }
+
+    pub fn on_window(&mut self, mut view: LiveWindowView) {
+        self.opened += 1;
+        view.serial = self.opened;
+        view.answered = false;
         self.notes.push(format!(
             "live: window {} dialog {} ask {} answerable {}",
             view.window,
@@ -113,10 +135,12 @@ impl LiveClient {
     /// The player dismissed window `window` (`None`) or answered its question with line `choice`, counted from its first
     /// choice. Only an answerable window's answer is sent; the window stays shown until the server closes it.
     pub fn answer(&mut self, window: u8, choice: Option<u8>) {
-        let Some(view) = self.windows.get(&window) else { return };
-        if !view.answerable {
+        let Some(view) = self.windows.get_mut(&window) else { return };
+        if !view.answerable || view.answered {
             return;
         }
+        view.answered = true;
+        let view = *view;
         let choice = match (view.ask, choice) {
             (Some(ask), Some(c)) => Some(c.min(ask.last.saturating_sub(ask.first))),
             (Some(_), None) => Some(0),
@@ -149,6 +173,7 @@ impl LiveClient {
         self.windows.clear();
         self.locked = false;
         self.movie = None;
+        self.live_area = false;
     }
 }
 
@@ -159,8 +184,8 @@ mod tests {
     #[test]
     fn only_the_leaders_answers_go_out_and_a_question_always_gets_one() {
         let mut live = LiveClient::default();
-        live.on_window(LiveWindowView { window: 1, dialog: 4, ask: Some(LiveAsk { first: 1, last: 3 }), answerable: true });
-        live.on_window(LiveWindowView { window: 2, dialog: 5, ask: None, answerable: false });
+        live.on_window(LiveWindowView::new(1, 4, Some(LiveAsk { first: 1, last: 3 }), true));
+        live.on_window(LiveWindowView::new(2, 5, None, false));
         live.answer(1, Some(9));
         live.answer(2, None);
         assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 1, choice: Some(2) }]);
@@ -168,5 +193,33 @@ mod tests {
         live.movie_done();
         live.movie_done();
         assert_eq!(live.take_outbox(), vec![ClientMsg::LiveMovieDone { movie: 53 }]);
+    }
+
+    #[test]
+    fn a_window_is_answered_once_and_a_reopened_one_can_be_answered_again() {
+        let mut live = LiveClient::default();
+        live.on_window(LiveWindowView::new(0, 7, None, true));
+        let first = live.windows().next().unwrap().serial;
+        live.answer(0, None);
+        live.answer(0, None);
+        assert_eq!(live.take_outbox(), vec![ClientMsg::LiveAnswer { window: 0, choice: None }]);
+        assert!(live.windows().next().unwrap().answered, "it stays shown until the server closes it");
+        // The same dialog opened again is a new window.
+        live.on_window(LiveWindowView::new(0, 7, None, true));
+        let view = *live.windows().next().unwrap();
+        assert_ne!(view.serial, first);
+        assert!(!view.answered);
+        live.answer(0, None);
+        assert_eq!(live.take_outbox().len(), 1);
+    }
+
+    #[test]
+    fn a_cast_makes_a_live_area_until_the_area_changes() {
+        let mut live = LiveClient::default();
+        assert!(!live.live_area);
+        live.on_cast();
+        assert!(live.live_area);
+        live.reset();
+        assert!(!live.live_area);
     }
 }

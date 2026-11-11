@@ -40,6 +40,7 @@
 //! happens, as in the game.
 
 mod layout;
+pub mod live;
 
 pub mod ff7;
 
@@ -58,7 +59,10 @@ use crate::ui::hud::hud_scale;
 use crate::ui::widgets::{Canvas, ACCENT, BORDER, DIM, PANEL_BOTTOM, PANEL_TOP, TEXT};
 use fmv_core::Pos;
 use fmv_ff7::script::dialogue::{Beat, Message, MessageOrigin, MessageSource, TextColour};
+use crate::live::LiveClient;
+use fmv_protocol::LiveAsk;
 use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use winit::keyboard::KeyCode;
 
@@ -454,6 +458,12 @@ pub trait Conversations {
     /// The conversation with `npc`, or `None` when it has nothing to say.
     fn start(&mut self, area: &str, npc: &NpcView) -> Option<Box<dyn MessageSource>>;
 
+    /// The text of dialog `dialog` of `area`'s original field script, as the window `window` of a live field shows it
+    /// (`ask`: the lines of its question), or `None` when this machine cannot read it (no such field or dialog).
+    fn live_message(&mut self, _area: &str, _window: u8, _dialog: usize, _ask: Option<LiveAsk>) -> Option<Message> {
+        None
+    }
+
     /// Where the story comes from (the hook for story progress), for sources whose branches depend
     /// on it; the others ignore it.
     fn set_story(&mut self, _story: ff7::StoryFactory) {}
@@ -493,6 +503,23 @@ pub struct Talk {
     /// player faced a character in reach (the [`NpcView::id`] of the one it picked, whether or not it had anything to
     /// say), `Some(None)` when it found nobody. Taken by [`Talk::take_press`].
     press: Option<Option<u32>>,
+    /// The area is a live field: the server's scripts own talking, so no conversation starts here (see [`Talk::set_live_area`]).
+    live_area: bool,
+    /// The window of a live field's script on show, and the one the server's windows were last built from.
+    live: Option<LiveShown>,
+    /// The window (number and opening) that could not be built, so that it is not tried again every frame.
+    live_failed: Option<(u8, u64)>,
+}
+
+/// A window a live field's script opened, on show.
+struct LiveShown {
+    window: u8,
+    serial: u64,
+    answerable: bool,
+    /// The first line of its question (the answer goes to the server counted from it).
+    first: usize,
+    view: DialogueWindow,
+    outcome: Rc<Cell<live::Outcome>>,
 }
 
 impl std::fmt::Debug for Talk {
@@ -503,7 +530,89 @@ impl std::fmt::Debug for Talk {
 
 impl Talk {
     pub fn new(conversations: Box<dyn Conversations>) -> Self {
-        Self { conversations, window: None, size: Cell::new((960, 540)), armed: Vec::new(), press: None }
+        Self { conversations, window: None, size: Cell::new((960, 540)), armed: Vec::new(), press: None, live_area: false, live: None, live_failed: None }
+    }
+
+    /// Whether the area is a live field (the client has received a `LiveCast` since it entered): the server's own scripts
+    /// run its talks, so an OK press only goes to the server (as `Interact`) and never opens a conversation here.
+    pub fn set_live_area(&mut self, live: bool) {
+        self.live_area = live;
+    }
+
+    /// Whether a live field's window is on show.
+    #[cfg(test)]
+    pub fn live_is_open(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Show what the server's scripts show: the lowest-numbered window `live` has open, built from this machine's own field data
+    /// when it first appears (`story` is asked for the story the text reads, only then). Closes the window the server closed. A window this
+    /// machine cannot show (no such dialog here, nothing written in it) is dismissed at once if this player is the one who answers, so
+    /// that the script is never left waiting on it.
+    pub fn sync_live(&mut self, live: &mut LiveClient, area: &str, story: impl FnOnce() -> ff7::StoryFactory) {
+        let Some(view) = live.windows().next().copied() else {
+            self.live = None;
+            self.live_failed = None;
+            return;
+        };
+        if self.live.as_ref().is_some_and(|s| (s.window, s.serial) == (view.window, view.serial)) || self.live_failed == Some((view.window, view.serial)) {
+            return;
+        }
+        self.live = None;
+        self.live_failed = None;
+        self.armed.clear();
+        self.conversations.set_story(story());
+        let message = self.conversations.live_message(area, view.window, usize::from(view.dialog), view.ask);
+        let outcome = Rc::new(Cell::new(live::Outcome::Open));
+        let first = message.as_ref().and_then(|m| m.choice).map_or(0, |c| c.first);
+        let built = message.and_then(|m| DialogueWindow::open(Box::new(live::LiveSource::new(m, Rc::clone(&outcome)))));
+        match built {
+            Some(window) => {
+                self.live = Some(LiveShown { window: view.window, serial: view.serial, answerable: view.answerable, first, view: window, outcome });
+            }
+            None => {
+                self.live_failed = Some((view.window, view.serial));
+                eprintln!("live: window {} dialog {} has nothing to show here{}", view.window, view.dialog, if view.answerable { "; dismissing it" } else { "" });
+                live.answer(view.window, None);
+            }
+        }
+    }
+
+    /// A key event for the live window on show. Returns whether it took the key. Only this player's own window (the leader's)
+    /// answers; a window of another leader is read (paged) and never sends anything. Like a conversation's window, only an arrow
+    /// key pressed while the window is open moves the pointer and repeats (a direction held while walking in does not spin it).
+    pub fn live_key(&mut self, live: &mut LiveClient, code: KeyCode, pressed: bool, repeat: bool) -> bool {
+        if !pressed {
+            self.armed.retain(|k| *k != code);
+            return false;
+        }
+        let Some(shown) = self.live.as_mut() else { return false };
+        // Leaving is the player's menu's business (Esc, Backspace): a script's window cannot be closed from here.
+        let Some(key) = dialogue_key(code, pressed, repeat).filter(|k| *k != DialogueKey::Back) else { return false };
+        if matches!(key, DialogueKey::Up | DialogueKey::Down) {
+            match (repeat, self.armed.contains(&code)) {
+                (false, false) => self.armed.push(code),
+                (true, false) => return false,
+                _ => {}
+            }
+        }
+        // The window the server has now may be another one under the same number (closed and reopened since the last
+        // frame): this one is stale and answers nothing.
+        let current = live.windows().find(|w| w.window == shown.window && w.serial == shown.serial);
+        if current.is_none_or(|w| w.answered) {
+            return true;
+        }
+        // The window stays shown whatever it answers with: the server closes it.
+        let open = shown.view.key(key, self.size.get());
+        if open || !shown.answerable {
+            return true;
+        }
+        match shown.outcome.get() {
+            live::Outcome::Answered(line) => live.answer(shown.window, Some(u8::try_from(line.saturating_sub(shown.first)).unwrap_or(u8::MAX))),
+            live::Outcome::Dismissed => live.answer(shown.window, None),
+            live::Outcome::Open => {}
+        }
+        true
     }
 
     /// The OK press the last [`Talk::key`] call was (see the `press` field), once: the window sends it to the server as
@@ -550,7 +659,7 @@ impl Talk {
     /// A key event. Returns whether the dialogue took it (the window then does nothing else with it).
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool, around: &Around<'_>) -> bool {
         self.press = None;
-        if around.blocked {
+        if around.blocked || self.live_area {
             self.set_window(None);
         }
         if !pressed {
@@ -577,6 +686,11 @@ impl Talk {
             return true;
         }
         if key != DialogueKey::Confirm || around.blocked {
+            return false;
+        }
+        if self.live_area {
+            // The server's scripts own talking on a live field: the press is theirs (it picks who is in front of the player).
+            self.press = Some(None);
             return false;
         }
         let spots: Vec<Spot> =
@@ -614,6 +728,9 @@ impl Talk {
         if let Some(window) = &self.window {
             window.draw(vw, vh, t, out);
         }
+        if let Some(shown) = &self.live {
+            shown.view.draw(vw, vh, t, out);
+        }
     }
 }
 
@@ -640,6 +757,7 @@ pub fn field_key(talk: &mut Talk, state: &ClientState, area: &str, now: f64, cod
     if dialogue_key(code, pressed, repeat) == Some(DialogueKey::Confirm) && !talk.is_open() && !blocked {
         talk.set_story(ff7::story_of(state.story.state()));
     }
+    talk.set_live_area(state.live.live_area);
     let around = Around { area, own: state.own.pos(), facing: state.own.facing(), npcs: state.npc_views(), blocked };
     let consumed = talk.key(code, pressed, repeat, &around);
     FieldKey { consumed, interact: talk.take_press() }

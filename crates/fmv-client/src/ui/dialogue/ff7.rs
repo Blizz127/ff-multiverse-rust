@@ -33,7 +33,8 @@ use super::layout::is_blank;
 use super::Conversations;
 use crate::mods::{self, ModSink, VoiceCue};
 use crate::state::NpcView;
-use fmv_ff7::script::dialogue::{characters, find_character, Beat, Character, MessageOrigin, MessageSource, StartOfGame, StoryVars, TalkSession};
+use fmv_ff7::script::dialogue::{characters, find_character, parse_message, Beat, Character, Message, MessageOrigin, MessageSource, StartOfGame, StoryVars, TalkSession};
+use fmv_protocol::LiveAsk;
 use fmv_ff7::script::FieldScript;
 use fmv_ff7::story::StoryState;
 use fmv_ff7::Ff7Adapter;
@@ -203,6 +204,16 @@ impl Conversations for Ff7Conversations {
             self.note(format!("mods: talk {area} {}: original section ({why})", npc.name));
         }
         Some(Box::new(session))
+    }
+
+    fn live_message(&mut self, area: &str, window: u8, dialog: usize, ask: Option<LiveAsk>) -> Option<Message> {
+        // The ORIGINAL's table, whatever the text layer: the server runs the original's scripts and names its dialogs.
+        let bytes = Arc::clone(&self.loaded(area)?.original.as_ref()?.bytes);
+        let script = FieldScript::parse(&bytes).ok()?;
+        let d = script.dialogs().get(dialog)?;
+        let raw = script.bytes().get(d.offset..d.offset.checked_add(d.len)?)?;
+        let pieces = parse_message(raw, &*(self.story)());
+        Some(super::live::message_for(dialog, window, pieces, ask))
     }
 
     fn set_story(&mut self, story: StoryFactory) {
