@@ -49,6 +49,10 @@ mod offset_tests;
 mod native_vm_tests;
 #[cfg(test)]
 mod native_outcome_tests;
+#[cfg(test)]
+mod scratch_vm_tests;
+#[cfg(test)]
+mod scratch_scene_tests;
 
 pub use data::*;
 pub use fade::{FadeBlend, FadeColor, FadeOp, FadeState};
@@ -58,3 +62,4 @@ pub use play::{auto_witnesses, auto_witnesses_with_resources, cast_places, cast_
 pub use vm::{AnimHow, Beat, CameraOp, GilOp, SceneResources, Resources, ResourceOutcome, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};
 
 pub use play::{BattleCheckpoint, BattleResolution, BattleResume, WindowCheckpoint, WindowAck, SceneInput, SceneBoundary, SceneSnapshot, ReplayIdentity, REPLAY_VERSION, replay_scene, replay_scene_to, with_trigger_position};
+pub use play::{replay_scene_with_scratch, replay_scene_to_with_scratch, run_to_end_with_scratch_strict, run_section_to_end_with_scratch_strict};

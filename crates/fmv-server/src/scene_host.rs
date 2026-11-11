@@ -60,6 +60,9 @@ fn safe_segment(outcome: &fmv_ff7::script::scene::Outcome, full_restore_is_redun
     let refused = |op: &&'static str| SKIPPED_STATE_OPS.contains(op)
         && !(full_restore_is_redundant && FULL_RESTORE_OPS.contains(op));
     outcome.is_complete()
+        // Checked field scratch belongs to a visit transaction, even when its afterimage
+        // is unchanged. This host can commit story/gil only and must not discard that input.
+        && outcome.scratch.is_none()
         && outcome.unknown_persistent_reads.is_empty()
         && [&outcome.setup_stats, &outcome.stats].iter().all(|s| !s.ignored.keys().any(refused))
         // Every persistent selector must be accounted for, including aliases and the higher banks.
@@ -133,7 +136,7 @@ impl Ff7SceneHost {
     /// Build the final transition against the latest durable segment's input. A resumed scene
     /// uses its post-battle resource snapshot here, so prefix writes cannot replace earned gil.
     fn scene_result(&self, progress: &[u8], story: &StoryState, outcome: &fmv_ff7::script::scene::Outcome, preview: bool, gil: Option<u32>) -> Option<SceneResult> {
-        if !executable_story(story) { return None; }
+        if !executable_story(story) || outcome.scratch.is_some() { return None; }
         if !(if preview { complete_outcome(outcome) } else if story.supports_extended() { safe_interpretation(outcome) } else { safe_outcome(outcome) }) { return None; }
         let mut after = story.clone();
         let changed = if story.supports_extended() {
@@ -345,10 +348,8 @@ mod tests {
     use super::*;
     use fmv_ff7::script::{dialogue::End, scene::{Outcome, Stats, Writes}};
 
-    #[test]
-    fn native_party_stories_refuse_scene_admission_execution_and_checkpoint_replay() {
+    fn empty_host() -> Ff7SceneHost {
         use fmv_core::{EditionProvenance, GameId, Platform};
-        use fmv_ff7::script::scene::{BRIDGE_SCENE_ID, FLOWER_STATION_SCENE_ID, TEAM_TALK_SCENE_ID};
         // An empty synthetic archive makes it observable that refusal precedes any field
         // lookup or interpretation; this gate must not depend on missing owned data.
         let mut archive = b"\0\0SQUARESOFT".to_vec();
@@ -360,7 +361,13 @@ mod tests {
             region: "unknown".into(), language: "en".into(), revision: "gate-test".into(),
             sources: vec![], modded: false,
         }).unwrap();
-        let host = Ff7SceneHost::with_extended_save(Arc::new(adapter), true);
+        Ff7SceneHost::with_extended_save(Arc::new(adapter), true)
+    }
+
+    #[test]
+    fn native_party_stories_refuse_scene_admission_execution_and_checkpoint_replay() {
+        use fmv_ff7::script::scene::{BRIDGE_SCENE_ID, FLOWER_STATION_SCENE_ID, TEAM_TALK_SCENE_ID};
+        let host = empty_host();
         assert!(host.continuation_for(BRIDGE_SCENE_ID, &StoryState::at(39).encode()));
         assert!(host.continuation_for(BRIDGE_SCENE_ID, &StoryState::at(39).into_extended().unwrap().encode()));
         let replay = fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] };
@@ -388,7 +395,7 @@ mod tests {
 
     #[test]
     fn incomplete_or_economic_scenes_cannot_advance_or_travel() {
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default(), scratch: None };
         assert!(safe_outcome(&outcome));
         outcome.unknown_persistent_reads.insert((3, 211));
         assert!(!safe_outcome(&outcome), "assumed persistent inputs cannot drive real progress");
@@ -445,12 +452,56 @@ mod tests {
     }
 
     #[test]
+    fn checked_scratch_cannot_be_discarded_by_story_only_results_even_when_unchanged() {
+        use fmv_ff7::script::{FieldScratch, FieldScratchRun};
+        let host = empty_host();
+        let mut outcome = Outcome { end: End::Finished, windows: 0, questions: 0, writes: Writes::default(), jump: None,
+            setup_stats: Stats::default(), unknown_persistent_reads: Default::default(), party: Vec::new(),
+            resources: fmv_ff7::script::scene::ResourceOutcome { gil_before: Some(240), gil_after: Some(240), ..Default::default() },
+            stats: Stats::default(), scratch: None };
+        let stories = [StoryState::at(39), StoryState::at(39).into_extended().unwrap()];
+        for story in &stories {
+            assert!(host.scene_result(&story.encode(), story, &outcome, false, Some(240)).is_some());
+        }
+        let cleared = FieldScratch::cleared_for_entry();
+        let unchanged = FieldScratchRun::new(&cleared).finish().unwrap();
+        assert!(!unchanged.changed() && !unchanged.any_change());
+        let unread_unknown = FieldScratchRun::new(&FieldScratch::unknown()).finish().unwrap();
+        assert!(!unread_unknown.changed(), "absent visit knowledge is still an explicit checked context");
+        let mut run = FieldScratchRun::new(&cleared);
+        run.write_u8(5, 31, 1).unwrap();
+        let changed = run.snapshot().unwrap();
+        run.write_u8(5, 31, 0).unwrap();
+        let restored = run.finish().unwrap();
+        assert!(!restored.changed() && restored.any_change());
+        let unknown = FieldScratchRun::new(&FieldScratch::unknown());
+        assert!(unknown.read_u8(5, 31).is_err());
+        let fault = unknown.finish();
+        assert!(fault.is_err());
+        for scratch in [Ok(unchanged), Ok(unread_unknown), Ok(changed), Ok(restored), fault] {
+            let complete = scratch.is_ok();
+            outcome.scratch = Some(scratch);
+            if complete { assert!(outcome.is_complete(), "checked scratch can be fully interpreted yet require a visit transaction"); }
+            assert!(!safe_outcome(&outcome));
+            assert!(!safe_interpretation(&outcome));
+            assert!(!safe_segment(&outcome, false) && !safe_segment(&outcome, true));
+            for story in &stories {
+                for preview in [false, true] {
+                    assert!(host.scene_result(&story.encode(), story, &outcome, preview, Some(240)).is_none(),
+                        "the result type cannot silently omit checked visit state (preview={preview})");
+                }
+            }
+        }
+        assert!(host.fields.lock().unwrap().is_empty(), "refusal needs no field lookup or live data");
+    }
+
+    #[test]
     fn extended_commit_checks_all_persistent_banks_and_never_drops_a_resource_operation() {
         use fmv_ff7::script::scene::{GilOp, ResourceOutcome};
         let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None,
             setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(),
             party: Vec::new(), resources: ResourceOutcome { gil_before: Some(1), gil_after: Some(0),
-                gil_ops: vec![GilOp::Subtract(1)], unknown_gil: false }, stats: Stats::default() };
+                gil_ops: vec![GilOp::Subtract(1)], unknown_gil: false }, stats: Stats::default(), scratch: None };
         outcome.writes.persistent.insert((3, 111), (1, 1));
         assert!(safe_interpretation(&outcome));
         assert!(!safe_outcome(&outcome), "legacy saver cannot carry economic effects");
@@ -467,7 +518,7 @@ mod tests {
     fn battle_segments_require_known_state_and_cannot_discard_a_restore() {
         let mut outcome = Outcome { end: End::Battle, windows: 2, writes: Writes::default(), jump: None,
             setup_stats: Stats::default(), questions: 1, unknown_persistent_reads: Default::default(),
-            party: Vec::new(), resources: Default::default(), stats: Stats::default() };
+            party: Vec::new(), resources: Default::default(), stats: Stats::default(), scratch: None };
         assert!(!complete_outcome(&outcome), "a battle is not a completed scene");
         assert!(safe_segment(&outcome, false), "a completely evaluated battle can be checkpointed");
         outcome.unknown_persistent_reads.insert((3, 66));
@@ -556,7 +607,7 @@ mod tests {
     #[test]
     fn a_party_change_is_carried_by_the_storys_party_table_or_refused() {
         use fmv_ff7::story::{PartyOp, BARRET, CLOUD};
-        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default() };
+        let mut outcome = Outcome { end: End::Finished, windows: 0, writes: Writes::default(), jump: None, setup_stats: Stats::default(), questions: 0, unknown_persistent_reads: Default::default(), party: Vec::new(), resources: Default::default(), stats: Stats::default(), scratch: None };
         let (escaped, split_up) = (StoryState::at(33), StoryState::at(36));
         assert!(outcome.party_is_the_storys(&escaped, &escaped), "a scene that touches no party");
         outcome.party = vec![PartyOp::Remove(BARRET)];

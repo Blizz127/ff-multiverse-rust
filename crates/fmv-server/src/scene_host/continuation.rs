@@ -108,7 +108,7 @@ fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32, full_
         windows: snapshot.stats.windows, questions: 0, writes: snapshot.writes,
         jump: snapshot.jump, setup_stats: snapshot.setup_stats,
         unknown_persistent_reads: snapshot.unknown_persistent_reads, party: snapshot.party,
-        resources: snapshot.resources, stats: snapshot.stats,
+        resources: snapshot.resources, stats: snapshot.stats, scratch: snapshot.scratch,
     };
     if !safe_segment(&outcome, full_restore_is_redundant) || outcome.resources.gil_before != Some(gil) { return None; }
     let next_gil = outcome.resources.gil_after?;
@@ -122,6 +122,31 @@ fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32, full_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_scratch_snapshots_cannot_be_reduced_to_story_only_durable_segments() {
+        use fmv_ff7::script::{FieldScratch, FieldScratchRun};
+        use fmv_ff7::script::scene::{ResourceOutcome, Stats, Writes};
+        let before = StoryState::at(39).into_extended().unwrap();
+        let snapshot = SceneSnapshot { boundary: ScriptBoundary::End(End::Finished), writes: Writes::default(),
+            resources: ResourceOutcome { gil_before: Some(240), gil_after: Some(240), ..Default::default() },
+            party: vec![], jump: None, setup_stats: Stats::default(), stats: Stats::default(),
+            unknown_persistent_reads: Default::default(), scratch: None };
+        assert!(checked_segment(snapshot.clone(), &before, 240, false).is_some(), "legacy segment still works");
+        let mut run = FieldScratchRun::new(&FieldScratch::cleared_for_entry());
+        let unchanged = run.snapshot().unwrap();
+        assert!(!unchanged.changed());
+        run.write_u8(6, 31, 7).unwrap();
+        let changed = run.finish().unwrap();
+        let faulted = FieldScratchRun::new(&FieldScratch::unknown());
+        assert!(faulted.read_u8(6, 31).is_err());
+        for scratch in [Ok(unchanged), Ok(changed), faulted.finish()] {
+            let mut checked = snapshot.clone();
+            checked.scratch = Some(scratch);
+            assert!(checked_segment(checked, &before, 240, false).is_none(),
+                "snapshot conversion must retain the checked result or fault so the save guard can refuse it");
+        }
+    }
 
     #[test]
     #[ignore = "needs owner's FMV_FF7_DATA; reads owned scripts without writing live state"]

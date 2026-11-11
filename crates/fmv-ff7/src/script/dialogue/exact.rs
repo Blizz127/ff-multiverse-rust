@@ -2,6 +2,7 @@
 //! No result escapes after a guessed input, skipped effect, or incomplete run.
 
 use super::*;
+use crate::script::{field_wide_bytes, FieldScratch, FieldScratchError, FieldScratchOutcome, FieldScratchRun};
 use crate::story::{canonical_persistent_bank, NativePartyOp, NativePartyOpError, NativeStoryBuilder, NativeStoryError, NativeStoryEvent, NativeStoryJournal, PartyOp, StoryState};
 use std::cell::{Cell, RefCell};
 
@@ -33,6 +34,11 @@ pub struct ExactRun {
     pub native: Option<NativeStoryJournal>,
     /// Exact persistent state at BATTLE, before its victory suffix executes.
     pub battle_story: Option<StoryState>,
+    /// Field-visit memory is separate from persistent story assignments. Present only
+    /// for an explicit checked-scratch entry point; old APIs retain their old behavior.
+    pub scratch: Option<FieldScratchOutcome>,
+    /// Scratch exactly at the acknowledged BATTLE, before its victory suffix.
+    pub battle_scratch: Option<FieldScratch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -43,6 +49,14 @@ pub enum ExactError {
     NativeStory(#[from] NativeStoryError),
     #[error(transparent)]
     NativeParty(#[from] NativePartyOpError),
+    #[error(transparent)]
+    Scratch(#[from] FieldScratchError),
+    #[error("existing-visit setup would change scratch values or knowledge")]
+    SetupScratch,
+    #[error("checked scratch does not accept trigger seeds")]
+    ScratchSeed,
+    #[error("checked scratch requires unambiguous source selectors for triangle read-back")]
+    ScratchTrigger,
     #[error("availability of character {0} is not known")]
     UnknownAvailability(u8),
     #[error("the field has no such entity or script")]
@@ -93,7 +107,8 @@ pub struct ExactScript {
     pub start_offset: Option<usize>,
     pub keys: u32,
     pub seeds: Vec<((u8, u8), u8)>,
-    /// The observed actor for each seeded triangle word (bank, address, entity).
+    /// The observed actor for each seeded triangle (bank, address, entity). Checked scratch
+    /// APIs require the original GETAI selector here, not its canonical physical bank.
     pub triangle_sources: Vec<(u8, u8, usize)>,
     pub after_battle: Option<u16>,
     pub countdown: Option<u32>,
@@ -103,6 +118,7 @@ pub struct ExactScript {
 pub(super) struct ExactState {
     story: StoryState,
     native: Option<NativeStoryBuilder>,
+    scratch: Option<FieldScratchRun>,
     pub(super) masks: BTreeMap<(u8, u8), u8>,
     seeds: BTreeMap<(u8, u8), u8>,
     fault: RefCell<Option<ExactError>>,
@@ -110,8 +126,10 @@ pub(super) struct ExactState {
     after_battle: Option<u16>,
     battle: Option<ExactBattle>,
     battle_story: Option<StoryState>,
+    battle_scratch: Option<FieldScratch>,
     battle_flags: u16,
     triangle_sources: BTreeMap<(u8, u8), usize>,
+    triangle_selectors: BTreeMap<(u8, u8), u8>,
     moved_actors: BTreeSet<usize>,
     all_positions_changed: bool,
     root_triangle_reads: BTreeSet<usize>,
@@ -153,14 +171,76 @@ impl Walk {
             }
         }
         self.exact = Some(ExactState {
-            story: story.clone(), native, masks: BTreeMap::new(), seeds: known,
-            fault: RefCell::new(None), offset: Cell::new(0), after_battle: battle, battle: None, battle_story: None,
+            story: story.clone(), native, scratch: None, masks: BTreeMap::new(), seeds: known,
+            fault: RefCell::new(None), offset: Cell::new(0), after_battle: battle, battle: None, battle_story: None, battle_scratch: None,
             // Original FieldInitDefaultValues starts the field battle mode at zero.
-            battle_flags: 0, triangle_sources: BTreeMap::new(), moved_actors: BTreeSet::new(), all_positions_changed: false, root_triangle_reads: BTreeSet::new(),
+            battle_flags: 0, triangle_sources: BTreeMap::new(), triangle_selectors: BTreeMap::new(), moved_actors: BTreeSet::new(), all_positions_changed: false, root_triangle_reads: BTreeSet::new(),
             party: if story.supports_native_party() { Vec::new() } else { (0..3).filter_map(|slot| story.party_member(slot)).collect() }, party_ops: Vec::new(), party_changed: false,
             countdown: None, countdown_seen: false,
         });
         Ok(self)
+    }
+
+    fn with_scratch(mut self, scratch: Option<&FieldScratch>) -> Self {
+        if let Some(exact) = &mut self.exact { exact.scratch = scratch.map(FieldScratchRun::new); }
+        self
+    }
+
+    fn checked_scratch(&self, bank: u8) -> Option<&FieldScratchRun> {
+        if !matches!(bank, 5 | 6) { return None; }
+        self.exact.as_ref()?.scratch.as_ref()
+    }
+
+    pub(super) fn has_checked_scratch(&self) -> bool {
+        self.exact.as_ref().is_some_and(|exact| exact.scratch.is_some())
+    }
+
+    pub(super) fn checked_scratch_word(&self, bank: u8, address: u8) -> Option<u16> {
+        let scratch = self.checked_scratch(bank)?;
+        Some(match scratch.read_u16(bank, usize::from(address)) {
+            Ok(value) => value,
+            Err(error) => { self.fail_exact(error.into()); 0 },
+        })
+    }
+
+    pub(super) fn checked_field_bit(&self, env: &dyn StoryVars, bank: u8, address: u8, wide: bool, bit: u8) -> Option<bool> {
+        if !self.has_checked_scratch() { return None; }
+        let mask = 1u16 << bit;
+        if let Some(scratch) = self.checked_scratch(bank) {
+            let value = if wide {
+                scratch.read_masked_u16(bank, usize::from(address), mask)
+            } else {
+                scratch.read_masked_u8(bank, usize::from(address), mask as u8).map(u16::from)
+            };
+            return Some(match value {
+                Ok(value) => value & mask != 0,
+                Err(error) => { self.fail_exact(error.into()); false },
+            });
+        }
+        let Some(bytes) = field_wide_bytes(bank) else { self.invalid_exact(); return Some(false); };
+        if wide && bytes == 2 && address == u8::MAX { self.invalid_exact(); return Some(false); }
+        if wide && bytes == 1 && bit >= 8 { return Some(false); }
+        let Some(at) = address.checked_add(bit / 8) else { self.invalid_exact(); return Some(false); };
+        let mask = 1 << (bit % 8);
+        Some(self.read_masked(env, bank, at, mask) & mask != 0)
+    }
+
+    pub(super) fn write_checked_scratch_word(&mut self, bank: u8, address: u8, value: u16) -> bool {
+        if !matches!(bank, 5 | 6) { return false; }
+        let Some(exact) = &mut self.exact else { return false };
+        let Some(scratch) = &mut exact.scratch else { return false };
+        let changed = match scratch.write_u16(bank, usize::from(address), value) {
+            Ok(changed) => changed,
+            Err(error) => { self.fail_exact(error.into()); return true; },
+        };
+        for offset in 0..if bank == 6 { 2 } else { 1 } {
+            let Some(at) = address.checked_add(offset) else { self.invalid_exact(); return true; };
+            let Some(&byte) = scratch.current().values().get(usize::from(at)) else { self.invalid_exact(); return true; };
+            self.writes.insert((5, at), byte);
+            exact.masks.insert((5, at), 255);
+        }
+        if changed { self.idle.clear(); }
+        true
     }
 
     pub(super) fn exact_key(&self, bank: u8, address: u8) -> (u8, u8) {
@@ -185,6 +265,14 @@ impl Walk {
     }
 
     pub(super) fn peek_byte(&self, env: &dyn StoryVars, bank: u8, address: u8) -> u8 {
+        if let Some(scratch) = self.checked_scratch(bank) {
+            // Export bytes only for masked assignment merging; authoritative reads below
+            // always validate the selected knowledge before this value can drive execution.
+            return scratch.current().values().get(usize::from(address)).copied().unwrap_or_else(|| {
+                self.invalid_exact();
+                0
+            });
+        }
         let k = self.exact_key(bank, address);
         if let Some(exact) = &self.exact {
             if let Some(native) = &exact.native {
@@ -202,6 +290,13 @@ impl Walk {
     }
 
     pub(super) fn read_masked(&self, env: &dyn StoryVars, bank: u8, address: u8, mask: u8) -> u8 {
+        if self.has_checked_scratch() && field_wide_bytes(bank).is_none() { self.invalid_exact(); return 0; }
+        if let Some(scratch) = self.checked_scratch(bank) {
+            return match scratch.read_masked_u8(bank, usize::from(address), mask) {
+                Ok(value) => value,
+                Err(error) => { self.fail_exact(error.into()); 0 },
+            };
+        }
         if let Some(exact) = &self.exact {
             let k = key(bank, address);
             let current = exact.native.as_ref().map_or(&exact.story, NativeStoryBuilder::state);
@@ -230,6 +325,14 @@ impl Walk {
                 self.invalid_exact();
                 return;
             }
+            if let Some(scratch) = &mut exact.scratch {
+                if matches!(bank, 5 | 6) {
+                    match scratch.write_masked_u8(bank, usize::from(address), value, mask) {
+                        Ok(changed) => if changed { self.idle.clear(); },
+                        Err(error) => { self.fail_exact(error.into()); return; },
+                    }
+                }
+            }
             if let Some(native) = &mut exact.native {
                 if canonical_persistent_bank(bank).is_some() {
                     if let Err(error) = native.write_masked(bank, address, value, mask) {
@@ -252,6 +355,20 @@ impl Walk {
         let Some(source) = ins.operand("value") else { self.invalid_exact(); return None };
         if source.bank == 0 { return Some(((source.value >> if high { 8 } else { 0 }) & 255) as u8); }
         let address = (source.value & 255) as u8;
+        if high && self.has_checked_scratch() {
+            match field_wide_bytes(source.bank) {
+                // The discarded low byte cannot affect HBYTE. Byte-wide selectors
+                // therefore produce zero without requiring knowledge of that byte.
+                Some(1) => return Some(0),
+                Some(2) => if let Some(scratch) = self.checked_scratch(source.bank) {
+                    return match scratch.read_masked_u16(source.bank, usize::from(address), 0xFF00) {
+                        Ok(value) => Some((value >> 8) as u8),
+                        Err(error) => { self.fail_exact(error.into()); None },
+                    };
+                },
+                _ => { self.invalid_exact(); return None; },
+            }
+        }
         let at = if high { address.checked_add(1) } else { Some(address) };
         let Some(at) = at else { self.invalid_exact(); return None };
         Some(self.var_byte(env, source.bank, at))
@@ -543,13 +660,20 @@ impl Walk {
     /// is inferred from a placeholder position or a default bank value.
     pub(super) fn exact_getai(&mut self, ins: &Instruction) {
         let Some((bank, address)) = Self::dest(ins, "var_triangle") else { self.invalid_exact(); return };
+        if self.has_checked_scratch() && (matches!(bank, 5 | 6)
+            || self.exact.as_ref().and_then(|exact| exact.triangle_selectors.get(&key(bank, address))) != Some(&bank)) {
+            self.fail_exact(ExactError::ScratchTrigger);
+            return;
+        }
         let entity = ins.literal("entity").and_then(|value| usize::try_from(value).ok());
         let value = self.exact.as_ref().and_then(|exact| {
             let entity = entity?;
             if exact.all_positions_changed || exact.moved_actors.contains(&entity)
                 || exact.triangle_sources.get(&key(bank, address)) != Some(&entity) { return None; }
+            let low = *exact.seeds.get(&key(bank, address))?;
+            if exact.scratch.is_some() && field_wide_bytes(bank) == Some(1) { return Some(u16::from(low)); }
             let high = address.checked_add(1)?;
-            Some(u16::from_le_bytes([*exact.seeds.get(&key(bank, address))?, *exact.seeds.get(&key(bank, high))?]))
+            Some(u16::from_le_bytes([low, *exact.seeds.get(&key(bank, high))?]))
         });
         match value {
             Some(value) => {
@@ -597,6 +721,7 @@ impl Walk {
         if exact.after_battle == Some(formation) && exact.battle.is_none() {
             exact.battle = Some(ExactBattle { formation, flags: exact.battle_flags });
             exact.battle_story = exact.native.as_ref().map(|native| native.state().clone());
+            exact.battle_scratch = exact.scratch.as_ref().map(|scratch| scratch.current().clone());
             true
         } else {
             self.fail_exact(ExactError::Battle);
@@ -618,7 +743,8 @@ impl Walk {
             writes.push(ExactWrite { bank, address, value: *value & mask, mask });
         }
         Ok(ExactRun { writes, battle: exact.battle, party: exact.party_ops.clone(),
-            native: exact.native.as_ref().map(NativeStoryBuilder::snapshot), battle_story: exact.battle_story.clone() })
+            native: exact.native.as_ref().map(NativeStoryBuilder::snapshot), battle_story: exact.battle_story.clone(),
+            scratch: exact.scratch.as_ref().map(FieldScratchRun::snapshot).transpose()?, battle_scratch: exact.battle_scratch.clone() })
     }
 }
 
@@ -740,22 +866,48 @@ fn run(walk: &mut Walk, script: &FieldScript<'_>, state: &StoryState, answers: &
 }
 
 pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32, entry: &ExactScript, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    run_script_exact_mode(script, state, None, seed, entry, answers)
+}
+
+/// Execute against an explicit field-visit snapshot. Unknown scratch is never cleared or
+/// inferred from story progress. `through_init` is an explicit authored root-entry choice;
+/// `setup` instead audits existing-visit initialization and cannot change scratch knowledge.
+/// Scratch trigger seeds/read-back remain unsupported: this API has no separate authoritative
+/// triangle-value input. Persistent GETAI observations must retain the original instruction
+/// selector and supply exactly the bytes it reads back. Canonicalized panel metadata does not
+/// establish that provenance, so no checked panel entry is provided.
+pub fn run_script_exact_with_scratch(script: &FieldScript<'_>, state: &StoryState, scratch: &FieldScratch, seed: u32, entry: &ExactScript, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    run_script_exact_mode(script, state, Some(scratch), seed, entry, answers)
+}
+
+fn run_script_exact_mode(script: &FieldScript<'_>, state: &StoryState, scratch: Option<&FieldScratch>, seed: u32, entry: &ExactScript, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    if scratch.is_some() {
+        if entry.seeds.iter().any(|&((bank, _), _)| matches!(bank, 5 | 6)) { return Err(ExactError::ScratchSeed); }
+        if entry.triangle_sources.iter().any(|&(bank, _, _)| matches!(bank, 5 | 6)) { return Err(ExactError::ScratchTrigger); }
+    }
     if script.span(entry.entity, entry.slot).is_none() { return Err(ExactError::MissingScript); }
     let mut walk = Walk::script(entry.entity, entry.slot, seed, Limits::default()).pressing(entry.keys)
-        .exact(state, &entry.seeds, entry.after_battle)?;
+        .exact(state, &entry.seeds, entry.after_battle)?.with_scratch(scratch);
     if let Some(exact) = &mut walk.exact {
         exact.countdown = entry.countdown;
         for &(bank, address, entity) in &entry.triangle_sources {
             if entity >= script.entity_count() { return Err(ExactError::InvalidOperand { offset: 0 }); }
-            let high = address.checked_add(1).ok_or(ExactError::InvalidOperand { offset: 0 })?;
-            if !exact.seeds.contains_key(&key(bank, address)) || !exact.seeds.contains_key(&key(bank, high))
+            let bytes = if scratch.is_some() { field_wide_bytes(bank).ok_or(ExactError::ScratchTrigger)? } else { 2 };
+            let high_known = if bytes == 2 {
+                let high = address.checked_add(1).ok_or(ExactError::InvalidOperand { offset: 0 })?;
+                exact.seeds.contains_key(&key(bank, high))
+            } else { true };
+            if !exact.seeds.contains_key(&key(bank, address)) || !high_known
                 || exact.triangle_sources.insert(key(bank, address), entity).is_some_and(|old| old != entity) {
                 return Err(ExactError::InvalidOperand { offset: 0 });
+            }
+            if scratch.is_some() && exact.triangle_selectors.insert(key(bank, address), bank).is_some_and(|old| old != bank) {
+                return Err(ExactError::ScratchTrigger);
             }
         }
     }
     if entry.setup {
-        let setup = audited_setup(script, entry.entity, state, false)?;
+        let setup = audited_setup(script, entry.entity, state, false, scratch)?;
         if let (Some(exact), Some(setup_exact)) = (&mut walk.exact, &setup.exact) { exact.battle_flags = setup_exact.battle_flags; }
         // Trigger seeds were observed after field setup. Setup placements precede those fresh
         // observations, unlike movements executed by the selected root below.
@@ -774,10 +926,20 @@ pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32,
 /// Audit setup for availability without treating talk-time setup as a new field entry. A setup
 /// assignment must already be fully known with that value; changing values or knowledge refuses.
 pub fn run_talk_exact(script: &FieldScript<'_>, entity: usize, state: &StoryState, seed: u32, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    run_talk_exact_mode(script, entity, state, None, seed, answers)
+}
+
+/// Talk in an existing field visit, retaining its explicit scratch values and knowledge.
+/// Setup is a dry-run audit: even a scratch change followed by restoration refuses.
+pub fn run_talk_exact_with_scratch(script: &FieldScript<'_>, entity: usize, state: &StoryState, scratch: &FieldScratch, seed: u32, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    run_talk_exact_mode(script, entity, state, Some(scratch), seed, answers)
+}
+
+fn run_talk_exact_mode(script: &FieldScript<'_>, entity: usize, state: &StoryState, scratch: Option<&FieldScratch>, seed: u32, answers: &[usize]) -> Result<ExactRun, ExactError> {
     if script.span(entity, INIT_SCRIPT).is_none() || script.span(entity, TALK_SCRIPT).is_none() { return Err(ExactError::MissingScript); }
-    let setup = audited_setup(script, entity, state, true)?;
+    let setup = audited_setup(script, entity, state, true, scratch)?;
     if setup.talk_off || !setup.visible { return Err(ExactError::NotTalkable); }
-    let mut walk = Walk::talk(entity, seed, Limits::default()).exact(state, &[], None)?;
+    let mut walk = Walk::talk(entity, seed, Limits::default()).exact(state, &[], None)?.with_scratch(scratch);
     // Setup scratch values remain available. Persistent assignments above were verified against
     // the exact baseline, so they need neither a second write nor invented known bits.
     if let (Some(exact), Some(setup_exact)) = (&mut walk.exact, &setup.exact) { exact.battle_flags = setup_exact.battle_flags; }
@@ -785,11 +947,12 @@ pub fn run_talk_exact(script: &FieldScript<'_>, entity: usize, state: &StoryStat
     run(&mut walk, script, state, answers)
 }
 
-fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, main: bool) -> Result<Walk, ExactError> {
+fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, main: bool, scratch: Option<&FieldScratch>) -> Result<Walk, ExactError> {
     if script.span(entity, INIT_SCRIPT).is_none() { return Err(ExactError::MissingScript); }
-    let mut setup = Walk::script(entity, INIT_SCRIPT, 1, Limits::default()).exact(state, &[], None)?;
+    let mut setup = Walk::script(entity, INIT_SCRIPT, 1, Limits::default()).exact(state, &[], None)?.with_scratch(scratch);
     setup.quiet = main;
     let established = run(&mut setup, script, state, &[])?;
+    if established.scratch.as_ref().is_some_and(FieldScratchOutcome::any_change) { return Err(ExactError::SetupScratch); }
     if let Some(native) = &established.native {
         if let Some(event) = native.events().iter().find(|event| event.changed()) {
             return Err(match event {

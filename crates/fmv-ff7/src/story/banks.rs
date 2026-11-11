@@ -16,7 +16,8 @@ const MAX_BANK_BYTES: usize = 5 * 256 - 2;
 pub const MAX_BANK_BLOB_BYTES: usize = 5 + 4 * MAX_BANK_BYTES;
 
 /// The physical persistent byte bank for a script's bank selector. The selectors in each pair
-/// address the same bytes; the operation's width determines how many bytes it accesses.
+/// address the same bytes. Storage APIs specify their width explicitly; a script interpreter
+/// must resolve its original selector's access width before canonicalizing the byte address.
 pub fn canonical_persistent_bank(bank: u8) -> Option<u8> {
     match bank {
         1 | 2 => Some(1),

@@ -331,7 +331,8 @@ restore them. See [the current foundation](DISC1-IMPLEMENTATION.md#native-party-
 The remaining integration complements the scheduler design: retaining a scratch image
 alone does not restore an interrupted field runtime.
 
-The pinned PSX engine has one 256-byte `g_FieldMapVars` buffer. Selectors 5/6 alias that
+The pinned PSX engine has one 256-byte `g_FieldMapVars` buffer. The owned PC executable
+independently confirms the same layout at `0xCC14D0`. Selectors 5/6 alias that
 storage: U8 access uses one byte through either selector; S16 access through selector 5
 still uses one unsigned byte, while selector 6 uses two adjacent little-endian bytes.
 Reject a selector-6 word at address 255 instead of reproducing native out-of-array access.
@@ -349,6 +350,13 @@ restoration. These are PSX source findings,
 not independently verified PC runtime behavior. See [scratch reset](https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/field/field_event.c#L132-L155)
 and [map dispatch](https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/field/field_main.c#L259-L270).
 New field entry clears only visit scratch, never the persistent `StoryState` reset image.
+
+Bounded PC inspection confirms the initializer's 256-byte clear at `0x60BEFB..0x60BF20`
+before script dispatch. Caller `0x63BDA8` conditionally bypasses initialization based on
+mode and retained pointers. The native battle-return writer has not been traced, so this
+does not establish universal PC battle-return preservation. Private byte-checked evidence
+is retained under `~/.local/share/ff-multiverse/research/pc-scratch-contract-2026-11-11/`;
+the executable SHA256 is `26998200234f7a49a700bdc1ae5d0a43fd001cc909871a366cf82bdffaa351c9`.
 
 Keep the proposed record separate from story progression and scope it to the account:
 
@@ -377,17 +385,40 @@ not discard the retained runtime.
 The current `jessie_train_talk_scene(bool)`/`Given` input is a probe convenience, not this
 production contract. Expose scratch outcomes separately from persistent story writes.
 
-The next interpreter increment is an opt-in checked-scratch path, with the current
-constructors retaining their legacy behavior. It must accept an explicit `FieldScratch`
-image, export a separate immutable before/after result and actual assignment masks, and
-keep unknown-read faults across setup and battle return. A later write cannot validate an
-earlier guessed read. For an existing visit, setup must be neutral in values and knowledge,
-including temporary changes that it restores; entry initialization is a separate authored
-execution. Reject scratch `Given` overrides and ambiguous trigger seeds initially. In
-particular, the current GETAI seed path loses the original selector when canonicalizing
-5/6, so it cannot yet prove the width of a checked panel read. Checked replay identity
-must include its mode and initial scratch values/masks. This interpreter work alone does
-not enable registration, scene admission, visit persistence or reconnect restoration.
+The opt-in checked-scratch interpreter path now accepts an explicit `FieldScratch` image;
+the existing constructors retain their legacy behavior. `FieldScratchRun` exports an
+immutable before/after result and actual assignment masks, preserving unknown-read faults
+across setup and battle rebase. A later write cannot validate an earlier guessed read.
+For an existing visit, setup must be neutral in values and knowledge, including temporary
+changes that it restores; entry initialization is a separate authored execution. Scratch
+`Given` overrides and scratch trigger seeds refuse. Direct exact GETAI observations into
+persistent storage must retain the executed instruction's original selector and supply its
+actual width. Canonicalized legacy panel metadata cannot prove that provenance; there is
+no checked panel API. Checked replay identity includes mode and initial values/masks.
+Legacy server result/continuation consumers reject every checked scratch result, including
+unchanged images and faults, until story/resources/visit can commit atomically. This work
+does not enable registration, scene admission, visit persistence or reconnect restoration.
+
+The next integration boundary is an idle checked-result commit bridge. Validate the
+complete story/resources/visit predecessor, apply the scratch outcome against its exact
+beforeimage, and submit one existing `Store::commit_field_visit(Advance, expected, next)`
+operation through the saver queue. Preserve the exact request across retries and publish
+the store's returned current state. The immutable field/init source identity is distinct
+from a replay fingerprint that also binds initial scratch. Active scenes need a later
+atomic batch extension: current standalone visit commits reject checkpoints/reservations,
+while scene batches forbid changing visits. No split commit can safely join these paths.
+
+Checked wide accesses preserve the original selector before aliasing: `1,3,5,11,13,15`
+read/write one byte; `2,4,6,7,12,14` use two little-endian bytes. PC helpers `0x60FD6C`
+and `0x61031E` establish this distinction for persistent banks as well as scratch.
+Word arithmetic reads signed 16-bit operands into 32-bit arithmetic and narrows the write.
+The verified PC `PLS2!`/`INC2!` handlers cap only above 32767; `MNS2!`/`DEC2!` instead
+compare against positive 32768, an unusual native rule preserved by the checked path.
+Signed division truncates toward zero; remainder follows the dividend sign. Division by
+zero and a two-byte access at 255 refuse explicitly instead of reproducing native faults
+or accessing neighboring storage. Script BITON/BITOFF/BITXOR use one addressed byte;
+checked execution refuses bit numbers outside the reviewed range 0–7 rather than
+redirecting the write to a neighboring byte. Legacy interpreter arithmetic remains unchanged.
 
 Owned `tin_1` scripts make the atomicity requirement concrete: Jessie 34:1 checks 5:31
 at offset 9089; answer 3 subtracts three affection at 9196; both answers set 5:31 at

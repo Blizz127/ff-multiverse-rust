@@ -165,20 +165,46 @@ and the movie-camera check of all 197 `mainplr` and 192 `ontrain` records. FF7 C
 with all targets passed with only the existing standing-animation warning. Movie
 playback and field-visit activation remain outside this checkpoint.
 
-These paths still use the existing scene scheduler and scratch initialization model.
+These paths still use the existing scene scheduler. Legacy constructors retain their
+scratch initialization model; opt-in checked constructors now accept an explicit image.
 Native-party support alone does not establish a restored field visit. In particular,
 absent scratch must not be assumed zero across separate talks or same-field travel;
-checked visit injection and cache identity are prerequisites for gameplay activation.
+runtime visit injection and cache identity are prerequisites for gameplay activation.
 The sound worker now reports unsupported native-party requests explicitly instead of
 returning an apparently successful empty field-sound plan.
 
 `FieldScratch` provides checked 256-byte values and knowledge masks for future visit
 restoration. Selectors 5/6 alias for byte access; wide selector 5 still uses one byte,
 while selector 6 uses a little-endian word. Invalid boundary reads/writes refuse
-atomically. Its explicit entry clear is distinct from an unknown loaded visit. It is
-not yet connected to the running scene VM; see the
+atomically. Its explicit entry clear is distinct from an unknown loaded visit. The opt-in
+scene VM/ScenePlay and exact ordinary-script/talk APIs now use `FieldScratchRun`, with
+sticky faults and immutable before/after images separate from persistent writes. Existing
+visit setup must change neither values nor knowledge, even temporarily. Checked replay
+identity binds the initial scratch image and mode. Ordinary execution also retains the
+scratch image at the exact BATTLE instruction, separately from its victory afterimage.
+Server result and continuation consumers reject all checked outcomes until they can commit
+the visit atomically, including checked outcomes that changed nothing. See the
 [field-visit contract](FIELD-TIMELINE-DESIGN.md#field-visit-state-contract-runtime-unimplemented)
 for lifetime, continuation and reconstruction requirements.
+
+The checked interpreter's owned Jessie tests execute the original setup roots to derive
+the initial scratch image; no guessed latch or omitted initializer supplies it. Both
+answers are tested at affection 0, 2 and 30, then replayed with the retained afterimage.
+The repeat talk does not deduct affection again, while an explicit new entry restores the
+choice. Unknown or partially unknown latch bytes refuse. The full scene keeps its original
+setup, which must be neutral against the supplied visit image. These checks establish the
+reviewed setup and conversation contract, not continuous ambient, RNG, model or scheduler
+restoration. All 961 FF7 unit tests and all 56 owned tests across `scene_real`,
+`train_lesson_real`, `rootmap_real` and `train_departure_real` pass for this increment.
+The complete workspace run passes 4,356 tests across 108 targets, with no failures and
+384 optional tests ignored. Workspace Clippy with all targets passes; its only warnings
+are the existing audio-test chunking, standing-animation fallback and avatar-test type ones.
+
+Static inspection of the owned PC executable also verifies selector widths across all
+persistent/scratch aliases and the unusual signed-word arithmetic rules now used by checked
+execution. The private evidence is retained with hashes; the
+[field-state contract](FIELD-TIMELINE-DESIGN.md#field-visit-state-contract-runtime-unimplemented)
+records exact helper addresses, unsupported edges and the remaining PC lifetime limits.
 
 `FieldVisitV1` storage keeps entry identity, revision, source identity, an opaque accepted
 arrival and reconstruction anchor, scratch values/masks, and a continuation reference in
@@ -199,7 +225,7 @@ existing 4 MiB character-record bound from the 1 MiB ordinary-record bound.
 This is storage support, not a running field-visit lifecycle. Enter/Advance refuses active
 scene checkpoints/reservations, and existing scene batches cannot change a visit or orphan
 its continuation link. No server path creates these visits yet; login explicitly refuses
-visit-bearing snapshots until anchor reconstruction, VM scratch injection, accepted entry
+visit-bearing snapshots until anchor reconstruction, runtime VM scratch injection, accepted entry
 and atomic active-continuation transitions are implemented. The train lesson remains
 unregistered, and existing accounts are not converted.
 

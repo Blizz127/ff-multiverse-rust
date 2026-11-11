@@ -143,7 +143,21 @@ mod tests_fuzz;
 
 pub use analysis::*;
 pub use decode::*;
-pub use field_scratch::{FieldScratch, FieldScratchError, FIELD_SCRATCH_BYTES};
+pub use field_scratch::{FieldScratch, FieldScratchError, FieldScratchOutcome, FieldScratchRun, FIELD_SCRATCH_BYTES};
+
+/// The original field memory selector controls a wide opcode's access size before
+/// byte-bank aliases are canonicalized. Selector 0 denotes an immediate operand,
+/// not a memory destination. Unsupported selectors are never inferred as zero.
+/// See field_opcodes.c ReadMemoryS16/WriteMemoryS16 in ff7-decomp revision
+/// d4db3de3c3aaf61269e048cf3f6a458996290de0; byte selectors stay unsigned.
+pub(crate) fn field_wide_bytes(selector: u8) -> Option<u8> {
+    match selector {
+        1 | 3 | 5 | 11 | 13 | 15 => Some(1),
+        2 | 4 | 6 | 7 | 12 | 14 => Some(2),
+        _ => None,
+    }
+}
+
 pub use layout::*;
 pub use maplist::*;
 pub use models::*;

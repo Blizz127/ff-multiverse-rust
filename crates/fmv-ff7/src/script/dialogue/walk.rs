@@ -9,13 +9,14 @@
 
 use super::pieces::parse_message;
 use super::{Beat, Choice, End, Message, MessageOrigin, MessageSource, Piece, StoryVars};
-use crate::script::{decode_at, FieldScript, Instruction, INIT_SCRIPT, TALK_SCRIPT};
+use crate::script::{decode_at, field_wide_bytes, FieldScript, Instruction, INIT_SCRIPT, TALK_SCRIPT};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 #[path = "exact.rs"]
 mod exact;
 pub use exact::{run_panel_exact, run_script_exact, run_talk_exact, ExactBattle, ExactError, ExactRun, ExactScript, ExactWrite};
+pub use exact::{run_script_exact_with_scratch, run_talk_exact_with_scratch};
 
 /// How far one walk may go. The defaults are far above anything the owned data needs (the longest
 /// talk script is a few hundred instructions) and still end a `JMPB 0` wait in a blink.
@@ -430,6 +431,14 @@ impl Walk {
     }
 
     fn var_word(&self, env: &dyn StoryVars, bank: u8, address: u8) -> u16 {
+        if self.has_checked_scratch() {
+            match field_wide_bytes(bank) {
+                Some(1) => return u16::from(self.var_byte(env, bank, address)),
+                Some(2) => {},
+                _ => { self.invalid_exact(); return 0; },
+            }
+        }
+        if let Some(value) = self.checked_scratch_word(bank, address) { return value; }
         if address == u8::MAX { self.invalid_exact(); }
         let low = self.var_byte(env, bank, address);
         let high = address.checked_add(1).map_or(0, |a| self.var_byte(env, bank, a));
@@ -441,6 +450,14 @@ impl Walk {
     }
 
     fn set_word(&mut self, bank: u8, address: u8, value: u16) {
+        if self.has_checked_scratch() {
+            match field_wide_bytes(bank) {
+                Some(1) => { self.set_byte(bank, address, value as u8); return; },
+                Some(2) => {},
+                _ => { self.invalid_exact(); return; },
+            }
+        }
+        if self.write_checked_scratch_word(bank, address, value) { return; }
         if self.exact.is_some() && address == u8::MAX { self.invalid_exact(); return; }
         if self.native_word(bank, address, value) { return; }
         let [low, high] = value.to_le_bytes();
@@ -483,11 +500,13 @@ impl Walk {
 
     fn arithmetic(&mut self, env: &dyn StoryVars, ins: &Instruction, op: Arith, wide: bool, saturate: bool) {
         let Some(var) = Self::dest(ins, "var") else { self.invalid_exact(); return };
+        let checked_wide = wide && self.has_checked_scratch();
         // (a plain set never looks at what the variable held)
         let cur = if matches!(op, Arith::Set) {
             0
         } else if wide {
-            i64::from(self.var_word(env, var.0, var.1))
+            let value = self.var_word(env, var.0, var.1);
+            if checked_wide { i64::from(i16::from_le_bytes(value.to_le_bytes())) } else { i64::from(value) }
         } else {
             i64::from(self.var_byte(env, var.0, var.1))
         };
@@ -511,7 +530,20 @@ impl Walk {
             Arith::Inc => cur.saturating_add(1),
             Arith::Dec => cur.saturating_sub(1),
         };
-        self.store(var, wide, new, saturate);
+        // Native wide arithmetic reads signed operands before narrowing the final write.
+        // PLS2!/INC2! clamp only the upper end (field_opcodes.c:4301–4312,4695–4706).
+        if checked_wide {
+            let new = match ins.opcode {
+                0x77 | 0x7B => new.min(i64::from(i16::MAX)),
+                // Both pinned PSX and PC handlers compare against positive 32768.
+                // This surprising native rule is not a conventional signed lower clamp.
+                0x79 | 0x7D => new.max(32768),
+                _ => new,
+            };
+            self.store(var, true, new, false);
+        } else {
+            self.store(var, wide, new, saturate);
+        }
     }
 
     /// `BITON`/`BITOFF`/`BITXOR`: the variable is a row of bits, bit `n` being bit `n % 8` of the
@@ -797,6 +829,7 @@ impl Walk {
                 let selected_bit = if self.exact.is_some() && matches!(comparison, 9 | 10) {
                     Self::dest(&ins, "left").and_then(|(bank, address)| {
                         let bit = u8::try_from(right).ok().filter(|&bit| u32::from(bit) < bits)?;
+                        if let Some(on) = self.checked_field_bit(env, bank, address, bits == 16, bit) { return Some(on); }
                         let address = address.checked_add(bit / 8)?;
                         Some(self.read_masked(env, bank, address, 1 << (bit % 8)) & (1 << (bit % 8)) != 0)
                     })

@@ -77,6 +77,9 @@
 //! The caller commits the result against its exact predecessor; a configured battle continuation
 //! must be gated on that battle's authoritative victory before publication. These APIs do not
 //! change the permissive window and survey behavior described above.
+//! [`run_script_exact_with_scratch`] and [`run_talk_exact_with_scratch`] additionally require
+//! an explicit field-visit snapshot and return its separate checked afterimage. They never
+//! clear scratch implicitly or fold it into persistent story writes.
 //!
 //! # Origins
 //!
@@ -106,10 +109,13 @@ mod tests;
 mod exact_tests;
 #[cfg(test)]
 mod native_exact_tests;
+#[cfg(test)]
+mod checked_scratch_tests;
 
 pub use pieces::{parse_message, Piece, TextColour, CHARACTER_NAMES};
 pub use walk::{availability, run_talk, Availability, Limits, Spot, TalkError, TalkRun, TalkSession, Walk, EFFECT_NOTE_LAYER, KEY_OK};
 pub use walk::{run_panel_exact, run_script_exact, run_talk_exact, ExactBattle, ExactError, ExactRun, ExactScript, ExactWrite};
+pub use walk::{run_script_exact_with_scratch, run_talk_exact_with_scratch};
 
 use super::FieldScript;
 
@@ -120,8 +126,9 @@ pub trait StoryVars {
     /// A richer save format must refuse before any legacy branch or setup is evaluated.
     fn execution_supported(&self) -> bool { true }
 
-    /// The savemap variable `address` of bank `bank` (1..=15) read as one byte. A word is the
-    /// byte at `address` and the one after it (little endian), so only bytes are asked for.
+    /// The savemap variable `address` of bank `bank` (1..=15) as one legacy/preview byte.
+    /// Checked field scratch bypasses this hook and preserves the original selector width:
+    /// wide selector 5 accesses one unsigned byte; selector 6 accesses a little-endian word.
     fn byte(&self, bank: u8, address: u8) -> u8;
 
     /// The playable character (0 = Cloud, 1 = Barret, ... 8 = Cid) standing in party slot `slot`

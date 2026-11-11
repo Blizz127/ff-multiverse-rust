@@ -12,9 +12,13 @@
 //! the native entry clear happened. Unknown bits have canonical zero values, and reads
 //! refuse missing knowledge. A loaded image must already be canonical. Word access at
 //! selector 6/address 255 is rejected before reading or writing; the native handler's
-//! unchecked neighbour access is not reproduced. This type is not wired into the VM.
+//! unchecked neighbour access is not reproduced. Interpreters opt into checked execution
+//! through [`FieldScratchRun`]; no constructor infers a new field entry.
 
 use std::ops::Range;
+
+mod run;
+pub use run::{FieldScratchOutcome, FieldScratchRun};
 
 pub const FIELD_SCRATCH_BYTES: usize = 256;
 
@@ -24,6 +28,8 @@ pub enum FieldScratchError {
     OutOfBounds { address: usize, bytes: u8 },
     Unknown { address: usize, missing_mask: u8 },
     NonCanonical { address: usize, unknown_value_bits: u8 },
+    StalePredecessor,
+    InvalidOutcome,
 }
 
 impl std::fmt::Display for FieldScratchError {
@@ -33,6 +39,8 @@ impl std::fmt::Display for FieldScratchError {
             Self::OutOfBounds { address, bytes } => write!(f, "{bytes}-byte scratch access at {address} exceeds 256 bytes"),
             Self::Unknown { address, missing_mask } => write!(f, "scratch byte {address} has unknown bits {missing_mask:#04x}"),
             Self::NonCanonical { address, unknown_value_bits } => write!(f, "scratch byte {address} has nonzero unknown bits {unknown_value_bits:#04x}"),
+            Self::StalePredecessor => write!(f, "scratch differs from the exact execution predecessor"),
+            Self::InvalidOutcome => write!(f, "scratch outcome values or knowledge disagree with its assignments"),
         }
     }
 }
@@ -91,15 +99,22 @@ impl FieldScratch {
 
     /// Selector 5 zero-extends one byte; selector 6 reads a little-endian word.
     pub fn read_u16(&self, selector: u8, address: usize) -> Result<u16, FieldScratchError> {
+        self.read_masked_u16(selector, address, u16::MAX)
+    }
+
+    /// Check the wide access bounds before reading only the selected physical bits. Selector
+    /// 5's upper bits are constant zero and require no neighbouring byte or knowledge. A
+    /// selector-6 word at 255 still refuses even when only its low bits are requested.
+    pub fn read_masked_u16(&self, selector: u8, address: usize, mask: u16) -> Result<u16, FieldScratchError> {
         let range = access(selector, address, true)?;
         let error = FieldScratchError::OutOfBounds { address, bytes: (range.end - range.start) as u8 };
         let values = self.values.get(range.clone()).ok_or(error)?;
         let known = self.known_masks.get(range).ok_or(error)?;
         let mut word = [0u8; 2];
-        for (offset, (target, (&value, &mask))) in word.iter_mut().zip(values.iter().zip(known)).enumerate() {
-            let missing_mask = !mask;
+        for (offset, ((target, (&value, &known)), required)) in word.iter_mut().zip(values.iter().zip(known)).zip(mask.to_le_bytes()).enumerate() {
+            let missing_mask = required & !known;
             if missing_mask != 0 { return Err(FieldScratchError::Unknown { address: address + offset, missing_mask }); }
-            *target = value;
+            *target = value & required;
         }
         Ok(u16::from_le_bytes(word))
     }

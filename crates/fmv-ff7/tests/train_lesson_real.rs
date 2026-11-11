@@ -7,14 +7,15 @@ mod script_common;
 use fmv_core::Pos;
 use fmv_ff7::field::FieldFile;
 use fmv_ff7::lgp::LgpArchive;
-use fmv_ff7::script::dialogue::End;
+use fmv_ff7::script::dialogue::{run_talk_exact_with_scratch, End, ExactError, ExactRun};
 use fmv_ff7::script::scene::{
     jessie_train_talk_scene, run_to_end_with_resources_strict, scenes, train_map_return_scene,
-    with_trigger_position, Outcome, SceneBoundary, SceneDef, SceneJump, ScenePlay, SceneResources,
-    Stage, Then, WindowAck, JESSIE_TRAIN_TALK_SCENE_ID, TRAIN_DEPARTURE_SCENE_ID,
+    with_trigger_position, Limits, Outcome, SceneBoundary, SceneDef, SceneError, SceneJump, ScenePlay,
+    SceneResources, SceneSnapshot, SceneVars, Stage, Step, Then, Vm, WindowAck,
+    JESSIE_TRAIN_TALK_SCENE_ID, TRAIN_DEPARTURE_SCENE_ID,
     TRAIN_MAP_RETURN_SCENE_ID, TRAIN_MAP_SCENE_ID,
 };
-use fmv_ff7::script::FieldScript;
+use fmv_ff7::script::{FieldScratch, FieldScratchError, FieldScript};
 use fmv_ff7::story::StoryState;
 use script_common::{data_dir, flevel_path, load_field};
 
@@ -50,6 +51,205 @@ fn complete_without_resources_changed(outcome: &Outcome) {
     assert!(outcome.is_complete() && outcome.unknown_persistent_reads.is_empty(), "{outcome:?}");
     assert!(outcome.party.is_empty() && outcome.resources.gil_ops.is_empty());
     assert_eq!((outcome.resources.gil_before, outcome.resources.gil_after), (Some(240), Some(240)));
+}
+
+/// Replace only the preview's invented visit latch with the checked caller's complete image.
+/// Every original initializer, actor, ambient root and talk instruction remains unchanged.
+fn checked_talk(field: &FieldFile) -> SceneDef {
+    let mut def = talk(field, false);
+    assert_eq!(def.given.len(), 1);
+    assert_eq!((def.given[0].bank, def.given[0].address, def.given[0].value), (5, 31, 0));
+    def.given.clear();
+    def
+}
+
+/// An explicit entry clear followed by this definition's actual original initializer roots.
+/// Normal execution permits their assignments; existing-visit quiet setup must not invent them.
+/// This derives the reviewed initialization image, not continuous ambient/model/RNG history.
+fn initialized_train_scratch(field: &FieldFile, def: &SceneDef, state: &StoryState) -> FieldScratch {
+    let script = FieldScript::from_field(field).unwrap();
+    let clear = FieldScratch::cleared_for_entry();
+    let vars = SceneVars::with_scratch(state.clone(), &def.given, clear.clone()).unwrap();
+    let mut vm = Vm::with_resources(vars, 1, Limits::default(), RESOURCES);
+    vm.begin(def.setup.iter().copied().map(Step::Await).collect());
+    assert!(matches!(vm.resume(&script, None).then, Then::End { how: End::Finished, .. }),
+        "the original initializer roots have no dialogue, transfer or battle");
+    let stats = vm.stats();
+    assert!(!stats.setup_incomplete && stats.unknown.is_empty() && stats.unresolved == 0
+        && stats.dropped_requests == 0, "{stats:?}");
+    assert!(vm.vars().unknown_persistent_reads().is_empty());
+    assert_eq!(vm.writes().iter().map(|(key, value)| (*key, *value)).collect::<Vec<_>>(),
+        [((5, 0), 0), ((5, 4), 0), ((5, 6), 10)], "the initializer roots write only these scratch bytes");
+    assert!(vm.party_ops().is_empty());
+    let effect = vm.scratch_outcome().unwrap().unwrap();
+    assert_eq!(effect.before(), &clear);
+    assert_eq!(effect.assigned_masks().iter().enumerate().filter(|(_, mask)| **mask != 0)
+        .map(|(address, &mask)| (address, mask)).collect::<Vec<_>>(), [(0, 255), (4, 255), (6, 255)]);
+    assert_eq!((effect.after().read_u8(5, 0), effect.after().read_u8(5, 4), effect.after().read_u8(5, 6)),
+        (Ok(0), Ok(0), Ok(10)), "observed authored assignments, never input seeds");
+    assert_eq!(effect.after().read_u8(5, 31), Ok(0), "entry cleared byte31; no initializer assigned it");
+    effect.after().clone()
+}
+
+fn apply_exact_story(state: &StoryState, result: &ExactRun) -> StoryState {
+    assert!(result.native.is_none() && result.party.is_empty() && result.battle.is_none());
+    let mut after = state.clone();
+    for write in &result.writes {
+        assert_eq!((write.bank, write.address), (1, 4), "only the authored affection assignment is persistent");
+        after.write_masked(write.bank, write.address, write.value, write.mask).unwrap();
+    }
+    after
+}
+
+fn finish_checked_talk(mut play: ScenePlay, answers: &[u8]) -> (SceneSnapshot, Vec<u16>) {
+    let mut answers = answers.iter().copied();
+    let mut ack = None;
+    let mut dialogs = Vec::new();
+    loop {
+        match play.next_strict(ack.take()).unwrap().then {
+            Then::Window(_) => {
+                let Some(SceneBoundary::Window(checkpoint)) = play.boundary() else { panic!("window boundary") };
+                dialogs.push(checkpoint.dialog.unwrap());
+                assert!(dialogs.len() <= 2, "a later Jessie talk has at most two windows");
+                let answer = checkpoint.choices.map(|_| answers.next().expect("an explicit answer"));
+                ack = Some(WindowAck { checkpoint, answer });
+            }
+            Then::End { how, .. } => { assert_eq!(how, End::Finished); break; }
+        }
+    }
+    assert_eq!(answers.next(), None, "all answers were consumed");
+    let snapshot = play.snapshot().unwrap();
+    assert!(snapshot.unknown_persistent_reads.is_empty() && snapshot.party.is_empty());
+    for stats in [&snapshot.setup_stats, &snapshot.stats] {
+        assert!(!stats.setup_incomplete && stats.unknown.is_empty() && stats.unresolved == 0
+            && stats.dropped_requests == 0, "{stats:?}");
+    }
+    assert_eq!((snapshot.resources.gil_before, snapshot.resources.gil_after), (Some(240), Some(240)));
+    assert!(snapshot.resources.gil_ops.is_empty() && snapshot.jump.is_none());
+    assert!(snapshot.writes.untracked.keys().all(|(bank, _)| !matches!(bank, 5 | 6)),
+        "checked scratch must not leak into persistent/legacy write summaries");
+    assert!(snapshot.scratch.as_ref().unwrap().is_ok());
+    (snapshot, dialogs)
+}
+
+#[test]
+#[ignore = "needs original FF7 data (FMV_FF7_DATA); checked scratch remains interpreter-only"]
+fn owned_jessie_checked_talk_retains_its_latch_until_an_explicit_new_entry() {
+    let field = train().expect("FMV_FF7_DATA must identify the owned original field archive");
+    let script = FieldScript::from_field(&field).unwrap();
+    let def = checked_talk(&field);
+    for affection in [0u8, 2, 30] {
+        for answer in [2, 3] {
+            let mut original = story(false, true);
+            original.write_byte(1, 4, affection).unwrap();
+            let before = original.encode();
+            let entry = initialized_train_scratch(&field, &def, &original);
+            assert_eq!(run_talk_exact_with_scratch(&script, 34, &original, &entry, 1, &[]),
+                Err(ExactError::MissingAnswer), "the unlatched branch requires its authored choice");
+            let first = run_talk_exact_with_scratch(&script, 34, &original, &entry, 1, &[answer]).unwrap();
+            let scratch = first.scratch.as_ref().unwrap();
+            assert_eq!(scratch.before(), &entry);
+            assert_eq!(scratch.after().read_u8(5, 31), Ok(1));
+            assert_eq!(scratch.assigned_masks()[31], 255);
+            let after = apply_exact_story(&original, &first);
+            let wanted = if answer == 3 { affection.saturating_sub(3) } else { affection };
+            let mut expected = original.clone();
+            expected.write_byte(1, 4, wanted).unwrap();
+            assert_eq!(after.encode(), expected.encode());
+            assert_eq!(original.encode(), before);
+            assert_eq!(entry.read_u8(5, 31), Ok(0), "the caller's input remains unchanged");
+
+            // Simulate restoring the exact visit image, preserving values AND knowledge.
+            let retained = FieldScratch::from_parts(*scratch.after().values(), *scratch.after().known_masks()).unwrap();
+            let repeat = run_talk_exact_with_scratch(&script, 34, &after, &retained, 1, &[]).unwrap();
+            assert!(repeat.writes.is_empty());
+            let repeat_scratch = repeat.scratch.as_ref().unwrap();
+            assert_eq!(repeat_scratch.before(), &retained);
+            assert_eq!(repeat_scratch.after(), &retained);
+            assert!(!repeat_scratch.any_change());
+            assert_eq!(repeat_scratch.assigned_masks()[31], 0, "the repeated talk only reads the latch");
+
+            // A distinct real entry may clear the latch. Run the original setup again;
+            // do not rewrite byte31 or manufacture byte6=10 as a test input.
+            let next_entry = initialized_train_scratch(&field, &def, &after);
+            assert_ne!(next_entry, retained);
+            let again = run_talk_exact_with_scratch(&script, 34, &after, &next_entry, 1, &[answer]).unwrap();
+            let next_story = apply_exact_story(&after, &again);
+            expected.write_byte(1, 4, if answer == 3 { wanted.saturating_sub(3) } else { wanted }).unwrap();
+            assert_eq!(next_story.encode(), expected.encode());
+            assert_eq!(again.scratch.as_ref().unwrap().after().read_u8(5, 31), Ok(1));
+            assert_eq!(retained.read_u8(5, 31), Ok(1), "new entry never mutates the old visit");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs original FF7 data (FMV_FF7_DATA); checked scratch remains interpreter-only"]
+fn owned_jessie_checked_talk_refuses_unknown_latch_without_a_zero_fallback() {
+    let field = train().expect("FMV_FF7_DATA must identify the owned original field archive");
+    let script = FieldScript::from_field(&field).unwrap();
+    let mut original = story(false, true);
+    original.write_byte(1, 4, 30).unwrap();
+    let entry = initialized_train_scratch(&field, &checked_talk(&field), &original);
+    for known in [0u8, 254] {
+        let mut masks = *entry.known_masks();
+        masks[31] = known;
+        let unknown = FieldScratch::from_parts(*entry.values(), masks).unwrap();
+        let before = unknown.clone();
+        let story_before = original.encode();
+        for answers in [&[][..], &[2][..], &[3][..]] {
+            assert_eq!(run_talk_exact_with_scratch(&script, 34, &original, &unknown, 1, answers),
+                Err(ExactError::Scratch(FieldScratchError::Unknown { address: 31, missing_mask: !known })));
+            assert_eq!(unknown, before);
+            assert_eq!(original.encode(), story_before);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs original FF7 data (FMV_FF7_DATA); checked scratch remains interpreter-only"]
+fn owned_jessie_full_scene_reuses_authored_setup_and_the_checked_visit_afterimage() {
+    let field = train().expect("FMV_FF7_DATA must identify the owned original field archive");
+    let def = checked_talk(&field);
+    for bit0 in [false, true] {
+        for answer in [2u8, 3] {
+            let mut original = story(bit0, true);
+            original.write_byte(1, 4, 30).unwrap();
+            assert!(matches!(ScenePlay::with_scratch(&field, &talk(&field, false), &original, 1,
+                RESOURCES, &FieldScratch::cleared_for_entry()), Err(SceneError::ScratchGiven { bank: 5, address: 31 })));
+            assert!(matches!(ScenePlay::with_scratch(&field, &def, &original, 1,
+                RESOURCES, &FieldScratch::cleared_for_entry()), Err(SceneError::ScratchSetup)),
+                "existing-visit reconstruction cannot silently initialize 5:6 to 10");
+            assert!(matches!(ScenePlay::with_scratch(&field, &def, &original, 1,
+                RESOURCES, &FieldScratch::unknown()), Err(SceneError::ScratchSetup)),
+                "reconstruction cannot silently promote unknown initializer bytes");
+            let entry = initialized_train_scratch(&field, &def, &original);
+            let (first, dialogs) = finish_checked_talk(
+                ScenePlay::with_scratch(&field, &def, &original, 1, RESOURCES, &entry).unwrap(), &[answer]);
+            assert_eq!(dialogs, [17, if answer == 2 { 18 } else { 19 }]);
+            let scratch = first.scratch.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(scratch.before(), &entry);
+            assert_eq!(scratch.after().read_u8(5, 31), Ok(1));
+            let mut after = original.clone();
+            first.writes.apply_extended_to(&mut after, &original).unwrap();
+            let mut expected = original.clone();
+            expected.write_byte(1, 4, if answer == 3 { 27 } else { 30 }).unwrap();
+            assert_eq!(after.encode(), expected.encode());
+            let (repeat, dialogs) = finish_checked_talk(
+                ScenePlay::with_scratch(&field, &def, &after, 1, RESOURCES, scratch.after()).unwrap(), &[]);
+            assert_eq!(dialogs, [20]);
+            assert!(repeat.writes.is_story_neutral());
+            let repeat_scratch = repeat.scratch.as_ref().unwrap().as_ref().unwrap();
+            assert_eq!(repeat_scratch.before(), scratch.after());
+            assert_eq!(repeat_scratch.after().read_u8(5, 31), Ok(1));
+            assert_eq!(repeat_scratch.assigned_masks()[31], 0);
+            // Background mains may update their own scratch bytes; their scheduler, random
+            // history and model state are not continuous across these separate ScenePlayers.
+            for address in [0, 4, 6] {
+                assert_eq!(repeat_scratch.after().read_u8(5, address), entry.read_u8(5, address));
+            }
+        }
+    }
 }
 
 #[test]

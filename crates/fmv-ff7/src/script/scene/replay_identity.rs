@@ -7,8 +7,22 @@
 //! host. Bump the domain version if this encoding or the interpreter's replay contract changes.
 
 use super::data::{SceneDef, ScriptRef, Spot, Step};
+use crate::script::FieldScratch;
 
 const DOMAIN: &[u8] = b"fmv-ff7/scene-replay-identity\0v1\0";
+
+/// Opt-in checked visits bind their original values and knowledge independently of source code.
+/// Absence delegates byte-for-byte to the legacy identity; no deployed replay changes meaning.
+pub(super) fn fingerprint_with_scratch(section: &[u8], def: &SceneDef, scratch: Option<&FieldScratch>) -> [u8; 32] {
+    let source = fingerprint(section, def);
+    let Some(scratch) = scratch else { return source };
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fmv-ff7/scene-checked-scratch\0v1\0");
+    hash.update(&source);
+    hash.update(scratch.values());
+    hash.update(scratch.known_masks());
+    *hash.finalize().as_bytes()
+}
 
 /// The exact script and semantic definition a resumable replay was constructed with. Integers
 /// are little-endian; strings, raw bytes and lists have u64 lengths; variants have explicit tags.
