@@ -284,7 +284,7 @@ impl Axis {
     }
 }
 
-fn ease(start: i16, target: i16, steps: i16, step: i16) -> i32 {
+pub(crate) fn ease(start: i16, target: i16, steps: i16, step: i16) -> i32 {
     debug_assert!(steps > 0);
     // Preserve the integer angle arithmetic, its byte wrap and signed truncation of the result.
     let angle = (((i32::from(step) << 12) / i32::from(steps)) / 32 + 128) as u8;
