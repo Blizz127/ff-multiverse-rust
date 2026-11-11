@@ -687,7 +687,8 @@ where
             | ServerMsg::LiveWindowClosed { .. }
             | ServerMsg::LiveControl { .. }
             | ServerMsg::LivePlace { .. }
-            | ServerMsg::LiveMovie { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::LiveMovie { .. }
+            | ServerMsg::LiveStage { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {

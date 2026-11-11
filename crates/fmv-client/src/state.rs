@@ -777,6 +777,11 @@ impl ClientState {
                 }
             }
             ServerMsg::LiveMovie { movie } => self.live.on_movie(movie),
+            ServerMsg::LiveStage { area, masks, fade } => {
+                if area == self.area {
+                    self.live.on_stage(&area.key, &masks, fade);
+                }
+            }
         }
         self.own.story_held = self.field_controls_held();
         None

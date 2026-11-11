@@ -100,6 +100,8 @@ pub trait LiveField: Send {
     fn advance(&mut self, input: Option<LiveInput>) -> Vec<LiveEvent>;
     /// The visible models other than the player's.
     fn cast(&self) -> Vec<NpcSnapshot>;
+    /// The stage: the background's group masks and the fade overlay (blend, colour).
+    fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>);
     /// Whether a script holds the player still.
     fn control_locked(&self) -> bool;
     /// Where the scripts put the player's character (while control is locked).
@@ -134,6 +136,7 @@ struct LiveRun {
     started: Instant,
     frames: u64,
     cast: Vec<NpcSnapshot>,
+    stage: (Vec<u8>, Option<(u8, [u8; 3])>),
     locked: bool,
     place: Option<(Pos, f32)>,
     /// The progression last saved (or the one the run started from).
@@ -308,6 +311,7 @@ impl World {
                             started: now,
                             frames: 0,
                             cast: Vec::new(),
+                            stage: (Vec::new(), None),
                             locked: false,
                             place: None,
                             saved: progression,
@@ -453,6 +457,15 @@ impl World {
                 self.tell_instance(id, Arc::new(ServerMsg::LiveCast { area: area.clone(), tick: self.tick, npcs: cast.clone() }), &mut failed);
             }
             run.cast = cast;
+        }
+        // The stage, when it changed.
+        let stage = run.field.stage();
+        if stage != run.stage {
+            if let Some(area) = &area_id {
+                let fade = stage.1.map(|(blend, rgb)| fmv_protocol::LiveFade { blend, rgb });
+                self.tell_instance(id, Arc::new(ServerMsg::LiveStage { area: area.clone(), masks: stage.0.clone(), fade }), &mut failed);
+            }
+            run.stage = stage;
         }
         // Control and the scripted player position.
         let locked = run.field.control_locked();

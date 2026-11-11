@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use fmv_protocol::{ClientMsg, LiveAsk};
+use fmv_ff7::background::BackgroundOp;
+use fmv_protocol::{ClientMsg, LiveAsk, LiveFade};
 
 /// A window a field script opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,11 @@ pub struct LiveClient {
     pub movie: Option<u16>,
     outbox: Vec<ClientMsg>,
     notes: Vec<String>,
+    /// The background masks last applied, and the operations that bring the shown background to the server's.
+    masks: Option<Vec<u8>>,
+    background: Vec<crate::scene::SceneBackground>,
+    /// The fade overlay the field shows now.
+    pub fade: Option<LiveFade>,
 }
 
 impl LiveClient {
@@ -57,6 +63,42 @@ impl LiveClient {
     pub fn on_movie(&mut self, movie: u16) {
         self.movie = Some(movie);
         self.notes.push(format!("live: movie {movie}"));
+    }
+
+    /// The stage changed: queue the background operations from the masks shown to the new ones (a first stage after
+    /// entering a field starts from the field's entry state, all masks clear).
+    pub fn on_stage(&mut self, field: &str, masks: &[u8], fade: Option<LiveFade>) {
+        let old = self.masks.clone().unwrap_or_else(|| vec![0; masks.len()]);
+        for (group, (&was, &now)) in old.iter().zip(masks).enumerate() {
+            let Ok(group) = u8::try_from(group) else { break };
+            for frame in 0..8u8 {
+                let bit = 1u8 << frame;
+                if was & bit != now & bit {
+                    let op = if now & bit != 0 { BackgroundOp::On { group, frame } } else { BackgroundOp::Off { group, frame } };
+                    self.background.push(crate::scene::SceneBackground { field: field.to_string(), op });
+                }
+            }
+        }
+        self.masks = Some(masks.to_vec());
+        self.fade = fade;
+    }
+
+    /// The live fade as the renderer draws a scene's.
+    pub fn fade_colour(&self) -> Option<fmv_ff7::script::scene::FadeColor> {
+        use fmv_ff7::script::scene::{FadeBlend, FadeColor};
+        self.fade.map(|f| FadeColor {
+            blend: match f.blend {
+                0 => FadeBlend::Add,
+                1 => FadeBlend::Subtract,
+                _ => FadeBlend::Black,
+            },
+            rgb: f.rgb,
+        })
+    }
+
+    /// The background operations to apply, in order.
+    pub fn take_background(&mut self) -> Vec<crate::scene::SceneBackground> {
+        std::mem::take(&mut self.background)
     }
 
     /// The windows open now, lowest number first.
@@ -101,6 +143,9 @@ impl LiveClient {
 
     /// A new area: nothing of the last field's windows or holds carries over.
     pub fn reset(&mut self) {
+        self.masks = None;
+        self.background.clear();
+        self.fade = None;
         self.windows.clear();
         self.locked = false;
         self.movie = None;

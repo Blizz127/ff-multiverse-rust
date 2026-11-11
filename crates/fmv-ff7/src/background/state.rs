@@ -41,6 +41,11 @@ impl Default for BackgroundState {
 }
 
 impl BackgroundState {
+    /// The 64 visibility masks (group `g`'s frame `f` is shown when bit `f` of `masks()[g]` is set).
+    pub fn masks(&self) -> &[u8; 64] {
+        &self.masks
+    }
+
     /// Apply one instruction, returning whether a mask changed. Groups outside 0..64 and frame
     /// indices outside 0..8 are unsupported and leave the state unchanged. Palette operations
     /// belong to [`super::PaletteState`] and do not alter these masks.

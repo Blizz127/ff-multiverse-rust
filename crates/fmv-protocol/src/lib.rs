@@ -720,6 +720,13 @@ pub enum ClientMsg {
     LiveMovieDone { movie: u16 },
 }
 
+/// A live field's fade overlay: how it blends (0 add, 1 subtract, 2 black) and its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveFade {
+    pub blend: u8,
+    pub rgb: [u8; 3],
+}
+
 /// A live window's question: the choice lines, counted in the window's last page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveAsk {
@@ -969,6 +976,14 @@ pub enum ServerMsg {
     /// New in v23. The field plays movie `movie`; answer `LiveMovieDone` when it is over (or at once when it cannot
     /// be played).
     LiveMovie { movie: u16 },
+    /// New in v23. The live field's stage: the background's 64 group visibility masks (64 bytes) and the fade overlay
+    /// (`None`: none). Sent when it changes.
+    LiveStage {
+        area: AreaId,
+        masks: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fade: Option<LiveFade>,
+    },
 }
 
 /// What a [`ServerMsg::Countdown`] says.

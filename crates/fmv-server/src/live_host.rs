@@ -132,6 +132,20 @@ impl LiveField for Ff7Live {
             .collect()
     }
 
+    fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>) {
+        use fmv_ff7::script::scene::FadeBlend;
+        let masks = self.rt.stage_background().masks().to_vec();
+        let fade = self.rt.stage_fade_color().map(|c| {
+            let blend = match c.blend {
+                FadeBlend::Add => 0,
+                FadeBlend::Subtract => 1,
+                FadeBlend::Black => 2,
+            };
+            (blend, c.rgb)
+        });
+        (masks, fade)
+    }
+
     fn control_locked(&self) -> bool {
         self.rt.state.character_lock
     }

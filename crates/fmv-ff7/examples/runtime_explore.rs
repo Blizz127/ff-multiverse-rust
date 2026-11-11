@@ -40,10 +40,14 @@ fn story_changed(a: &FieldRuntime, b: &FieldRuntime) -> bool {
 
 /// A fingerprint of the story a runtime holds (persistent bytes the engine does not own).
 fn story_key(rt: &FieldRuntime) -> u64 {
+    banks_key(&rt.mem.banks)
+}
+
+fn banks_key(banks: &Banks) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for i in 0..fmv_ff7::runtime::PERSISTENT_BYTES {
         let sel = [1u8, 3, 11, 13, 15][i / 256];
-        let b = rt.mem.banks.get(i) & !fmv_ff7::story::engine_owned_bits(sel, (i % 256) as u8);
+        let b = banks.get(i) & !fmv_ff7::story::engine_owned_bits(sel, (i % 256) as u8);
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
@@ -152,7 +156,24 @@ fn main() {
     let mut best_moment = 0u16;
     let mut actions: Vec<(String, u16)> = Vec::new();
     let mut images: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut entered: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
     for step in 0..steps {
+        // A field already entered with this very story leads where it led before: take the next alternative.
+        if !entered.insert((field_name.clone(), banks_key(&banks))) {
+            match alternatives.pop() {
+                Some((f, b, a, sn, _)) => {
+                    field_name = f;
+                    banks = b;
+                    arrival = a;
+                    seen = sn;
+                    continue;
+                }
+                None => {
+                    println!("{step:>3} nothing left to try (best {best_moment})");
+                    break;
+                }
+            }
+        }
         let Some((field, walk)) = open(&mut lgp, &field_name) else {
             println!("STOP cannot load {field_name}");
             break;
@@ -178,6 +199,8 @@ fn main() {
         }
         // Try every triangle, standing and with OK.
         let mut best: Option<(i32, usize, bool, FieldRuntime, Outcome)> = None;
+        // Every scored action, as a state to come back to: (score, field it leaves the player in, story, arrival).
+        let mut cands: Vec<(i32, String, Banks, Option<(i32, i32, i32)>, String)> = Vec::new();
         for t in 0..walk.triangles.len() {
             let v = walk.triangles[t];
             let c = ((i32::from(v[0].x) + i32::from(v[1].x) + i32::from(v[2].x)) / 3, (i32::from(v[0].y) + i32::from(v[1].y) + i32::from(v[2].y)) / 3, (i32::from(v[0].z) + i32::from(v[1].z) + i32::from(v[2].z)) / 3);
@@ -207,6 +230,11 @@ fn main() {
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                 let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                if score > 0 {
+                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
+                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     best = Some((score, t, ok, probe, out));
                 }
@@ -235,6 +263,11 @@ fn main() {
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                 let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                if score > 0 {
+                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
+                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     println!("    talk to model {mi} ({}) scores {score}", rt.entity_name(rt.models()[mi].entity).unwrap_or(""));
                     best = Some((score, usize::MAX / 2 - mi, true, probe, out));
@@ -268,6 +301,11 @@ fn main() {
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
                 let score = if images.contains(&(landed, story_key(&probe))) { 0 } else { score };
+                if score > 0 {
+                    let land = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
+                    let arr = out.jump.map(|j| (i32::from(j.1), i32::from(j.2), 0)).or(arrival);
+                    cands.push((score, land.clone(), probe.mem.banks.clone(), arr, format!("{field_name} -> {land} (score {score}, moment {})", moment(&probe))));
+                }
                 if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
                     println!("    line {i} {mode} scores {score}");
                     best = Some((score, usize::MAX - i, mode == "on +ok", probe, out));
@@ -278,6 +316,19 @@ fn main() {
         let done_here = actions.iter().filter(|a| **a == here).count();
         if done_here >= 6 {
             best = None;
+        }
+        // The runners-up wait as alternatives (lowest score pushed first, so the best of them comes back first).
+        if let Some(b) = &best {
+            let chosen = (b.0, story_key(&b.3));
+            cands.sort_by_key(|c| c.0);
+            for c in cands {
+                if (c.0, banks_key(&c.2)) == chosen {
+                    continue;
+                }
+                let mut sn = seen.clone();
+                sn.push((field_name.clone(), moment(&rt)));
+                alternatives.push((c.1, c.2, c.3, sn, c.4));
+            }
         }
         let Some((_, t, ok, probe, out)) = best else {
             // No script moves things on: walk through a gateway of the field's data into a field not yet seen at this

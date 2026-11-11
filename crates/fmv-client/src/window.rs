@@ -1289,6 +1289,7 @@ impl App {
         // Out of battles: whatever scene there was is over.
         self.battle_scene = None;
         self.view.apply_background_events(self.session.state.scene.drain_background());
+        self.view.apply_background_events(self.session.state.live.take_background());
         let draw = field_draw(self.avatars.as_mut(), &mut self.npc_epoch, &self.view, &self.session.state, self.session.info.tint, render_t, dt);
         // The part of the field the window shows this frame: around the player's character as it is drawn now, or
         // where the scene points the camera (everything below maps view space to the window through it).
@@ -1346,7 +1347,7 @@ impl App {
         if let Some(panel) = &self.graphics_panel {
             panel.draw(renderer.graphics_status(), (vw, vh), &mut overlay);
         }
-        let result = renderer.render_layers_effects(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay), self.camera.clip_range(view.range), state.scene.fade());
+        let result = renderer.render_layers_effects(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay), self.camera.clip_range(view.range), state.scene.fade().or_else(|| state.live.fade_colour()));
         let gpu_error = renderer.first_gpu_error();
         match (result, gpu_error) {
             (FrameResult::Fatal(msg), _) => self.fail(el, msg),
