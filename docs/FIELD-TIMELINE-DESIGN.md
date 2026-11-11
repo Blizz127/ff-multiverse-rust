@@ -167,6 +167,56 @@ for unrestricted native behavior.
    reviewed scenes. Any safe idle fast-forward must preserve RNG draws, input observations,
    opcode quotas, animation deadlines, and event ordering; otherwise advance each tick.
 
+## PC movie contract: static evidence, runtime integration pending
+
+The owned Steam app 3837340/build 21140793 includes the English PE32 program
+`resources/ff7_1.02/ff7_en` (5,997,027 bytes), SHA-256
+`26998200234f7a49a700bdc1ae5d0a43fd001cc909871a366cf82bdffaa351c9`.
+The addresses below identify instructions in that exact file. Each reviewed range was
+checked against its PE mapping and original file bytes. Raw, file-backed static
+disassembly is corroborated by retained REA/Ghidra 12.1.4 function dossiers from the
+same digest. These are static findings, not runtime measurements; they establish a
+PC movie contract without assuming PSX movie behavior. Representative retained evidence:
+loader `ev_95c485c9260999fb51f35b3c98ef860474576b35c2d15d2a6f0ea0e355d557ff`,
+frame getter `ev_715f530b20cfbaf638fbbc86561f3c8e8da933f1cf1a77848885b8e4da37065d`,
+and sample update `ev_b5f976967700424b2d58a54697743fe9a1e5f0eaf71cec1acb006609fcd0ece3`.
+
+| Native path | Verified behavior |
+| --- | --- |
+| Preparation `0x40ADB0`, member read `0x40AF83`–`0x40AFB7` | Reads the complete CAM member into the record buffer without skipping a header. Disc-1 movie 23 selects `ontrain.cam`/`ontrain.avi`; movie 24 selects `mainplr.cam`/`mainplr.avi`. |
+| Media preparation `0x4176D1` | Calls `IMediaSeeking::SetTimeFormat` with `TIME_FORMAT_FRAME`; successful preparation therefore selects video-frame position units. |
+| Frame getter `0x418613` | Reads `GetCurrentPosition` and returns its low 32 bits unchanged, with no increment or ±1 adjustment. Stopped/error paths return zero, so zero alone does not establish a valid first frame. |
+| Camera selection `0x40AD49` | Selects the buffer at `40 * frame` and copies ten DWORDs. The native guard counts camera reads; it is not a safe bound on the frame index. A new parser must check member length and index independently. |
+| `PMVIE` `0x61A224`; `MOVIE` `0x61A321` | Separate prepare and start/completion request handshakes retain the issuing script's PC while pending. This does not establish a pause of other field entities. |
+| `MVIEF` `0x61A438`; snapshot write `0x63C29B` | Normal playback reads the frame snapshot written from the getter before script dispatch. It neither increments the movie position nor blocks. An alternate branch selected by global `0xCC0B68` increments a synthetic counter and must not define ordinary playback semantics. |
+| Ordinary update `0x417FCA` | Tests multimedia-stream result `0x00040003` (`MS_S_ENDOFSTREAM`); the non-looping path sets the movie-end flag. Completion is separate from frame position and is not derived from CAM record count. |
+
+The interface/constant meanings are independently anchored in the
+[Microsoft SDK definitions](https://github.com/microsoft/win32metadata/tree/9cf94833626504b330c2f616ce71a2d3497cdc76/generation/WinSDK/RecompiledIdlHeaders):
+`um/strmif.h` (`IMediaSeeking` vtable), `shared/uuids.h` (`TIME_FORMAT_FRAME`),
+and `um/mmstream.h` (`MS_S_ENDOFSTREAM`). The position uses the selected frame format;
+it is not a software counter advanced once per field tick.
+
+The owned files fully decode: `mainplr.avi` has 197 video frames and `ontrain.avi`
+has 192, both at exact rational rate `15/1` fps. Their CAM members contain 197 and
+192 records of 40 bytes respectively. In these two members every record's first
+38 bytes are zero, including the camera matrix; matching record counts do not make
+those zero matrices usable camera poses. Preserve the final word at offset `0x26`
+as opaque data. The reviewed 13 direct current-camera-pointer references do not read
+it, but that bounded review does not prove its global PC meaning or that it is unused.
+The pinned PSX source calls the corresponding word RGB24 mode; that is evidence for a
+different platform, not a verified PC interpretation. `MVCAM` and `BGMOVIE` write
+separate module control bytes, not this record word.
+
+Still unresolved are the first camera-sampling phase after playback starts, the global
+PC meaning of record word `0x26`, per-field/per-movie update cadence, alternate movie
+update modes, and synchronization with rendering, audio and concurrent scripts. Startup
+requests a media sample before a field callback can observe its position; synchronous
+sample updates and the ordinary slow-playback branch also prevent inferring one sample
+per field tick. The `15/1` video rate therefore does not prove an exact two-field-ticks
+per movie-frame rule. Movie activation and the native timeline remain unimplemented;
+these static facts do not establish end-to-end playback or timing parity.
+
 ## Multiplayer timing policy
 
 The server owns a monotonic 30 Hz scene clock as an explicit port timing policy. The

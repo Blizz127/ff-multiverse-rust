@@ -96,14 +96,13 @@ FF7 login also refuses a prepared version-4 save until gameplay and wire support
 are activated together; an older protocol-21 peer must not receive an unfamiliar
 story blob and substitute its starting state.
 
-Battle roster lookup now distinguishes an unknown party from a known empty one and
+Battle roster lookup distinguishes an unknown party from a known empty one and
 preserves the order of known main slots. Malformed, duplicate or oversized rosters
-refuse instead of losing members. Version 4 script execution remains disabled in the
-scene, dialogue, ordinary-point and field-sound interpreters and the server host.
-Those paths must gain native party operations, ordered resource outcomes and checked
-replay before accepting the richer snapshot. Scripted battles additionally need the
-party at the exact BATTLE instruction; the original or final story can contain a
-different temporary party.
+refuse instead of losing members. The checked scene and exact ordinary-point paths
+now interpret native party operations under the existing gameplay fences.
+Server admission, registration, permissive dialogue, trigger placement and field-sound
+execution remain gated. Scripted battles need the party at the exact BATTLE instruction;
+the original or final story can contain a different temporary party.
 
 An isolated native-party evaluator now models Add, Remove, Set, availability, locking
 and the reviewed `FIELD_Init` return boundary. It retains immutable before/after images
@@ -116,16 +115,49 @@ requires its exact party/raw predecessor. Unrelated banks remain intact; durable
 still require the complete story CAS. This evaluator follows the pinned PSX implementation;
 PC equivalence remains to be checked against the owned executable. Its supported operands
 are ordinary characters 0–8; flashback characters 9/10 and PHS-menu selection are deferred.
-Scene/ordinary interpreters do not call it yet, and all version-4 gameplay gates remain.
-Its 18 tests include 15,028 comparisons against the previous accepted tuple behavior,
+Its initial 18 tests include 15,028 comparisons against the previous accepted tuple behavior,
 plus exact assignment masks, duplicate repair, ordered availability effects and stale
-knowledge refusals. All 825 FF7 unit tests and 500 server tests pass; the latter now
-round-trips the maximum 5,129-byte native-party snapshot through three opaque fixture
+knowledge refusals. At evaluator checkpoint `8793a29`, all 825 FF7 unit tests and 500
+server tests passed. The server suite round-trips the maximum 5,129-byte native-party
+snapshot through three opaque fixture
 battles, 125 windows and repeated store reopening, retaining index compatibility 5.
 The four owned-data targets (`scene_real`, `train_lesson_real`, `rootmap_real`,
 `train_departure_real`) also pass all 53 tests with ignored tests explicitly included.
 All-target Clippy for FF7 and the server passes with the pre-existing standing-animation
 fallback warning.
+
+The interpreter layer uses one sealed journal for all persistent assignments and
+native party effects, in execution order. A final byte map cannot represent a raw-party
+write followed by a native party operation and then restoration of that raw byte: the
+main party can still have changed. Each journal retains the complete predecessor and
+afterimage; applying it validates every ordered event on a clone before publishing.
+Knownness changes and temporary change-then-restore operations remain visible to setup
+audits. Direct raw writes do not infer main membership, availability or locks.
+
+At a native BATTLE boundary the evaluated story supplies the canon roster; only the
+final victory step is a durable save result. Legacy actions retain their online leader
+roster policy. Scene continuation resources follow character/account identity through
+reordering or removal, while newly added or returning canon members refuse until a
+durable source for their resources exists. Recovery must bind both roster order and
+initial combat resources to the retained boundary and prior fight, rather than merely
+checking that their numbers fit engine limits.
+
+Native-journal checkpoint `b483409` passed the full workspace suite: 4,277 tests passed,
+none failed, and 379 optional tests were ignored. Separately, 54 owned-data checks
+ran successfully: the four route targets above and a new strict reactor-door replay
+that verifies the authored Barret join against the complete native journal. Recovery
+coverage also verifies that a saved field is loaded before roster validation while
+combat still waits for each connected player's area handshake. These checks exercise
+the internal native paths; they do not activate version-4 accounts or field visits.
+Workspace Clippy with all targets passed after two lint corrections; its three
+remaining warnings are the pre-existing audio, standing-animation and avatar-test ones.
+
+These paths still use the existing scene scheduler and scratch initialization model.
+Native-party support alone does not establish a restored field visit. In particular,
+absent scratch must not be assumed zero across separate talks or same-field travel;
+checked visit injection and cache identity are prerequisites for gameplay activation.
+The sound worker now reports unsupported native-party requests explicitly instead of
+returning an apparently successful empty field-sound plan.
 
 `FieldScratch` provides checked 256-byte values and knowledge masks for future visit
 restoration. Selectors 5/6 alias for byte access; wide selector 5 still uses one byte,
@@ -318,9 +350,13 @@ by assuming unknown flags are clear.
   Vorbis audio at 22,050 Hz; format detection must inspect the contents. Full-file video/audio
   decoding passed without diagnostics. `mainplr` has 197 decoded frames (13.133 s container
   duration), and `ontrain` has 192 (12.800 s). The archive contains matching `.cam` entries
-  of 7,880 and 7,680 bytes. Their correspondence to 40-byte records is a hypothesis until
-  the PC camera layout and indexing are verified; file availability does not establish
-  movie playback or concurrent script timing.
+  of 7,880 and 7,680 bytes. Static inspection of the owned PC executable now verifies
+  headerless 40-byte records selected by the media frame position, without a plus/minus-one
+  adjustment. Playback completion uses the stream's end signal, not the camera record count.
+  The first observed frame and concurrent field scheduling remain unverified; see the
+  [PC movie evidence and limits](FIELD-TIMELINE-DESIGN.md). The first 38 bytes of every
+  record in these two camera tracks are zero, so they cannot supply a projection matrix.
+  The final word's PC meaning remains unresolved; it must not be treated as a camera-valid bit.
   The exact video durations are 197/15 s and 64/5 s. Decoded audio contains 286,848 and
   282,240 samples per channel respectively (about 13.009 s and 12.800 s); stream duration
   fields are absent and audio timestamps begin at 0.011 s. Audio sample counts alone
