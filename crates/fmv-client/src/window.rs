@@ -1200,6 +1200,7 @@ impl App {
         let scene_visible = !self.session.state.field_controls_held() && !self.session.state.battle.in_battle() && !self.session.state.battle.lingering(self.session.now());
         self.session.state.scene.advance_visible(dt, scene_visible);
         self.session.flush_scene();
+        self.session.flush_live();
         self.session.log_scene_notes();
         self.scene_notice();
         if self.session.state.scene.started() != self.scene_started {

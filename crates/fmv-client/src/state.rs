@@ -414,6 +414,8 @@ pub struct ClientState {
     pub scene: SceneClient,
     /// The countdown the server runs for our story, as it last said (see `crate::ui::countdown`). Empty until it says.
     pub countdown: CountdownMirror,
+    /// A live field's windows, holds and movies (protocol 23, see `crate::live`).
+    pub live: crate::live::LiveClient,
     remotes: BTreeMap<EntityId, Remote>,
     /// The non-player characters of the current area (from its `AreaSnapshot`).
     npcs: Vec<NpcView>,
@@ -463,6 +465,7 @@ impl ClientState {
             story_hold_ack: None,
             scene: SceneClient::new(),
             countdown: CountdownMirror::default(),
+            live: crate::live::LiveClient::default(),
             remotes: BTreeMap::new(),
             npcs: Vec::new(),
             npc_epoch: 0,
@@ -508,7 +511,9 @@ impl ClientState {
     pub fn ordinary_game_over(&self) -> bool { self.ordinary_game_over }
 
     /// Field input remains held through a story transaction or an ordinary authored Game Over.
-    pub fn field_controls_held(&self) -> bool { self.is_story_pending() || self.ordinary_game_over() }
+    pub fn field_controls_held(&self) -> bool {
+        self.is_story_pending() || self.ordinary_game_over() || self.live.locked || self.live.has_windows() || self.live.movie.is_some()
+    }
 
     pub fn story_pending_id(&self) -> Option<u64> { self.story_hold.as_ref().map(|h| h.id) }
 
@@ -561,6 +566,7 @@ impl ClientState {
     /// after a transfer we refused (it is not a change).
     pub fn change_area(&mut self, area: AreaId, arrival: Pos, facing: f32, forward: bool) {
         self.area = area;
+        self.live.reset();
         self.remotes.clear();
         self.npcs.clear();
         self.npc_epoch += 1;
@@ -746,6 +752,30 @@ impl ClientState {
             ServerMsg::CharacterDeleted { .. } => {
                 return Some("protocol error: the server announced a deleted character to a joined session".to_string());
             }
+            // A live field (protocol 23, see `crate::live`): its cast replaces the area's NPCs.
+            ServerMsg::LiveCast { area, npcs, .. } => {
+                if area == self.area {
+                    self.npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
+                    self.npc_epoch += 1;
+                }
+            }
+            ServerMsg::LiveWindow { area, window, dialog, ask, answerable } => {
+                if area == self.area {
+                    self.live.on_window(crate::live::LiveWindowView { window, dialog, ask, answerable });
+                }
+            }
+            ServerMsg::LiveWindowClosed { area, window } => {
+                if area == self.area {
+                    self.live.on_window_closed(window);
+                }
+            }
+            ServerMsg::LiveControl { locked } => self.live.on_control(locked),
+            ServerMsg::LivePlace { pos, facing } => {
+                if pos.is_finite() && facing.is_finite() {
+                    self.own.adopt_held_pose(pos, facing, AnimState::Idle);
+                }
+            }
+            ServerMsg::LiveMovie { movie } => self.live.on_movie(movie),
         }
         self.own.story_held = self.field_controls_held();
         None

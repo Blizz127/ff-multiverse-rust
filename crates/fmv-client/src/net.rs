@@ -256,6 +256,8 @@ pub enum NetCommand {
     Scene(crate::scene::SceneCmd),
     /// Ordered behind every command sent before the game loop installed this story hold.
     StoryPendingAck { id: u64 },
+    /// A live field's answer or movie acknowledgement (protocol 23, see `crate::live`).
+    Live(ClientMsg),
     Leave,
 }
 
@@ -678,7 +680,14 @@ where
             | ServerMsg::SceneBattleResumed { .. }
             | ServerMsg::SceneGameOver { .. }
             | ServerMsg::SceneEnded { .. }
-            | ServerMsg::SceneRefused { .. }) => push_backlog(&mut backlog, other),
+            | ServerMsg::SceneRefused { .. }
+            // A live field's traffic (protocol 23) can follow the snapshot at once.
+            | ServerMsg::LiveCast { .. }
+            | ServerMsg::LiveWindow { .. }
+            | ServerMsg::LiveWindowClosed { .. }
+            | ServerMsg::LiveControl { .. }
+            | ServerMsg::LivePlace { .. }
+            | ServerMsg::LiveMovie { .. }) => push_backlog(&mut backlog, other),
         }
         if let (Some(_), Some(_), Some(_)) = (&welcome, &offer, &snapshot) {
             let (Some(w), Some(o), Some(entities)) = (welcome, offer, snapshot) else {
@@ -783,6 +792,7 @@ async fn session_loop<R, W>(
                 Some(NetCommand::Area(a)) => a.into_msg(),
                 Some(NetCommand::Scene(c)) => c.into_msg(),
                 Some(NetCommand::StoryPendingAck { id }) => ClientMsg::StoryPendingAck { id },
+                Some(NetCommand::Live(msg)) => msg,
                 Some(NetCommand::Leave) | None => {
                     let _ = timeout(WRITE_TIMEOUT, write_msg(&mut wr, &ClientMsg::Leave)).await;
                     break;

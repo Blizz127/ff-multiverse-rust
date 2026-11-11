@@ -39,6 +39,7 @@ mod gamepad;
 mod graphics;
 mod headless;
 mod interp;
+mod live;
 mod login;
 mod mods;
 mod model_layer;

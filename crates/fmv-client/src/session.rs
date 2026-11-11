@@ -360,6 +360,16 @@ impl Session {
         }
     }
 
+    /// Send what the live field client owes the server (answers, movie acknowledgements), and print its notes on stderr.
+    pub fn flush_live(&mut self) {
+        for msg in self.state.live.take_outbox() {
+            self.net.send(NetCommand::Live(msg));
+        }
+        for line in self.state.live.take_notes() {
+            eprintln!("{line}");
+        }
+    }
+
     /// Print what the scene client has to say about itself since the last call, one `scene:` line each, on stderr (ids and
     /// counts only; the headless bot's scene lines go to stdout, see `crate::scene::bot`).
     pub fn log_scene_notes(&mut self) {

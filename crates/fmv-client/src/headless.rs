@@ -473,6 +473,13 @@ pub fn run(args: &Args, mut session: Session, ff7: Option<Arc<Ff7Adapter>>, mut 
             print_scene_lines(scene_bot.take_lines());
         }
         session.flush_scene();
+        // A headless player answers every live window it may (first choice) and skips movies (it has no screen).
+        let windows: Vec<(u8, bool)> = session.state.live.windows().map(|w| (w.window, w.ask.is_some())).collect();
+        for (window, ask) in windows {
+            session.state.live.answer(window, ask.then_some(0));
+        }
+        session.state.live.movie_done();
+        session.flush_live();
         session.log_scene_notes();
         // Battles: attack when our gauge is full, ask for a debug encounter (once) if told to.
         if !session.state.field_controls_held() || session.state.battle.in_battle() {
