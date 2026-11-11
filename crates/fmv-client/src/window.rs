@@ -1429,6 +1429,9 @@ pub(crate) fn field_draw(
         own: false,
         party: state.party.is_party_entity(v.id),
     }));
+    // The story's party walking behind its leader (see `followers`; none while a scene's cast plays them), drawn under the
+    // local player, which stays last.
+    players.extend(crate::followers::players(state, &npcs, story.is_some(), render_t));
     let own_who = Who(state.self_entity().0);
     players.push(AvatarPlayer {
         who: own_who,
@@ -2429,7 +2432,8 @@ mod tests {
         let draw = field_draw(None, &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.0);
         assert!(draw.built.is_none());
         assert_eq!(epoch, state.npc_epoch(), "the frame noted which list of characters it saw");
-        assert_eq!(draw.markers.len(), 3, "two characters and the local player");
+        assert_eq!(draw.markers.len(), 4, "two characters, Cloud following (the story's party: see `followers`) and the local player");
+        assert!(!draw.markers[2].own && draw.markers[2].tint == [150, 150, 150], "the follower is drawn like the scene cast");
         let npcs = state.npc_views();
         for (marker, npc) in draw.markers.iter().zip(npcs) {
             assert_eq!(marker.tint, npc_appearance(npc).marker_tint);
@@ -2462,15 +2466,15 @@ mod tests {
         let draw = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
         assert_eq!(*asked.borrow(), ["agyb/acfe"], "asked for once, by the time the first frame was built");
         let built = draw.built.as_ref().expect("a stage and avatars: models");
-        assert_eq!(built.frame.models.len(), 2, "the character with a model and the local player");
-        // The players list is [gu0, ghost, own]: only `ghost` (index 1) has no model.
+        assert_eq!(built.frame.models.len(), 3, "the character with a model, Cloud following (see `followers`) and the local player");
+        // The players list is [gu0, ghost, Cloud following, own]: only `ghost` (index 1) has no model.
         assert_eq!(built.markers, [1]);
         assert_eq!(draw.markers.len(), 1, "one marker: the character the data names no model for");
         assert!(!draw.markers[0].own);
         // A second frame in the same state loads nothing and keeps the epoch.
         let again = field_draw(Some(&mut avatars), &mut epoch, &view, &state, [1, 2, 3], 1.0, 0.016);
         assert_eq!(asked.borrow().len(), 1);
-        assert_eq!(again.built.unwrap().frame.models.len(), 2);
+        assert_eq!(again.built.unwrap().frame.models.len(), 3);
         // The model's name goes over its head; the markers' over the marker.
         let npcs = state.npc_views();
         let feet = view.to_view(npcs[0].pos).unwrap();

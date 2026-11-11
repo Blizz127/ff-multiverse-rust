@@ -200,6 +200,12 @@ impl PartyMirror {
         self.party.as_ref().is_some_and(|p| p.is_leader(self.me))
     }
 
+    /// The entity of this account's party leader, when the server has said who it is (`None`: no party, or not yet known).
+    pub fn leader_entity(&self) -> Option<EntityId> {
+        let party = self.party.as_ref()?;
+        self.names.get(&party.leader)?.entity
+    }
+
     /// Is `account` in this account's party? (This account itself counts, when it is in one.)
     pub fn is_party_account(&self, account: AccountId) -> bool {
         self.party.as_ref().is_some_and(|p| p.contains(account))

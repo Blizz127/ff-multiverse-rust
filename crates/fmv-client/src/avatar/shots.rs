@@ -1100,6 +1100,8 @@ fn offscreen_field_two_originals() {
         npcs: vec![],
     };
     assert!(state.apply(0.0, snapshot).is_none());
+    // This picture is about the two players' own characters: no story party walking behind them (see `followers`).
+    state.followers.lock().unwrap().switch_off();
 
     // The window's own composition of the frame (the first call loads the models).
     let (mut epoch, render_t) = (0, 1.0);
@@ -1285,4 +1287,70 @@ fn real_ff7_the_guards_of_md1stin_can_be_talked_to_where_a_player_can_stand() {
             assert_eq!(away.take_press(), Some(None), "{}: the press goes out as OK where the player stands", guard.name);
         }
     }
+}
+
+/// The story's party walks behind its leader (see `crate::followers`): the player walks along md1stin's platform and Cloud
+/// (the story's party at the start) is drawn on the path it walked, a little behind it, with his own field model and
+/// walking. The picture is `field_cloud_follows.png` (`FMV_SHOT_DIR`): look at where he stands, his size beside the
+/// player's, that he walks, and that the scenery in front hides him as it hides players.
+#[test]
+#[ignore = "needs the owner's real FF7 data (FMV_FF7_LIBRARY, FMV_FF7_DATA or FMV_FF7_FLEVEL) and a GPU or software Vulkan/GL driver"]
+fn offscreen_field_cloud_follows() {
+    use crate::backdrop::FieldView;
+    use crate::state::ClientState;
+    use crate::window::field_draw;
+    use fmv_core::{AccountId, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
+    use fmv_ff7::playable::PLACEHOLDER_BODIES;
+    use fmv_protocol::ServerMsg;
+    use real::*;
+
+    let Some(real) = open() else { return };
+    let Some(mut gpu) = Offscreen::new() else { return };
+    let key = "md1stin";
+    let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
+    let stage = view.stage.clone().expect("an FF7 field has a stage");
+    let area = real.adapter.load_field(key).expect("field");
+    let mut avatars = avatars(&real);
+    let flat = flat_front(&area);
+    // Two open places of the platform, the second farther from the camera: the player walks from the far one to the near
+    // one, so Cloud comes after it, on the corridor's own floor.
+    let candidates = spots(&mut avatars, &view, &stage, &area, flat.as_ref(), (450.0, 1300.0));
+    let open_places: Vec<Spot> = candidates.iter().copied().filter(|s| s.covered == 0.0).collect();
+    let near = open_places.iter().copied().min_by(|a, b| a.depth.total_cmp(&b.depth)).expect("an uncovered place");
+    let far = open_places
+        .iter()
+        .copied()
+        .filter(|s| s.depth > near.depth * 1.25)
+        .min_by(|a, b| a.depth.total_cmp(&b.depth))
+        .expect("an uncovered place farther away");
+    let body = PLACEHOLDER_BODIES[0];
+    let tint = [70, 130, 245];
+    let area_id = AreaId { game: GameId::Ff7, key: key.to_string() };
+    let mut state = ClientState::new(EntityId(1), AccountId(1), far.pos, area_id.clone());
+    state.change_area(area_id.clone(), far.pos, 0.0, false);
+    let snapshot = ServerMsg::AreaSnapshot {
+        area: area_id.clone(),
+        tick: 1,
+        entities: vec![EntitySnapshot { id: EntityId(1), pos: far.pos, facing: 0.0, anim: AnimState::Idle, avatar: AvatarAppearance::new("Blizz", tint, Some(body.model.appearance_ref.to_string())) }],
+        npcs: vec![],
+    };
+    assert!(state.apply(0.0, snapshot).is_none());
+    // The walk: the trail the followers take is the leader's own path (fed frame by frame, as the window does).
+    let (mut epoch, render_t) = (0, 1.0);
+    let heading = (near.pos.y - far.pos.y).atan2(near.pos.x - far.pos.x);
+    for i in 0..=60 {
+        let t = i as f32 / 60.0;
+        let p = Pos::new(far.pos.x + (near.pos.x - far.pos.x) * t, far.pos.y + (near.pos.y - far.pos.y) * t, far.pos.z + (near.pos.z - far.pos.z) * t);
+        state.own.set_motion(p, heading, AnimState::Walk);
+        field_draw(Some(&mut avatars), &mut epoch, &view, &state, tint, render_t, 0.016);
+    }
+    let draw = field_draw(Some(&mut avatars), &mut epoch, &view, &state, tint, render_t, 0.016);
+    let built = draw.built.as_ref().expect("models");
+    let looks: Vec<&str> = built.frame.models.iter().map(|m| m.asset.appearance.appearance_ref).collect();
+    eprintln!("drawn: {looks:?}; walked {:.0} units", (near.pos.x - far.pos.x).hypot(near.pos.y - far.pos.y));
+    assert!(looks.contains(&"ff7/cloud"), "Cloud follows the player: {looks:?}");
+    assert!(looks.contains(&body.model.appearance_ref), "the player's own body: {looks:?}");
+    let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
+    let img = gpu.render_field(1100, 680, &scene, Some(&built.frame), &DrawList::new());
+    save("field_cloud_follows", 1100, 680, &img);
 }

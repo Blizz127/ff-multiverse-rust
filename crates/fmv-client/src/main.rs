@@ -32,6 +32,7 @@ mod camera;
 mod cli;
 mod delete;
 mod ff7;
+mod followers;
 mod gamemode;
 mod gamepad;
 mod graphics;

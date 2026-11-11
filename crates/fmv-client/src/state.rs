@@ -404,6 +404,8 @@ pub struct ClientState {
     pub progress: ProgressMirror,
     /// Where the server says our story stands (see `crate::story`). Empty until it says: a new account.
     pub story: StoryMirror,
+    /// The story's party walking behind its leader on the field (see `followers`): presentation only.
+    pub(crate) followers: std::sync::Mutex<crate::followers::Followers>,
     story_hold: Option<StoryHold>,
     story_last_hold: u64,
     story_hold_epoch: u64,
@@ -454,6 +456,7 @@ impl ClientState {
             ordinary_game_over: false,
             progress: ProgressMirror::default(),
             story: StoryMirror::default(),
+            followers: Default::default(),
             story_hold: None,
             story_last_hold: 0,
             story_hold_epoch: 0,
