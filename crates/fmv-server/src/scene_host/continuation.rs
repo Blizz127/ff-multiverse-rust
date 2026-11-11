@@ -63,7 +63,7 @@ impl Ff7SceneHost {
                 (ScriptBoundary::Battle(mark), SceneReplayEvent::Battle { ordinal, identity, formation, progress, gil }) => {
                     if mark.ordinal != *ordinal || mark.formation != *formation || mark.flags != Some(8)
                         || mark.identity_bytes() != *identity || !persistable_field_gil(*gil, *gil) { return None; }
-                    let stored = StoryState::decode(progress)?;
+                    let stored = StoryState::decode(progress).filter(super::executable_story)?;
                     // Combat changes resources, not the field script's persistent selectors.
                     // A forged or mismatched story afterimage must not choose a later branch.
                     if stored != after || stored.encode() != *progress { return None; }
@@ -102,6 +102,7 @@ impl Ff7SceneHost {
 /// Validate and apply just this segment. Earlier committed resource operations have already
 /// been removed by checked resume; cumulative interpreter failures remain grounds for refusal.
 fn checked_segment(snapshot: SceneSnapshot, before: &StoryState, gil: u32, full_restore_is_redundant: bool) -> Option<(Outcome, StoryState, u32)> {
+    if !super::executable_story(before) { return None; }
     let outcome = Outcome {
         end: match snapshot.boundary { ScriptBoundary::End(end) => end, _ => End::Battle },
         windows: snapshot.stats.windows, questions: 0, writes: snapshot.writes,

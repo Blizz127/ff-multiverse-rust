@@ -1205,6 +1205,17 @@ impl AreaRuntime for Ff7FieldArea {
         crate::story::canon_party_of(progress)
     }
 
+    fn try_story_party(&self, progress: &[u8]) -> Result<Vec<u8>, AdapterError> {
+        crate::story::checked_canon_party_of(progress)
+            .ok_or_else(|| AdapterError::Unsupported("the saved canon party is unknown or unreadable".into()))
+    }
+
+    fn supports_saved_progression(&self, progress: &[u8]) -> bool {
+        // V4 is currently a storage foundation. Do not send it to a protocol-21 peer
+        // whose older story decoder could substitute a starting state for this format.
+        !crate::story::StoryState::decode(progress).is_some_and(|story| story.supports_native_party())
+    }
+
     // The canon party is in the battle, not in the field (see `crate::story`, "What this does not do").
 
     /// The hint is the index of a triangle of this walkmesh (an exit's `arrival_hint`): when it
@@ -1243,6 +1254,21 @@ mod tests {
     use crate::testutil::{build_lgp, FieldSpec};
     use std::io::{self, Cursor, SeekFrom};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn native_party_storage_can_be_inspected_but_cannot_enter_legacy_gameplay() {
+        let area = area();
+        for native in [crate::story::StoryState::fresh_native_first_control(),
+            crate::story::StoryState::fresh_first_control().into_native_party().unwrap()] {
+            assert!(!area.supports_saved_progression(&native.encode()));
+        }
+        for legacy in [Vec::new(), crate::story::StoryState::at(69).encode(),
+            crate::story::StoryState::fresh_first_control().encode(), vec![254]] {
+            assert!(area.supports_saved_progression(&legacy), "the existing legacy admission policy stays unchanged");
+        }
+        assert_eq!(area.try_story_party(&crate::story::StoryState::fresh_native_first_control().encode()).unwrap(), vec![0]);
+        assert!(area.try_story_party(&[254]).is_err());
+    }
 
     /// Synthetic data labelled the way the import pipeline labels it: FIXTURE.
     fn provenance() -> EditionProvenance {

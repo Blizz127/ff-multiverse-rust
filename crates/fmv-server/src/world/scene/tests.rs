@@ -703,6 +703,7 @@ fn debug_new_story_does_not_initialize_an_empty_coherent_token_login() {
         },
         checkpoint: None,
         reservation: None,
+        field_visit: None,
     };
     new.scene_state = Some(state.clone());
     new.scene_group = vec![state];

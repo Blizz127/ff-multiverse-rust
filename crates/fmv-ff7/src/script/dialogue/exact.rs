@@ -34,6 +34,8 @@ pub struct ExactRun {
 pub enum ExactError {
     #[error("exact dialogue requires a version 3 story")]
     LegacyStory,
+    #[error("native party execution is not implemented for exact dialogue")]
+    NativePartyUnsupported,
     #[error("the field has no such entity or script")]
     MissingScript,
     #[error("the character is hidden or not talkable")]
@@ -113,6 +115,11 @@ fn key(bank: u8, address: u8) -> (u8, u8) {
     (canonical_persistent_bank(bank).unwrap_or(if bank == 6 { 5 } else { bank }), address)
 }
 
+fn require_supported_party(state: &StoryState) -> Result<(), ExactError> {
+    if state.supports_native_party() { return Err(ExactError::NativePartyUnsupported); }
+    Ok(())
+}
+
 fn presentation(opcode: u8) -> bool {
     matches!(opcode,
         0x08 | 0x09 | 0x24..=0x27 | 0x29 | 0x2A | 0x2C | 0x2D | 0x2E | 0x2F | 0x33..=0x37
@@ -124,6 +131,7 @@ fn presentation(opcode: u8) -> bool {
 
 impl Walk {
     fn exact(mut self, story: &StoryState, seeds: &[((u8, u8), u8)], battle: Option<u16>) -> Result<Self, ExactError> {
+        require_supported_party(story)?;
         if !story.supports_extended() { return Err(ExactError::LegacyStory); }
         let mut known = BTreeMap::new();
         for &((bank, address), value) in seeds {
@@ -581,6 +589,7 @@ fn run(walk: &mut Walk, script: &FieldScript<'_>, state: &StoryState, answers: &
 }
 
 pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32, entry: &ExactScript, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    require_supported_party(state)?;
     if script.span(entry.entity, entry.slot).is_none() { return Err(ExactError::MissingScript); }
     let mut walk = Walk::script(entry.entity, entry.slot, seed, Limits::default()).pressing(entry.keys)
         .exact(state, &entry.seeds, entry.after_battle)?;
@@ -615,6 +624,7 @@ pub fn run_script_exact(script: &FieldScript<'_>, state: &StoryState, seed: u32,
 /// Audit setup for availability without treating talk-time setup as a new field entry. A setup
 /// assignment must already be fully known with that value; changing values or knowledge refuses.
 pub fn run_talk_exact(script: &FieldScript<'_>, entity: usize, state: &StoryState, seed: u32, answers: &[usize]) -> Result<ExactRun, ExactError> {
+    require_supported_party(state)?;
     if script.span(entity, INIT_SCRIPT).is_none() || script.span(entity, TALK_SCRIPT).is_none() { return Err(ExactError::MissingScript); }
     let setup = audited_setup(script, entity, state, true)?;
     if setup.talk_off || !setup.visible { return Err(ExactError::NotTalkable); }
@@ -644,6 +654,7 @@ fn audited_setup(script: &FieldScript<'_>, entity: usize, state: &StoryState, ma
 }
 
 pub fn run_panel_exact(script: &FieldScript<'_>, entity: usize, state: &StoryState, seed: u32, triangle: u16, vars: &[(u8, u8)]) -> Result<ExactRun, ExactError> {
+    require_supported_party(state)?;
     let main = script.disassemble_partial(entity, INIT_SCRIPT).ok()
         .and_then(|listing| listing.instructions.into_iter().find(|ins| ins.opcode == 0x00).map(|ins| ins.end()))
         .ok_or(ExactError::MissingScript)?;

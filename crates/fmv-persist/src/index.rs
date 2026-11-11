@@ -25,7 +25,8 @@
 //! (`{"schema_version":2,"kind":"fmv-index-log"}`). Version 3 introduced durable scene
 //! batches. Explicit durable story writes now raise the header to 4, excluding earlier
 //! writers that lack exact ordinary story/battle commits and uncertain-write fencing.
-//! Reading and compaction preserve an existing version 2 or 3 header. The entries that
+//! Field-visit state requires version 5 so prior writers cannot discard its metadata.
+//! Reading and compaction preserve each existing supported header. The entries that
 //! follow retain the same format:
 //!
 //! * `{"op":"account","id":7,"name":"Tifa","token":"<64 hex>","at":1700000000}` plus optional
@@ -85,10 +86,32 @@ pub(crate) const INDEX_LOG_FILE: &str = "index.log";
 /// Minimum header of legacy scene batch intents. Recovery must keep accepting these under
 /// version 3; raising the current writer's fence must not strand an older pending intent.
 pub(crate) const SCENE_BATCH_INDEX_VERSION: u32 = 3;
-/// Current recognized index maximum and the fence for explicit durable story writes.
+/// The minimum fence for explicit durable story writes.
 /// Character schema 3 and batch intent schema 2 are unchanged; version 4 excludes prior
 /// writers whose ordinary story/reward and uncertain-write behavior is incompatible.
 pub(crate) const DURABLE_STORY_INDEX_VERSION: u32 = 4;
+/// Current recognized index maximum and the minimum fence for account-owned field visits.
+pub(crate) const FIELD_VISIT_INDEX_VERSION: u32 = 5;
+
+/// Explicit minimum reader/writer compatibility for a store. Selecting a level only raises
+/// its recognized index fence; it does not initialize, validate or register game records.
+/// Existing records and registration defaults remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreCompatibility {
+    /// Exact ordinary story and recoverable battle outcomes (index version 4).
+    DurableStory,
+    /// Account-owned field visits and their atomic progress updates (index version 5).
+    FieldVisit,
+}
+
+impl StoreCompatibility {
+    pub(crate) fn index_version(self) -> u32 {
+        match self {
+            Self::DurableStory => DURABLE_STORY_INDEX_VERSION,
+            Self::FieldVisit => FIELD_VISIT_INDEX_VERSION,
+        }
+    }
+}
 const LOG_KIND: &str = "fmv-index-log";
 const CHECKSUM_LEN: usize = 8;
 /// Longest line read back. An account line is under 400 bytes (24 characters of up to four
@@ -140,8 +163,8 @@ pub(crate) struct Index {
 impl Index {
     pub(crate) fn format_version(&self) -> u32 { self.format_version.unwrap_or(INDEX_LOG_VERSION) }
 
-    pub(crate) fn require_scene_batch_format(&mut self) {
-        self.format_version = Some(DURABLE_STORY_INDEX_VERSION);
+    pub(crate) fn require_format(&mut self, minimum: u32) {
+        self.format_version = Some(self.format_version().max(minimum));
     }
 
     /// Make room for `accounts` accounts in every table now. Registering an account then never
@@ -335,7 +358,7 @@ fn header_line(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
-    if !(INDEX_LOG_VERSION..=DURABLE_STORY_INDEX_VERSION).contains(&version) {
+    if !(INDEX_LOG_VERSION..=FIELD_VISIT_INDEX_VERSION).contains(&version) {
         return Err(PersistError::corrupt(path, "unsupported index output version"));
     }
     encode_line(
@@ -348,7 +371,7 @@ fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
 }
 
 fn check_header(path: &Path, line: &[u8]) -> Result<u32> {
-    check_header_upto(path, line, DURABLE_STORY_INDEX_VERSION)
+    check_header_upto(path, line, FIELD_VISIT_INDEX_VERSION)
 }
 
 fn check_header_upto(path: &Path, line: &[u8], maximum: u32) -> Result<u32> {
@@ -933,7 +956,7 @@ mod tests {
 
     #[test]
     fn recognized_header_fences_reject_prior_readers_and_preserve_each_version_during_open_and_compaction() {
-        for version in [INDEX_LOG_VERSION, SCENE_BATCH_INDEX_VERSION, DURABLE_STORY_INDEX_VERSION] {
+        for version in [INDEX_LOG_VERSION, SCENE_BATCH_INDEX_VERSION, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let path = root.join(INDEX_LOG_FILE);
@@ -945,7 +968,7 @@ mod tests {
             assert_eq!(check_header(&path, first).unwrap(), version);
             if version > INDEX_LOG_VERSION {
                 // The preceding reader used this recognized-version check before reading
-                // accounts or touching transaction recovery. In particular, max3 rejects4.
+                // accounts or touching transaction recovery: max3 rejects4 and max4 rejects5.
                 assert!(matches!(check_header_upto(&path, first, version - 1),
                     Err(PersistError::FutureSchema { .. })));
             }

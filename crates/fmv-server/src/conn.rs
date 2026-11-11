@@ -631,6 +631,8 @@ impl Conn {
                         JoinError::AlreadyOnline => Close::reject(RejectCode::AlreadyOnline, ALREADY_ONLINE),
                         JoinError::ProgressChanged => Close::reject(RejectCode::Internal, "A scene save completed during login. Please reconnect to load current progress."),
                         JoinError::StorageUnavailable => Close::reject(RejectCode::Internal, "Server storage requires recovery. Please reconnect after the server restarts."),
+                        JoinError::UnsupportedFieldVisit => Close::reject(RejectCode::Internal, "This save needs field-visit support that this server does not yet provide."),
+                        JoinError::UnsupportedProgression => Close::reject(RejectCode::Internal, "This save uses a story format that this server does not yet support for gameplay."),
                     })
             })
         };

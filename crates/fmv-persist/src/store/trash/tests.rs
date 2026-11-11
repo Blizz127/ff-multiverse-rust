@@ -13,6 +13,7 @@ use crate::character::{GameCharacter, NewPlayerCharacter};
 use crate::model::Registered;
 
 mod format;
+mod field_visit_format;
 
 const NOW: u64 = 1_700_000_000;
 
@@ -625,7 +626,7 @@ fn a_failed_restore_puts_the_records_back_and_retains_the_selected_format_fences
     let manifest_path = format!("{TRASH_DIR}/{}/{MANIFEST_FILE}", deleted.entry);
     let mut expected_manifest: serde_json::Value = serde_json::from_slice(&before.remove(&manifest_path).unwrap()).unwrap();
     assert_eq!(expected_manifest["schema_version"], LEGACY_MANIFEST_VERSION);
-    expected_manifest["schema_version"] = MANIFEST_VERSION.into();
+    expected_manifest["schema_version"] = DURABLE_STORY_MANIFEST_VERSION.into();
     let actual_manifest: serde_json::Value = serde_json::from_slice(&records_after.remove(&manifest_path).unwrap()).unwrap();
     assert_eq!(actual_manifest, expected_manifest, "only the compatibility marker changes; no restore plan remains");
     assert_eq!(records_after, before, "every source record is back unchanged and no new record was left");

@@ -683,7 +683,12 @@ impl World {
         let max_limit = bw.rules().progress_limits().max_limit;
         let companion_level = bw.settings.level.unwrap_or_else(|| leader.progress.unwrap_or_else(|| progress::fresh(bw.rules(), progress::DEFAULT_CHARACTER)).level);
         let companion_limit = if bw.settings.debug_limit_full { max_limit } else { 0 };
-        let canon: Vec<u8> = self.areas.get(&player.area).map_or_else(Vec::new, |area| area.runtime().story_party(&leader.progression));
+        let canon = self.areas.get(&player.area).ok_or(BattleRejection::Unsupported)?
+            .runtime().try_story_party(&leader.progression).map_err(|_| BattleRejection::Unsupported)?;
+        if canon.len() > MAX_BATTLE_PARTY.saturating_sub(entities.len())
+            || canon.iter().enumerate().any(|(index, character)| canon[..index].contains(character)) {
+            return Err(BattleRejection::Unsupported);
+        }
         // Who commands them (`--companions-player-commanded`, `BattleMember::commander`): the party's LEADER when it fights, else
         // the first player that does (a solo battle's only player), as FF7's player commands the whole party. Nobody when the
         // switch is off: the server commands them. Every other player commands only their own character.
@@ -695,16 +700,15 @@ impl World {
         };
         let companions: Vec<BattleMember> = canon
             .iter()
-            .filter_map(|&character| {
-                let name = clip_character_name(&bw.rules().character_name(character)?);
+            .map(|&character| {
+                let name = clip_character_name(&bw.rules().character_name(character).ok_or(BattleRejection::Unsupported)?);
                 let member = BattleMember { status: bw.settings.debug_status, ..BattleMember::companion(name, character, companion_level, companion_limit) };
-                Some(match commander {
+                Ok(match commander {
                     Some(account) => member.commanded_by(account),
                     None => member,
                 })
             })
-            .take(MAX_BATTLE_PARTY.saturating_sub(entities.len()))
-            .collect();
+            .collect::<Result<_, BattleRejection>>()?;
 
         // Each player fights as its own character (its stat curve) at its own level (see `progress`); `--battle-level`
         // pins the level of the fight, not what the account has earned.
@@ -3780,9 +3784,13 @@ mod tests {
 
     /// The fixture's plaza with a story: `story_party` answers `party(progression)`, the canon party at that story
     /// state. Everything else is the plaza's.
+    type CheckedParty = fn(&[u8]) -> Result<Vec<u8>, fmv_adapter_api::AdapterError>;
+
     struct StoryArea {
         inner: Box<dyn AreaRuntime>,
         party: fn(&[u8]) -> Vec<u8>,
+        checked_party: Option<CheckedParty>,
+        admit: fn(&[u8]) -> bool,
     }
 
     impl AreaRuntime for StoryArea {
@@ -3807,6 +3815,10 @@ mod tests {
         fn story_party(&self, progress: &[u8]) -> Vec<u8> {
             (self.party)(progress)
         }
+        fn try_story_party(&self, progress: &[u8]) -> Result<Vec<u8>, fmv_adapter_api::AdapterError> {
+            self.checked_party.map_or_else(|| Ok(self.story_party(progress)), |query| query(progress))
+        }
+        fn supports_saved_progression(&self, progress: &[u8]) -> bool { (self.admit)(progress) }
     }
 
     /// Pin this two-companion machinery fixture to the source-backed reactor stage at moment 11.
@@ -3818,9 +3830,108 @@ mod tests {
     /// A world over the plaza whose story's canon party is `party(progression)`, with battles on.
     fn world_with_party(settings: BattleSettings, party: fn(&[u8]) -> Vec<u8>) -> World {
         let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
-        let mut w = World::new(Box::new(StoryArea { inner, party })).unwrap();
+        let mut w = World::new(Box::new(StoryArea { inner, party, checked_party: None, admit: |_| true })).unwrap();
         w.configure_battle(Some(settings), true);
         w
+    }
+
+    #[test]
+    fn unknown_canon_party_refuses_a_battle_but_known_empty_and_ordered_slots_are_distinct() {
+        use fmv_ff7::story::StoryState;
+        let checked: CheckedParty = |blob| fmv_ff7::story::checked_canon_party_of(blob)
+            .ok_or_else(|| fmv_adapter_api::AdapterError::Unsupported("unknown party".into()));
+        let unknown = StoryState::fresh_first_control().into_native_party().unwrap();
+        let mut empty = StoryState::fresh_native_first_control();
+        empty.native_party_mut().unwrap().write_main_slots([255; 3], 7).unwrap();
+        let mut ordered = StoryState::fresh_native_first_control();
+        ordered.native_party_mut().unwrap().write_main_slots([2, 255, 0], 7).unwrap();
+        // Main membership is independent of availability and of the raw field tuple.
+        ordered.native_party_mut().unwrap().write_availability_masked(0, u16::MAX);
+        for (blob, expected) in [
+            (unknown.encode(), None), (vec![254], None),
+            (empty.encode(), Some(vec![])), (ordered.encode(), Some(vec![2, 0])),
+        ] {
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| panic!("the unchecked fallback must not build a battle"), checked_party: Some(checked), admit: |_| true,
+            })).unwrap();
+            w.configure_battle(Some(settings(SyntheticRules::default())), true);
+            let now = Instant::now();
+            let mut player = seat_story(&mut w, "A", now, ProgressSeed::of(0, None), blob);
+            player.drain();
+            let reply = w.request_encounter(player.entity, Some(1), now);
+            if let Some(expected) = expected {
+                assert_eq!(reply, BattleReply::Done);
+                let roster = roster_of(&mut player);
+                assert_eq!(roster.iter().filter(|m| m.is_companion()).map(|m| m.character).collect::<Vec<_>>(), expected);
+                assert_eq!(roster.iter().filter(|m| m.entity().is_some()).count(), 1);
+            } else {
+                assert_eq!(reply, refused(None, BattleRejection::Unsupported));
+                assert_eq!(w.battle_count(), 0);
+                assert!(!w.in_battle(player.entity));
+                assert!(!player.battle_msgs().iter().any(|m| matches!(m, ServerMsg::EncounterStart { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_duplicate_or_oversized_canon_rosters_are_refused_instead_of_silently_dropped() {
+        for party in [vec![0, 0], vec![0, 255], vec![0, 200, 1], (0..8).collect()] {
+            let checked: CheckedParty = |blob| Ok(blob.to_vec());
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| panic!("checked roster required"), checked_party: Some(checked), admit: |_| true,
+            })).unwrap();
+            w.configure_battle(Some(settings(SyntheticRules::default())), true);
+            let now = Instant::now();
+            let mut player = seat_story(&mut w, "A", now, ProgressSeed::of(0, None), party);
+            player.drain();
+            assert_eq!(w.request_encounter(player.entity, Some(1), now), refused(None, BattleRejection::Unsupported));
+            assert_eq!(w.battle_count(), 0);
+            assert!(!player.battle_msgs().iter().any(|m| matches!(m, ServerMsg::EncounterStart { .. })));
+        }
+    }
+
+    #[test]
+    fn unsupported_saved_progression_never_reaches_a_client_or_a_debug_save() {
+        use fmv_persist::{ProgressPair, Progression, SceneState};
+        for source in 0..3 {
+            let inner = FixtureAdapter::new().load_area(FIXTURE_AREA_KEY).unwrap();
+            let mut w = World::new(Box::new(StoryArea {
+                inner, party: |_| Vec::new(), checked_party: None, admit: |blob| blob != [4],
+            })).unwrap();
+            let (saver, mut queue) = SaverHandle::channel();
+            w.set_progress_saver(saver);
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let (tx, mut rx) = mpsc::channel(32);
+            let mut new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "Unsupported".into(), tint: [0; 3], appearance_ref: None },
+                progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(),
+                tx, close: Arc::new(watch::channel(false).0),
+            };
+            match source {
+                0 => new.progression = vec![4],
+                1 => {
+                    let state = SceneState {
+                        pair: ProgressPair { story: Progression::empty(account, w.home_game()), character: None },
+                        checkpoint: None, reservation: None, field_visit: None,
+                    };
+                    let mut peer = state.clone();
+                    peer.pair.story.account_id = AccountId(account.0 + 1);
+                    peer.pair.story.blob = vec![4];
+                    new.scene_state = Some(state.clone());
+                    new.scene_group = vec![state, peer];
+                }
+                _ => w.scenes.debug_new_story = Some(vec![4]),
+            }
+            assert_eq!(w.join(new, Instant::now()), Err(crate::world::JoinError::UnsupportedProgression));
+            assert_eq!(w.player_count(), 0);
+            assert!(!w.has_session(account));
+            assert!(rx.try_recv().is_err(), "no story, scene or placement publication");
+            assert!(queue.try_recv().is_err(), "even a selected debug baseline must be checked before saving");
+        }
     }
 
     /// A player with a story `progression` (what the canon party is read from) and character progress `progress`.
@@ -4012,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn a_story_with_no_canon_party_or_a_rule_set_that_names_nobody_fights_with_the_players_only() {
+    fn a_story_with_no_canon_party_fights_with_the_players_only() {
         let t0 = Instant::now();
         // No canon party in the story (the plaza's own default).
         let mut w = world_with(Some(settings(SyntheticRules::default())), true);
@@ -4020,16 +4131,6 @@ mod tests {
         a.drain();
         assert_eq!(w.request_encounter(a.entity, Some(0), t0), BattleReply::Done);
         assert_eq!(who(&roster_of(&mut a)), vec![("player", "A".to_string(), 0, 5)]);
-        // An id the rules know nobody by is left out rather than invented.
-        fn odd(_: &[u8]) -> Vec<u8> {
-            vec![0, 200, 1]
-        }
-        let mut w = world_with_party(settings(SyntheticRules::default()), odd);
-        let mut b = seat(&mut w, "B", t0);
-        b.drain();
-        assert_eq!(w.request_encounter(b.entity, Some(0), t0), BattleReply::Done);
-        let names: Vec<String> = roster_of(&mut b).iter().map(|m| m.name.clone()).collect();
-        assert_eq!(names, ["Cloud", "Barret", "B"]);
     }
 
     /// Preemptive start: every gauge is full at once. With pacing off the companions act on the server's first step, as
@@ -4964,7 +5065,7 @@ mod tests {
             character.inventory = Some(vec![InventoryEntry::new(i as u16 * 3, 1)]);
             fmv_persist::SceneState { pair: fmv_persist::ProgressPair {
                 story: fmv_persist::Progression::empty(player.account, GameId::Ff7), character: Some(character),
-            }, checkpoint: None, reservation: None }
+            }, checkpoint: None, reservation: None, field_visit: None }
         }).collect();
         let carry = SceneCombatCarry { members: previous.setup.party.iter().enumerate().map(|(i, member)| {
             (member.clone(), BattleInitialState { hp: 140 - 10 * i as u32, mp: 20 - i as u32,
@@ -5061,7 +5162,7 @@ mod tests {
                 pair: fmv_persist::ProgressPair {
                     story: fmv_persist::Progression::new(*account, world.home_game(), player.progression.clone(), 0),
                     character: Some(character),
-                }, checkpoint: None, reservation: None,
+                }, checkpoint: None, reservation: None, field_visit: None,
             }
         }).collect()
     }
@@ -5091,7 +5192,7 @@ mod tests {
                 .expect("valid test battle settlement"));
             pair.character.as_mut().unwrap().schema_version = 3; // the durable outcome receipt stamps this envelope
             if pair.story.account_id == job.owner { pair.story.blob = job.next_story.clone(); }
-            fmv_persist::SceneState { pair, checkpoint: None, reservation: None }
+            fmv_persist::SceneState { pair, checkpoint: None, reservation: None, field_visit: None }
         }).collect();
         fmv_persist::SceneBatchCommitted { commit: fmv_persist::SceneCommit::Applied, current }
     }

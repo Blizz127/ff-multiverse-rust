@@ -31,10 +31,10 @@ fn matches_source(def: &SceneDef, source: StoryPointSource) -> bool {
 
 impl Ff7SceneHost {
     pub(super) fn exact_point_scene(&self, field: &str, before: &[u8], point: u32) -> Option<&SceneDef> {
-        if !self.extended_save || !StoryState::decode(before)?.supports_extended() { return None; }
+        let story = StoryState::decode(before)?;
+        if !self.extended_save || !story.supports_extended() || !super::executable_story(&story) { return None; }
         let area = self.field(field)?;
         let source = area.story_point_source(before, point)?;
-        let story = StoryState::decode(before)?;
         let mut matches = self.defs.iter().filter(|def| def.field.eq_ignore_ascii_case(field)
             && def.applies_at(story.moment) && matches_source(def, source));
         let def = matches.next()?;

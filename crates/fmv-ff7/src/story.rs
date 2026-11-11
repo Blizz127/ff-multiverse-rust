@@ -55,12 +55,22 @@
 //! [`StoryState::add_byte_checked`] provides ordered numeric changes with caller-supplied bounds.
 //! Existing version 1/2 states keep their byte-for-byte representation until explicitly promoted;
 //! promotion retains their tracked knowledge and does not infer new-game defaults or past choices.
-//! The largest representation is [`MAX_BANK_BLOB_BYTES`] bytes. Readers must allow that bound before
-//! enabling this format. The legacy union merge refuses version 3: a transactional store must use
+//! The largest version-3 representation is [`MAX_BANK_BLOB_BYTES`] bytes. Readers must allow that bound before
+//! enabling this format. The legacy union merge refuses versions 3 and 4: a transactional store must use
 //! [`compare_exchange_progression`] against the exact previous blob, under the same lock as its
 //! scene receipt, so stale saves cannot undo clears or numeric updates. This module performs no I/O.
 //! Version 3 phases include every carried value and knowledge mask; this conservative partition can
 //! later be narrowed with field-specific dependency evidence.
+//!
+//! **Version 4** adds explicit [`NativePartyState`] resources after the same bank records:
+//! main-party slots and independent PHS availability/lock masks. Raw field-party slots stay
+//! in the banks. [`StoryState::into_native_party`] promotes with entirely unknown resources;
+//! [`StoryState::fresh_native_first_control`] is a separate, explicit fresh port profile.
+//! Neither changes version-3 defaults. The maximum v4 blob is [`MAX_NATIVE_PARTY_BLOB_BYTES`]
+//! bytes. Exact replacement also preserves party knowledge and refuses a v4 downgrade.
+//! Its phase identity includes all party values and knownness. This schema alone does not
+//! enable v4 execution: interpreters and authoritative roster consumers must use these
+//! resources before registration or gameplay can opt into the new format.
 //!
 //! Explicit new-account registration can use [`StoryState::fresh_first_control`], the port's
 //! source-backed reset/opening profile. [`StoryState::fresh_reset`] separately describes the earlier
@@ -187,6 +197,8 @@ mod party_visibility;
 pub use party_visibility::{party_visibility_matches, reviewed_party_visibility};
 mod fresh;
 pub use banks::{canonical_persistent_bank, compare_exchange_progression, StoryWriteError, BLOB_VERSION_BANKS, MAX_BANK_BLOB_BYTES};
+mod native_party;
+pub use native_party::{checked_canon_party_of, NativePartyError, NativePartyState, BLOB_VERSION_NATIVE_PARTY, MAX_NATIVE_PARTY_BLOB_BYTES, NATIVE_PARTY_BYTES};
 
 /// The bank of the main progress counter (`Var[2][0]`).
 pub const MOMENT_BANK: u8 = 2;
@@ -278,7 +290,8 @@ pub fn tracked_var(bank: u8, address: u8) -> Option<TrackedVar> {
     TRACKED_VARS.iter().copied().find(|t| t.bank == bank && t.address == address)
 }
 
-/// An account's FF7 story state: its moment, legacy variables, or version 3 persistent bank knowledge.
+/// An account's FF7 story state: its moment, legacy variables, persistent bank knowledge,
+/// and, only in version 4, explicit native party resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoryState {
     /// The main progress counter (`Var[2][0]`).
@@ -287,6 +300,9 @@ pub struct StoryState {
     vars: BTreeMap<(u8, u8), u8>,
     /// Canonical persistent banks with known-bit masks; absent in the legacy formats.
     banks: Option<BTreeMap<(u8, u8), banks::KnownByte>>,
+    /// Resources outside the field banks; absent in versions 1–3. Raw field-party slots
+    /// remain in the bank image, never duplicated here.
+    native_party: Option<NativePartyState>,
 }
 
 impl StoryState {
@@ -298,11 +314,12 @@ impl StoryState {
 
     /// A legacy state at `moment`, with tracked bits zero and other variables unknown.
     pub const fn at(moment: u16) -> Self {
-        Self { moment, vars: BTreeMap::new(), banks: None }
+        Self { moment, vars: BTreeMap::new(), banks: None, native_party: None }
     }
 
     /// Read a progression blob: empty retains the legacy initial state, `[1, lo, hi]` a stored moment, a canonical version 2
-    /// blob a moment and variables, version 3 persistent values and known masks; anything else is unreadable (`None`).
+    /// blob a moment and variables, version 3 persistent values and known masks, or version 4
+    /// banks and native party resources; anything else is unreadable (`None`).
     // (`as_chunks` would satisfy the lint but needs Rust 1.88; the workspace keeps `chunks_exact`, see `lgp`.)
     #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn decode(blob: &[u8]) -> Option<Self> {
@@ -329,15 +346,16 @@ impl StoryState {
                 }
                 Some(state)
             }
-            [BLOB_VERSION_BANKS, ..] => banks::decode(blob),
+            [BLOB_VERSION_BANKS | BLOB_VERSION_NATIVE_PARTY, ..] => banks::decode(blob),
             _ => None,
         }
     }
 
     /// The blob that stores this state: version 1 (`[1, lo, hi]`, exactly what version 1 builds wrote) when no
-    /// variable is set, else the canonical version 2; an explicitly extended state always writes version 3.
+    /// variable is set, else the canonical version 2. Extended banks write version 3 unless
+    /// native party resources were explicitly added, in which case they write version 4.
     pub fn encode(&self) -> Vec<u8> {
-        if let Some(banks) = &self.banks { return banks::encode(self.moment, banks); }
+        if let Some(banks) = &self.banks { return banks::encode(self.moment, banks, self.native_party); }
         let [lo, hi] = self.moment.to_le_bytes();
         if self.vars.is_empty() {
             return vec![BLOB_VERSION, lo, hi];
@@ -545,6 +563,8 @@ pub fn canon_party_of(progress: &[u8]) -> Vec<u8> {
 /// whichever character the player looks like: `talk.set_story(Box::new(move || Box::new(state.clone())))` with
 /// `state` decoded from the progression the server told this client (`fmv-client`'s `StoryMirror::progress`).
 impl StoryVars for StoryState {
+    fn execution_supported(&self) -> bool { !self.supports_native_party() }
+
     fn byte(&self, bank: u8, address: u8) -> u8 {
         let [lo, hi] = self.moment.to_le_bytes();
         match (bank, address) {
@@ -952,6 +972,8 @@ fn panel_step(script: &FieldScript<'_>, entity: usize, triangle: usize, vars: &[
         triangle: BTreeMap<(u8, u8), u8>,
     }
     impl StoryVars for Standing<'_> {
+        fn execution_supported(&self) -> bool { self.state.execution_supported() }
+
         fn byte(&self, bank: u8, address: u8) -> u8 {
             self.triangle.get(&(bank, address)).copied().unwrap_or_else(|| self.state.byte(bank, address))
         }
@@ -1035,6 +1057,7 @@ impl AreaStory {
     /// that whole scene. No legacy projection is returned or applied here.
     pub fn point_source(&self, progress: &[u8], id: u32) -> Option<StoryPointSource> {
         let state = StoryState::decode(progress).filter(StoryState::supports_extended)?;
+        if state.supports_native_party() { return None; }
         let point = self.points.get(usize::try_from(id).ok()?)?;
         if !point.requires.iter().all(|guard| guard.holds(&state)) { return None; }
         let advances = point.effects.iter().filter(|effect| effect.requires.iter().all(|guard| guard.holds(&state)))
@@ -1094,7 +1117,8 @@ impl AreaStory {
             // Conservatively partition on all known persistent inputs, including their knownness.
             // Include the exact moment too: the legacy interval scanner does not yet recognize
             // every byte-alias/variable comparison that version 3 scripts can make.
-            let mut key = vec![PHASE_TAG, BLOB_VERSION_BANKS];
+            let version = if state.supports_native_party() { BLOB_VERSION_NATIVE_PARTY } else { BLOB_VERSION_BANKS };
+            let mut key = vec![PHASE_TAG, version];
             key.extend(blake3::hash(&state.encode()).as_bytes());
             return Some(PhaseKey(key));
         }

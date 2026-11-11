@@ -21,6 +21,13 @@ use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerI
 mod continuation;
 mod points;
 
+/// Decoding the native-party envelope is not yet permission to execute it through the
+/// legacy moment-derived party model. Keep all scene entry and replay paths closed until
+/// the interpreter and its durable outcomes carry those resources together.
+fn executable_story(story: &StoryState) -> bool {
+    !story.supports_native_party()
+}
+
 fn complete_outcome(outcome: &fmv_ff7::script::scene::Outcome) -> bool {
     (match outcome.end {
         fmv_ff7::script::dialogue::End::Finished => outcome.jump.is_none(),
@@ -114,6 +121,7 @@ impl Ff7SceneHost {
     fn finish_scene(&self, scene: &str, progress: &[u8], seed: u32, answers: &[u8], preview: bool, gil: Option<u32>) -> Option<SceneResult> {
         let def = self.def(scene)?;
         let story = def.prepare_story(&StoryState::decode(progress)?).ok()?;
+        if !executable_story(&story) { return None; }
         if !preview && story.supports_extended() && (!self.extended_save || gil.is_none()) { return None; }
         let area = self.field(&def.field)?;
         let answers: Vec<usize> = answers.iter().map(|&a| usize::from(a)).collect();
@@ -125,6 +133,7 @@ impl Ff7SceneHost {
     /// Build the final transition against the latest durable segment's input. A resumed scene
     /// uses its post-battle resource snapshot here, so prefix writes cannot replace earned gil.
     fn scene_result(&self, progress: &[u8], story: &StoryState, outcome: &fmv_ff7::script::scene::Outcome, preview: bool, gil: Option<u32>) -> Option<SceneResult> {
+        if !executable_story(story) { return None; }
         if !(if preview { complete_outcome(outcome) } else if story.supports_extended() { safe_interpretation(outcome) } else { safe_outcome(outcome) }) { return None; }
         let mut after = story.clone();
         let changed = if story.supports_extended() {
@@ -201,6 +210,7 @@ impl SceneHost for Ff7SceneHost {
 
     fn offered(&self, scene: &str, progress: &[u8]) -> bool {
         let (Some(def), Some(story)) = (self.def(scene), StoryState::decode(progress)) else { return false };
+        if !executable_story(&story) { return false; }
         if points::is_point_continuation(scene) {
             return self.exact_point_offered(def, progress);
         }
@@ -219,8 +229,9 @@ impl SceneHost for Ff7SceneHost {
     }
 
     fn continuation_for(&self, scene: &str, progress: &[u8]) -> bool {
+        let Some(story) = StoryState::decode(progress).filter(executable_story) else { return false; };
         self.continuation(scene) && self.def(scene).is_some_and(|def|
-            def.requires_continuation() || StoryState::decode(progress).is_some_and(|story| story.supports_extended()))
+            def.requires_continuation() || story.supports_extended())
     }
 
     fn noncombat_continuation(&self, scene: &str) -> bool {
@@ -291,6 +302,7 @@ impl SceneHost for Ff7SceneHost {
 
     fn trigger(&self, scene: &str, progress: &[u8]) -> Option<TriggerInfo> {
         let (def, story) = (self.def(scene)?, StoryState::decode(progress)?);
+        if !executable_story(&story) { return None; }
         // Point scenes are admitted only by the area's authoritative trigger. Making their
         // director into an Interact target would bypass that trigger, even with radius zero.
         if def.is_point_cutscene() { return None; }
@@ -332,6 +344,47 @@ impl SceneHost for Ff7SceneHost {
 mod tests {
     use super::*;
     use fmv_ff7::script::{dialogue::End, scene::{Outcome, Stats, Writes}};
+
+    #[test]
+    fn native_party_stories_refuse_scene_admission_execution_and_checkpoint_replay() {
+        use fmv_core::{EditionProvenance, GameId, Platform};
+        use fmv_ff7::script::scene::{BRIDGE_SCENE_ID, FLOWER_STATION_SCENE_ID, TEAM_TALK_SCENE_ID};
+        // An empty synthetic archive makes it observable that refusal precedes any field
+        // lookup or interpretation; this gate must not depend on missing owned data.
+        let mut archive = b"\0\0SQUARESOFT".to_vec();
+        archive.extend(0u32.to_le_bytes());
+        archive.resize(16 + 3600 + 2, 0);
+        archive.extend(b"FINAL FANTASY7");
+        let adapter = Ff7Adapter::from_flevel_reader(std::io::Cursor::new(archive), EditionProvenance {
+            game: GameId::Ff7, platform: Platform::Synthetic, edition: "fixture".into(),
+            region: "unknown".into(), language: "en".into(), revision: "gate-test".into(),
+            sources: vec![], modded: false,
+        }).unwrap();
+        let host = Ff7SceneHost::with_extended_save(Arc::new(adapter), true);
+        assert!(host.continuation_for(BRIDGE_SCENE_ID, &StoryState::at(39).encode()));
+        assert!(host.continuation_for(BRIDGE_SCENE_ID, &StoryState::at(39).into_extended().unwrap().encode()));
+        let replay = fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] };
+        for mut state in [StoryState::fresh_native_first_control(),
+            StoryState::fresh_first_control().into_native_party().unwrap()] {
+            for (scene, moment) in [(FLOWER_STATION_SCENE_ID, 36), (BRIDGE_SCENE_ID, 39), (TEAM_TALK_SCENE_ID, 6)] {
+                state.moment = moment;
+                let before = state.encode();
+                assert!(!host.offered(scene, &before));
+                assert!(!host.continuation_for(scene, &before), "saved v4 checkpoints cannot resume through the old VM");
+                assert!(host.trigger(scene, &before).is_none());
+                assert!(host.finish_with_resources(scene, &before, 7, &[], 600).is_none());
+                assert!(host.finish_preview_with_resources(scene, &before, 7, &[], 600).is_none());
+                assert!(host.initial_continuation(scene, &before, 7, 600, None).is_none());
+                assert!(host.evaluate_continuation(scene, &before, 7, 600, Some(&replay)).is_none());
+                assert_eq!(state.encode(), before, "refusal does not rewrite or promote the input");
+            }
+            state.moment = 6;
+            assert!(host.point_continuation("md1_1", &state.encode(), 0).is_none());
+        }
+        assert!(host.fields.lock().unwrap().is_empty(), "all refusals precede field execution");
+        assert!(!StoryState::decode(&host.fresh_story().unwrap()).unwrap().supports_native_party(),
+            "registration remains on its proven v3 path until native consumers are implemented");
+    }
 
     #[test]
     fn incomplete_or_economic_scenes_cannot_advance_or_travel() {

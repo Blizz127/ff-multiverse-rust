@@ -49,6 +49,8 @@ fn widest_character(account: AccountId, slot: u16, receipts: usize) -> Character
         checkpoint: None,
         reservation: None,
         scene_roster: None,
+        field_visit: None,
+        last_visit_commit: None,
     }
 }
 

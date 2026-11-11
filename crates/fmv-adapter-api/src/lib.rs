@@ -785,6 +785,22 @@ pub trait AreaRuntime: Send + Sync {
         let _ = progress;
         Vec::new()
     }
+
+    /// The authoritative canon roster for a battle. An empty roster is a known absence;
+    /// an error means the saved inputs cannot establish the roster, so no battle may start.
+    /// Adapters with partially known party resources must override this instead of guessing
+    /// their starting party. The default preserves adapters whose roster is always known.
+    fn try_story_party(&self, progress: &[u8]) -> Result<Vec<u8>, AdapterError> {
+        Ok(self.story_party(progress))
+    }
+
+    /// Whether this build can admit the saved story into gameplay. Storage support can
+    /// precede interpreter/wire support; false prevents publishing such a snapshot to a
+    /// client or replacing it with a default. This does not migrate or modify any bytes.
+    fn supports_saved_progression(&self, progress: &[u8]) -> bool {
+        let _ = progress;
+        true
+    }
 }
 
 /// A game adapter bound to one owned-content source (or the synthetic fixture).
@@ -1145,6 +1161,7 @@ mod tests {
         assert_eq!(area.story_advance(&[], 0), None);
         assert!(area.npcs_in_phase(&PhaseKey(vec![9])).is_empty());
         assert!(area.story_party(&[1, 2, 3]).is_empty(), "no canon party: the players fight alone");
+        assert!(area.try_story_party(&[1, 2, 3]).unwrap().is_empty());
     }
 
     /// A link along x = `x` from y = -50 to 50 at height `z`.

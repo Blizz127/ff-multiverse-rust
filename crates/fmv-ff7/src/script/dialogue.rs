@@ -113,6 +113,10 @@ use super::FieldScript;
 /// What the story says about the walker's world: the one place a talk script's branches learn how
 /// far the player is. The default [`StartOfGame`] stands for a new game.
 pub trait StoryVars {
+    /// Whether this story model can be executed by the current dialogue interpreter.
+    /// A richer save format must refuse before any legacy branch or setup is evaluated.
+    fn execution_supported(&self) -> bool { true }
+
     /// The savemap variable `address` of bank `bank` (1..=15) read as one byte. A word is the
     /// byte at `address` and the one after it (little endian), so only bytes are asked for.
     fn byte(&self, bank: u8, address: u8) -> u8;

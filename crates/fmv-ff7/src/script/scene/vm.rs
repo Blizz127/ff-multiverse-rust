@@ -362,6 +362,8 @@ impl SceneVars {
 }
 
 impl StoryVars for SceneVars {
+    fn execution_supported(&self) -> bool { self.story.execution_supported() }
+
     fn byte(&self, bank: u8, address: u8) -> u8 {
         self.audit_mask(bank, address, u8::MAX);
         self.baseline_byte(bank, address)
@@ -636,13 +638,18 @@ pub struct Vm {
     party_bank: [u8; 3],
     /// Source-validated MENU6 sites that retain the existing canonical names.
     default_name_sites: Vec<(usize, u8)>,
+    /// V4 resources are storage-only until native party execution is implemented. Once rejected,
+    /// a later begin, statistics reset or legacy battle snapshot must not restart this VM.
+    unsupported_native_party: bool,
     resources: ResourceOutcome,
     stats: Stats,
 }
 
 impl Vm {
     pub fn new(vars: SceneVars, seed: u32, limits: Limits) -> Self {
-        let party = [0, 1, 2].map(|slot| vars.party_member(slot).unwrap_or(255));
+        let unsupported_native_party = vars.story.supports_native_party();
+        let party = if unsupported_native_party { [255; 3] }
+            else { [0, 1, 2].map(|slot| vars.party_member(slot).unwrap_or(255)) };
         Self {
             jump: None,
             battle: None,
@@ -693,6 +700,7 @@ impl Vm {
             party_main: party,
             party_bank: party,
             default_name_sites: Vec::new(),
+            unsupported_native_party,
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -706,6 +714,30 @@ impl Vm {
     }
 
     pub fn resources(&self) -> &ResourceOutcome { &self.resources }
+
+    /// Refuse unsupported native-party execution before evaluating any instruction or accepting
+    /// an answer. Clear unpublished output so an invalid battle rebase cannot expose a stale
+    /// success boundary or a partial assignment. The latch survives all public resets.
+    fn refuse_native_party(&mut self) -> bool {
+        if !self.unsupported_native_party { return false; }
+        self.stats.setup_incomplete = true;
+        self.stats.unresolved = self.stats.unresolved.max(1);
+        self.done = Some(End::Broken);
+        self.pending = None;
+        self.queued_note = None;
+        self.out.clear();
+        self.writes.clear();
+        self.written_masks.clear();
+        self.party_ops.clear();
+        self.resources.gil_ops.clear();
+        self.resources.gil_after = self.resources.gil_before;
+        self.jump = None;
+        self.battle = None;
+        self.battle_checkpoint = None;
+        self.battle_flags = None;
+        self.window_checkpoint = None;
+        true
+    }
 
     /// Installed by ScenePlay only after validating the original script and semantic scene.
     /// An empty list keeps every MENU unsupported; this is not a general name-editor capability.
@@ -2338,6 +2370,7 @@ impl Vm {
     /// other tables hold where everyone stands, and the variables hold what those scripts wrote. The threads are
     /// dropped, loops included.
     pub fn setup(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
+        if self.refuse_native_party() { return; }
         self.quiet = true;
         self.threads.clear();
         self.slots.clear();
@@ -2390,6 +2423,8 @@ impl Vm {
     }
 
     pub(super) fn resume_battle(&mut self, story: &StoryState, resources: SceneResources) {
+        self.unsupported_native_party |= story.supports_native_party();
+        if self.refuse_native_party() { return; }
         // Acknowledged persistent assignments now live in the authoritative afterimage. Scratch
         // selectors (5/6) and every scheduler/actor/RNG detail stay exactly where combat paused.
         self.writes.retain(|(bank, _), _| crate::story::canonical_persistent_bank(*bank).is_none());
@@ -2440,6 +2475,9 @@ impl Vm {
     /// last, if that asked (the absolute line number of the choice, as a script stores it; anything else is clamped
     /// into the choices, `None` takes the cursor's starting line).
     pub fn resume(&mut self, script: &FieldScript<'_>, answer: Option<usize>) -> Beat {
+        if self.refuse_native_party() {
+            return Beat { stage: Vec::new(), then: Then::End { at: self.clock.saturating_sub(self.origin), how: End::Broken } };
+        }
         self.window_checkpoint = None;
         if let Some((opener, note)) = self.queued_note.take() {
             let at = self.clock.saturating_sub(self.origin);

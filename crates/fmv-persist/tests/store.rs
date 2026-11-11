@@ -903,15 +903,15 @@ fn future_and_zero_schema_versions_are_rejected_for_every_record_kind() {
     let store = Arc::try_unwrap(store).expect("kinds were dropped, store is unique");
     drop(store);
     // The index version lives in the header of index.log. Fresh stores use v2;
-    // explicit durable story writes use supported v4, so v5 is the first future format.
+    // field visits use supported v5, so v6 is the first future format.
     let log_original = fs::read(index_log(&root)).unwrap();
-    let newer = 5u64;
+    let newer = 6u64;
     for future in [newer, u64::from(u32::MAX)] {
         set_log_schema(&root, Some(json!(future)));
         match Store::open(&root) {
             Err(PersistError::FutureSchema {
                 found, supported, ..
-            }) => assert_eq!((u64::from(found), supported), (future, 4)),
+            }) => assert_eq!((u64::from(found), supported), (future, 5)),
             other => panic!("index.log v{future}: expected FutureSchema, got {other:?}"),
         }
         assert!(
@@ -1324,7 +1324,8 @@ fn snapshot_destination_rules() {
         restore_snapshot(&good, &busy),
         Err(PersistError::Snapshot(_))
     ));
-    set_log_schema(&good, Some(json!(5)));
+    // Version 5 is supported for field visits; version 6 is still a future index.
+    set_log_schema(&good, Some(json!(6)));
     assert!(matches!(
         restore_snapshot(&good, guard.path().join("from-good")),
         Err(PersistError::FutureSchema { .. })

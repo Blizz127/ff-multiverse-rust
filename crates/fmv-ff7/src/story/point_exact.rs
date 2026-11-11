@@ -9,6 +9,8 @@ use fmv_adapter_api::StoryBattlePolicy;
 pub enum StoryPointError {
     #[error("ordinary exact story points require a supported version 3 predecessor")]
     Story,
+    #[error("ordinary exact story points do not yet support native party resources")]
+    NativePartyUnsupported,
     #[error("the script does not match the source from which these points were discovered")]
     Source,
     #[error("the point has no unambiguous authored entry or authoritative triangle input")]
@@ -61,6 +63,10 @@ impl AreaStory {
     fn evaluate_exact_with(&self, script: &FieldScript<'_>, blob: &[u8], id: u32)
         -> Result<Option<(StoryStep, Option<ExactBattle>)>, StoryPointError> {
         let state = StoryState::decode(blob).filter(StoryState::supports_extended).ok_or(StoryPointError::Story)?;
+        // The v3 evaluator checks the authored party against a moment-based profile.
+        // Native main slots, raw field slots and independent PHS masks need their own
+        // execution model; accepting the blob here would silently substitute that profile.
+        if state.supports_native_party() { return Err(StoryPointError::NativePartyUnsupported); }
         if self.source.0 != script.bytes() { return Err(StoryPointError::Source); }
         let Some(point) = usize::try_from(id).ok().and_then(|id| self.points.get(id)) else { return Ok(None) };
         let run = match &point.trigger {
@@ -244,6 +250,45 @@ mod tests {
         let area = model(&bytes);
         assert!(matches!(area.advance_exact_with(&FieldScript::parse(&bytes).unwrap(), &before, 0), Err(StoryPointError::BattleMode(2))));
         assert!(area.advance(&before, 0).is_none() && area.battle_policy(&before, 0).is_none(), "no partial story save after an unsupported countdown battle");
+    }
+
+    #[test]
+    fn native_party_points_refuse_before_substituting_the_legacy_party_profile() {
+        let mode = vec![0x72, 8, 0, 0];
+        let body = [word(2, 0, 7), vec![0x70, 0, 44, 1]].concat();
+        let bytes = SynthScript::default().entity("director", vec![(0, [mode, at_six(body)].concat())]).build();
+        let script = FieldScript::parse(&bytes).unwrap();
+        let area = model(&bytes);
+        assert_eq!(area.point_count(), 1);
+        let v3 = StoryState::at(6).into_extended().unwrap();
+        let v3_blob = v3.encode();
+        assert_eq!(StoryState::decode(&area.advance_exact_with(&script, &v3_blob, 0).unwrap().unwrap().progress).unwrap().moment, 7);
+        assert!(area.point_source(&v3_blob, 0).is_some());
+        assert_eq!(area.battle_policy(&v3_blob, 0), Some(StoryBattlePolicy {
+            formation: 300, escape_forbidden: true, victory_fanfare: true, game_over_on_defeat: true,
+        }), "the supported v3 point and battle are unchanged");
+
+        let cases = [
+            NativePartyState::unknown(),
+            NativePartyState::from_parts([2, 255, 0], 7, (0x8004, 0xffff), (0x4000, 0xffff)).unwrap(),
+            NativePartyState::from_parts([0, 255, 255], 7, (0x8000, 0x8001), (0, 0x4000)).unwrap(),
+            NativePartyState::from_parts([255, 255, 255], 7, (0, 0xffff), (0xffff, 0xffff)).unwrap(),
+        ];
+        for resources in cases {
+            let mut native = v3.clone().into_native_party().unwrap();
+            native.replace_native_party(&NativePartyState::unknown(), resources).unwrap();
+            // The raw field tuple is deliberately independent of every main tuple above.
+            for (address, value) in [(9, 1), (10, 0), (11, 255)] { native.write_byte(3, address, value).unwrap(); }
+            let before = native.encode();
+            assert_eq!(StoryState::decode(&before).unwrap(), native, "the refused native input is valid");
+            assert_eq!(area.advance_exact_with(&script, &before, 0), Err(StoryPointError::NativePartyUnsupported));
+            assert!(area.advance(&before, 0).is_none());
+            assert!(area.advance_with(&script, &before, 0).is_none());
+            assert!(area.battle_policy(&before, 0).is_none(), "no battle policy can bypass the resource refusal");
+            assert!(area.point_source(&before, 0).is_none(), "a refused point cannot enter a scene through its source metadata");
+            assert_eq!(native.encode(), before, "refusal changes no source bytes or resource knowledge");
+        }
+        assert_eq!(v3.encode(), v3_blob);
     }
 
     #[test]

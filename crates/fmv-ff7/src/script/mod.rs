@@ -122,6 +122,7 @@
 mod analysis;
 mod decode;
 pub mod dialogue;
+mod field_scratch;
 mod layout;
 pub mod scene;
 mod maplist;
@@ -142,6 +143,7 @@ mod tests_fuzz;
 
 pub use analysis::*;
 pub use decode::*;
+pub use field_scratch::{FieldScratch, FieldScratchError, FIELD_SCRATCH_BYTES};
 pub use layout::*;
 pub use maplist::*;
 pub use models::*;

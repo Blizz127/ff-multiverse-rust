@@ -62,6 +62,14 @@
 //!   fence, including legacy story-only archives. Detached archives from index-4 stores carry
 //!   manifest version 2 so older import tools also refuse them. Compaction and snapshots retain the fence; rollback
 //!   requires a snapshot taken before opt-in. Opening an existing store alone does not upgrade it.
+//! * **Explicit field visits commit with their story/resource result.** [`Store::commit_field_visit`]
+//!   compares the full [`SceneState`] and retains one exact operation receipt. Enter creates a
+//!   new visit identity; Advance increments its revision without forgetting known scratch bits.
+//!   Both are idle-only until a separate runtime lifecycle is implemented. Ordinary saves and
+//!   scene batches preserve visit metadata. Character envelope 4, intent 3, index header 5 and
+//!   detached archive manifest 3 exclude older writers before success; no legacy record is
+//!   initialized or upgraded merely by opening it. [`Store::require_compatibility`] lets future
+//!   adapter-owned opaque formats explicitly request this fence without inventing a visit.
 //! * **The story blob moves forward through one atomic step.** [`Progression`] (one opaque blob per
 //!   account and game, read only by the game's adapter) is written with [`Store::put_progression`] or,
 //!   when the new value depends on the old one, [`Store::update_progression`]: a read-modify-write under
@@ -143,6 +151,9 @@ pub use character::{
     MAX_PLAYER_CHARACTER_BYTES,
 };
 pub use error::{PersistError, Result};
+pub use index::StoreCompatibility;
+pub use store::field_visit::{FieldVisitV1, FieldVisitEntryV1, FieldVisitOperation, FieldVisitOperationKind, FieldVisitCommitted,
+    MAX_FIELD_VISIT_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_ANCHOR_BYTES};
 pub use model::{
     game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, NewCharacterProgress, NewProgression, Progression,
     Registered, INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS,

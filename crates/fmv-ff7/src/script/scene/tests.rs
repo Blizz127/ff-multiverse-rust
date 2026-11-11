@@ -130,6 +130,84 @@ fn field_of(section: Vec<u8>) -> FieldFile {
 }
 
 #[test]
+fn native_party_stories_are_preserved_but_not_executed_by_scene_entrypoints() {
+    use crate::story::NativePartyState;
+    let section = script(vec![("a", vec![(0, vec![setbyte(1, 40, 9)]), (1, vec![setword(2, 0, 5)])])], vec![]);
+    let field = field_of(section.clone());
+    let mut def = demo_def(vec![], start(0, 1));
+    def.setup = vec![ScriptRef::new(0, 0)];
+    let legacy = StoryState::at(4);
+    let extended = legacy.clone().into_extended().unwrap();
+    let resources = Resources { gil: Some(10) };
+    let identity = ScenePlay::with_resources(&field, &def, &extended, 1, resources).unwrap().replay_identity();
+    let unknown = extended.clone().into_native_party().unwrap();
+    let mut divergent = unknown.clone();
+    *divergent.native_party_mut().unwrap() = NativePartyState::from_parts([2, 255, 0], 7, (0x108, 0xFFFF), (0x80, 0xFFFF)).unwrap();
+    for (address, value) in [(9, 0), (10, 1), (11, 255)] { divergent.write_byte(3, address, value).unwrap(); }
+    for state in [unknown, divergent] {
+        let bytes = state.encode();
+        assert!(matches!(ScenePlay::new(&field, &def, &state, 1), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(ScenePlay::with_limits(&field, &def, &state, 1, Limits::default()), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(ScenePlay::with_resources(&field, &def, &state, 1, resources), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &section), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(ScenePlay::with_script_section_and_resources(&field, &def, &state, 1, &section, resources), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(ScenePlay::with_script_section(&field, &def, &state, 1, &[]), Err(SceneError::NativePartyUnsupported)),
+            "unsupported stories refuse before parsing or rebinding replacement sources");
+        assert!(matches!(run_to_end(&field, &def, &state, 1, &[]), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(run_to_end_with_resources_strict(&field, &def, &state, 1, resources, &[]), Err(SceneError::NativePartyUnsupported)));
+        assert!(matches!(replay_scene(&field, &def, &state, resources, identity, &[]), Err(SceneError::NativePartyUnsupported)));
+        assert!(trigger_npc(&field, &def, &state).is_none());
+        assert_eq!(state.encode(), bytes, "refusal never repairs or promotes the stored image");
+    }
+    for state in [legacy, extended] {
+        let outcome = run_to_end(&field, &def, &state, 1, &[]).unwrap();
+        assert_eq!(outcome.end, End::Finished);
+        assert_eq!(outcome.writes.moment, Some(5));
+    }
+}
+
+#[test]
+fn native_party_battle_afterimages_are_rejected_without_consuming_the_pending_boundary() {
+    let field = field_of(script(vec![("a", vec![(1, vec![vec![0x72, 8, 0], vec![0x70, 0, 72, 1], setword(2, 0, 5)])])], vec![]));
+    let def = demo_def(vec![], start(0, 1));
+    let story = StoryState::at(4).into_extended().unwrap();
+    let resources = Resources { gil: Some(10) };
+    let mut play = ScenePlay::with_resources(&field, &def, &story, 1, resources).unwrap();
+    let identity = play.replay_identity();
+    play.next_strict(None).unwrap();
+    let Some(SceneBoundary::Battle(checkpoint)) = play.boundary() else { panic!("expected battle") };
+    let before = play.snapshot();
+    let bad_resume = BattleResume { checkpoint, resolution: BattleResolution::Victory,
+        story: story.clone().into_native_party().unwrap(), resources: Resources { gil: Some(20) } };
+    assert_eq!(play.resume_battle_checked(bad_resume.clone()), Err(SceneError::NativePartyUnsupported));
+    assert_eq!(play.snapshot(), before);
+    assert!(play.transcript().is_empty());
+    assert!(matches!(replay_scene(&field, &def, &story, resources, identity, &[SceneInput::Battle(bad_resume.clone())]), Err(SceneError::NativePartyUnsupported)));
+    play.resume_battle_checked(BattleResume { story, ..bad_resume }).unwrap();
+    play.next_strict(None).unwrap();
+    assert_eq!(play.boundary(), Some(SceneBoundary::End(End::Finished)));
+    assert_eq!(play.writes().moment, Some(5));
+    assert_eq!(play.resources().gil_after, Some(20));
+}
+
+#[test]
+fn a_legacy_scene_outcome_cannot_validate_or_apply_to_native_party_state() {
+    let story = StoryState::at(4).into_extended().unwrap();
+    let field = field_of(script(vec![("a", vec![(1, vec![setword(2, 0, 5)])])], vec![]));
+    let outcome = run_to_end(&field, &demo_def(vec![], start(0, 1)), &story, 1, &[]).unwrap();
+    let native = story.clone().into_native_party().unwrap();
+    let mut after = native.clone();
+    assert_eq!(outcome.writes.apply_extended_to(&mut after, &native), None);
+    assert_eq!(after, native);
+    assert!(!outcome.party_is_the_storys(&native, &native));
+    assert!(!outcome.party_is_the_storys(&story, &native));
+    assert!(!outcome.party_is_the_storys(&native, &story));
+    let mut legacy_after = story.clone();
+    assert_eq!(outcome.writes.apply_extended_to(&mut legacy_after, &story), Some(true));
+    assert!(outcome.party_is_the_storys(&story, &legacy_after));
+}
+
+#[test]
 fn replacement_scene_entities_are_rebound_by_unique_name() {
     let original = script(vec![("dic", vec![]), ("cloud", vec![]), ("barret", vec![]), ("biggs", vec![]), ("jessie", vec![]), ("wedge", vec![])], vec![]);
     let replacement = script(vec![("Wedge", vec![]), ("Jessie", vec![]), ("Biggs", vec![]), ("Barret", vec![]), ("Cloud", vec![]), ("Dic", vec![])], vec![]);
@@ -2066,6 +2144,8 @@ fn the_trigger_npc_is_found_from_the_stage_script_and_the_models_record() {
     assert_eq!((npc.x, npc.y), (30, 40));
     assert!((npc.talk_radius - 80.0).abs() < 1e-3, "TALKR 80 at scale 512");
     assert!((npc.heading - 0.0).abs() < 1e-5, "DIR 64 faces +x");
+    let native = StoryState::at(4).into_native_party().unwrap();
+    assert!(trigger_npc(&field, &def, &native).is_none(), "v4 never runs the stage setup through the legacy party model");
 }
 
 // ---- a scene plays once per story, as far as the story carries its mark ------------------------------
@@ -2846,4 +2926,83 @@ fn legacy_name_menu_keeps_its_ignored_preview_path_even_with_a_configured_site()
     assert_eq!(vm.stats().unknown.get("MENU"), Some(&1));
     assert_eq!(vm.stats().unresolved, 1);
     assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+}
+
+
+// ---- storage-only native-party version refuses direct VM execution ----------------------------
+
+#[test]
+fn native_party_vm_refuses_setup_and_resume_even_after_begin_and_statistics_reset() {
+    let story = StoryState::at(33).into_native_party().unwrap();
+    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 7), visi(1), message(0, 0), mapjump(117)])])], texts(1));
+    let source = FieldScript::parse(&section).unwrap();
+    for with_resources in [false, true] {
+        let vars = SceneVars::new(story.clone(), &[]);
+        let mut vm = if with_resources { Vm::with_resources(vars, 1, Limits::default(), SceneResources { gil: Some(77) }) }
+            else { Vm::new(vars, 1, Limits::default()) };
+        vm.setup(&source, &[ScriptRef::new(0, 1)]);
+        assert_eq!(vm.stats().steps, 0);
+        assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
+        assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+        assert!(vm.places().is_empty());
+        for _ in 0..2 {
+            vm.take_stats();
+            vm.begin(start(0, 1));
+            let beat = vm.resume(&source, Some(0));
+            assert!(matches!(beat.then, Then::End { how: End::Broken, .. }));
+            assert!(beat.stage.is_empty());
+            assert_eq!(vm.stats().steps, 0);
+            assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
+            assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+            assert_eq!(vm.destination(), None);
+        }
+        assert_eq!(vm.vars().story, story);
+    }
+}
+
+#[test]
+fn native_party_battle_rebase_poison_cannot_be_cleared_by_a_later_legacy_snapshot() {
+    let legacy = StoryState::at(33).into_extended().unwrap();
+    let native = legacy.clone().into_native_party().unwrap();
+    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 5), message(0, 0), setbyte(3, 60, 7), visi(1)])])], texts(1));
+    let source = FieldScript::parse(&section).unwrap();
+    let mut vm = Vm::with_resources(SceneVars::new(legacy.clone(), &[]), 1, Limits::default(), SceneResources { gil: Some(77) });
+    vm.begin(start(0, 1));
+    assert!(matches!(vm.resume(&source, None).then, Then::Window(_)));
+    assert_eq!(vm.writes().get(&(3, 60)), Some(&5));
+    vm.resume_battle(&native, SceneResources { gil: Some(999) });
+    assert!(vm.is_over());
+    assert_eq!(vm.vars().story, legacy, "unsupported rebase never adopts native state through the legacy interpreter");
+    assert_eq!(vm.resources().gil_after, Some(77));
+    assert!(vm.writes().is_empty());
+    vm.take_stats();
+    vm.resume_battle(&legacy, SceneResources { gil: Some(1) });
+    vm.begin(start(0, 1));
+    let beat = vm.resume(&source, Some(0));
+    assert!(matches!(beat.then, Then::End { how: End::Broken, .. }));
+    assert!(beat.stage.is_empty());
+    assert!(vm.writes().is_empty() && vm.party_ops().is_empty());
+    assert_eq!(vm.resources().gil_after, Some(77));
+    assert!(vm.stats().setup_incomplete && vm.stats().unresolved > 0);
+}
+
+#[test]
+fn native_party_gate_preserves_legacy_vm_execution_and_scenevars_forwards_support() {
+    use crate::script::dialogue::StoryVars;
+    let v1 = StoryState::at(33);
+    let mut v2 = v1.clone();
+    v2.set_bit(REACTOR_STATE.bank, REACTOR_STATE.address, 0, true);
+    let v3 = v2.clone().into_extended().unwrap();
+    let section = script(vec![("a", vec![(1, vec![setbyte(3, 60, 7), visi(1)])])], vec![]);
+    for story in [v1, v2, v3] {
+        assert!(SceneVars::new(story.clone(), &[]).execution_supported());
+        let (beats, vm) = run_with(&section, start(0, 1), &[], vm_for(story, &[]));
+        assert!(matches!(beats.last().map(|b| &b.then), Some(Then::End { how: End::Finished, .. })));
+        assert_eq!(vm.writes().get(&(3, 60)), Some(&7));
+        assert!(!vm.stats().setup_incomplete);
+        assert_eq!(vm.stats().unresolved, 0);
+    }
+    let native = SceneVars::new(StoryState::at(33).into_native_party().unwrap(), &[]);
+    let erased: &dyn StoryVars = &native;
+    assert!(!erased.execution_supported(), "wrapping native StoryState must not bypass the dialogue gate");
 }

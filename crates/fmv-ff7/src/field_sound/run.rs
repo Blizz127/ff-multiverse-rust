@@ -139,6 +139,8 @@ pub struct Timed {
 /// Why a run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
+    /// Native party resources require an execution model this sound runner does not yet have.
+    NativePartyUnsupported,
     /// The script ended (`RET`, or it fell off its end into the `RET` that follows it): everything it does is known.
     Returned,
     /// A backward jump: the script is waiting or repeating (the loop's body is not run).
@@ -160,6 +162,7 @@ impl Stop {
     /// A short word for tallies and logs.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::NativePartyUnsupported => "unsupported native party",
             Self::Returned => "returned",
             Self::IdleLoop { .. } => "idle loop",
             Self::LeavesField { .. } => "leaves the field",
@@ -461,6 +464,13 @@ impl<'a> Machine<'a> {
     /// beginning `t0` frames after whatever the caller counts from. The events and the run's record stay in the
     /// machine. Returns the record's index.
     pub fn run(&mut self, at: ScriptRef, part: Part, from: Option<usize>, t0: u32) -> usize {
+        // Party writers are ignored by this planner. Accepting a native-party story could
+        // therefore select sound from stale raw slots after an authored party change.
+        if self.env.story.supports_native_party() {
+            let id = self.runs.len();
+            self.runs.push(RunInfo { at, parent: None, stop: Stop::NativePartyUnsupported, frames: None, open: 0b1111 });
+            return id;
+        }
         self.steps = 0;
         let mut stack = vec![at];
         self.run_inner(at, part, from, t0, None, &mut stack).0
@@ -489,7 +499,7 @@ impl<'a> Machine<'a> {
                 (target, jump.saturating_add(1))
             }
             Stop::Unjudged { at: off } | Stop::Unknown { at: off, .. } => (off, usize::MAX),
-            Stop::Budget | Stop::Broken => (0, usize::MAX),
+            Stop::Budget | Stop::Broken | Stop::NativePartyUnsupported => (0, usize::MAX),
             Stop::Returned | Stop::LeavesField { .. } => return 0,
         };
         let mut mask = 0u8;

@@ -366,6 +366,11 @@ impl Walk {
     /// Run on to the next window or the end. `answer` is the player's answer to the window this
     /// walk handed out last, if that asked (see [`MessageSource::next`]).
     pub fn resume(&mut self, script: &FieldScript<'_>, env: &dyn StoryVars, answer: Option<usize>) -> Beat {
+        if !env.execution_supported() {
+            self.queued = None;
+            self.pending = None;
+            return self.finish(End::Broken);
+        }
         if let Some(note) = self.queued.take() {
             return Beat::Message(note);
         }
@@ -946,6 +951,9 @@ pub struct Availability {
 /// the story moves on carries a `TLKON 1` behind a progress test). Returns the variables the
 /// passes wrote too, which the talk that follows starts from.
 fn prelude(script: &FieldScript<'_>, env: &dyn StoryVars, entity: usize, limits: Limits) -> (Availability, BTreeMap<(u8, u8), u8>) {
+    if !env.execution_supported() {
+        return (Availability { talkable: false, visible: false }, BTreeMap::new());
+    }
     let mut walk = Walk::script(entity, INIT_SCRIPT, 1, limits);
     walk.quiet = true;
     // A quiet walk never hands out a window: it only ever ends.
@@ -972,6 +980,7 @@ pub struct TalkRun {
 /// cursor's starting line) and report what it wrote: the character's own set-up decides first whether it can be
 /// talked to in the story `env` tells (as [`TalkSession::talk`] does), then its talk script runs to its end.
 pub fn run_talk(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars, seed: u32) -> Result<TalkRun, TalkError> {
+    if !env.execution_supported() { return Err(TalkError::UnsupportedStory); }
     if entity >= script.entity_count() {
         return Err(TalkError::NoSuchEntity);
     }
@@ -992,6 +1001,8 @@ pub fn run_talk(script: &FieldScript<'_>, entity: usize, env: &dyn StoryVars, se
 /// Why a conversation could not be started.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TalkError {
+    #[error("this story format is not supported by the dialogue interpreter")]
+    UnsupportedStory,
     #[error("the field's script section cannot be read")]
     BadSection,
     #[error("the field has no such entity")]
@@ -1011,6 +1022,7 @@ impl TalkSession {
     /// The conversation with `entity`: its talk script, unless its own set-up has hidden it or
     /// switched talking off for the story as `vars` tells it.
     pub fn talk(section: Vec<u8>, entity: usize, vars: Box<dyn StoryVars>, seed: u32) -> Result<Self, TalkError> {
+        if !vars.execution_supported() { return Err(TalkError::UnsupportedStory); }
         let (verdict, writes) = {
             let script = FieldScript::parse(&section).map_err(|_| TalkError::BadSection)?;
             if entity >= script.entity_count() {
@@ -1028,6 +1040,7 @@ impl TalkSession {
     /// Script `slot` of `entity`, whatever it is (the lines a character speaks in a cutscene), with
     /// no check of whether it can be talked to.
     pub fn script(section: Vec<u8>, entity: usize, slot: usize, vars: Box<dyn StoryVars>, seed: u32) -> Result<Self, TalkError> {
+        if !vars.execution_supported() { return Err(TalkError::UnsupportedStory); }
         let script = FieldScript::parse(&section).map_err(|_| TalkError::BadSection)?;
         if entity >= script.entity_count() {
             return Err(TalkError::NoSuchEntity);

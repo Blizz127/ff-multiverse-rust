@@ -238,7 +238,7 @@ fn damaged_or_future_pending_manifest_headers_cannot_bypass_the_outer_recovery_f
             match damage {
                 "kind" => manifest["kind"] = serde_json::json!("not-a-trash-entry"),
                 "foreign file" => manifest["files"] = serde_json::json!(["accounts/999999.json"]),
-                "future schema" => manifest["schema_version"] = serde_json::json!(3),
+                "future schema" => manifest["schema_version"] = serde_json::json!(4),
                 "missing schema" => { manifest.as_object_mut().unwrap().remove("schema_version"); }
                 "string schema" => manifest["schema_version"] = serde_json::json!("2"),
                 "truncated" => {},
@@ -251,7 +251,7 @@ fn damaged_or_future_pending_manifest_headers_cannot_bypass_the_outer_recovery_f
             let before = files(&root);
             let opened = Store::open(&root);
             if damage == "future schema" {
-                assert!(matches!(opened, Err(PersistError::FutureSchema { found: 3, supported: 2, .. })),
+                assert!(matches!(opened, Err(PersistError::FutureSchema { found: 4, supported: 3, .. })),
                     "a future archive version is refused even when index v{version} is current");
             } else {
                 assert!(opened.is_err(), "pending {damage} under index v{version} cannot fall through to live-account cleanup");

@@ -294,6 +294,10 @@ pub enum JoinError {
     ProgressChanged,
     /// The shared store or save worker requires recovery before gameplay can resume.
     StorageUnavailable,
+    /// The stored visit needs runtime restoration that this build does not yet implement.
+    UnsupportedFieldVisit,
+    /// The adapter can preserve this story format, but cannot run it in this build.
+    UnsupportedProgression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +465,10 @@ impl World {
         self.by_account.contains_key(&account)
     }
 
+    fn saved_progression_supported(&self, progress: &[u8]) -> bool {
+        self.areas.get(&self.home).is_some_and(|area| area.runtime().supports_saved_progression(progress))
+    }
+
     /// Spawn the player (round-robin over the spawn points), queue the full `AreaSnapshot` and
     /// then the `InstancePlacement` to the joiner (always the first things in its queue after the
     /// handshake replies) and `PlayerJoined` to everyone else. The movement budget starts empty.
@@ -474,6 +482,17 @@ impl World {
 
     pub fn join(&mut self, new: NewPlayer, now: Instant) -> Result<Pos, JoinError> {
         if self.scenes.storage_failed { return Err(JoinError::StorageUnavailable); }
+        if !self.saved_progression_supported(&new.progression)
+            || new.scene_group.iter().filter(|state| state.pair.story.game == self.home_game())
+                .any(|state| !self.saved_progression_supported(&state.pair.story.blob)) {
+            return Err(JoinError::UnsupportedProgression);
+        }
+        // The storage foundation can preserve visits before the field runtime can restore
+        // them. Never replace a saved anchor/scratch image with an ordinary story spawn.
+        if new.scene_state.as_ref().is_some_and(|state| state.field_visit.is_some())
+            || new.scene_group.iter().any(|state| state.field_visit.is_some()) {
+            return Err(JoinError::UnsupportedFieldVisit);
+        }
         // Checked here, under the world lock, because two handshakes with the same token can both
         // pass authentication.
         let recovering = new.scene_state.as_ref().is_some_and(|state| state.checkpoint.is_some() || state.reservation.is_some());
@@ -502,6 +521,7 @@ impl World {
         let mut new = new;
         if !recovering && new.scene_state.is_none() && new.progression.is_empty() {
             if let Some(story) = self.scenes.debug_new_story.clone() {
+                if !self.saved_progression_supported(&story) { return Err(JoinError::UnsupportedProgression); }
                 if self.saver.as_ref().is_some_and(|saver| !saver.save_story(new.account, story.clone())) {
                     return Err(JoinError::StorageUnavailable);
                 }
@@ -1628,7 +1648,7 @@ mod tests {
                 pair: fmv_persist::ProgressPair {
                     story: fmv_persist::Progression::empty(account, w.home_game()), character: None,
                 },
-                checkpoint: None, reservation: None,
+                checkpoint: None, reservation: None, field_visit: None,
             };
             let (tx, mut rx) = mpsc::channel(32);
             let mut new = NewPlayer {
@@ -1662,7 +1682,7 @@ mod tests {
                 pair: fmv_persist::ProgressPair {
                     story: fmv_persist::Progression::new(account, w.home_game(), stored_story.clone(), 0), character: None,
                 },
-                checkpoint: None, reservation: None,
+                checkpoint: None, reservation: None, field_visit: None,
             };
             let (tx, mut rx) = mpsc::channel(32);
             let new = NewPlayer {
@@ -1675,6 +1695,46 @@ mod tests {
             assert!(w.join(new, Instant::now()).is_ok());
             assert!(w.has_session(account));
             assert!(matches!(&*rx.try_recv().unwrap(), ServerMsg::AreaSnapshot { .. }));
+        }
+    }
+
+    #[test]
+    fn stored_field_visits_refuse_admission_before_their_runtime_can_be_restored() {
+        for in_cohort_only in [false, true] {
+            let mut w = world();
+            let (session, entity) = w.allocate_ids();
+            let account = AccountId(entity.0);
+            let mut state = fmv_persist::SceneState {
+                pair: fmv_persist::ProgressPair {
+                    story: fmv_persist::Progression::empty(account, w.home_game()), character: None,
+                },
+                checkpoint: None, reservation: None, field_visit: None,
+            };
+            let mut group = vec![state.clone()];
+            let visit = fmv_persist::FieldVisitV1 {
+                schema_version: 1, visit_id: [1; 16], revision: 3, field: "tin_1".into(),
+                source_identity: [2; 32],
+                entry: fmv_persist::FieldVisitEntryV1 { operation: [3; 16], arrival: vec![1] },
+                anchor: vec![2], scratch_values: [0; 256], scratch_known_masks: [255; 256],
+                active_continuation: None,
+            };
+            if in_cohort_only {
+                group[0].field_visit = Some(visit);
+            } else {
+                state.field_visit = Some(visit);
+                group[0] = state.clone();
+            }
+            let (tx, mut rx) = mpsc::channel(32);
+            let new = NewPlayer {
+                session, entity, account,
+                avatar: AvatarAppearance { display_name: "visit".into(), tint: [0; 3], appearance_ref: None },
+                progression: Vec::new(), progress: Default::default(),
+                scene_state: Some(state), scene_group: group, tx, close: Arc::new(watch::channel(false).0),
+            };
+            assert_eq!(w.join(new, Instant::now()), Err(JoinError::UnsupportedFieldVisit));
+            assert_eq!(w.player_count(), 0);
+            assert!(!w.has_session(account));
+            assert!(rx.try_recv().is_err(), "do not publish a guessed field spawn or replay a visit initializer");
         }
     }
 

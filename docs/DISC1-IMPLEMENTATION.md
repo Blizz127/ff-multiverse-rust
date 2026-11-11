@@ -78,6 +78,76 @@ values. Resource-dependent trigger setup also needs an authoritative resource sn
 such scenes can be enabled. Continue expanding ordinary field progression, equipment/materia,
 canon-party state and a chapter manifest alongside the curated scenes.
 
+## Native-party and field-visit foundation
+
+The next storage model is separate from route activation. FF7 story version 4 appends
+12 bytes to the known-bank representation: three main-party slots and their knowledge
+mask, plus independent 16-bit availability and locking values and knowledge masks.
+The full image is at most 5,129 bytes. Raw field slots remain in bank 3:9–11; their
+order or membership need not match the main party. Known empty slots differ from
+unknown slots, and active membership does not imply availability or locking.
+
+Versions 1–3 retain their existing encoding. Explicit promotion to version 4 leaves
+the new resources unknown, even when the moment or raw slots look familiar. The
+separate fresh native-party constructor is an explicit port reset/opening profile,
+not proof of arbitrary PC startup state. It establishes only the opening's known
+lock bit; other lock bits remain unknown. Registration still writes version 3.
+FF7 login also refuses a prepared version-4 save until gameplay and wire support
+are activated together; an older protocol-21 peer must not receive an unfamiliar
+story blob and substitute its starting state.
+
+Battle roster lookup now distinguishes an unknown party from a known empty one and
+preserves the order of known main slots. Malformed, duplicate or oversized rosters
+refuse instead of losing members. Version 4 script execution remains disabled in the
+scene, dialogue, ordinary-point and field-sound interpreters and the server host.
+Those paths must gain native party operations, ordered resource outcomes and checked
+replay before accepting the richer snapshot. Scripted battles additionally need the
+party at the exact BATTLE instruction; the original or final story can contain a
+different temporary party.
+
+`FieldScratch` provides checked 256-byte values and knowledge masks for future visit
+restoration. Selectors 5/6 alias for byte access; wide selector 5 still uses one byte,
+while selector 6 uses a little-endian word. Invalid boundary reads/writes refuse
+atomically. Its explicit entry clear is distinct from an unknown loaded visit. It is
+not yet connected to the running scene VM; see the
+[field-visit contract](FIELD-TIMELINE-DESIGN.md#field-visit-state-contract-runtime-unimplemented)
+for lifetime, continuation and reconstruction requirements.
+
+`FieldVisitV1` storage keeps entry identity, revision, source identity, an opaque accepted
+arrival and reconstruction anchor, scratch values/masks, and a continuation reference in
+the private character envelope. Its idle-only Enter/Advance transaction compares the
+complete story, resources and visit, then journals both records together. A bounded last
+operation receipt acknowledges an identical retry using the current state, preserving
+later rewards. Advance retains known scratch bits and increments revision without wrapping;
+actual entry replaces the visit identity, including same-field travel. Existing story,
+character and battle writes preserve visits rather than defaulting them to absent.
+
+The first visit write requires character envelope 4 and index compatibility 5. Opening or
+compacting an older store does not select that format. Explicit compatibility selection is
+also available for a future party-v4 writer; storage does not inspect an adapter's opaque
+story bytes to infer it. Detached archives from index-5 stores use manifest 3, including
+party-only stores with no visit-bearing character. Snapshot copy limits distinguish the
+existing 4 MiB character-record bound from the 1 MiB ordinary-record bound.
+
+This is storage support, not a running field-visit lifecycle. Enter/Advance refuses active
+scene checkpoints/reservations, and existing scene batches cannot change a visit or orphan
+its continuation link. No server path creates these visits yet; login explicitly refuses
+visit-bearing snapshots until anchor reconstruction, VM scratch injection, accepted entry
+and atomic active-continuation transitions are implemented. The train lesson remains
+unregistered, and existing accounts are not converted.
+
+Verification: the workspace run plus corrected-target reruns passed 4,180 tests;
+378 optional tests were ignored. The two initial failures were stale expectations:
+index version 5 is now supported, and an invalid canon member now refuses the entire
+battle instead of being dropped. The affected persistence and server targets passed
+35 and 499 tests after those corrections. Separately, all 37 ignored `scene_real`
+tests ran successfully against the owned field archive. New coverage includes visit
+Enter/Advance recovery at every journal boundary, exact retry identity, scratch
+knownness, archive rekeys, large snapshots and refusal before unsupported saves can
+reach a client. These are foundation checks, not acceptance of the unregistered route.
+Workspace Clippy with all targets also completed successfully; its three warnings in
+audio tests, standing-animation fallback and avatar test types predate this change.
+
 ## Current wave: cargo door to passenger-train control
 
 `ff7/cargoin/passenger-door` and `ff7/tin_1/sector-seven-train` append at registry
@@ -217,8 +287,22 @@ by assuming unknown flags are clear.
   repeat the flag test. It preserves the accepted Cloud crossing, plays ten windows and
   requests movie 24 before station MAPJUMP 146 at `(-2891,3392)`, triangle 26. A delayed
   concurrent helper performs audio/fade work during that movie; immediately skipping the
-  movie also truncates this helper. The verified movie basename is `mainplr`; its owned
-  container/location and camera media are not yet established.
+  movie also truncates this helper. The verified movie basename is `mainplr`. The owner's
+  Alienware Steam app 3837340/build 21140793 supplies it at
+  `ff7/workingdir/data/movies/mainplr.avi`, alongside `ontrain.avi` for movie 23 and
+  `data/cd/moviecam.lgp`. Private, hash-verified copies of only those three files are now
+  available to local tests (7,979,036 bytes total; no game media is stored in this repository).
+  Both `.avi` files actually contain Matroska VP8 video at 1280×896 and 15 fps with stereo
+  Vorbis audio at 22,050 Hz; format detection must inspect the contents. Full-file video/audio
+  decoding passed without diagnostics. `mainplr` has 197 decoded frames (13.133 s container
+  duration), and `ontrain` has 192 (12.800 s). The archive contains matching `.cam` entries
+  of 7,880 and 7,680 bytes. Their correspondence to 40-byte records is a hypothesis until
+  the PC camera layout and indexing are verified; file availability does not establish
+  movie playback or concurrent script timing.
+  The exact video durations are 197/15 s and 64/5 s. Decoded audio contains 286,848 and
+  282,240 samples per channel respectively (about 13.009 s and 12.800 s); stream duration
+  fields are absent and audio timestamps begin at 0.011 s. Audio sample counts alone
+  therefore do not define the movie's final frame or completion boundary.
 * Station arrival has one window and writes moment 63 without inherited train scratch.
   Its final Cloud position is `(-2738,3017,101)`, triangle 9, direction 16. Original
   `UC 0` and the moment write precede Barret's window and remaining actor work. A durable

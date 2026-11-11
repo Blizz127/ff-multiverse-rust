@@ -77,6 +77,7 @@ use crate::snapshot::{self, SnapshotInfo};
 
 mod player_character;
 mod progression_cas;
+pub(crate) mod field_visit;
 pub(crate) mod scene;
 pub mod restyle;
 pub mod trash;
@@ -1401,23 +1402,51 @@ impl Store {
         self.write_character_record(&path, next)
     }
 
+    /// Raise the recognized index fence to an explicitly selected minimum compatibility.
+    /// This does not initialize, validate or register records, and cannot downgrade an
+    /// existing store. Existing registration methods keep their own default requirements.
+    /// Callers that need an atomic registration/write must establish its required fence
+    /// inside that operation after validation and before any record becomes visible.
+    /// An uncertain fence replacement blocks progress and writes until this Store reopens.
+    pub fn require_compatibility(&self, minimum: index::StoreCompatibility) -> Result<()> {
+        let counters = self.writer()?;
+        let _progress = self.progress_write();
+        self.ensure_index_format(&counters, minimum.index_version())
+    }
+
     /// The caller already holds the writer and progress gates. Raise the recognized index
     /// header to version 4 before explicit durable story operations or schema-3 progress are
     /// acknowledged. Earlier version-3 writers lack the ordinary exact-story/battle commit
     /// and uncertain-write guarantees; they must refuse the entire store. The character and
     /// intent formats do not change. No account data changes.
     fn ensure_scene_batch_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_index_format(counters, index::DURABLE_STORY_INDEX_VERSION)
+    }
+
+    /// The caller already holds the writer and progress gates. Protect visit metadata from
+    /// earlier writers before its first durable write or successful acknowledgment.
+    fn ensure_field_visit_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_index_format(counters, index::FIELD_VISIT_INDEX_VERSION)
+    }
+
+    /// Select a supported minimum without changing records or lowering a prior fence.
+    /// Both caller gates are already held. Validation rejects unknown output versions before
+    /// the uncertainty latch; a legacy minimum of 2 leaves existing version-2/3 stores alone.
+    fn ensure_index_format(&self, counters: &Counters, minimum: u32) -> Result<()> {
         self.ensure_transaction_healthy()?;
+        if !(crate::model::INDEX_LOG_VERSION..=index::FIELD_VISIT_INDEX_VERSION).contains(&minimum) {
+            return Err(PersistError::InvalidField { field: "store_compatibility", reason: "unsupported index compatibility minimum".into() });
+        }
         let mut log = self.log();
         log.ensure_healthy()?;
-        if self.index().format_version() >= index::DURABLE_STORY_INDEX_VERSION { return Ok(()); }
+        if self.index().format_version() >= minimum { return Ok(()); }
         let path = self.log_path();
         // atomic_write can report a directory-sync failure after replacing the log. Until
         // reopening decides which inode survived, no reader or writer may use this Store.
         self.transaction_poisoned.store(true, Ordering::Release);
         let upgraded = (|| {
             let (len, _) = index::write_compacted_version(&path, &self.index(), counters.next_account_id,
-                counters.next_avatar_id, index::DURABLE_STORY_INDEX_VERSION)?;
+                counters.next_avatar_id, minimum)?;
             #[cfg(test)]
             if FAIL_SCENE_FORMAT_AFTER_RENAME.with(|flag| flag.replace(false)) {
                 return Err(PersistError::io("injected scene format fence failure", &path,
@@ -1425,7 +1454,7 @@ impl Store {
             }
             let fresh = LogWriter::open(&path, len)?;
             *log = fresh;
-            self.index_mut().require_scene_batch_format();
+            self.index_mut().require_format(minimum);
             Ok(())
         })();
         match upgraded {

@@ -6,7 +6,7 @@
 //! <https://ff7-mods.github.io/ff7-flat-wiki/FF7/Kernel/Memory_management.html>.
 //! Temporary banks 5/6 and special read-only banks 8/9/10 are not persistent story data.
 
-use super::{StoryState, BTreeMap, TRACKED_VARS, MOMENT_BANK};
+use super::{StoryState, BTreeMap, TRACKED_VARS, MOMENT_BANK, NativePartyState, BLOB_VERSION_NATIVE_PARTY, NATIVE_PARTY_BYTES};
 
 pub const BLOB_VERSION_BANKS: u8 = 3;
 /// Five 256-byte banks, excluding the two moment bytes carried in the header.
@@ -49,7 +49,7 @@ pub enum StoryWriteError {
 }
 
 impl StoryState {
-    /// Whether this state uses the known-bit version 3 representation.
+    /// Whether this state carries known-bit persistent banks (versions 3 and 4).
     pub fn supports_extended(&self) -> bool { self.banks.is_some() }
 
     /// The bits known at this address. Zero means unknown, not an authored zero.
@@ -153,12 +153,17 @@ impl StoryState {
 
 #[allow(clippy::chunks_exact_to_as_chunks)]
 pub(super) fn decode(blob: &[u8]) -> Option<StoryState> {
-    let [BLOB_VERSION_BANKS, lo, hi, count_lo, count_hi, rest @ ..] = blob else { return None };
+    let [version @ (BLOB_VERSION_BANKS | BLOB_VERSION_NATIVE_PARTY), lo, hi, count_lo, count_hi, rest @ ..] = blob else { return None };
     let count = usize::from(u16::from_le_bytes([*count_lo, *count_hi]));
-    if count > MAX_BANK_BYTES || rest.len() != count.checked_mul(4)? { return None; }
+    let bank_len = count.checked_mul(4)?;
+    let suffix_len = if *version == BLOB_VERSION_NATIVE_PARTY { NATIVE_PARTY_BYTES } else { 0 };
+    if count > MAX_BANK_BYTES || rest.len() != bank_len.checked_add(suffix_len)? { return None; }
+    let native_party = if *version == BLOB_VERSION_NATIVE_PARTY {
+        Some(NativePartyState::decode(rest.get(bank_len..)?)?)
+    } else { None };
     let mut banks = BTreeMap::new();
     let mut previous = None;
-    for entry in rest.chunks_exact(4) {
+    for entry in rest.get(..bank_len)?.chunks_exact(4) {
         let [bank, address, value, mask] = entry else { return None };
         let key = (*bank, *address);
         if canonical_persistent_bank(*bank) != Some(*bank) || (*bank == 1 && *address < 2)
@@ -166,14 +171,15 @@ pub(super) fn decode(blob: &[u8]) -> Option<StoryState> {
         banks.insert(key, KnownByte { value: *value, mask: *mask });
         previous = Some(key);
     }
-    Some(StoryState { moment: u16::from_le_bytes([*lo, *hi]), vars: BTreeMap::new(), banks: Some(banks) })
+    Some(StoryState { moment: u16::from_le_bytes([*lo, *hi]), vars: BTreeMap::new(), banks: Some(banks), native_party })
 }
 
-pub(super) fn encode(moment: u16, banks: &BTreeMap<(u8, u8), KnownByte>) -> Vec<u8> {
-    let mut bytes = vec![BLOB_VERSION_BANKS];
+pub(super) fn encode(moment: u16, banks: &BTreeMap<(u8, u8), KnownByte>, native_party: Option<NativePartyState>) -> Vec<u8> {
+    let mut bytes = vec![if native_party.is_some() { BLOB_VERSION_NATIVE_PARTY } else { BLOB_VERSION_BANKS }];
     bytes.extend(moment.to_le_bytes());
     bytes.extend((banks.len() as u16).to_le_bytes());
     for (&(bank, address), b) in banks { bytes.extend([bank, address, b.value, b.mask]); }
+    if let Some(party) = native_party { bytes.extend(party.encode()); }
     bytes
 }
 
@@ -185,6 +191,9 @@ pub fn compare_exchange_progression(stored: &[u8], expected: &[u8], advanced: &[
     let old = StoryState::decode(stored)?;
     let new = StoryState::decode(advanced)?;
     if old.supports_extended() && !new.supports_extended() { return None; }
+    if let Some(old_party) = old.native_party() {
+        if !new.native_party()?.retains_knowledge(old_party) { return None; }
+    }
     if new.supports_extended() {
         let old = old.into_extended().ok()?;
         // A transaction may change a known value, but may not forget one. This also prevents a

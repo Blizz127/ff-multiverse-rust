@@ -1307,6 +1307,8 @@ fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero
     let party = at(0x03FD);
     assert_eq!(party.mnemonic, "PRTYE");
     assert_eq!(["character1", "character2", "character3"].map(|name| party.literal(name)), [Some(0), Some(254), Some(254)]);
+    assert_eq!((at(1025).mnemonic, at(1025).literal("character")), ("MMBLK", Some(0)),
+        "the native first-control profile knows only this authored PHS lock bit");
     let moment = at(1176);
     assert_eq!((moment.mnemonic, moment.literal("value")), ("SETWORD", Some(1)));
     assert_eq!(moment.operands.iter().find(|op| op.name == "var").map(|op| (op.bank, op.value)), Some((2, 0)));
@@ -1330,6 +1332,9 @@ fn extended_opening_retains_authored_defaults_at_the_first_window_including_zero
     let mutations: Vec<_> = code.values().filter(|ins| matches!(ins.mnemonic, "PRTYE" | "PRTYP" | "PRTYM" | "SPTYE" | "MENU" | "TUTOR"))
         .map(|ins| (ins.offset, ins.mnemonic)).collect();
     assert_eq!(mutations, [(1021, "PRTYE")]);
+    let locks: Vec<_> = code.values().filter(|ins| matches!(ins.mnemonic, "MMBLK" | "MMBUK"))
+        .map(|ins| (ins.offset, ins.mnemonic, ins.literal("character"))).collect();
+    assert_eq!(locks, [(1025, "MMBLK", Some(0))]);
     assert!(code.values().all(|ins| ins.operands.iter().all(|op| !matches!(op.bank, 3 | 4))));
     let story = StoryState::at(0).into_extended().unwrap();
     let mut vm = Vm::new(SceneVars::new(story.clone(), &[]), 1, Limits::default());

@@ -31,7 +31,8 @@
 //! startup call; it does not establish arbitrary main-party slot ordering or repair old saves.
 //! `SysInitNewGame` separately sets physical bank 4 byte 0 (script bank 13) to 1:
 //! <https://github.com/Xeeynamo/ff7-decomp/blob/d4db3de3c3aaf61269e048cf3f6a458996290de0/src/main/110B8.c#L263-L274>.
-//! No gil, inventory, character, or party resource record is synthesized here.
+//! No gil, inventory or character record is synthesized here. The separate, explicit v4
+//! constructor also carries a native-party port profile; the existing v3 constructors do not.
 
 use super::{banks::KnownByte, StoryState};
 use std::collections::BTreeMap;
@@ -102,7 +103,7 @@ impl StoryState {
         for (bank, address, value) in RESET_EXCEPTIONS {
             banks.insert((bank, address), KnownByte { value, mask: u8::MAX });
         }
-        Self { moment: 0, vars: BTreeMap::new(), banks: Some(banks) }
+        Self { moment: 0, vars: BTreeMap::new(), banks: Some(banks), native_party: None }
     }
 
     /// The port's explicit fresh-account reset/opening profile at the first controllable
@@ -139,6 +140,25 @@ impl StoryState {
                 banks.insert((bank, address), KnownByte { value, mask: u8::MAX });
             }
         }
+        state
+    }
+
+    /// Explicit version-4 fresh-account profile. This is never called by decoding, legacy
+    /// promotion, or [`Self::fresh_first_control`], which continues to produce version 3.
+    ///
+    /// The port adopts the reset's main slots `[0,255,255]` and availability mask `1`,
+    /// then carries the opening's positively established raw slots in the bank image.
+    /// This is an initialization policy, not verified arbitrary-byte PC first-control
+    /// equivalence: the opaque post-reset LIMTMENU routine could affect main-slot ordering
+    /// or availability. PRTYE alone establishes only the raw tuple and availability bit 0.
+    ///
+    /// Reset does not initialize the PHS lock mask. The owned opening's MM BLK0 at offset
+    /// 1025 establishes only bit 0 as locked; every other lock bit remains unknown. The
+    /// original operations are pinned at `field_opcodes.c:5830..5848`, in the revision
+    /// linked in this module. These resources are independent of bank 1's menu-lock flags.
+    pub fn fresh_native_first_control() -> Self {
+        let mut state = Self::fresh_first_control();
+        state.native_party = Some(super::NativePartyState::first_control_profile());
         state
     }
 }
@@ -258,5 +278,41 @@ mod tests {
         assert_eq!(old.clone().into_extended().unwrap().known_byte(1, 4), None);
         assert_ne!(old.into_extended().unwrap(), fresh);
         assert_ne!(StoryState::fresh_reset(), fresh);
+    }
+
+    #[test]
+    fn native_first_control_is_explicit_and_keeps_the_v3_profile_byte_for_byte() {
+        let old = StoryState::fresh_first_control();
+        let reset = StoryState::fresh_reset();
+        assert!(!old.supports_native_party() && !reset.supports_native_party());
+        assert_eq!(old.encode().first(), Some(&BLOB_VERSION_BANKS));
+        let native = StoryState::fresh_native_first_control();
+        assert_eq!(native.moment, old.moment);
+        assert_eq!(native.banks, old.banks);
+        let party = native.native_party().unwrap();
+        assert_eq!(party.known_main(), Some([0, 255, 255]));
+        assert_eq!(party.availability_bits(), (1, u16::MAX), "explicit reset/opening port policy");
+        assert_eq!(party.locking_bits(), (1, 1), "only the authored MM BLK0 establishes a lock bit");
+        assert_eq!(party.known_locked(0), Ok(Some(true)));
+        for bit in 1..16 { assert_eq!(party.known_locked(bit), Ok(None)); }
+        for (slot, address) in [9, 10, 11].into_iter().enumerate() {
+            assert_eq!(party.known_main_slot(slot as u8).unwrap(), native.known_byte(3, address));
+        }
+        let mut encoded = native.encode();
+        assert_eq!(encoded.first(), Some(&super::super::BLOB_VERSION_NATIVE_PARTY));
+        assert_eq!(StoryState::decode(&encoded), Some(native));
+        encoded.truncate(encoded.len() - super::super::NATIVE_PARTY_BYTES);
+        *encoded.first_mut().unwrap() = BLOB_VERSION_BANKS;
+        assert_eq!(encoded, old.encode(), "v4 does not alter or duplicate the underlying bank image");
+    }
+
+    #[test]
+    fn promoting_even_the_fresh_v3_profile_does_not_infer_native_resources() {
+        let old = StoryState::fresh_first_control();
+        let promoted = old.clone().into_native_party().unwrap();
+        assert_eq!(promoted.native_party(), Some(&super::super::NativePartyState::unknown()));
+        assert_eq!(promoted.banks, old.banks);
+        assert_ne!(promoted, StoryState::fresh_native_first_control());
+        assert_eq!(promoted.clone().into_extended().unwrap(), promoted, "bank-only promotion preserves v4 knowledge");
     }
 }

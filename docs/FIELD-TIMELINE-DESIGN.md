@@ -263,11 +263,15 @@ and PC parity remain separate limits. This design establishes the scheduling and
 multiplayer timing work needed next; it does not claim those other fidelity gaps are
 resolved or that the scheduler is already implemented.
 
-## Future field-visit state contract (unimplemented)
+## Field-visit state contract (runtime unimplemented)
 
-This is a proposed next integration boundary, not existing durable visit support or
-permission to activate the train lesson/return. It complements the scheduler design:
-retaining a scratch image alone does not restore an interrupted field runtime.
+The idle storage foundation now implements this record and atomic Enter/Advance updates
+with story/resources. It does not implement the running field lifecycle or activate the
+train lesson/return. Existing checkpoint operations preserve visits and cannot create or
+clear their active-continuation links; login refuses stored visits until the runtime can
+restore them. See [the current foundation](DISC1-IMPLEMENTATION.md#native-party-and-field-visit-foundation).
+The remaining integration complements the scheduler design: retaining a scratch image
+alone does not restore an interrupted field runtime.
 
 The pinned PSX engine has one 256-byte `g_FieldMapVars` buffer. Selectors 5/6 alias that
 storage: U8 access uses one byte through either selector; S16 access through selector 5

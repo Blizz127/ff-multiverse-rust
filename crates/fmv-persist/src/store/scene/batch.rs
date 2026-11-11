@@ -95,6 +95,10 @@ pub struct SceneState {
     pub pair: ProgressPair,
     pub checkpoint: Option<SceneCheckpoint>,
     pub reservation: Option<SceneReservation>,
+    /// Explicit durable field-entry state. Absence means no entry was recorded, never
+    /// evidence of a zero initializer. Existing scene operations preserve it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_visit: Option<crate::FieldVisitV1>,
 }
 
 /// Current state in the request's account order. A duplicate returns current progress,
@@ -272,9 +276,10 @@ fn validate_roster(roster: &[RosterMember]) -> Result<()> {
 }
 
 impl Images {
-    fn state(&self, account: AccountId, game: GameId) -> SceneState {
+    pub(in crate::store) fn state(&self, account: AccountId, game: GameId) -> SceneState {
         SceneState { pair: self.pair(account, game), checkpoint: self.character.as_ref().and_then(|r| r.checkpoint.clone()),
-            reservation: self.character.as_ref().and_then(|r| r.reservation.clone()) }
+            reservation: self.character.as_ref().and_then(|r| r.reservation.clone()),
+            field_visit: self.character.as_ref().and_then(|r| r.field_visit.clone()) }
     }
 }
 
@@ -296,6 +301,7 @@ fn validate_states(states: &[SceneState]) -> Result<()> {
         let (account, member_game) = identity(state);
         if member_game != game { return Err(invalid("batch spans different games")); }
         state.pair.validate(account, game)?;
+        crate::store::field_visit::validate_link(state.field_visit.as_ref(), state.checkpoint.as_ref(), state.reservation.as_ref())?;
         if state.pair.character.is_none() { return Err(invalid("batch requires stored character progress")); }
         if let Some(checkpoint) = &state.checkpoint { validate_checkpoint(checkpoint)?; }
         if let Some(reservation) = &state.reservation { validate_reservation(reservation)?; }
@@ -327,6 +333,9 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
     validate_states(after)?;
     if before.len() != after.len() || before.iter().zip(after).any(|(a, b)| identity(a) != identity(b)) {
         return Err(invalid("batch after-images must have the same accounts and order"));
+    }
+    if before.iter().zip(after).any(|(a, b)| a.field_visit != b.field_visit) {
+        return Err(invalid("existing scene operations must preserve field visits unchanged"));
     }
     if operation.kind == SceneOperationKind::BattleOutcome {
         if operation.ordinal != 0 || operation.attempt != 0 {
@@ -498,8 +507,14 @@ impl Store {
     /// Game rules must validate deltas and which participant owns any authored story change.
     pub fn commit_battle_outcome(&self, instance: [u8; 32], selected_result: &[u8], expected: &[ProgressPair], next: &[ProgressPair]) -> Result<SceneBatchCommitted> {
         let operation = SceneOperation { instance, ordinal: 0, attempt: 0, kind: SceneOperationKind::BattleOutcome };
-        let states = |pairs: &[ProgressPair]| pairs.iter().cloned().map(|pair| SceneState {
-            pair, checkpoint: None, reservation: None,
+        let accounts: Vec<_> = expected.iter().map(|pair| pair.story.account_id).collect();
+        let game = expected.first().ok_or_else(|| invalid("empty battle outcome"))?.story.game;
+        let current = self.get_scene_states(&accounts, game)?;
+        if expected.len() != next.len() { return Err(invalid("battle outcome member counts differ")); }
+        // Pair-only callers do not own visit metadata. Capture it coherently, then include
+        // it in the exact CAS below: a concurrent visit change refuses, never overwrites.
+        let states = |pairs: &[ProgressPair]| pairs.iter().zip(&current).map(|(pair, current)| SceneState {
+            pair: pair.clone(), ..current.clone()
         }).collect::<Vec<_>>();
         self.commit_scene_batch(&operation, selected_result, &states(expected), &states(next))
     }
@@ -688,6 +703,7 @@ impl Store {
             let new = row.after.character.as_ref().ok_or_else(|| invalid("batch has no character after-image"))?;
             old.validate()?;
             new.validate()?;
+            if old.last_visit_commit != new.last_visit_commit { return Err(invalid("batch must preserve the last field visit receipt")); }
             if old.scene_receipts != new.scene_receipts { return Err(invalid("batch must preserve ordinary scene receipts")); }
             let mut receipts = old.batch_receipts.clone();
             let slot = match intent.operation.kind {
@@ -740,6 +756,10 @@ impl Store {
         let file: BatchIntentFile = serde_json::from_slice(bytes).map_err(|e| PersistError::corrupt(path, format!("invalid scene batch intent: {e}")))?;
         if file.schema_version != BATCH_INTENT_VERSION || file.kind != "fmv-scene-batch-transaction" || file.checksum != digest(&file.intent)? {
             return Err(PersistError::corrupt(path, "scene batch intent kind, version or checksum mismatch"));
+        }
+        if file.intent.rows.iter().flat_map(|row| [&row.before, &row.after]).any(|images| images.character.as_ref().is_some_and(|record| record.progress.schema_version >= super::CHARACTER_VISIT_VERSION))
+            && self.index().format_version() < crate::index::FIELD_VISIT_INDEX_VERSION {
+            return Err(PersistError::corrupt(path, "visit-bearing batch intent lacks its required index format fence"));
         }
         let retires_landing = file.intent.operation.kind == SceneOperationKind::Complete
             && file.intent.rows.iter().any(|row| row.before.character.as_ref().and_then(|record| record.checkpoint.as_ref())

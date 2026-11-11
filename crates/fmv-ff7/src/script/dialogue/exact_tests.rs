@@ -46,6 +46,105 @@ fn writes(run: &ExactRun) -> Vec<(u8, u8, u8, u8)> {
 }
 
 #[test]
+fn every_exact_entry_refuses_native_party_before_using_the_legacy_party_projection() {
+    use crate::story::NativePartyState;
+    let body = [vec![0x74, 3, 0, 70], set_byte(3, 71, 42), vec![0]].concat();
+    let code = SynthScript::default().entity("npc", vec![
+        (0, [vec![0], body.clone()].concat()), (1, body),
+    ]).build();
+    let script = FieldScript::parse(&code).unwrap();
+    let mut legacy = state();
+    // The talk-time main prelude repeats only already-established assignments.
+    legacy.write_byte(3, 70, 0).unwrap();
+    legacy.write_byte(3, 71, 42).unwrap();
+    let entry = ExactScript { entity: 0, slot: 1, ..ExactScript::default() };
+    for result in [
+        run_script_exact(&script, &legacy, 7, &entry, &[]),
+        run_talk_exact(&script, 0, &legacy, 7, &[]),
+        run_panel_exact(&script, 0, &legacy, 7, 8, &[]),
+    ] {
+        assert_eq!(writes(&result.unwrap()), vec![(3, 70, 0, 255), (3, 71, 42, 255)],
+            "version 3 keeps its existing Cloud projection");
+    }
+
+    let mut native = legacy.clone().into_native_party().unwrap();
+    for (address, member) in [(9, 1), (10, 0), (11, 255)] {
+        native.write_byte(3, address, member).unwrap();
+    }
+    *native.native_party_mut().unwrap() = NativePartyState::from_parts(
+        [2, 255, 0], 7, (0x8004, 0x8007), (0x0200, 0x0201),
+    ).unwrap();
+    for before in [legacy.into_native_party().unwrap(), native] {
+        let saved = before.encode();
+        for result in [
+            run_script_exact(&script, &before, 7, &entry, &[]),
+            run_talk_exact(&script, 0, &before, 7, &[]),
+            run_panel_exact(&script, 0, &before, 7, 8, &[]),
+        ] {
+            assert_eq!(result, Err(ExactError::NativePartyUnsupported));
+        }
+        assert_eq!(before.encode(), saved, "refusal preserves values and unknown bits");
+    }
+    assert_eq!(script.bytes(), code, "evaluation never changes the source");
+}
+
+#[test]
+fn permissive_dialogue_also_refuses_native_party_before_setup_or_a_window() {
+    use super::{availability, run_talk, Availability, Beat, End, Limits, TalkError, TalkSession, Walk};
+    use crate::story::NativePartyState;
+    let code = section(&[set_byte(3, 66, 9)], &[
+        vec![0x74, 3, 0, 70], vec![0x40, 0, 0], set_byte(3, 71, 42),
+    ], vec![dialog("Hello")]);
+    let script = FieldScript::parse(&code).unwrap();
+    let legacy = state();
+    assert_eq!(availability(&script, 0, &legacy), Availability { visible: true, talkable: true });
+    assert!(run_talk(&script, 0, &legacy, 7).is_ok());
+    assert!(TalkSession::talk(code.clone(), 0, Box::new(legacy.clone()), 7).is_ok());
+    assert!(TalkSession::script(code.clone(), 0, 1, Box::new(legacy.clone()), 7).is_ok());
+    let mut native = legacy.clone().into_native_party().unwrap();
+    *native.native_party_mut().unwrap() = NativePartyState::from_parts(
+        [2, 255, 0], 7, (0x8004, 0x8007), (0x0200, 0x0201),
+    ).unwrap();
+    for (address, member) in [(9, 1), (10, 0), (11, 255)] {
+        native.write_byte(3, address, member).unwrap();
+    }
+    let saved = native.encode();
+    assert_eq!(availability(&script, 0, &native), Availability { visible: false, talkable: false });
+    assert_eq!(run_talk(&script, 0, &native, 7), Err(TalkError::UnsupportedStory));
+    assert_eq!(TalkSession::talk(code.clone(), 0, Box::new(native.clone()), 7).unwrap_err(), TalkError::UnsupportedStory);
+    assert_eq!(TalkSession::script(code.clone(), 0, 1, Box::new(native.clone()), 7).unwrap_err(), TalkError::UnsupportedStory);
+    let mut walk = Walk::talk(0, 7, Limits::default());
+    assert_eq!(walk.resume(&script, &native, None), Beat::End(End::Broken));
+    assert_eq!((walk.steps(), walk.beats(), walk.written(3, 70)), (0, 0, None));
+    assert_eq!(walk.resume(&script, &legacy, None), Beat::End(End::Broken), "a refused walk stays stopped");
+    assert_eq!(native.encode(), saved);
+}
+
+#[test]
+fn unsupported_story_cannot_consume_a_pending_answer_or_emit_a_queued_gift_note() {
+    use super::{Beat, End, Limits, Walk};
+    let legacy = state();
+    let native = legacy.clone().into_native_party().unwrap();
+    let code = section(&[], &[
+        set_byte(5, 19, 1), vec![0x48, 5, 0, 0, 1, 2, 19], set_byte(3, 66, 7),
+    ], vec![question()]);
+    let script = FieldScript::parse(&code).unwrap();
+    let mut walk = Walk::talk(0, 7, Limits::default());
+    assert!(matches!(walk.resume(&script, &legacy, None), Beat::Message(message) if message.choice.is_some()));
+    let steps = walk.steps();
+    assert_eq!(walk.resume(&script, &native, Some(2)), Beat::End(End::Broken));
+    assert_eq!((walk.steps(), walk.written(5, 19), walk.written(3, 66)), (steps, Some(1), None));
+    assert_eq!(walk.resume(&script, &legacy, Some(2)), Beat::End(End::Broken));
+
+    let code = section(&[], &[vec![0x39, 0, 1, 0, 0, 0], vec![0x40, 0, 0]], vec![dialog("Gift")]);
+    let script = FieldScript::parse(&code).unwrap();
+    let mut walk = Walk::talk(0, 7, Limits::default());
+    assert!(matches!(walk.resume(&script, &legacy, None), Beat::Message(_)));
+    assert_eq!(walk.resume(&script, &native, None), Beat::End(End::Broken));
+    assert_eq!(walk.resume(&script, &legacy, None), Beat::End(End::Broken), "the queued note was discarded");
+}
+
+#[test]
 fn exact_writes_and_subsequent_reads_share_both_persistent_bank_views() {
     let code = section(&[], &[
         set_byte(1, 40, 0x12), set_byte(1, 41, 0x34),
