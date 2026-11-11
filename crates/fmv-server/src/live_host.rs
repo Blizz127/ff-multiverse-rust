@@ -94,7 +94,7 @@ impl LiveField for Ff7Live {
             triangle: 0,
             dir: facing_to_field_direction(i.facing),
             ok: i.ok,
-            keys_held: if i.ok { PAD_OK } else { 0 },
+            keys_held: if i.ok || i.ok_held { PAD_OK } else { 0 },
             keys_pressed: if i.ok { PAD_OK } else { 0 },
         });
         self.rt.tick(player);

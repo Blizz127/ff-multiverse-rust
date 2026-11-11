@@ -36,6 +36,8 @@ const MAX_FRAMES_PER_TICK: u64 = 30;
 pub const SAVE_EVERY: Duration = Duration::from_secs(2);
 /// How long a movie may take before the field goes on without the clients' answer.
 const MOVIE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Frames an OK press stays held for the field's scripts (a fifth of a second).
+const OK_HOLD_FRAMES: u8 = 6;
 /// The phase-key prefix of a live instance.
 const LIVE_PHASE: &[u8] = b"live";
 
@@ -74,6 +76,8 @@ pub struct LiveInput {
     pub facing: f32,
     /// OK went down.
     pub ok: bool,
+    /// OK is held (a press holds for a few frames, so a script that polls the pad sees it).
+    pub ok_held: bool,
 }
 
 /// What a frame did that the world must carry out or tell.
@@ -148,6 +152,8 @@ struct LiveRun {
     last_save: Instant,
     waiting: Option<Waiting>,
     windows: BTreeSet<u8>,
+    /// Frames the governor's last OK press is still held for.
+    ok_hold: u8,
     /// The run cannot go on (its save failed): it stops advancing and the instance keeps its last state.
     halted: bool,
 }
@@ -327,6 +333,7 @@ impl World {
                             last_save: now,
                             waiting: None,
                             windows: BTreeSet::new(),
+                            ok_hold: 0,
                             halted: false,
                         },
                     );
@@ -393,10 +400,16 @@ impl World {
         }
         let mut events = Vec::new();
         for _ in 0..frames {
+            if ok {
+                run.ok_hold = OK_HOLD_FRAMES;
+            }
+            let ok_held = run.ok_hold > 0;
+            run.ok_hold = run.ok_hold.saturating_sub(1);
             let input = governor_entity.and_then(|e| self.players.get(&e)).filter(|p| p.transit.is_none() && p.battle.is_none()).map(|p| LiveInput {
                 pos: p.snapshot.pos,
                 facing: p.snapshot.facing,
                 ok,
+                ok_held,
             });
             ok = false;
             events.extend(run.field.advance(input));

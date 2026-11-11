@@ -81,12 +81,23 @@ impl Outcome {
     }
 }
 
-/// Run `frames` frames. The player walks `path` (a point a frame), then stands at its end, facing `dir`, holding OK
+/// Run up to `frames` frames. The player walks `path` (a point a frame), then stands at its end, facing `dir`, holding OK
 /// on frames 2 to 6 when `ok`. While a script holds the player, the player follows where the scripts put it. Returns
 /// what happened and where the player ends.
-fn run(rt: &mut FieldRuntime, frames: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
+/// The same, stopping early once at least `min` frames ran and the field has been idle (no script holds the player, no
+/// window is open, no command is pending) for twenty frames: the story's clocks should not run while nothing happens.
+fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
     let mut out = Outcome::default();
+    let mut idle = 0u32;
     for f in 0..frames {
+        if !rt.player_scripted() && !rt.window_open() && rt.command().is_none() {
+            idle += 1;
+        } else {
+            idle = 0;
+        }
+        if f >= min.max(path.len() as u32 + 8) && idle >= 20 {
+            break;
+        }
         if let Some(p) = path.get(f as usize) {
             at = *p;
         }
@@ -170,6 +181,8 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
 /// One step of a route.
 struct Step {
     text: String,
+    /// The step as `scripts/live-route.py` commands (`field: cmd; cmd`), empty when the field moves on by itself.
+    cmds: String,
     parent: Option<Rc<Step>>,
 }
 
@@ -178,6 +191,19 @@ fn chain(step: &Option<Rc<Step>>) -> Vec<String> {
     let mut cur = step.clone();
     while let Some(s) = cur {
         out.push(s.text.clone());
+        cur = s.parent.clone();
+    }
+    out.reverse();
+    out
+}
+
+fn commands(step: &Option<Rc<Step>>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = step.clone();
+    while let Some(s) = cur {
+        if !s.cmds.is_empty() {
+            out.push(s.cmds.clone());
+        }
         cur = s.parent.clone();
     }
     out.reverse();
@@ -346,11 +372,11 @@ fn main() {
             }
         }
         let before = moment_of(&rt.mem.banks);
-        let settle = if fresh { run(&mut rt, SETTLE_FRAMES, &[], at, 0, false) } else { (Outcome::default(), at) };
+        let settle = if fresh { run_idle(&mut rt, SETTLE_FRAMES, 45, &[], at, 0, false) } else { (Outcome::default(), at) };
         let moved = settle.1 != at;
         at = settle.1;
         let now = moment_of(&rt.mem.banks);
-        if now > best.0 {
+        if now > best.0 && !settle.0.game_over {
             best = (now, via.clone(), field_name.clone());
         }
         let carry_out = Some((rt.save_data().clone(), rt.gil));
@@ -370,7 +396,7 @@ fn main() {
         if let Some(jump) = settle.0.jump {
             let to = maplist.name(jump.0).unwrap_or("?").to_string();
             println!("{step:>4} {field_name:<10} moment {before}->{now} on its own: battles {:?} movies {:?} windows {} -> {to}", settle.0.battles, settle.0.movies, settle.0.windows);
-            let via = Some(Rc::new(Step { text: format!("{field_name}: (plays by itself, moment {before}->{now}) -> {to}"), parent: via }));
+            let via = Some(Rc::new(Step { text: format!("{field_name}: (plays by itself, moment {before}->{now}) -> {to}"), cmds: String::new(), parent: via }));
             push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), 5);
             continue;
         }
@@ -384,11 +410,11 @@ fn main() {
 
         // What the field does by itself over a probe's time, and which scratch bytes only follow the player's position.
         let mut baseline = rt.clone();
-        let _ = run(&mut baseline, PROBE_FRAMES, &[], at, 0, false);
+        let _ = run_idle(&mut baseline, PROBE_FRAMES, 60, &[], at, 0, false);
         let mut noise = [false; 256];
         for t in (0..walk.triangles.len()).filter(|t| reach[*t]).step_by((reach_count / 4).max(1)).take(5) {
             let mut other = rt.clone();
-            let _ = run(&mut other, PROBE_FRAMES, &[], centre(&walk, t), 0, false);
+            let _ = run_idle(&mut other, PROBE_FRAMES, 60, &[], centre(&walk, t), 0, false);
             for (i, n) in noise.iter_mut().enumerate() {
                 *n |= other.mem.scratch[i] != baseline.mem.scratch[i];
             }
@@ -417,11 +443,11 @@ fn main() {
         images.insert((field_name.clone(), story_key(&rt.mem.banks), image_key(&baseline, here_place)));
 
         // The actions: (label, path, stand, dir, ok).
-        let mut actions: Vec<(String, Vec<Pos>, Pos, u8, bool)> = Vec::new();
+        let mut actions: Vec<(String, Vec<Pos>, Pos, u8, bool, String)> = Vec::new();
         for t in (0..walk.triangles.len()).filter(|t| reach[*t]) {
             let c = centre(&walk, t);
-            actions.push((format!("tri {t}"), Vec::new(), c, 0, false));
-            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true));
+            actions.push((format!("tri {t}"), Vec::new(), c, 0, false, format!("tri {t}")));
+            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true, format!("tri {t}; ok")));
         }
         let on_reach = |rt: &FieldRuntime, p: Pos| rt.triangle_at(p.0, p.1, p.2).is_some_and(|t| reach.get(usize::from(t)).copied().unwrap_or(false));
         let pc = rt.state.pc_model;
@@ -430,7 +456,7 @@ fn main() {
                 let stand = (m.x + ox, m.y + oy, m.z);
                 if on_reach(&rt, stand) {
                     let face = direction_of(i64::from(-ox), i64::from(-oy));
-                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true));
+                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {}; face {face}; ok", stand.0, stand.1)));
                     break;
                 }
             }
@@ -444,10 +470,10 @@ fn main() {
             let (a_side, b_side) = (side(-6), side(6));
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
             if on_reach(&rt, a_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false));
+                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("xy {} {}; to {} {}", a_side.0, a_side.1, b_side.0, b_side.1)));
             }
             if on_reach(&rt, b_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false));
+                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("xy {} {}; to {} {}", b_side.0, b_side.1, a_side.0, a_side.1)));
             }
             // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
             // in front of the player), or on its middle when neither side can be stood on.
@@ -456,24 +482,24 @@ fn main() {
                 let stand = side(k);
                 if on_reach(&rt, stand) {
                     let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
-                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true));
+                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {}; face {face}; ok", stand.0, stand.1)));
                     stood = true;
                 }
             }
             if !stood && on_reach(&rt, mid) {
-                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true));
+                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, format!("xy {} {}; ok", mid.0, mid.1)));
             }
         }
 
         let mut kept = 0u32;
         let mut line = Vec::new();
-        for (label, path, stand, face, ok) in actions {
+        for (label, path, stand, face, ok, cmds) in actions {
             let mut probe = rt.clone();
-            let (mut out, mut end) = run(&mut probe, PROBE_FRAMES, &path, stand, face, ok);
+            let (mut out, mut end) = run_idle(&mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
             let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
             let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
             if (moved_story || moved_scratch || out.windows > 0 || probe.player_scripted()) && out.jump.is_none() && !out.game_over {
-                let (more, e) = run(&mut probe, FOLLOW_FRAMES, &[], end, face, false);
+                let (more, e) = run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
                 out.absorb(more);
                 end = e;
             }
@@ -504,7 +530,7 @@ fn main() {
                     if entered.contains(&(to.clone(), story_key(&probe.mem.banks))) {
                         continue;
                     }
-                    let via = Some(Rc::new(Step { text: format!("{summary} -> {to}"), parent: via.clone() }));
+                    let via = Some(Rc::new(Step { text: format!("{summary} -> {to}"), cmds: format!("{field_name}: {cmds}"), parent: via.clone() }));
                     line.push(format!("[{score}] {label} -> {to}"));
                     push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);
                 }
@@ -512,7 +538,7 @@ fn main() {
                     if !images.insert((field_name.clone(), story_key(&probe.mem.banks), image_key(&probe, end_place))) {
                         continue;
                     }
-                    let via = Some(Rc::new(Step { text: summary, parent: via.clone() }));
+                    let via = Some(Rc::new(Step { text: summary, cmds: format!("{field_name}: {cmds}"), parent: via.clone() }));
                     line.push(format!("[{score}] {label}"));
                     let banks = probe.mem.banks.clone();
                     let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
@@ -533,7 +559,7 @@ fn main() {
                     continue;
                 }
                 let jump = (g.target_field_id, g.destination[0], g.destination[1], g.destination[2]);
-                let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), parent: via.clone() }));
+                let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), cmds: format!("{field_name}: gate {gi}"), parent: via.clone() }));
                 let score = if visited.contains(&to) { 0 } else { 3 };
                 line.push(format!("[{score}] gate {gi} -> {to}"));
                 push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), score);
@@ -553,6 +579,6 @@ fn main() {
         println!("  {l}");
     }
     if let Some(path) = route_out {
-        let _ = std::fs::write(path, route.join("\n") + "\n");
+        let _ = std::fs::write(path, commands(&best.1).join("\n") + "\n");
     }
 }
