@@ -659,3 +659,178 @@ impl World {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use fmv_adapter_api::GameAdapter;
+    use fmv_core::{AccountId, AnimState, AvatarAppearance, EntityId, Pos};
+    use fmv_fixture::rooms::{RoomsAdapter, HALL, YARD};
+    use fmv_party::PartyConfig;
+    use fmv_protocol::ServerMsg;
+    use tokio::sync::{mpsc, watch};
+
+    use super::super::{NewPlayer, Outbound, World};
+    use super::*;
+    use crate::saver::{Msg, SaverHandle};
+
+    /// A field that opens one window on its first frame, and on an OK press jumps to the yard after writing its story.
+    struct FakeField {
+        frame: u64,
+        open: bool,
+        story: Vec<u8>,
+        locked: bool,
+    }
+
+    impl LiveField for FakeField {
+        fn advance(&mut self, input: Option<LiveInput>) -> Vec<LiveEvent> {
+            self.frame += 1;
+            let mut out = Vec::new();
+            if self.frame == 1 {
+                self.open = true;
+                out.push(LiveEvent::Window { window: 0, dialog: 5, ask: None, entity: 2, offset: 77, passive: false });
+            }
+            if input.is_some_and(|i| i.ok) {
+                self.story = vec![9];
+                out.push(LiveEvent::MapJump { target: Some(YARD.to_string()), field_id: 1, arrival: Pos::new(150.0, -100.0, 0.0), facing: 0.0, hint: None });
+            }
+            out
+        }
+        fn cast(&self) -> Vec<NpcSnapshot> {
+            vec![NpcSnapshot { id: 0, name: "walker".into(), model: "m".into(), idle_animation: None, pos: Pos::new(self.frame as f32, 0.0, 0.0), facing: 0.0 }]
+        }
+        fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>) {
+            (vec![0; 64], None)
+        }
+        fn control_locked(&self) -> bool {
+            self.locked
+        }
+        fn player_place(&self) -> Option<(Pos, f32)> {
+            None
+        }
+        fn answer(&mut self, _window: u8, _choice: Option<u8>) -> bool {
+            std::mem::take(&mut self.open)
+        }
+        fn complete_command(&mut self) {}
+        fn battle_over(&mut self, _outcome: LiveBattleOutcome) {}
+        fn idle(&self) -> bool {
+            !self.open
+        }
+        fn clocks(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn countdown(&self) -> Option<u32> {
+            None
+        }
+        fn blocks(&self, _from: Pos, to: Pos) -> bool {
+            to.x > 250.0 && to.y < 120.0
+        }
+        fn map_jumps_disabled(&self) -> bool {
+            false
+        }
+        fn battles_disabled(&self) -> bool {
+            true
+        }
+        fn progression(&self, saved: &[u8]) -> Option<Vec<u8>> {
+            (self.story != saved).then(|| self.story.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeHost(Mutex<Vec<String>>);
+
+    impl LiveFieldHost for FakeHost {
+        fn runs(&self, area: &AreaKey, _progression: &[u8]) -> bool {
+            area == HALL
+        }
+        fn start(&self, area: &AreaKey, progression: &[u8], _seed: &LiveSeed) -> Option<Box<dyn LiveField>> {
+            self.0.lock().unwrap().push(area.clone());
+            Some(Box::new(FakeField { frame: 0, open: false, story: progression.to_vec(), locked: false }))
+        }
+    }
+
+    struct Seat {
+        entity: EntityId,
+        rx: mpsc::Receiver<Outbound>,
+    }
+
+    impl Seat {
+        fn drain(&mut self) -> Vec<ServerMsg> {
+            let mut out = Vec::new();
+            while let Ok(m) = self.rx.try_recv() {
+                out.push((*m).clone());
+            }
+            out
+        }
+    }
+
+    fn world() -> (World, mpsc::UnboundedReceiver<Msg>, Arc<FakeHost>) {
+        let adapter: Arc<dyn GameAdapter> = Arc::new(RoomsAdapter::with_interactions());
+        let mut w = World::with_party_config(adapter.load_area(HALL).unwrap(), PartyConfig::default()).unwrap();
+        w.set_area_source(adapter);
+        let (handle, rx) = SaverHandle::channel();
+        w.set_progress_saver(handle);
+        let host = Arc::new(FakeHost(Mutex::new(Vec::new())));
+        w.set_live_host(host.clone());
+        (w, rx, host)
+    }
+
+    fn seat(w: &mut World, name: &str, now: Instant) -> Seat {
+        let (session, entity) = w.allocate_ids();
+        let (tx, rx) = mpsc::channel(256);
+        let close = Arc::new(watch::channel(false).0);
+        let avatar = AvatarAppearance { display_name: name.into(), tint: [1, 2, 3], appearance_ref: None };
+        let account = AccountId(entity.0);
+        w.join(NewPlayer { session, entity, account, avatar, progression: Vec::new(), progress: Default::default(), scene_state: None, scene_group: Vec::new(), tx, close }, now).expect("joins");
+        Seat { entity, rx }
+    }
+
+    #[test]
+    fn a_live_field_runs_for_its_governor_shows_its_cast_and_window_and_takes_only_the_governors_answer() {
+        let t0 = Instant::now();
+        let (mut w, _saved, host) = world();
+        let mut a = seat(&mut w, "A", t0);
+        assert!(w.in_live_field(a.entity), "the hall runs live from the moment the player stands in it");
+        w.advance_live(t0 + Duration::from_millis(100));
+        w.advance_live(t0 + Duration::from_millis(200));
+        assert_eq!(*host.0.lock().unwrap(), [HALL.to_string()], "one field for the one instance");
+        let msgs = a.drain();
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::LiveCast { npcs, .. } if npcs.len() == 1)), "{msgs:?}");
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::LiveWindow { window: 0, dialog: 5, answerable: true, entity: 2, offset: 77, .. })), "{msgs:?}");
+        // The governor dismisses it.
+        w.live_answer(a.entity, 0, None);
+        w.advance_live(t0 + Duration::from_millis(300));
+        assert!(!w.live_locked(a.entity));
+    }
+
+    #[test]
+    fn a_script_locked_way_is_refused_and_ok_goes_to_the_field_which_can_take_the_instance_elsewhere_and_saves_its_story() {
+        let t0 = Instant::now();
+        let (mut w, mut saved, _host) = world();
+        let mut a = seat(&mut w, "A", t0);
+        w.advance_live(t0 + Duration::from_millis(100));
+        w.live_answer(a.entity, 0, None);
+        // The field closed part of the hall.
+        let from = w.players.get(&a.entity).unwrap().snapshot.pos;
+        assert!(w.live_blocks(a.entity, from, Pos::new(260.0, 100.0, 0.0)));
+        assert!(matches!(
+            w.apply_move(a.entity, Pos::new(260.0, 100.0, 0.0), 0.0, AnimState::Walk, t0 + Duration::from_millis(900)),
+            crate::world::MoveOutcome::Rejected { .. }
+        ));
+        a.drain();
+        // OK is the field's: it jumps to the yard.
+        assert_eq!(w.press(a.entity, None, t0 + Duration::from_secs(1)), crate::world::PressOutcome::Nothing);
+        w.advance_live(t0 + Duration::from_millis(1100));
+        let msgs = a.drain();
+        assert!(msgs.iter().any(|m| matches!(m, ServerMsg::AreaChange { area, .. } if area.key == YARD)), "{msgs:?}");
+        let mut stories = Vec::new();
+        while let Ok(msg) = saved.try_recv() {
+            if let Msg::StoryCas { job, .. } = msg {
+                stories.push((job.expected_story.clone(), job.next_story.clone()));
+            }
+        }
+        assert_eq!(stories, [(Vec::new(), vec![9])], "the story the field wrote is saved as an exact step when it leaves");
+    }
+}
