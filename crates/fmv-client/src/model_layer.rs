@@ -129,6 +129,65 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the owner's Ninostyle IRO and FF7 char.lgp"]
+    fn owned_field_materials_keep_original_faces_and_do_not_bias_ninostyle_clothing() {
+        use crate::avatar::mesh::MergedMesh;
+        use fmv_ff7::{model::load_field_model, PartBlend};
+        let dir = std::env::var("FMV_NINO_TEST").expect("FMV_NINO_TEST");
+        let char_path = std::env::var("FMV_CHAR_LGP").expect("FMV_CHAR_LGP");
+        let layer = Arc::new(Layer::open(&Path::new(&dir).join("Ninostyle Chibi.iro"), FIELD_ID, FIELD_FOLDERS).unwrap());
+        let mut original = fmv_ff7::lgp::LgpArchive::open_path(&char_path).unwrap();
+        let names: Vec<String> = original.list().iter().filter(|e| e.name.to_ascii_lowercase().ends_with(".hrc"))
+            .map(|e| e.name.clone()).collect();
+        let mut checked = 0;
+        for name in &names {
+            let model = load_field_model(&mut original, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let has_head = model.bones.iter().any(|b| b.name.eq_ignore_ascii_case("head"));
+            let mut legacy = Vec::new();
+            for part in &model.parts {
+                let overlay = part.blend == PartBlend::Opaque && part.texture.is_some();
+                assert!(!has_head || !overlay || model.bones[part.bone_index].name.eq_ignore_ascii_case("head"),
+                    "{name}: original opaque texture outside its named head");
+                legacy.extend(std::iter::repeat_n(if overlay { 1.0 } else { 0.0 }, part.positions.len()));
+            }
+            if model.parts.iter().any(|p| !p.indices.is_empty()) {
+                assert_eq!(MergedMesh::build(&model).unwrap().overlay, legacy, "{name}: original depth flags");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 300, "the original archive survey only checked {checked} drawable models");
+        eprintln!("original materials: {checked} drawable models from {} skeletons keep their depth flags", names.len());
+
+        let mut replaced = fmv_ff7::lgp::LgpArchive::open_path(&char_path).unwrap();
+        replaced.set_overlay(move |name| layer.read(name));
+        for (name, hrc) in [("Cloud", "aaaa"), ("Barret", "acgd"), ("Yuffie", "abjb"),
+            ("lean", "awcb"), ("sturdy", "bwab"), ("slight", "cwed")] {
+            let base = load_field_model(&mut original, hrc).unwrap();
+            let model = load_field_model(&mut replaced, hrc).unwrap();
+            assert!(model.triangle_count() > base.triangle_count(), "{name}: the replacement geometry loaded");
+            assert_eq!(model.bones.len(), base.bones.len(), "{name}: rig bone count");
+            for (changed, old) in model.bones.iter().zip(&base.bones) {
+                assert_eq!((&changed.name, changed.parent, changed.length), (&old.name, old.parent, old.length),
+                    "{name}: replacement keeps the original rig");
+            }
+            let mesh = MergedMesh::build(&model).unwrap();
+            let (mut offset, mut clothing, mut head_parts) = (0, 0, 0);
+            for part in &model.parts {
+                let end = offset + part.positions.len();
+                if part.blend == PartBlend::Opaque && part.texture.is_some() {
+                    let head = model.bones[part.bone_index].name.eq_ignore_ascii_case("head");
+                    let expected = if head { 1.0 } else { 0.0 };
+                    assert!(mesh.overlay[offset..end].iter().all(|&flag| flag == expected), "{name}: material depth");
+                    if head { head_parts += 1; } else { clothing += 1; }
+                }
+                offset = end;
+            }
+            assert!(head_parts > 0 && clothing >= 10, "{name}: expected textured head and clothing, got {head_parts}/{clothing}");
+            eprintln!("{name}: {clothing} textured clothing groups use ordinary depth; {head_parts} head groups keep their overlays");
+        }
+    }
+
+    #[test]
     #[ignore = "requires the owner's Ninostyle IRO and FF7 battle.lgp"]
     fn owned_battle_archive_loads_canon_models() {
         use fmv_ff7::battle_model::{BattleCharacter, BattleModels};
