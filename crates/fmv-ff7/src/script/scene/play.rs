@@ -78,6 +78,12 @@ pub enum SceneError {
     WindowData,
     #[error("the accepted scene trigger position cannot be represented on this field's floor")]
     SceneOrigin,
+    #[error("the train entry does not match the reviewed arrival profile")]
+    TrainEntry,
+    #[error("the train entry initializers do not match the reviewed zero-time contract")]
+    TrainEntrySetup,
+    #[error("the checked train arrival has not reached its exact complete ready boundary")]
+    TrainReady,
 }
 
 /// Replay semantics version. Change this when the interpreter's durable replay contract changes.
@@ -459,6 +465,7 @@ pub struct ScenePlay {
     unchecked: bool,
     strict: bool,
     transcript: Vec<SceneInput>,
+    train_entry: Option<super::train_arrival::TrainArrivalEntry>,
 }
 
 impl std::fmt::Debug for ScenePlay {
@@ -541,6 +548,22 @@ impl ScenePlay {
 
     #[allow(clippy::too_many_arguments)]
     fn with_script(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits, script: &FieldScript<'_>, resources: SceneResources, scratch: Option<&FieldScratch>) -> Result<Self, SceneError> {
+        Self::with_script_entry(field, def, story, seed, limits, script, resources, scratch, None)
+    }
+
+    /// No public general entry bypass: the train profile validates the source and landing.
+    pub(super) fn with_train_entry(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32,
+        resources: SceneResources, landing: super::vm::SceneJump, source: [u8; 32]) -> Result<Self, SceneError> {
+        let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
+        let clear = FieldScratch::cleared_for_entry();
+        Self::with_script_entry(field, def, story, seed, Limits::default(), &script, resources,
+            Some(&clear), Some((landing, source)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_script_entry(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, limits: Limits,
+        script: &FieldScript<'_>, resources: SceneResources, scratch: Option<&FieldScratch>,
+        entry: Option<(super::vm::SceneJump, [u8; 32])>) -> Result<Self, SceneError> {
         if scratch.is_some() { Self::check_scratch_inputs(story, def)?; }
         let story = def.prepare_story(story)?;
         if usize::from(def.trigger.entity) >= script.entity_count() {
@@ -556,13 +579,24 @@ impl ScenePlay {
         if story.supports_extended() {
             vm.allow_default_name_sites(super::default_names::sites(script.bytes(), def));
         }
-        vm.setup(script, &def.setup);
+        if entry.is_some() { vm.setup_train_entry(script, &def.setup); }
+        else { vm.setup(script, &def.setup); }
         if vm.scratch_setup_changed() { return Err(SceneError::ScratchSetup); }
         if vm.checked_scratch() && !vm.vars().unknown_persistent_reads().is_empty() {
             return Err(SceneError::UnknownPersistentRead);
         }
         if let Some(Err(error)) = vm.scratch_outcome() { return Err(SceneError::Scratch(error)); }
         if vm.checked_scratch() && !vm.setup_is_state_neutral() { return Err(SceneError::SetupState); }
+        if entry.is_some() && !super::train_arrival::safe_stats(vm.stats()) {
+            return Err(SceneError::TrainEntrySetup);
+        }
+        let train_entry = match entry {
+            Some((landing, source)) => Some(super::train_arrival::TrainArrivalEntry::new(
+                story.clone(), resources, landing, source,
+                vm.scratch_before().ok_or(SceneError::TrainEntrySetup)?.clone(),
+                vm.scratch_current().ok_or(SceneError::TrainEntrySetup)?.clone())),
+            None => None,
+        };
         let setup = vm.take_stats();
         // A cast member the stage scripts did not place stands where the cast says, and the scene knows it.
         for m in &def.cast {
@@ -589,7 +623,7 @@ impl ScenePlay {
         let heights = initial.iter().filter_map(|event| match *event {
             Stage::Place { entity, z: Some(z), .. } => Some((entity, z)), _ => None,
         }).collect();
-        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None, seed, unchecked: false, strict: false, transcript: Vec::new() })
+        Ok(Self { def: def.clone(), section, ground, vm, setup, initial, animation_clips, initial_default_animations, heights, cast, off_cast: 0, story: story.clone(), ended: None, seed, unchecked: false, strict: false, transcript: Vec::new(), train_entry })
     }
 
     fn animation_clips(field: &FieldFile, script: &FieldScript<'_>, cast: &[CastMember]) -> BTreeMap<u8, Vec<String>> {
@@ -653,6 +687,18 @@ impl ScenePlay {
 
     pub fn def(&self) -> &SceneDef {
         &self.def
+    }
+
+    /// Entry provenance and the actual initializer afterimage, available only for the
+    /// reviewed train-entry factory. This is execution evidence, not world admission.
+    pub fn train_entry(&self) -> Option<&super::train_arrival::TrainArrivalEntry> { self.train_entry.as_ref() }
+
+    pub(super) fn train_ready_pose(&self) -> Option<(Where, f32)> {
+        (self.strict && !self.unchecked && self.ended == Some(End::Finished)
+            && self.vm.visible_of(30) == Some(true)
+            && self.vm.control_instruction(false) == Some((30, 0x153C, 0))
+            && self.vm.control_instruction(true) == Some((30, 0x153E, 0))).then_some(())?;
+        Some((self.vm.place_of(30)?, self.vm.heading_of(30)?))
     }
 
     pub fn ground(&self) -> &Ground {
@@ -762,12 +808,17 @@ impl ScenePlay {
         if self.vm.scratch_setup_changed() { return Err(SceneError::ScratchSetup); }
         if !self.vm.vars().unknown_persistent_reads().is_empty() { return Err(SceneError::UnknownPersistentRead); }
         if let Some(Err(error)) = self.scratch_outcome() { return Err(SceneError::Scratch(error)); }
+        if self.train_entry.is_some() && !super::train_arrival::safe_stats(self.vm.stats()) {
+            return Err(SceneError::TrainReady);
+        }
         Ok(())
     }
 
     pub fn replay_identity(&self) -> ReplayIdentity {
-        ReplayIdentity { version: REPLAY_VERSION,
-            fingerprint: super::replay_identity::fingerprint_with_scratch(&self.section, &self.def, self.vm.scratch_before()), seed: self.seed }
+        let fingerprint = super::replay_identity::fingerprint_with_scratch(&self.section, &self.def, self.vm.scratch_before());
+        let fingerprint = self.train_entry.as_ref().map_or(fingerprint, |entry|
+            super::replay_identity::fingerprint_train_entry(fingerprint, entry.source_identity()));
+        ReplayIdentity { version: REPLAY_VERSION, fingerprint, seed: self.seed }
     }
 
     pub fn transcript(&self) -> &[SceneInput] { &self.transcript }

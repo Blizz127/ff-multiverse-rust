@@ -56,6 +56,11 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use winit::keyboard::KeyCode;
 
+mod ready;
+pub use ready::PresentationRef;
+#[cfg(test)]
+pub use ready::TrainReadyPresentation;
+
 /// A message for the server about a scene.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SceneCmd {
@@ -267,7 +272,7 @@ pub struct ScenePlayer {
 
 impl Drop for ScenePlayer {
     fn drop(&mut self) {
-        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        if !self.silent && self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
     }
 }
 
@@ -368,6 +373,37 @@ impl ScenePlayer {
         if replay.events.is_empty() {
             return Ok(Self::new_mode(run, def, source, instant, true, false, shake_rng));
         }
+        let mut player = Self::replay_silent(run, def, source, replay, shake_rng)?;
+        player.silent = false;
+        player.instant = instant;
+        player.accepted = player.passed;
+        if player.over || player.played_out {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::End { run: player.run.id, skipped: false });
+            }
+        } else if let Some(paused) = &player.battle {
+            if player.is_owner() {
+                player.outbox.push(SceneCmd::BattleReady { run: player.run.id, ordinal: paused.checkpoint.ordinal, step: player.passed });
+            }
+        } else {
+            player.sound(SoundAction::Begin);
+            // Only the historical prefix was silent; the current blank window is new work.
+            if player.is_owner() && player.panel.as_ref().is_some_and(Panel::is_blank) {
+                let panel = player.panel.take().expect("the blank current panel");
+                player.pass(panel, None);
+                player.settle();
+            }
+        }
+        Ok(player)
+    }
+
+    /// Rebuild without ever activating a run. In particular an empty prefix is silent too,
+    /// and reaching Finished does not queue End or play a historical sound/voice cue.
+    fn replay_silent(run: Run, def: SceneDef, source: Box<dyn SceneSource>, replay: &SceneReplay, shake_rng: [u8; 2]) -> Result<Self, String> {
+        replay.validate().map_err(str::to_owned)?;
+        if source.fingerprint() != Some(replay.source) {
+            return Err("the scene replay source differs from the installed game".into());
+        }
         let mut player = Self::new_mode(run, def, source, false, true, true, shake_rng);
         for event in &replay.events {
             player.reach_boundary()?;
@@ -404,27 +440,6 @@ impl ScenePlayer {
             }
         }
         player.reach_boundary()?;
-        player.silent = false;
-        player.instant = instant;
-        player.accepted = player.passed;
-        if player.over || player.played_out {
-            if player.is_owner() {
-                player.outbox.push(SceneCmd::End { run: player.run.id, skipped: false });
-            }
-        } else if let Some(paused) = &player.battle {
-            if player.is_owner() {
-                player.outbox.push(SceneCmd::BattleReady { run: player.run.id, ordinal: paused.checkpoint.ordinal, step: player.passed });
-            }
-        } else {
-            player.sound(SoundAction::Begin);
-            // The current window is new work, even when its text is empty. Only the accepted
-            // historical prefix was silent; normal owner auto-acknowledgement resumes here.
-            if player.is_owner() && player.panel.as_ref().is_some_and(Panel::is_blank) {
-                let panel = player.panel.take().expect("the blank current panel");
-                player.pass(panel, None);
-                player.settle();
-            }
-        }
         Ok(player)
     }
 
@@ -507,15 +522,16 @@ impl ScenePlayer {
 
     /// What the scene told the camera, with the stage's own clock of it (see [`super::stage::CameraClock`]): the
     /// window's field camera shows it (`crate::camera`).
+    #[cfg(test)]
     pub fn camera_clock(&self) -> super::stage::CameraClock {
         self.cast.camera_clock()
     }
 
     pub fn background_ops(&self) -> &[fmv_ff7::background::BackgroundOp] { self.cast.background_ops() }
 
-    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> { self.cast.fade() }
+    pub fn fade(&self) -> Option<fmv_ff7::script::scene::FadeColor> { self.presentation().fade() }
 
-    pub fn shake(&self) -> [f32; 2] { self.cast.shake() }
+    pub fn shake(&self) -> [f32; 2] { self.presentation().shake() }
 
     pub fn shake_rng_indices(&self) -> [u8; 2] { self.cast.shake_rng_indices() }
 
@@ -547,17 +563,7 @@ impl ScenePlayer {
     }
 
     pub fn cast_draws(&self) -> Vec<CastDraw<'_>> {
-        self.cast
-            .actors()
-            .filter(|a| a.shown())
-            .filter_map(|a| {
-                let member = self.def.member(a.entity())?;
-                let [x, y, z] = a.pos()?;
-                let [rx, ry, rz] = a.render_pos()?;
-                Some(CastDraw { entity: a.entity(), look: &member.look, pos: Pos::new(x, y, z), render_pos: Pos::new(rx, ry, rz), facing: a.heading(), moving: a.moving(),
-                    frame: if a.moving() { a.walked_frames() } else { self.elapsed_frames }, clip: a.animation(), return_clip: a.full_once_return() })
-            })
-            .collect()
+        self.presentation().cast_draws()
     }
 
     /// Where every participant stands while the scene runs: on the witness spot it was given, which way the spot faces. A
@@ -1102,7 +1108,7 @@ impl ScenePlayer {
     fn finish(&mut self) {
         if self.over { return; }
         self.sound(SoundAction::End);
-        if self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
+        if !self.silent && self.source.echo_voice() { Global.cue(VoiceCue::Stop); }
         self.terminal_fade = self.handoff_fade();
         self.over = true;
         self.battle = None;

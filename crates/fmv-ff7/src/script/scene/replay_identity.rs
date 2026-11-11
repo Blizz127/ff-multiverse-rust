@@ -11,6 +11,15 @@ use crate::script::FieldScratch;
 
 const DOMAIN: &[u8] = b"fmv-ff7/scene-replay-identity\0v1\0";
 
+/// Fresh entry is different from an existing visit even when both begin with zero bytes.
+pub(super) fn fingerprint_train_entry(checked: [u8; 32], profile: [u8; 32]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fmv-ff7/train-entry-replay\0v1\0quiet-zero-time-init\0");
+    hash.update(&checked);
+    hash.update(&profile);
+    *hash.finalize().as_bytes()
+}
+
 /// Opt-in checked visits bind their original values and knowledge independently of source code.
 /// Absence delegates byte-for-byte to the legacy identity; no deployed replay changes meaning.
 pub(super) fn fingerprint_with_scratch(section: &[u8], def: &SceneDef, scratch: Option<&FieldScratch>) -> [u8; 32] {

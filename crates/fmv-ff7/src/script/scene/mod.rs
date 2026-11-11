@@ -35,6 +35,7 @@ mod jump;
 mod offset;
 mod play;
 mod replay_identity;
+pub mod train_arrival;
 mod vm;
 
 #[cfg(test)]
@@ -63,3 +64,5 @@ pub use vm::{AnimHow, Beat, CameraOp, GilOp, SceneResources, Resources, Resource
 
 pub use play::{BattleCheckpoint, BattleResolution, BattleResume, WindowCheckpoint, WindowAck, SceneInput, SceneBoundary, SceneSnapshot, ReplayIdentity, REPLAY_VERSION, replay_scene, replay_scene_to, with_trigger_position};
 pub use play::{replay_scene_with_scratch, replay_scene_to_with_scratch, run_to_end_with_scratch_strict, run_section_to_end_with_scratch_strict};
+pub use train_arrival::{TrainArrival, TrainArrivalEntry, TrainArrivalReady, TrainArrivalPose,
+    TRAIN_ARRIVAL_LANDING, replay_train_arrival, train_arrival_ready};

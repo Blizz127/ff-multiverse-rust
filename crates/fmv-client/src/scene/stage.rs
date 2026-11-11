@@ -40,6 +40,11 @@ use crate::avatar::anim::ClipFrame;
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 
+// The retained checkpoint API remains compiled while runtime ready-anchor admission is gated.
+#[cfg_attr(not(test), allow(dead_code))]
+mod checkpoint;
+pub use checkpoint::{CastCheckpoint, MAX_CAST_CHECKPOINT_BYTES};
+
 /// What the scene told the camera last (the window's field camera, `crate::camera`, shows it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CameraState {
@@ -392,7 +397,8 @@ impl Cast {
         self.camera
     }
 
-    #[cfg(test)]
+    // Production capture is staged behind ready-anchor admission; tests use this now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn counts(&self) -> Counts {
         self.counts
     }

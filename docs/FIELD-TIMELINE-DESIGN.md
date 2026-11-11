@@ -523,3 +523,51 @@ Acceptance before enabling these paths:
   work and releases control only at the validated endpoint, including after restart.
 - Entry and ready anchors remain distinct; missing legacy state is never inferred from
   moment/field name. Watchers cannot mutate the owner's visit or acquire its latch.
+
+## Checked train-entry and retained presentation
+
+The passenger-train profile starts from the accepted cargo landing in `tin_1`, moment 48,
+with explicit entry scratch clearing and audited zero-time initialization. It executes the
+arrival in that same VM, retaining the ordered background journal, actor work, RNG and
+execution budgets. Source identity binds the entire field plus the semantic definition,
+cast metadata, limits and entry profile. It does not bind external model asset bytes.
+
+The versioned input record retains the complete original canonical story, including native
+party data and partial knowledge masks, authoritative gil, seed, landing and both exact
+window acknowledgments. Its bound is 5,385 bytes. Checksums detect corruption; the containing
+transaction must still establish accepted-entry provenance. Strict replay must execute the
+real control/menu release and reach the terminal pose, not merely reproduce moment 51.
+
+A separate client presentation payload, at most 7,714 bytes, binds that entire input record.
+It retains the actual terminal clocks and float bits rather than trying to derive them from
+elapsed time or window count. Dialogue pauses actor/script time while effects continue;
+fractional update partitioning and handoff delay can change retained phase. The narrow
+checkpoint refuses active movement, turning and OFST interpolation. Replay independently
+checks actor positions, visibility, clip descriptors, camera instruction, counts and authored
+effect configuration. It regenerates background operations to apply once to a fresh field.
+Reconstruction has no live scene commands, sound/voice playback or voice-stop on drop.
+The passive presentation cannot itself lock controls, hide participants or mutate a save.
+
+Storage now permits 8 KiB each for entry and anchor, and 80 KiB for the complete visit.
+The existing V1 serialization stays unchanged; changing byte arrays to another representation
+would invalidate private replay canonical bytes and prior receipt hashes. Small payloads
+retain character/index versions 4/5. A payload above 1 KiB requires versions 5/6 before
+intent publication, and recovery checks both images. Detached index-6 archives use manifest
+4 and preserve that minimum after rekey, removal and restore. These are conditional format
+fences, not automatic conversions of existing saves.
+
+Production admission remains closed. Existing arrival checkpoints use a legacy replay
+fingerprint and cannot be relabeled as checked-entry evidence. A gated ContinueLanding path
+must first persist the reviewed entry profile and its identity, or supply an independently
+audited conversion. Its completion must establish the ready visit atomically, including the
+exact presentation record. Ordinary Complete followed by standalone Enter is not sufficient. Account ownership,
+current-state retries, ordered client ACKs and save epochs must hold through this transition.
+Full field audio, concurrent scheduling and native movie timing remain separate requirements.
+
+Validation for this checkpoint passes the full 4,482-test workspace, 59 explicit owned
+FF7 route/arrival checks, all three owned server visit checks and six offscreen GPU tests.
+The train image and subsequent effect updates match uninterrupted port playback exactly.
+Persistence's 387 tests include maximum payloads, all six visit journal interruption stages,
+current-state retries after rewards, old-format recovery, archive rekeys and combined record
+bounds. The enlarged generic record remains below the unchanged 4 MiB character cap.
+These tests leave production visit and native-party admission gates in place.

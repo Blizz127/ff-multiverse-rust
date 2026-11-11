@@ -225,8 +225,8 @@ refuses temporary persistent, party, gil or knowledge changes even if later rest
 through the real saver FIFO. Its acknowledgment returns the current full state on duplicates,
 preserving later rewards. Only completed idle operations are supported: battle/travel,
 active continuation metadata and unknown or skipped state effects refuse. Active scenes use
-the separate staged batch path below; gameplay admission and anchor reconstruction remain
-unimplemented.
+the separate staged batch path below; gameplay admission and runtime installation of
+restored anchors remain unimplemented.
 
 The idle-bridge checkpoint passes 4,385 workspace tests across 108 targets, with no failures
 and 386 optional tests ignored. This includes 968 FF7 unit tests, 14 synthetic semantic
@@ -273,17 +273,53 @@ standing-animation and avatar-test warnings. After test-only lint cleanup, all e
 storage tests, three owned field-visit tests and four graphics panel tests pass again; the
 four final panel images are byte-identical to the inspected images.
 
-The first visit write requires character envelope 4 and index compatibility 5. Opening or
-compacting an older store does not select that format. Explicit compatibility selection is
-also available for a future party-v4 writer; storage does not inspect an adapter's opaque
-story bytes to infer it. Detached archives from index-5 stores use manifest 3, including
-party-only stores with no visit-bearing character. Snapshot copy limits distinguish the
-existing 4 MiB character-record bound from the 1 MiB ordinary-record bound.
+The checked train-entry and independent background-filter wave passes 4,482 workspace tests
+across 110 targets, with zero failures and 396 optional tests ignored. Focused suites include
+979 FF7 library tests, 1,528 client tests, 562 server tests and all 387 persistence tests.
+Separate owned-data runs pass 59 scene/train/ROOTMAP/departure tests and all three server
+field-visit tests. Six explicit GPU checks pass on llvmpipe: four background-filter checks,
+the five-row graphics panel, and actual train-ready capture/restoration after fractional
+updates, both dialogue dwells and a delayed handoff. The uninterrupted/restored train images
+match exactly at handoff and after further updates; all 18 final GPU outputs are byte-identical
+to the reviewed outputs. These comparisons establish restoration of the port's presentation,
+not native timing parity or an Alienware hardware acceptance run. Workspace Clippy with all
+targets passes with only the three pre-existing audio, standing-animation and avatar-test
+warnings.
+
+A visit with entry and anchor payloads of at most 1 KiB retains character envelope 4 and
+index compatibility 5. The checked train-entry record and exact presentation phases need
+larger slots: each now permits 8 KiB, with an 80 KiB bound on the serialized visit. Either
+payload exceeding 1 KiB selects character envelope 5 and index compatibility 6 before any
+intent or record is published. The V1 visit's serialized shape stays unchanged so existing
+replay and receipt hashes remain valid. Opening or compacting an older store does not
+select a newer format; shrinking or removing a large visit does not lower its store fence.
+Detached index-5 archives retain manifest 3; index-6 archives require manifest 4, including
+stores whose last large visit has been removed. Explicit compatibility selection remains
+available for a future party-v4 writer; storage does not inspect opaque adapter story bytes
+to infer it. Snapshot copy limits retain the existing 4 MiB character-record bound and
+1 MiB ordinary-record bound.
+
+The checked passenger-train entry reconstructs the original moment-48 arrival, accepted
+cargo landing and authoritative gil, with entry scratch clearing and authored initialization
+in the same VM as the scene. A complete input record retains every story value and known
+mask, source/execution identity, seed, landing and both exact window acknowledgments. Ready
+requires the actual control/menu-release instructions and terminal Cloud pose; moment 51
+alone is insufficient. A separate bounded client checkpoint retains actual animation,
+camera, fade and shake phases, including fractional updates and time spent reading windows.
+Silent replay validates the authored terminal structure and regenerates background changes;
+it does not substitute uninterrupted timing for the recorded visual state.
+
+These entry and presentation helpers remain isolated from production admission. Creating the
+new visit must be atomic with completing the existing arrival checkpoint. Splitting that
+into ordinary Complete followed by Enter would leave a crash gap. Runtime account holds,
+ordered playback acknowledgment, save-epoch fences and complete field audio/scheduling
+still need integration. This restoration contract compares the port's uninterrupted output;
+it does not establish native-PC timing fidelity.
 
 This remains staged transaction support, not a running field-visit lifecycle. No production
 server path creates these visits; login explicitly refuses visit-bearing snapshots. Activation
-still needs accepted entry/trigger provenance, runtime scratch injection and reconstruction of
-actors, camera, background and audio. Scene profiles must establish supported paths within the
+still needs accepted entry/trigger provenance, runtime scratch injection, installation of
+restored actors/camera/background, and complete audio restoration. Scene profiles must establish supported paths within the
 128-window bound; receipt growth and safe compaction remain unresolved. Preserving opaque
 entry/anchor bytes does not prove they can be restored. The train lesson remains unregistered,
 and existing accounts are not converted.

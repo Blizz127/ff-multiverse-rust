@@ -39,6 +39,45 @@ pub struct FadeState {
 }
 
 impl FadeState {
+    /// Exact presentation state for an enclosing, versioned terminal checkpoint. The
+    /// fixed 18-byte payload preserves the prior NFADE target and fractional-frame bits;
+    /// a rendered colour alone cannot reproduce the next update or replacement fade.
+    pub fn checkpoint_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(18);
+        bytes.push(self.kind);
+        bytes.extend_from_slice(&self.adjust.to_le_bytes());
+        bytes.extend_from_slice(&self.speed.to_le_bytes());
+        bytes.extend_from_slice(&self.rgb);
+        bytes.extend_from_slice(&self.start);
+        bytes.extend_from_slice(&self.target);
+        bytes.extend_from_slice(&self.fraction.to_bits().to_le_bytes());
+        bytes
+    }
+
+    /// Decode a bounded, safe state without advancing it. Source identity and the
+    /// provenance of the recorded presentation phase belong to the enclosing checkpoint.
+    pub fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let bytes: [u8; 18] = bytes.try_into().map_err(|_| "fade checkpoint has the wrong length")?;
+        let [kind, a0, a1, s0, s1, r, g, b, sr, sg, sb, tr, tg, tb, f0, f1, f2, f3] = bytes;
+        let adjust = u16::from_le_bytes([a0, a1]);
+        let speed = u16::from_le_bytes([s0, s1]);
+        let fraction = f32::from_bits(u32::from_le_bytes([f0, f1, f2, f3]));
+        if !fraction.is_finite() || fraction.is_sign_negative() || !(0.0..1.0).contains(&fraction) {
+            return Err("fade checkpoint has an invalid fractional frame".into());
+        }
+        let valid = match kind {
+            // Clearing a fade changes its kind before the next update and retains the
+            // preceding mode's counters, including an NFADE duration up to i16::MAX.
+            0 => adjust <= i16::MAX as u16 && speed <= i16::MAX as u16,
+            1 | 5 | 7 | 9 => adjust <= 256 && speed <= 255,
+            2 | 4 | 6 | 8 | 10 => adjust <= 255 && speed <= 255,
+            11 | 12 => (1..=i16::MAX as u16).contains(&speed) && adjust <= speed,
+            _ => false,
+        };
+        if !valid { return Err("fade checkpoint has invalid mode or counters".into()); }
+        Ok(Self { kind, adjust, speed, rgb: [r, g, b], start: [sr, sg, sb], target: [tr, tg, tb], fraction })
+    }
+
     /// Replace the one global fade. An unsupported instruction leaves the previous effect intact.
     pub fn apply(&mut self, op: FadeOp) -> bool {
         match op {
@@ -139,6 +178,61 @@ impl FadeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_keep_fraction_and_nfade_history_through_future_updates() {
+        let mut original = FadeState::default();
+        assert!(original.apply(FadeOp::Nfade { kind: 11, rgb: [20, 80, 160], frames: 7 }));
+        original.advance(7.25);
+        assert!(original.apply(FadeOp::Nfade { kind: 12, rgb: [230, 100, 9], frames: 31 }));
+        original.advance(3.17);
+        let bytes = original.checkpoint_bytes();
+        assert_eq!(bytes.len(), 18);
+        let mut restored = FadeState::from_checkpoint_bytes(&bytes).unwrap();
+        assert_eq!(restored.checkpoint_bytes(), bytes);
+        for frames in [0.37, 5.5, 0.01, 31.25] {
+            original.advance(frames);
+            restored.advance(frames);
+            assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes());
+            assert_eq!(restored.color(), original.color());
+        }
+        let replacement = FadeOp::Nfade { kind: 11, rgb: [60, 7, 99], frames: 9 };
+        assert!(original.apply(replacement)); assert!(restored.apply(replacement));
+        original.advance(2.3); restored.advance(2.3);
+        assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes(), "prior target survives replacement");
+
+        assert!(original.apply(FadeOp::Fade { kind: 1, rgb: [0; 3], speed: 0, adjust: 255 }));
+        assert_eq!(original.adjust, 256);
+        assert_eq!(FadeState::from_checkpoint_bytes(&original.checkpoint_bytes()).unwrap(), original);
+        assert!(original.apply(FadeOp::Nfade { kind: 11, rgb: [9; 3], frames: i16::MAX }));
+        original.advance(500.0);
+        assert!(original.apply(FadeOp::Fade { kind: 0, rgb: [0; 3], speed: 0, adjust: 0 }));
+        assert_eq!(FadeState::from_checkpoint_bytes(&original.checkpoint_bytes()).unwrap(), original,
+            "mode zero may retain the previous NFADE counters until a field update");
+    }
+
+    #[test]
+    fn checkpoints_reject_truncation_modes_counters_and_nonfinite_fraction() {
+        let quiet = FadeState::default().checkpoint_bytes();
+        for length in 0..quiet.len() { assert!(FadeState::from_checkpoint_bytes(&quiet[..length]).is_err()); }
+        let mut longer = quiet.clone(); longer.push(0);
+        assert!(FadeState::from_checkpoint_bytes(&longer).is_err());
+        for kind in [3, 13, 255] {
+            let mut invalid = quiet.clone(); invalid[0] = kind;
+            assert!(FadeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+        for (kind, adjust, speed) in [(1, 257u16, 0u16), (1, 0, 256), (2, 256, 0),
+            (4, 256, 0), (11, 0, 0), (12, 2, 1), (12, 0, 32768), (0, 32768, 0)] {
+            let mut invalid = quiet.clone(); invalid[0] = kind;
+            invalid[1..3].copy_from_slice(&adjust.to_le_bytes());
+            invalid[3..5].copy_from_slice(&speed.to_le_bytes());
+            assert!(FadeState::from_checkpoint_bytes(&invalid).is_err(), "kind {kind}, adjust {adjust}, speed {speed}");
+        }
+        for fraction in [f32::NAN, f32::INFINITY, -0.25, -0.0, 1.0] {
+            let mut invalid = quiet.clone(); invalid[14..].copy_from_slice(&fraction.to_bits().to_le_bytes());
+            assert!(FadeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn fade_blue_uses_the_fourth_bank_and_nfade_duration_is_signed() {

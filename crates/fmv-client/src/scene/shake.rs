@@ -39,6 +39,38 @@ impl ShakeState {
         self.axes.map(|axis| axis.rng_index)
     }
 
+    /// Exact presentation state, embedded in the versioned terminal-stage checkpoint.
+    /// The 34-byte payload includes the retained offset and segment endpoints: neither
+    /// the visible offset nor the random cursor alone determines the following frame.
+    #[cfg_attr(not(test), allow(dead_code))] // Retained phase API; ready-anchor admission remains gated.
+    pub(super) fn checkpoint_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(34);
+        for axis in &self.axes {
+            bytes.extend_from_slice(&[u8::from(axis.enabled), u8::from(axis.active), axis.rng_index, axis.offset as u8, axis.amplitude]);
+            for word in [axis.start, axis.target, axis.steps, axis.step] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&self.fraction.to_bits().to_le_bytes());
+        bytes
+    }
+
+    /// Restore only a bounded, safe machine state. This validates the representation;
+    /// the enclosing checkpoint separately binds it to the actual source and arrival.
+    #[cfg_attr(not(test), allow(dead_code))] // Retained phase API; ready-anchor admission remains gated.
+    pub(super) fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 34 { return Err("shake checkpoint has the wrong length".into()); }
+        let first = bytes.get(..13).ok_or("shake checkpoint has no first axis")?;
+        let second = bytes.get(13..26).ok_or("shake checkpoint has no second axis")?;
+        let fraction: [u8; 8] = bytes.get(26..).ok_or("shake checkpoint has no fraction")?
+            .try_into().map_err(|_| "shake checkpoint has the wrong fraction length")?;
+        let fraction = f64::from_bits(u64::from_le_bytes(fraction));
+        if !fraction.is_finite() || fraction.is_sign_negative() || !(0.0..1.0).contains(&fraction) {
+            return Err("shake checkpoint has an invalid fractional frame".into());
+        }
+        Ok(Self { axes: [Axis::from_checkpoint_bytes(first)?, Axis::from_checkpoint_bytes(second)?], fraction })
+    }
+
     /// Apply SHAKE without restarting either axis's phase. Disabled-axis operands are ignored.
     /// Returns false, preserving both axes, if an enabled axis has zero segment steps.
     pub fn apply(&mut self, mask: u8, x_amplitude: u8, x_steps: u8, y_amplitude: u8, y_steps: u8) -> bool {
@@ -90,6 +122,31 @@ struct Axis {
 }
 
 impl Axis {
+    #[cfg_attr(not(test), allow(dead_code))] // Used only by the staged retained phase decoder.
+    fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let bytes: [u8; 13] = bytes.try_into().map_err(|_| "shake axis has the wrong length")?;
+        let [enabled, active, rng_index, offset, amplitude, s0, s1, t0, t1, n0, n1, i0, i1] = bytes;
+        let boolean = |value| match value {
+            0 => Ok(false), 1 => Ok(true), _ => Err("shake axis has an invalid boolean".to_string()),
+        };
+        let axis = Self {
+            enabled: boolean(enabled)?, active: boolean(active)?, rng_index, offset: offset as i8, amplitude,
+            start: i16::from_le_bytes([s0, s1]), target: i16::from_le_bytes([t0, t1]),
+            steps: i16::from_le_bytes([n0, n1]), step: i16::from_le_bytes([i0, i1]),
+        };
+        if !(0..=255).contains(&axis.steps) || !(-128..=128).contains(&axis.start) || !(-128..=128).contains(&axis.target) {
+            return Err("shake axis has invalid segment operands".into());
+        }
+        // Zero steps is possible only for an axis that has never been enabled. Every
+        // interpolating state needs a nonzero divisor. A nonzero-step counter can be
+        // negative after the original disabled-axis counter wraps; preserve that case.
+        if axis.steps == 0 && (axis.enabled || axis.active || axis.offset != 0 || axis.amplitude != 0
+            || axis.start != 0 || axis.target != 0 || axis.step != 0) {
+            return Err("shake axis would interpolate with zero steps".into());
+        }
+        Ok(axis)
+    }
+
     fn settled(&self) -> bool {
         !self.enabled && !self.active && self.step == self.steps
     }
@@ -235,6 +292,70 @@ const RANDOM: [u8; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_preserve_fraction_segments_and_future_updates_exactly() {
+        let mut original = ShakeState::with_rng_indices([253, 91]);
+        assert!(original.apply(3, 24, 4, 5, 2));
+        for frames in [0.17, 2.5, 1.0, 0.03125] { original.advance(frames); }
+        assert!(original.apply(2, 0, 0, 20, 3));
+        let bytes = original.checkpoint_bytes();
+        assert_eq!(bytes.len(), 34);
+        let mut restored = ShakeState::from_checkpoint_bytes(&bytes).unwrap();
+        assert_eq!(restored.checkpoint_bytes(), bytes, "fraction bits and retained offsets survive");
+        for frames in [0.37, 17.25, 0.01, 2500.5] {
+            original.advance(frames);
+            restored.advance(frames);
+            assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes());
+        }
+        assert!(original.apply(0, 0, 0, 0, 0));
+        assert!(restored.apply(0, 0, 0, 0, 0));
+        for frames in [0.7, 1.0, 30.0] {
+            original.advance(frames);
+            restored.advance(frames);
+            assert_eq!(restored.checkpoint_bytes(), original.checkpoint_bytes());
+        }
+    }
+
+    #[test]
+    fn checkpoints_preserve_the_disabled_counter_wrap_and_refuse_unsafe_states() {
+        let mut wrapped = ShakeState::default();
+        assert!(wrapped.apply(1, 20, 8, 0, 0));
+        wrapped.advance(4.0);
+        assert!(wrapped.apply(0, 0, 0, 0, 0));
+        wrapped.advance(100.0);
+        assert!(wrapped.apply(1, 20, 2, 0, 0));
+        assert!(wrapped.apply(0, 0, 0, 0, 0));
+        wrapped.advance(32_760.25);
+        assert_eq!(wrapped.axes[0].step, i16::MIN);
+        let bytes = wrapped.checkpoint_bytes();
+        let mut restored = ShakeState::from_checkpoint_bytes(&bytes).unwrap();
+        restored.advance(32_771.5);
+        wrapped.advance(32_771.5);
+        assert_eq!(restored.checkpoint_bytes(), wrapped.checkpoint_bytes());
+
+        let quiet = ShakeState::default().checkpoint_bytes();
+        assert!(ShakeState::from_checkpoint_bytes(&quiet).is_ok());
+        for length in 0..quiet.len() { assert!(ShakeState::from_checkpoint_bytes(&quiet[..length]).is_err()); }
+        let mut longer = quiet.clone(); longer.push(0);
+        assert!(ShakeState::from_checkpoint_bytes(&longer).is_err());
+        for (at, value) in [(0, 2), (1, 2), (13, 2), (14, 2), (0, 1), (1, 1), (4, 1), (11, 1)] {
+            let mut invalid = quiet.clone(); invalid[at] = value;
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err(), "invalid byte {at}");
+        }
+        for steps in [-1i16, 256] {
+            let mut invalid = bytes.clone(); invalid[9..11].copy_from_slice(&steps.to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+        for endpoint in [-129i16, 129] {
+            let mut invalid = bytes.clone(); invalid[5..7].copy_from_slice(&endpoint.to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+        for fraction in [f64::NAN, f64::INFINITY, -0.25, -0.0, 1.0] {
+            let mut invalid = bytes.clone(); invalid[26..].copy_from_slice(&fraction.to_bits().to_le_bytes());
+            assert!(ShakeState::from_checkpoint_bytes(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn large_updates_match_individual_frames_including_long_segments_and_extreme_amplitudes() {

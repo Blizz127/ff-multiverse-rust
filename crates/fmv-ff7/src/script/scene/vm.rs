@@ -693,6 +693,9 @@ pub struct Vm {
     /// Checked quiet setup changed persistent knowledge/value, party state or resources at
     /// some point. Restoring the original image and resetting counters never clear this audit.
     setup_state_changed: bool,
+    /// Last actually executed UC/MENU2 instruction. This records authored state only;
+    /// world control remains held until its own durable publication policy releases it.
+    control_instructions: [Option<(usize, usize, u8)>; 2],
     resources: ResourceOutcome,
     stats: Stats,
 }
@@ -763,6 +766,7 @@ impl Vm {
             invalid_scratch_setup,
             invalid_scratch_execution: false,
             setup_state_changed: false,
+            control_instructions: [None; 2],
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -786,6 +790,9 @@ impl Vm {
     /// change followed by restoration is not neutral. This audit survives every VM reset.
     /// Unchecked constructors retain their previous behavior and do not perform this audit.
     pub fn setup_is_state_neutral(&self) -> bool { !self.setup_state_changed && !self.invalid_scratch_setup }
+    pub(super) fn control_instruction(&self, menu: bool) -> Option<(usize, usize, u8)> {
+        self.control_instructions.get(usize::from(menu)).copied().flatten()
+    }
     fn checked_execution_refused(&self) -> bool {
         self.checked_scratch() && (self.stats.setup_incomplete || self.stats.unresolved != 0
             || self.stats.dropped_requests != 0 || !self.stats.unknown.is_empty()
@@ -1953,6 +1960,13 @@ impl Vm {
             self.party_main, self.party_bank, self.resources.gil_after,
         ));
         let flow = self.exec(script, idx, entity, &ins, &mut class);
+        if matches!(ins.opcode, 0x33 | 0x4A) {
+            if let Some(disabled) = ins.literal("disabled").and_then(|value| u8::try_from(value).ok()) {
+                if let Some(last) = self.control_instructions.get_mut(usize::from(ins.opcode == 0x4A)) {
+                    *last = Some((entity, ins.offset, disabled));
+                }
+            }
+        }
         if let Some((events, main, bank, gil)) = setup_before {
             self.setup_state_changed |= main != self.party_main || bank != self.party_bank
                 || gil != self.resources.gil_after
@@ -2823,6 +2837,17 @@ impl Vm {
     /// other tables hold where everyone stands, and the variables hold what those scripts wrote. The threads are
     /// dropped, loops included.
     pub fn setup(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
+        self.setup_with_entry_policy(script, refs, false);
+    }
+
+    /// Only the reviewed train-entry constructor may permit initializer scratch writes.
+    /// The caller proves that these initializers are finite and take no scene time. Every
+    /// other audit, journal, RNG state and cumulative instruction budget stays in this VM.
+    pub(super) fn setup_train_entry(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef]) {
+        self.setup_with_entry_policy(script, refs, true);
+    }
+
+    fn setup_with_entry_policy(&mut self, script: &FieldScript<'_>, refs: &[ScriptRef], entry: bool) {
         if !self.scratch_valid() { self.stats.setup_incomplete = true; return; }
         if self.refuse_invalid_native_state() { return; }
         self.quiet = true;
@@ -2857,7 +2882,7 @@ impl Vm {
         self.slots.clear();
         self.out.clear();
         self.quiet = false;
-        if self.vars.scratch.as_ref().is_some_and(FieldScratchRun::any_change) {
+        if !entry && self.vars.scratch.as_ref().is_some_and(FieldScratchRun::any_change) {
             self.invalid_scratch_setup = true;
             self.stats.setup_incomplete = true;
         }
