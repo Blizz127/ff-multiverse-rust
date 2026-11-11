@@ -255,6 +255,8 @@ struct Player {
     /// Set after a link moved the player: until the client has taken the new position (an intent that agrees with it)
     /// every intent is answered with that position (see the `press` module).
     fence: Option<press::Fence>,
+    /// Until when an OK press does nothing, after one that advanced the story (see `press::PRESS_HOLD`).
+    press_hold: Option<Instant>,
     /// The story scene this player is held in (as owner or watcher), if any (see the `scene` module).
     scene: Option<fmv_protocol::SceneRunId>,
     /// Correlated ordinary story/battle save hold. Controls return only after storage and the
@@ -596,6 +598,7 @@ impl World {
                 transit: None,
                 arming: LinkArming::default(),
                 fence: None,
+                press_hold: None,
                 scene: None,
                 story_pending: None,
                 preview: None,

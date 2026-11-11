@@ -114,6 +114,8 @@ impl Session {
         let (name, tint) = own_identity(&entities, entity);
         let player = if character.name == UNKNOWN_CHARACTER_NAME { name.as_str() } else { character.name.as_str() };
         state.progress.set_player(player);
+        crate::adventurer_lines::set_name(player);
+        crate::adventurer_lines::set_field(&area_id.key);
         let mut pending_end = None;
         let mut scene_backlog = VecDeque::new();
         let mut defer = false;

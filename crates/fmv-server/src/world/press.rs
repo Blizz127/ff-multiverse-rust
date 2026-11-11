@@ -67,6 +67,11 @@ pub enum PressOutcome {
     Gone,
 }
 
+/// How long OK presses do nothing after one advanced the story. The original holds the player (`UC`) while what the
+/// press started plays (the first reactor's lift rides for several seconds); without that hold every further press of an
+/// impatient player toggled the lift straight back (owner, 2026-11-11: down, up, down... fourteen times in eight seconds).
+pub(super) const PRESS_HOLD: Duration = Duration::from_secs(6);
+
 impl World {
     /// `entity` has been placed where it stands now (it joined, arrived through an exit): the links within reach start
     /// disarmed and nothing is fenced.
@@ -136,7 +141,8 @@ impl World {
             let Some(p) = self.players.get(&entity) else { return PressOutcome::Gone };
             // (a player held in a story scene presses nothing: see `scene`)
             if p.battle.is_some() || p.transit.is_some() || p.scene.is_some() || p.story_pending.is_some()
-                || self.ordinary_battle_account_held(p.account) || p.fence.is_some_and(|f| now < f.until) {
+                || self.ordinary_battle_account_held(p.account) || p.fence.is_some_and(|f| now < f.until)
+                || p.press_hold.is_some_and(|until| now < until) {
                 return PressOutcome::Nothing;
             }
             (p.snapshot.pos, p.area.clone(), p.placement.as_ref().map(|p| p.key.phase.clone()).unwrap_or_default())
@@ -155,19 +161,31 @@ impl World {
             // A character the area does not have is no character addressed: the press is where the player stands.
             let addressed = npc.and_then(|id| area.npc_position(id, &phase));
             let talking = addressed.is_some();
-            let points: Vec<u32> = area
-                .story_points_in_phase(&phase)
+            let in_phase = area.story_points_in_phase(&phase);
+            let talk: Vec<u32> = if talking {
+                in_phase.iter().filter(|point| matches!(point.trigger, StoryTrigger::Talk { .. }) && point.is_pressed_at(pos, addressed)).map(|point| point.id).collect()
+            } else {
+                Vec::new()
+            };
+            // OK where the player stands: what a press does when no character was addressed, AND when the one the client
+            // addressed has nothing to say here (a character standing next to a panel, like Jessie beside the first
+            // reactor's lift button, must not swallow the panel's press: the original only talks when there is a talk).
+            let here: Vec<u32> = in_phase
                 .iter()
-                .filter(|point| matches!(point.trigger, StoryTrigger::Talk { .. }) == talking && point.is_pressed_at(pos, addressed))
+                .filter(|point| !matches!(point.trigger, StoryTrigger::Talk { .. }) && point.is_pressed_at(pos, None))
                 .map(|point| point.id)
                 .collect();
-            let link = if talking { None } else { area.links().iter().position(|l| l.needs_ok && l.is_touched_at(pos)) };
+            let link = area.links().iter().position(|l| l.needs_ok && l.is_touched_at(pos));
+            let points = if talk.is_empty() { here } else { talk.into_iter().chain(here).collect() };
             (points, link)
         };
         // The story: each point is judged on the story as it was before the press, and the first that applies is the
         // press's (the lift's ride down and ride up exclude each other).
         for point in points {
             if self.reach_story_point(entity, point, Some(now), now, false) != super::story::Reached::Nothing {
+                if let Some(p) = self.players.get_mut(&entity) {
+                    p.press_hold = Some(now + PRESS_HOLD);
+                }
                 return PressOutcome::Nothing;
             }
         }
@@ -484,6 +502,10 @@ mod tests {
         // with the step, and the saver is handed it (what the store keeps of it is the adapter's merge)
         a.drain();
         w.take_logs();
+        // a press right after the step that advanced the story does nothing (the original holds the player while it plays)
+        assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
+        assert_eq!(progression(&w, &a), STORY_ADVANCED, "held: the ride the first press started is still playing");
+        now += PRESS_HOLD;
         assert_eq!(w.press(a.entity, None, now), PressOutcome::Nothing);
         assert!(progression(&w, &a).is_empty());
         assert!(a.drain().iter().any(|m| matches!(m, ServerMsg::StoryUpdate { progress, advance: Some(_) } if progress.is_empty())));

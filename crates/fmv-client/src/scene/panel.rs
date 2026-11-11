@@ -102,6 +102,8 @@ fn is_blank(message: &Message) -> bool {
 
 impl Panel {
     pub fn new(window: Window) -> Self {
+        let mut window = window;
+        crate::adventurer_lines::adopt(&mut window.message);
         // The cursor starts on the line the script says, if that is one of the choices.
         let cursor = window.message.choice.map_or(0, |c| c.cursor.saturating_sub(c.first).min(c.last.saturating_sub(c.first)));
         Self { window, page: 0, cursor, scroll: 0 }
