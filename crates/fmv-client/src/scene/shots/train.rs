@@ -11,7 +11,7 @@ pub(super) fn start_held(rig: &mut Rig, origin: Option<SceneOrigin>) {
     rig.state.apply(0.0, ServerMsg::SceneStart {
         run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED,
         progress: rig.story.encode(), gil: rig.gil,
-        replay: Some(SceneReplay { source: rig.play.replay_identity().fingerprint, origin, events: Vec::new() }),
+        replay: Some(SceneReplay { source: rig.play.replay_identity().fingerprint, origin, events: Vec::new() }), presentation_origin: None,
         owner: EntityId(1), participants: (0..3).map(|spot| SceneParticipant { entity: EntityId(u64::from(spot) + 1), spot }).collect(),
         you: SceneRole::Owner,
     });

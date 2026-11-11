@@ -772,8 +772,9 @@ pub fn rgb555_to_rgba(raw: u16) -> [u8; 4] {
 ///
 /// Verified on owned data by comparing renderings: many palette pages store a non-black key
 /// colour at index 0 (pure green `0x03E0` in several fields, for example) that must not show,
-/// while 2.2 million layer-2 pixels use a non-zero index whose colour is exactly `0x0000` and
-/// must stay opaque. For a page with transparency enabled, "transparent only if index 0 is
+/// while non-zero indices must stay opaque even when their stored word is `0x0000`. That
+/// word aliases entry 0's RGB on PC (see [`Palette::rgba`]); it is not a transparency test.
+/// For a page with transparency enabled, "transparent only if index 0 is
 /// also black" paints green blotches over `cosmin2` and fills the trestle gaps of `mtcrl_5`;
 /// "any black is transparent" punches holes in dark foreground objects.
 fn palette_alpha(index: usize) -> u8 {
@@ -872,12 +873,15 @@ impl Palette {
     }
 
     /// Palette-only RGBA8 lookup: index 0 carries alpha 0 and every other index is opaque.
-    /// A field's actual transparency additionally depends on its background header;
-    /// [`Background::tile_rgba`] applies [`Background::palette_transparency`].
+    /// A raw word of exactly zero uses this page's entry-0 RGB; `0x8000` is ordinary black.
+    /// This changes colour only: a field's actual transparency additionally depends on its
+    /// background header, applied by [`Background::tile_rgba`]. Raw words remain unchanged.
+    ///
+    /// Primary format evidence: Makou Reactor's `PalettePC::color` and `isZero` at
+    /// [574e4ba5, Palette.cpp lines 34–41 and 99–110](https://github.com/myst6re/makoureactor/blob/574e4ba5c2bdef6fd604e75790ecb41558e08f9b/src/core/field/Palette.cpp#L99-L110).
+    /// Its zero marker tests the complete 16-bit word, independently of index-zero keying.
     pub fn rgba(&self, page: usize, index: usize) -> Option<[u8; 4]> {
-        let raw = self.raw(page, index)?;
-        let [r, g, b, _] = rgb555_to_rgba(raw);
-        Some([r, g, b, palette_alpha(index)])
+        Some(pc_palette_color(self.raw(page, index)?, self.raw(page, 0)?, index))
     }
 
     /// Every colour of `page` as RGBA8 (same alpha rule as [`Palette::rgba`]).
@@ -886,17 +890,21 @@ impl Palette {
         let start = page.checked_mul(per_page)?;
         let end = start.checked_add(per_page)?;
         let colors = self.colors.get(start..end)?;
+        let first = colors.first().copied().unwrap_or(0);
         Some(
             colors
                 .iter()
                 .enumerate()
-                .map(|(index, &raw)| {
-                    let [r, g, b, _] = rgb555_to_rgba(raw);
-                    [r, g, b, palette_alpha(index)]
-                })
+                .map(|(index, &raw)| pc_palette_color(raw, first, index))
                 .collect(),
         )
     }
+}
+
+/// PC colour aliases do not change the index used for transparency.
+fn pc_palette_color(raw: u16, first: u16, index: usize) -> [u8; 4] {
+    let [r, g, b, _] = rgb555_to_rgba(if raw == 0 { first } else { raw });
+    [r, g, b, palette_alpha(index)]
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1586,12 +1594,12 @@ mod tests {
     #[test]
     fn palette_index_zero_is_transparent_even_when_its_colour_is_not_black() {
         // Owned data stores key colours (pure green 0x03E0, white) at index 0 and uses a non-zero
-        // index for opaque black: index 0 is transparent, nothing else is.
+        // index for opaque black (0x8000): index 0 is transparent, nothing else is.
         let mut bytes = vec![0u8; 4];
         for v in [0u16, 480, 3, 1] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        for c in [0x03E0u16, 0x0000, 0x7FFF] {
+        for c in [0x03E0u16, 0x8000, 0x7FFF] {
             bytes.extend_from_slice(&c.to_le_bytes());
         }
         let p = Palette::parse(&bytes).unwrap();
@@ -1599,6 +1607,32 @@ mod tests {
         assert_eq!(p.rgba(0, 1), Some([0, 0, 0, 255]));
         assert_eq!(p.rgba(0, 2), Some([255, 255, 255, 255]));
         assert_eq!(p.page_rgba(0).unwrap(), vec![[0, 255, 0, 0], [0, 0, 0, 255], [255, 255, 255, 255]]);
+    }
+
+    #[test]
+    fn pc_zero_words_alias_the_pages_first_rgb_without_changing_alpha_or_raw_storage() {
+        let mut bytes = vec![0u8; 4];
+        for header in [0u16, 480, 4, 2] { bytes.extend_from_slice(&header.to_le_bytes()); }
+        for raw in [0x10C7u16, 0, 0x8000, 0x001F, 0x0464, 0, 0x8000, 0] {
+            bytes.extend_from_slice(&raw.to_le_bytes());
+        }
+        let mut palette = Palette::parse(&bytes).unwrap();
+        let expected = [
+            vec![[57, 49, 33, 0], [57, 49, 33, 255], [0, 0, 0, 255], [255, 0, 0, 255]],
+            vec![[33, 24, 8, 0], [33, 24, 8, 255], [0, 0, 0, 255], [33, 24, 8, 255]],
+        ];
+        for (page, expected) in expected.into_iter().enumerate() {
+            assert_eq!(palette.page_rgba(page), Some(expected.clone()));
+            for (index, color) in expected.into_iter().enumerate() { assert_eq!(palette.rgba(page, index), Some(color)); }
+            assert_eq!(palette.raw(page, 1), Some(0), "RGB substitution never rewrites script palette words");
+            assert_eq!(palette.raw(page, 2), Some(0x8000), "bit 15 distinguishes explicit black from the alias");
+        }
+        palette.set_raw(0, 0, 0x03E0).unwrap();
+        assert_eq!(palette.rgba(0, 1), Some([0, 255, 0, 255]), "an alias reads its own current page's first RGB");
+        assert_eq!(palette.rgba(1, 1), Some([33, 24, 8, 255]), "another page is unchanged");
+        palette.set_raw(0, 0, 0).unwrap();
+        assert_eq!(palette.rgba(0, 1), Some([0, 0, 0, 255]), "entry zero may itself be black, without recursion");
+        assert_eq!(rgb555_to_rgba(0), [0, 0, 0, 0], "direct-colour decoding has no palette alias");
     }
 
     #[test]

@@ -94,6 +94,7 @@ mod continuation;
 mod door_offsets;
 mod effects;
 mod rootmap;
+mod station_guards;
 mod train;
 mod train_ready;
 
@@ -306,7 +307,8 @@ const SPOT_NAMES: [&str; 3] = ["witness0", "witness1", "witness2"];
 /// The rig for `def`: the game's proof scene (made by [`Ff7Scenes`]) or, when `moved`, one made from `def` itself (the witness
 /// spots changed). The local player is the owner; two party members stand in the area too, to watch.
 fn make_rig(real: &Real, def: SceneDef, moved: bool) -> Rig {
-    let story = StoryState::at(*def.trigger.moments.start());
+    let story = if def.requires_presentation_origin() { StoryState::fresh_first_control() }
+        else { StoryState::at(*def.trigger.moments.start()) };
     make_rig_with_snapshot(real, def, moved, story, 0)
 }
 
@@ -316,7 +318,7 @@ fn make_rig_with_snapshot(real: &Real, def: SceneDef, moved: bool, story: StoryS
     let area = real.adapter.load_field(key).expect("the proof field loads");
     let view = FieldView::ff7_with(&real.adapter, key, true).expect("field view");
     let scale = view.stage.as_ref().expect("the field has a stage").model_scale;
-    let play = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(gil) }).expect("the scene plays here");
+    let mut play = ScenePlay::with_resources(area.field_file(), &def, &story, SEED, fmv_ff7::script::scene::SceneResources { gil: Some(gil) }).expect("the scene plays here");
     // The area's own characters, announced as the server announces them, and then the scene's trigger as the server adds it
     // while the scene is on offer.
     let clip = |text: &str, max: usize| -> String { text.chars().filter(|c| !c.is_control()).take(max).collect() };
@@ -350,6 +352,12 @@ fn make_rig_with_snapshot(real: &Real, def: SceneDef, moved: bool, story: StoryS
     let z = play.ground().height(arrival.x, arrival.y, Some(arrival.triangle), None).expect("the arrival spot is on the floor");
     let own_real = Pos::new(f32::from(arrival.x), f32::from(arrival.y), z);
     let facing = field_direction_to_facing(arrival.direction);
+    if def.requires_presentation_origin() {
+        let bound = fmv_ff7::script::scene::with_trigger_position(area.field_file(), &def, own_real, facing,
+            Some(u32::from(arrival.triangle))).expect("the test participant stands on the accepted source floor");
+        play = ScenePlay::with_resources(area.field_file(), &bound, &story, SEED,
+            fmv_ff7::script::scene::SceneResources { gil: Some(gil) }).expect("the reference uses the same actual origin");
+    }
     let own_tint = [90, 125, 245];
     let looks = looks();
     let area_id = AreaId { game: GameId::Ff7, key: key.to_string() };
@@ -604,7 +612,7 @@ fn survey(mut def: SceneDef, default: Spot, prefix: &str, mode: Survey) {
     let spot = def.witness[0];
     let path = matches!(mode, Survey::Quiet { .. }).then(|| scene_path(&real, &def));
     let mut rig = make_rig(&real, def, true);
-    let msg = ServerMsg::SceneStart {
+    let msg = ServerMsg::SceneStart { presentation_origin: None,
         run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), gil: 0, replay: None, owner: EntityId(1),
         participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }], you: SceneRole::Owner,
     };
@@ -999,6 +1007,7 @@ fn offscreen_real_ff7_the_field_camera_keeps_each_route_scenes_lead_in_view() {
     let Some(real) = open() else { return };
     let mut gpu = Offscreen::new().expect("software or physical GPU");
     let story_for = |id: &str| -> StoryState {
+        if id == "ff7/md1stin/station-guards" { return StoryState::fresh_first_control(); }
         let (moment, bit): (u16, Option<(u8, u8, u8)>) = match id {
             "ff7/md8_4/post-escape" | "ff7/md8_1/post-escape-station" => (33, None),
             "ff7/md1_1/team-talk" => (6, None),
@@ -1072,7 +1081,11 @@ impl Rig {
     /// The server starts the scene for the owner and two watchers: entities 1, 2 and 3 on witness spots 0, 1 and 2.
     fn start(&mut self) {
         let participants = (0..3u8).map(|spot| SceneParticipant { entity: EntityId(u64::from(spot) + 1), spot }).collect();
+        let presentation_origin = self.def.requires_presentation_origin().then(|| fmv_protocol::SceneOrigin {
+            pos: self.state.own.pos(), facing: self.state.own.facing(), triangle: Some(u32::from(self.def.arrival.triangle)),
+        });
         let msg = ServerMsg::SceneStart {
+            presentation_origin,
             run: SceneRunId(1),
             scene: self.def.id.clone(),
             seed: SEED,
@@ -1316,7 +1329,12 @@ impl Rig {
         let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject, self.state.npc_views())
             || super::draw::participant_label_hidden(story, self.state.self_entity(), subject) { None }
             else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
-        let hud_input = hud::gather_anchored(&self.state, &self.info(), &self.view, 1.0, &anchor);
+        let mut hud_input = hud::gather_anchored(&self.state, &self.info(), &self.view, 1.0, &anchor);
+        if let Some(story) = story {
+            let mut labels = super::draw::cast_labels(story, draw.built.as_ref(), &self.view);
+            labels.append(&mut hud_input.labels);
+            hud_input.labels = labels;
+        }
         let mut overlay = DrawList::new();
         hud::draw_hud(&hud_input, w, h, &mut overlay);
         if let (true, Some(story)) = (window, story) {

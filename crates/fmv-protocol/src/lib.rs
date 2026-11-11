@@ -1,4 +1,10 @@
-//! FF Multiverse wire protocol v21.
+//! FF Multiverse wire protocol v22.
+//!
+//! v22 adds the required nullable `presentation_origin` to [`ServerMsg::SceneStart`]. An ordinary
+//! point cutscene can bind its actors to the server-accepted trigger pose without pretending to be
+//! a durable replay. Durable scenes continue to carry their accepted origin inside [`SceneReplay`]
+//! and send null in this new field. Older peers cannot reproduce the point's actual activation pose
+//! and are refused at the handshake. This field changes playback inputs, not persistence authority.
 //!
 //! v21 adds the ordinary story and battle transaction hold: [`ServerMsg::StoryPending`] fixes the player's
 //! authoritative position and implicitly sets [`AnimState::Idle`], [`ClientMsg::StoryPendingAck`]
@@ -487,8 +493,8 @@ pub use fmv_party::{
     PartyEvent, PartyId, Placement,
 };
 
-// Older peers cannot acknowledge and preserve an ordinary story or battle transaction's field hold.
-pub const PROTOCOL_VERSION: u16 = 21;
+// Older peers cannot bind an ordinary point cutscene to its accepted activation pose.
+pub const PROTOCOL_VERSION: u16 = 22;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -886,6 +892,11 @@ pub enum ServerMsg {
         /// playback, even when its accepted history is empty. Replay uses the original inputs above.
         #[serde(deserialize_with = "scene::required_replay")]
         replay: Option<SceneReplay>,
+        /// Required since v22. The accepted activation pose of an ordinary presentation scene.
+        /// Durable scenes send `None` here and retain their origin in `replay`; the two channels
+        /// must never supply competing origins. This does not select durable playback.
+        #[serde(deserialize_with = "crate::required_option")]
+        presentation_origin: Option<SceneOrigin>,
         owner: EntityId,
         participants: Vec<SceneParticipant>,
         you: SceneRole,
@@ -1065,8 +1076,8 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_twenty_one() {
-        assert_eq!(PROTOCOL_VERSION, 21);
+    fn the_version_is_twenty_two() {
+        assert_eq!(PROTOCOL_VERSION, 22);
     }
 
     // -----------------------------------------------------------------------------------------

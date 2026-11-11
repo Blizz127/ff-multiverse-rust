@@ -141,7 +141,7 @@ enum Action {
     Prepare { plan: SceneBattlePlan, ordinal: u32 },
     Resolve(SceneBattleFinished),
     Finish(SceneResult),
-    Continue { record: SceneRun, instance: [u8; 32], boundary: SceneBoundary, payload: Box<Payload> },
+    Continue { record: SceneRun, instance: [u8; 32], boundary: Box<SceneBoundary>, payload: Box<Payload> },
     Complete(SceneResult),
     /// The authored terminal destination is already the source-backed login entry. Retire
     /// only its metadata, after arrival, without changing any saved story or resources.
@@ -170,7 +170,7 @@ fn replay_can_be_announced(scene: &str, progress: &[u8], seed: u32, gil: u32, re
     let participants = (0..fmv_persist::MAX_SCENE_BATCH_ACCOUNTS).map(|slot| SceneParticipant {
         entity: EntityId(u64::MAX - slot as u64), spot: slot as u8,
     }).collect();
-    fmv_protocol::encode(&ServerMsg::SceneStart {
+    fmv_protocol::encode(&ServerMsg::SceneStart { presentation_origin: None,
         run: SceneRunId(u64::MAX), scene: scene.to_owned(), seed, progress: progress.to_vec(), gil,
         replay: Some(replay.clone()), owner: EntityId(u64::MAX), participants, you: SceneRole::Watcher,
     }).is_ok()
@@ -254,7 +254,7 @@ impl World {
         let watchers = self.watchers_for(entity, player.account, to);
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
-        let record = SceneRun { scene, owner: entity, watchers, seed: run.0.wrapping_mul(0x9E37_79B9) as u32,
+        let record = SceneRun { presentation_origin: None, scene, owner: entity, watchers, seed: run.0.wrapping_mul(0x9E37_79B9) as u32,
             progress: player.progression.clone(), gil: player.progress.map_or(0, |p| p.gil), answers: vec![], steps: 0,
             started: now, last_activity: now, writes_story: true, preview: false, then: None };
         self.start_run(run, record, &mut Vec::new());
@@ -733,7 +733,7 @@ impl World {
                 record.watchers.retain(|entity| self.players.get(entity).is_some_and(|p| p.scene == Some(run)));
                 let c = self.scenes.continuations.get_mut(&run).expect("present");
                 c.instance = instance;
-                c.boundary = boundary;
+                c.boundary = *boundary;
                 c.payload = *payload;
                 c.phase = Phase::Playing;
                 self.scenes.runs.insert(run, record);
@@ -890,7 +890,7 @@ impl World {
         let mut failed=vec![];
         for p in &participants {
             if only.is_some_and(|e|e!=p.entity) {continue;}
-            self.send_to(p.entity,ServerMsg::SceneStart{run,scene:record.scene.clone(),seed:record.seed,
+            self.send_to(p.entity,ServerMsg::SceneStart{ presentation_origin: None,run,scene:record.scene.clone(),seed:record.seed,
                 progress:record.progress.clone(),gil:record.gil,replay:Some(c.payload.replay.clone()),owner:record.owner,
                 participants:participants.clone(),you:if p.entity==record.owner{SceneRole::Owner}else{SceneRole::Watcher}},&mut failed);
         }
@@ -1018,7 +1018,7 @@ impl World {
             let steps=payload.replay.events.iter().filter(|e|matches!(e,SceneReplayEvent::Window{..})).count() as u32;
             let phase=match checkpoint.phase {ScenePhase::BeforeBattle{..} if payload.game_over => Phase::GameOver { id: BattleId(0) },
                 ScenePhase::BeforeBattle{..}=>Phase::Dormant,ScenePhase::Resume{..}=>Phase::Playing,ScenePhase::Landing{..}=>Phase::Landing};
-            self.scenes.runs.insert(run,SceneRun{scene:checkpoint.scene_key.clone(),owner:owner_entity,watchers,
+            self.scenes.runs.insert(run,SceneRun{ presentation_origin: None,scene:checkpoint.scene_key.clone(),owner:owner_entity,watchers,
                 seed:checkpoint.seed,progress:checkpoint.original_story.clone(),gil:checkpoint.original_gil,answers:vec![],steps,
                 started:now,last_activity:now,writes_story:true,preview:false,then:None});
             self.scenes.continuations.insert(run,Continuation{owner,instance:checkpoint.instance,accounts,payload,boundary,
@@ -1110,9 +1110,9 @@ impl World {
             let Some(instance)=fresh_instance() else {self.continuation_failure(run,"continuation instance could not be allocated");return true;};
             let payload=Payload{replay:SceneReplay{source:boundary.source,origin:None,events:vec![]},field:area,position:pos,facing,
                 plan:None,carry:None,landing:Some(destination),game_over:false};
-            let record=SceneRun{scene:info.id,owner:owner_entity,watchers,seed,progress,gil,answers:vec![],steps:0,
+            let record=SceneRun{ presentation_origin: None,scene:info.id,owner:owner_entity,watchers,seed,progress,gil,answers:vec![],steps:0,
                 started:now,last_activity:now,writes_story:true,preview:false,then:None};
-            self.queue_continuation_action(run,Action::Continue{record,instance,boundary,payload:Box::new(payload)});
+            self.queue_continuation_action(run,Action::Continue{record,instance,boundary:Box::new(boundary),payload:Box::new(payload)});
             return true;
         }
         let (fighting,dormant,game_over,context)=match &c.phase {

@@ -30,6 +30,9 @@ use crate::script::FieldScript;
 use std::ops::RangeInclusive;
 
 mod train_route;
+mod station_guard;
+pub use station_guard::{station_guard_scene, station_guard_victory_scene, STATION_GUARD_SCENE_ID,
+    STATION_GUARD_VICTORY_SCENE_ID};
 pub use train_route::{jessie_train_talk_scene, train_map_scene, train_map_return_scene, train_departure_scene,
     JESSIE_TRAIN_TALK_SCENE_ID, TRAIN_MAP_SCENE_ID, TRAIN_MAP_RETURN_SCENE_ID, TRAIN_DEPARTURE_SCENE_ID};
 
@@ -194,8 +197,23 @@ impl SceneDef {
     pub fn origin_actor(&self) -> Option<u8> {
         match self.id.as_str() {
             BRIDGE_SCENE_ID | TEAM_TALK_SCENE_ID => Some(1), CARGO_DOOR_SCENE_ID => Some(11),
+            STATION_GUARD_SCENE_ID | STATION_GUARD_VICTORY_SCENE_ID => Some(1),
             JESSIE_TRAIN_TALK_SCENE_ID | TRAIN_DEPARTURE_SCENE_ID => Some(30), _ => None,
         }
+    }
+
+    /// Ordinary station presentations read the controlled actor's actual triangle. They
+    /// require the accepted trigger pose even though they are not durable continuations.
+    /// Other presentation scenes retain their established placement policy.
+    pub fn requires_presentation_origin(&self) -> bool {
+        station_guard::is_station_guard(&self.id)
+    }
+
+    /// A script actor bound to the actual participant solely for source reads. The
+    /// station director reads Cloud's current triangle, but never replaces or moves the
+    /// participant's body; render that body and its name instead of an additional cast Cloud.
+    pub fn presentation_player_actor(&self) -> Option<u8> {
+        self.requires_presentation_origin().then_some(1)
     }
 
     /// The snapshot used to interpret this scene. Promotion is local and preserves unknown bits;
@@ -279,6 +297,9 @@ impl SceneDef {
 
     fn matches_step(&self, field: &str, before: &StoryState, after: &StoryState) -> bool {
         if !self.field.eq_ignore_ascii_case(field) || !self.applies_at(before.moment) { return false; }
+        // Legacy station progression does not execute its battle-after-write instruction.
+        // Never show a guard prelude or continuation for a path that cannot play that fight.
+        if station_guard::is_station_guard(&self.id) && !before.supports_extended() { return false; }
         match (self.presents, self.presents_bit) {
             (Some(moment), None) => after.moment == moment && after.moment > before.moment,
             (None, Some((bank, address, bit))) => before.moment == after.moment
@@ -991,9 +1012,9 @@ pub fn proof_scene() -> SceneDef {
 /// Every scene the game offers, in the order a server numbers their triggers by (a scene is added at the END, so the
 /// ones before it keep their numbers): the proof, the two the escape from the first reactor ends in, and the cutscenes of the
 /// reactor's own story points, followed by the flower encounter, bridge confrontation, cargo arrival,
-/// cargo door and passenger-train arrival.
+/// cargo door, passenger-train arrival and the station's guard approach.
 pub fn scenes() -> Vec<SceneDef> {
-    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene(), bridge_scene(), cargo_train_scene(), cargo_door_scene(), train_scene()]
+    vec![proof_scene(), post_escape_scene(), station_scene(), team_talk_scene(), reactor_door_scene(), guard_scorpion_scene(), guard_scorpion_victory_scene(), jessie_rescue_scene(), jessie_ladder_scene(), run_ahead_scene(), jessie_descent_scene(), reactor_approach_scene(), reactor_finale_scene(), flower_station_scene(), bridge_scene(), cargo_train_scene(), cargo_door_scene(), train_scene(), station_guard_scene()]
 }
 
 /// Whether `field` (the archive's spelling; case does not matter) is the field of a scene the game offers: a place a

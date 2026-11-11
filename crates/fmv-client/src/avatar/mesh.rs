@@ -7,7 +7,7 @@
 //! one matrix per run), and the triangles are sorted into [`Batch`]es that need different state:
 //!
 //! 1. all opaque untextured triangles (almost everything: the vertex colours are the shading),
-//! 2. the opaque textured parts (the face overlays: eyes, brows, mouth), one batch per texture,
+//! 2. the opaque textured parts (face overlays and replacement models' clothing), one batch per texture,
 //! 3. the semi-transparent parts (rare: 23 of 4 875 groups in the owned archive), one batch each,
 //!    drawn last and without writing depth.
 //!
@@ -18,7 +18,7 @@ use super::identity::head_colour_is_own;
 use fmv_ff7::{FieldModel, MeshPart, PartBlend, RgbaImage};
 use std::sync::Arc;
 
-/// The name of the bone of a field model's head (every skeleton of the owned `char.lgp` has it, third in the file).
+/// A humanoid field model's head; prop and battle skeletons may have no bone with this name.
 const HEAD_BONE: &str = "head";
 
 /// Vertices one merged model may have (a field model has a few thousand): a hostile or broken
@@ -145,9 +145,12 @@ impl MergedMesh {
     /// Merge the parts of `model`. Triangles with an out-of-range index are left out (the loader
     /// already drops them; this keeps the buffers sound whatever it is given). Parts that name a
     /// texture the loader could not read draw untextured. The whole-number shifts of a decal's
-    /// texture coordinates are taken off (see [`whole_cell_offsets`]).
+    /// texture coordinates are taken off (see [`whole_cell_offsets`]). A named head identifies a
+    /// field skeleton: only its head textures receive face-overlay depth bias, so replacement
+    /// clothing uses ordinary depth. Models without a named head retain their existing behavior.
     pub fn build(model: &FieldModel) -> Result<Self, MeshError> {
-        Self::build_inner(model, false)
+        let field_skeleton = model.bones.iter().any(|bone| bone.name.eq_ignore_ascii_case(HEAD_BONE));
+        Self::build_inner(model, field_skeleton)
     }
 
     /// Player bodies may use textures for clothing; only head textures are face overlays.
@@ -155,7 +158,7 @@ impl MergedMesh {
         Self::build_inner(model, true)
     }
 
-    fn build_inner(model: &FieldModel, body: bool) -> Result<Self, MeshError> {
+    fn build_inner(model: &FieldModel, head_only: bool) -> Result<Self, MeshError> {
         let total: usize = model.parts.iter().map(|p| p.positions.len()).sum();
         if total > MAX_MODEL_VERTICES {
             return Err(MeshError::TooManyVertices(total));
@@ -182,7 +185,7 @@ impl MergedMesh {
             let is_blended = part.blend != PartBlend::Opaque;
             let alpha = if is_blended { (part.alpha.clamp(0.0, 1.0) * 255.0).round() as u8 } else { 255 };
             let head = model.bones.get(part.bone_index).is_some_and(|bone| bone.name.eq_ignore_ascii_case(HEAD_BONE));
-            let overlay = if !is_blended && part.texture.is_some() && (!body || head) { 1.0 } else { 0.0 };
+            let overlay = if !is_blended && part.texture.is_some() && (!head_only || head) { 1.0 } else { 0.0 };
             let shift = if part.texture.is_some() { whole_cell_offsets(&part.uvs) } else { [0.0; 2] };
             // The hair is on the head bone, drawn from vertex colours (a decal is flagged by `overlay` already).
             let on_head = !is_blended && part.texture.is_none() && model.bones.get(part.bone_index).is_some_and(|bone| bone.name.eq_ignore_ascii_case(HEAD_BONE));
@@ -368,6 +371,36 @@ pub(crate) mod tests {
         face.texture = Some(image());
         let m = MergedMesh::build_body(&model(vec![clothing, face])).unwrap();
         assert_eq!(m.overlay, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn canonical_field_clothing_uses_ordinary_depth_and_keeps_the_head_overlays() {
+        let mut clothing = part(0, &[[0, 1, 2]], 3);
+        clothing.texture = Some(image());
+        let mut face = part(1, &[[0, 1, 2]], 3);
+        face.texture = Some(image());
+        let mut field = model(vec![clothing, face]);
+        field.bones[1].name = "HEAD".into();
+        let mesh = MergedMesh::build(&field).unwrap();
+        assert_eq!(mesh.overlay, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+        assert_eq!(mesh.indices, [0, 1, 2, 3, 4, 5], "both textured surfaces still draw");
+        assert_eq!(mesh.batches.len(), 2);
+        assert_eq!(mesh.own, [0.0; 6], "clothing is not given an identity-colour exemption");
+    }
+
+    #[test]
+    fn original_field_faces_and_models_without_a_named_head_keep_their_depth_flags() {
+        let mut face = part(1, &[[0, 1, 2]], 3);
+        face.texture = Some(image());
+        let original = model(vec![part(0, &[[0, 1, 2]], 3), face.clone()]);
+        assert_eq!(MergedMesh::build(&original).unwrap().overlay, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+
+        // Battle models and props have no field head name. Keep their prior classification.
+        let mut other = model(vec![face.clone(), face]);
+        other.parts[0].bone_index = 0;
+        other.bones[0].name = "bone0".into();
+        other.bones[1].name = "bone1".into();
+        assert_eq!(MergedMesh::build(&other).unwrap().overlay, [1.0; 6]);
     }
 
     /// Hair keeps its colour under a player's identity colour: the vertices of the HEAD bone (bone 1 here) whose colour is a

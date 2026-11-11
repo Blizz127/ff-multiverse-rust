@@ -28,7 +28,7 @@ use super::player::{Run, SceneCmd, SceneEvent, SceneKey, ScenePlayer, SceneSound
 use super::source::{NoScenes, SceneBuilder};
 use fmv_ff7::story::StoryState;
 use fmv_ff7::script::scene::SceneResources;
-use fmv_protocol::{SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
+use fmv_protocol::{SceneOrigin, SceneOutcome, SceneParticipant, SceneRefusal, SceneReplay, SceneRole, SceneRunId, ServerMsg, MAX_SCENE_STEPS};
 use std::collections::VecDeque;
 use winit::keyboard::KeyCode;
 
@@ -176,10 +176,19 @@ impl SceneClient {
     // ---- the server ----------------------------------------------------------------------------------------------
 
     /// One of the server's scene messages (anything else is not ours). `area` is the key of the field this player stands in.
+    #[cfg(test)]
     pub fn on_message(&mut self, area: &str, msg: ServerMsg) {
+        let _ = self.on_message_with_presentation_origin(area, msg);
+    }
+
+    /// Apply scene traffic and return the accepted ordinary owner's trigger pose only after its
+    /// source and player were built. The state adopts it before the next message or rendered frame;
+    /// a watcher, refused source or durable replay never places the local player through this path.
+    /// The result also survives a successful instant scene finishing during construction.
+    pub fn on_message_with_presentation_origin(&mut self, area: &str, msg: ServerMsg) -> Option<SceneOrigin> {
         match msg {
-            ServerMsg::SceneStart { run, scene, seed, progress, gil, replay, participants, you, .. } => {
-                self.start(Start { run, scene, seed, progress, gil, replay, participants, you }, area);
+            ServerMsg::SceneStart { run, scene, seed, progress, gil, replay, presentation_origin, participants, you, .. } => {
+                return self.start(Start { run, scene, seed, progress, gil, replay, presentation_origin, participants, you }, area);
             }
             ServerMsg::SceneStep { run, step, answer } => {
                 if let Some(player) = self.player.as_mut().filter(|p| p.run_id() == run) {
@@ -219,11 +228,25 @@ impl SceneClient {
             }
             _ => {}
         }
+        None
     }
 
-    fn start(&mut self, start: Start, area: &str) {
-        let Start { run, scene, seed, progress, gil, replay, participants, you } = start;
+    fn start(&mut self, start: Start, area: &str) -> Option<SceneOrigin> {
+        let Start { run, scene, seed, progress, gil, replay, presentation_origin, participants, you } = start;
         let durable = replay.is_some();
+        if durable && presentation_origin.is_some() {
+            self.unavailable(run, you, &scene, "a scene has both ordinary and durable origins", true);
+            return None;
+        }
+        let needs_origin = fmv_ff7::script::scene::scene(&scene).is_some_and(|def| def.requires_presentation_origin());
+        let origin_error = presentation_origin.as_ref().and_then(|origin| origin.validate().err())
+            .or_else(|| (!durable && needs_origin && presentation_origin.is_none()).then_some("the accepted presentation origin is missing"));
+        if let Some(why) = origin_error {
+            let reserved = self.player.as_ref().is_some_and(ScenePlayer::is_durable);
+            if !reserved { self.end_local(); }
+            self.unavailable(run, you, &scene, why, reserved);
+            return None;
+        }
         let binding = replay.as_ref().map(|r| StartBinding {
             scene: scene.clone(), seed, progress: progress.clone(), gil, role: you,
             source: r.source, origin: r.origin,
@@ -233,7 +256,7 @@ impl SceneClient {
             // ordered step stream, including answers queued ahead of their visible animation.
             let Some(replay) = replay.as_ref() else {
                 self.unavailable(run, you, &scene, "a retained durable scene lost its replay binding", true);
-                return;
+                return None;
             };
             let matches = binding == self.binding && replay.validate().is_ok()
                 && replay.events.iter().map(ReplayInput::from).eq(self.authoritative.iter().cloned())
@@ -252,7 +275,7 @@ impl SceneClient {
             } else if let Some(player) = self.player.as_mut() {
                 player.refresh_participants(participants);
             }
-            return;
+            return None;
         }
         // A run still on show is a stale one (the server holds a player in one run at a time): it is replaced.
         self.end_local();
@@ -272,6 +295,7 @@ impl SceneClient {
         let resources = SceneResources { gil: Some(gil) };
         let built = match StoryState::decode(&progress) {
             Some(story) if durable => self.builder.build_with_origin(&scene, &story, seed, resources, replay.as_ref().and_then(|r| r.origin.as_ref())),
+            Some(story) if presentation_origin.is_some() => self.builder.build_with_origin(&scene, &story, seed, resources, presentation_origin.as_ref()),
             Some(story) if replay.is_none() && you == SceneRole::Owner && participants.len() == 1 => self.builder.build_private(&scene, &story, seed, resources),
             Some(story) => self.builder.build(&scene, &story, seed, resources),
             None => Err("the story the scene plays against cannot be read here".to_string()),
@@ -294,13 +318,18 @@ impl SceneClient {
                     None => Ok(ScenePlayer::new_seeded(identity, built.def, built.source, self.instant, self.shake_rng)),
                 };
                 match player {
-                    Ok(player) => { self.player = Some(player); self.reap(); }
+                    Ok(player) => {
+                        self.player = Some(player);
+                        self.reap();
+                        return if !durable && you == SceneRole::Owner { presentation_origin } else { None };
+                    }
                     Err(why) => self.unavailable(run, you, &scene, &why, durable),
                 }
             }
             Ok(built) => self.unavailable(run, you, &scene, &format!("the scene plays in another field ({}), this is {}", clean_id(&built.def.field), clean_id(area)), durable),
             Err(why) => self.unavailable(run, you, &scene, &why, durable),
         }
+        None
     }
 
     /// An ordinary scene can be left without advancing the owner's story. A reserved durable
@@ -556,6 +585,7 @@ struct Start {
     progress: Vec<u8>,
     gil: u32,
     replay: Option<SceneReplay>,
+    presentation_origin: Option<fmv_protocol::SceneOrigin>,
     participants: Vec<SceneParticipant>,
     you: SceneRole,
 }

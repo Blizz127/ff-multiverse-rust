@@ -63,7 +63,7 @@ Version 3 stores byte/word aliases, known masks, clears and numeric updates. Lit
 assignments establish only the bits they write; unknown numeric inputs still refuse authoritative
 completion. Reviewed scene transactions compare exact prior story/resources, retain once-only
 receipts and hold the cohort until the queued store acknowledgment. The bridge adds atomic
-roster batches and durable battle/landing checkpoints; protocol 21 carries their replay data
+roster batches and durable battle/landing checkpoints; protocol 22 carries their replay data
 and the ordered holds used by ordinary field-story transactions.
 This is not general persistent execution of every field script or automatic save conversion.
 The current change uses replay contract 3 for model offsets, palette state and corrected

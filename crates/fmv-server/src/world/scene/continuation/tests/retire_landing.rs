@@ -95,7 +95,7 @@ fn terminal_rig() -> Rig {
 }
 
 fn start_terminal(rig: &mut Rig, watchers: Vec<EntityId>) {
-    rig.world.start_run(rig.run, SceneRun { scene: TERMINAL.into(), owner: rig.owner.entity, watchers, seed: 19,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: TERMINAL.into(), owner: rig.owner.entity, watchers, seed: 19,
         progress: DOOR_STORY.to_vec(), gil: 240, answers: vec![], steps: 0, started: rig.now, last_activity: rig.now,
         writes_story: true, preview: false, then: None }, &mut vec![]);
     assert!(rig.owner.drain().iter().any(|m| matches!(m, ServerMsg::SceneStart { scene, replay: Some(_), .. } if scene == TERMINAL)));

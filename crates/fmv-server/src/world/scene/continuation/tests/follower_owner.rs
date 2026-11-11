@@ -17,7 +17,7 @@ fn a_follower_owned_scene_keeps_leader_first_battle_slots_through_checkpoint_reo
     assert_eq!(rig.world.party_invite(leader.entity, rig.owner.entity, rig.now), crate::world::PartyOutcome::Done);
     let invite = rig.world.parties.invites().next().unwrap().id;
     assert_eq!(rig.world.party_accept(rig.owner.entity, invite, rig.now), crate::world::PartyOutcome::Done);
-    rig.world.start_run(rig.run, SceneRun { scene: SCENE.into(), owner: rig.owner.entity,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: SCENE.into(), owner: rig.owner.entity,
         watchers: vec![leader.entity], seed: 19, progress: ORIGINAL.to_vec(), gil: 240,
         answers: vec![], steps: 0, started: rig.now, last_activity: rig.now,
         writes_story: true, preview: false, then: None }, &mut vec![]);

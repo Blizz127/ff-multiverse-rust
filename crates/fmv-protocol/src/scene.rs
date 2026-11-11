@@ -17,7 +17,7 @@
 //! ```text
 //! (S -> C  AreaSnapshot { npcs: [.. a scene NPC, id >= SCENE_NPC_ID_BASE ..] })       the trigger is on offer
 //! C -> S  Interact { npc: Some(SCENE_NPC_ID_BASE + n) }                              OK next to it
-//! S -> C  SceneStart { run, scene, seed, progress, gil, replay, owner, participants, you } every participant
+//! S -> C  SceneStart { run, scene, seed, progress, gil, replay, presentation_origin, owner, participants, you } every participant
 //!         ... each client plays the scene locally; the player is held (no moves, no encounters, no OK) ...
 //! C -> S  SceneStep { run, step, answer }                                            the owner moved past window `step`
 //! S -> C  SceneStep { run, step, answer }                                            every watcher (not the owner)
@@ -263,12 +263,13 @@ mod tests {
                 progress: vec![1, 72, 0],
                 gil: 1,
                 replay: None,
+                presentation_origin: None,
                 owner: EntityId(3),
                 participants: vec![SceneParticipant { entity: EntityId(3), spot: 0 }, SceneParticipant { entity: EntityId(4), spot: 1 }],
                 you: SceneRole::Watcher,
             },
             concat!(
-                r#"{"SceneStart":{"run":7,"scene":"ff7/mds7pb_1/tifa-bar","seed":41,"progress":[1,72,0],"gil":1,"replay":null,"owner":3,"#,
+                r#"{"SceneStart":{"run":7,"scene":"ff7/mds7pb_1/tifa-bar","seed":41,"progress":[1,72,0],"gil":1,"replay":null,"presentation_origin":null,"owner":3,"#,
                 r#""participants":[{"entity":3,"spot":0},{"entity":4,"spot":1}],"you":"Watcher"}}"#
             ),
         );
@@ -279,7 +280,7 @@ mod tests {
 
     #[test]
     fn scenes_require_the_new_protocol() {
-        assert_eq!(crate::PROTOCOL_VERSION, 21);
+        assert_eq!(crate::PROTOCOL_VERSION, 22);
     }
 
     #[test]
@@ -300,7 +301,7 @@ mod tests {
     fn continuation_start(replay: Option<SceneReplay>) -> ServerMsg {
         ServerMsg::SceneStart {
             run: SceneRunId(7), scene: "ff7/md8brdg/confrontation".into(), seed: 41,
-            progress: vec![3, 39, 0], gil: 600, replay, owner: EntityId(3),
+            progress: vec![3, 39, 0], gil: 600, replay, presentation_origin: None, owner: EntityId(3),
             participants: vec![SceneParticipant { entity: EntityId(3), spot: 0 }], you: SceneRole::Owner,
         }
     }
@@ -319,6 +320,54 @@ mod tests {
         let hello_v19 = br#"{"Hello":{"protocol_version":19,"client_build":"c","auth":{"Token":"x"},"character":{"tint":[0,0,0]}}}"#;
         assert_eq!(crate::probe_hello_version(hello_v19), Some(19));
         assert_ne!(crate::probe_hello_version(hello_v19), Some(crate::PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn a_v22_start_requires_an_explicit_presentation_origin_without_selecting_replay() {
+        let accepted = SceneOrigin { pos: Pos::new(-12.5, 35.25, 9.0), facing: 0.75, triangle: Some(12) };
+        for origin in [None, Some(accepted)] {
+            for you in [SceneRole::Owner, SceneRole::Watcher] {
+                let mut message = continuation_start(None);
+                let ServerMsg::SceneStart { presentation_origin, you: role, .. } = &mut message else { unreachable!() };
+                *presentation_origin = origin;
+                *role = you;
+                let frame = crate::encode(&message).unwrap();
+                assert_eq!(crate::decode::<ServerMsg>(&frame[4..]).unwrap(), message);
+                let mut json = serde_json::to_value(&message).unwrap();
+                assert!(json["SceneStart"]["replay"].is_null(), "an activation pose is not a durable replay");
+                assert_eq!(json["SceneStart"]["presentation_origin"], serde_json::to_value(origin).unwrap());
+                json["SceneStart"].as_object_mut().unwrap().remove("presentation_origin");
+                let error = crate::decode::<ServerMsg>(&serde_json::to_vec(&json).unwrap()).unwrap_err();
+                assert!(error.to_string().contains("missing field `presentation_origin`"), "{error}");
+            }
+        }
+        let durable = continuation_start(Some(SceneReplay { source: [2; 32], origin: Some(accepted), events: vec![] }));
+        let mut json = serde_json::to_value(durable).unwrap();
+        assert!(json["SceneStart"]["presentation_origin"].is_null(), "durable origin remains in its replay");
+        json["SceneStart"].as_object_mut().unwrap().remove("presentation_origin");
+        assert!(serde_json::from_value::<ServerMsg>(json).is_err(), "null is explicit for durable playback too");
+        let hello_v21 = br#"{"Hello":{"protocol_version":21,"client_build":"c","auth":{"Token":"x"},"character":{"tint":[0,0,0]}}}"#;
+        assert_eq!(crate::probe_hello_version(hello_v21), Some(21));
+        assert_ne!(crate::probe_hello_version(hello_v21), Some(crate::PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn an_ordinary_presentation_origin_rejects_invalid_pose_metadata() {
+        let mut message = continuation_start(None);
+        let ServerMsg::SceneStart { presentation_origin, .. } = &mut message else { unreachable!() };
+        *presentation_origin = Some(SceneOrigin { pos: Pos::new(1.0, 2.0, 3.0), facing: 0.0, triangle: Some(12) });
+        let valid = serde_json::to_value(message).unwrap();
+        for coordinate in ["x", "y", "z"] {
+            let mut bad = valid.clone();
+            bad["SceneStart"]["presentation_origin"]["pos"][coordinate] = serde_json::json!(1e40);
+            assert!(serde_json::from_value::<ServerMsg>(bad).is_err(), "non-finite {coordinate}");
+        }
+        let mut bad = valid.clone();
+        bad["SceneStart"]["presentation_origin"]["facing"] = serde_json::json!(1e40);
+        assert!(serde_json::from_value::<ServerMsg>(bad).is_err());
+        let mut bad = valid;
+        bad["SceneStart"]["presentation_origin"].as_object_mut().unwrap().remove("triangle");
+        assert!(serde_json::from_value::<ServerMsg>(bad).is_err(), "missing triangle metadata is not null");
     }
 
     #[test]
@@ -423,7 +472,7 @@ mod tests {
             for you in [SceneRole::Owner, SceneRole::Watcher] {
                 let msg = ServerMsg::SceneStart {
                     run: SceneRunId(7), scene: "ff7/md8_2/station".into(), seed: 41,
-                    progress: vec![1, 36, 0], gil, replay: None, owner: EntityId(3),
+                    progress: vec![1, 36, 0], gil, replay: None, presentation_origin: None, owner: EntityId(3),
                     participants: vec![SceneParticipant { entity: EntityId(3), spot: 0 }, SceneParticipant { entity: EntityId(4), spot: 1 }],
                     you,
                 };

@@ -215,7 +215,7 @@ impl Rig {
         let mut owner = join(&mut world, state.clone(), vec![state], now);
         owner.drain();
         let run = SceneRunId(71);
-        world.start_run(run, SceneRun { scene: SCENE.into(), owner: owner.entity, watchers: vec![], seed: 19,
+        world.start_run(run, SceneRun { presentation_origin: None, scene: SCENE.into(), owner: owner.entity, watchers: vec![], seed: 19,
             progress: ORIGINAL.to_vec(), gil: 240, answers: vec![], steps: 0, started: now, last_activity: now,
             writes_story: true, preview: false, then: None }, &mut vec![]);
         assert!(owner.drain().iter().any(|m| matches!(m, ServerMsg::SceneStart { replay: Some(_), .. })));
@@ -303,7 +303,7 @@ fn door_rig(final_field: &'static str) -> Rig {
     let mut owner = join(&mut world, state.clone(), vec![state], now);
     owner.drain();
     let run = SceneRunId(71);
-    world.start_run(run, SceneRun { scene: DOOR.into(), owner: owner.entity, watchers: vec![], seed: 19,
+    world.start_run(run, SceneRun { presentation_origin: None, scene: DOOR.into(), owner: owner.entity, watchers: vec![], seed: 19,
         progress: DOOR_STORY.to_vec(), gil: 240, answers: vec![], steps: 0, started: now, last_activity: now,
         writes_story: true, preview: false, then: None }, &mut vec![]);
     assert!(owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { scene, replay: Some(_), .. } if scene == DOOR)));
@@ -995,7 +995,7 @@ fn recovery_in_the_same_entry_field_restores_the_saved_position_and_facing() {
     let player = rig.world.players.get_mut(&rig.owner.entity).unwrap();
     player.snapshot.pos = origin;
     player.snapshot.facing = facing;
-    rig.world.start_run(rig.run, SceneRun { scene: SCENE.into(), owner: rig.owner.entity,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: SCENE.into(), owner: rig.owner.entity,
         watchers: vec![], seed: 19, progress: ORIGINAL.to_vec(), gil: 240, answers: vec![],
         steps: 0, started: rig.now, last_activity: rig.now, writes_story: true, preview: false,
         then: None }, &mut vec![]);
@@ -1052,7 +1052,7 @@ fn recovered_coop_waits_for_each_connected_players_area_handshake() {
     assert!(matches!(rig.world.party_invite(rig.owner.entity, guest.entity, rig.now), crate::world::PartyOutcome::Done));
     let invite = rig.world.parties.invites().next().unwrap().id;
     assert!(matches!(rig.world.party_accept(guest.entity, invite, rig.now), crate::world::PartyOutcome::Done));
-    rig.world.start_run(rig.run, SceneRun { scene: SCENE.into(), owner: rig.owner.entity,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: SCENE.into(), owner: rig.owner.entity,
         watchers: vec![guest.entity], seed: 19, progress: ORIGINAL.to_vec(), gil: 240, answers: vec![],
         steps: 0, started: rig.now, last_activity: rig.now, writes_story: true, preview: false,
         then: None }, &mut vec![]);

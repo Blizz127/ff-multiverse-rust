@@ -623,7 +623,7 @@ mod tests {
             let mut session = Session::new(net, joined);
             // Model a failure outside network dispatch, as when checked VM advancement rejects
             // a durable continuation. No server acknowledgement is needed to close safely.
-            session.state.scene.on_message(HALL, ServerMsg::SceneStart {
+            session.state.scene.on_message(HALL, ServerMsg::SceneStart { presentation_origin: None,
                 run: fmv_protocol::SceneRunId(7), scene: "test/missing/continuation".into(), seed: 1,
                 progress: fmv_ff7::story::StoryState::at(39).encode(), gil: 0,
                 replay: Some(fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] }),
@@ -655,7 +655,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             let mut net = NetHandle::spawn(config(addr), Box::new(RoomsAdapter::new())).unwrap();
             let mut joined = net.wait_joined().unwrap();
-            joined.backlog.push(ServerMsg::SceneStart {
+            joined.backlog.push(ServerMsg::SceneStart { presentation_origin: None,
                 run: fmv_protocol::SceneRunId(7), scene: "test/recovery/provider".into(), seed: 1,
                 progress: fmv_ff7::story::StoryState::at(39).encode(), gil: 0,
                 replay: Some(fmv_protocol::SceneReplay { source: [0; 32], origin: None, events: vec![] }),

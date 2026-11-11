@@ -1196,6 +1196,9 @@ impl Renderer {
         self.gpu_errors.lock().ok().and_then(|v| v.first().cloned())
     }
 
+    /// The effective device texture limit used by both backdrop and scenery uploads.
+    pub fn max_texture_dimension_2d(&self) -> u32 { self.gpu.device.limits().max_texture_dimension_2d }
+
     /// The size of the window surface in pixels, as last reported by [`Renderer::resize`].
     pub fn size(&self) -> (u32, u32) {
         self.size

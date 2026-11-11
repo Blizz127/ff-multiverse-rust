@@ -670,7 +670,7 @@ impl World {
     /// budget, and facing and anim are tracked only from accepted moves.
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
         // The rules are the rules of the area the player stands in (areas differ in speed).
-        let (from, chord, crossed) = {
+        let (from, chord) = {
             let Some(p) = self.players.get_mut(&entity) else {
                 return MoveOutcome::Gone;
             };
@@ -697,20 +697,29 @@ impl World {
                 return MoveOutcome::Rejected { corrected: from, reason: Rejection::TooFast };
             }
             let chord = walk_chord(area.runtime(), from, to, dist, area.rules());
-            // Crossing an exit line leaves the area, when one of the exits there is open for the story that governs
-            // the player. Judged on the move as the adapter accepted it, and only where there is somewhere to go
-            // (a single-area world has no exits).
-            let crossed: Vec<Exit> = match &chord {
-                Chord::Clear(accepted) if self.source.is_some() => area.crossed_exits(from, *accepted).into_iter().cloned().collect(),
-                _ => Vec::new(),
-            };
-            (from, chord, crossed)
+            (from, chord)
         };
         let facing = normalize_facing(facing);
         let dist = dist_xy(from, to);
 
         match chord {
             Chord::Clear(accepted) => {
+                // A source that reads its player's triangle must see a genuine accepted
+                // crossing. A long chord may otherwise finish beyond the trigger region.
+                let presented = match self.presentation_move(entity, from, accepted, facing) {
+                    Ok(pos) => pos,
+                    Err(()) => return MoveOutcome::Rejected { corrected: from, reason: Rejection::Blocked },
+                };
+                let clipped = presented != accepted;
+                let accepted = presented;
+                let dist = if clipped { dist_xy(from, accepted) } else { dist };
+                let anim = if clipped { AnimState::Idle } else { anim };
+                // Discarded movement beyond a presentation cannot cross an exit or later
+                // reappear as a deferred link/encounter after its scene and battle.
+                let crossed: Vec<Exit> = if self.source.is_some() {
+                    self.players.get(&entity).and_then(|p| self.areas.get(&p.area))
+                        .map(|area| area.crossed_exits(from, accepted).into_iter().cloned().collect()).unwrap_or_default()
+                } else { Vec::new() };
                 let Some(p) = self.players.get_mut(&entity) else {
                     return MoveOutcome::Gone;
                 };
@@ -751,7 +760,7 @@ impl World {
                 }
                 // Walking is what rolls random encounters (a no-op without an encounter table).
                 self.roll_encounter(entity, dist, now);
-                MoveOutcome::Applied
+                if clipped { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied }
             }
             Chord::Blocked { place } => {
                 let Some(p) = self.players.get_mut(&entity) else {

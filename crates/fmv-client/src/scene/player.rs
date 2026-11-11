@@ -562,6 +562,7 @@ impl ScenePlayer {
         &self.def
     }
 
+    #[cfg(test)]
     pub fn cast_draws(&self) -> Vec<CastDraw<'_>> {
         self.presentation().cast_draws()
     }

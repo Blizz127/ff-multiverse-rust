@@ -332,32 +332,49 @@ impl std::fmt::Debug for TileAtlas {
 /// [`MAX_ATLAS_WIDTH`]): the 32-pixel tiles first, then the 16-pixel ones, each in rows, in the order
 /// of `tiles` within a size. The image is only as wide as the widest row. `None` if `max_width` is out
 /// of range, a tile is not square with a side of 16 or 32 or has the wrong number of pixels, or the
-/// result would be taller than [`MAX_ATLAS_HEIGHT`]. No tiles give an empty atlas.
+/// result would be taller than [`MAX_ATLAS_HEIGHT`] or exceed the raster byte budget. Native
+/// pixel bytes are preserved, including alpha. No tiles give an empty atlas.
 pub fn pack_atlas(tiles: &[DepthTile], max_width: u32) -> Option<TileAtlas> {
+    for tile in tiles {
+        let side = i64::from(tile.rect.max_x) - i64::from(tile.rect.min_x);
+        let tall = i64::from(tile.rect.max_y) - i64::from(tile.rect.min_y);
+        if !matches!(side, 16 | 32) || tall != side { return None; }
+    }
+    let pixels: Vec<_> = tiles.iter().map(|tile| super::raster::TilePixels { side: tile.size(), rgba: &tile.rgba }).collect();
+    pack_pixels(&pixels, max_width, false)
+}
+
+/// Pack raster pixels independently of logical tile geometry. Sides 16, 32, 64 and 128 are
+/// accepted; larger squares go first and ties keep input order. The returned rectangles are
+/// texel coordinates, while a renderer continues to use the native `DepthTile::rect`.
+/// Alpha is clipped at 128 consistently with `raster::compose_tile_pixels`; RGB is preserved.
+/// Invalid lengths, widths, total input bytes or atlas allocations return `None` before a
+/// pixel buffer is allocated. Empty input produces the same empty atlas as `pack_atlas`.
+pub fn pack_tile_pixels(tiles: &[super::raster::TilePixels<'_>], max_width: u32) -> Option<TileAtlas> {
+    pack_pixels(tiles, max_width, true)
+}
+
+fn pack_pixels(tiles: &[super::raster::TilePixels<'_>], max_width: u32, clip_alpha: bool) -> Option<TileAtlas> {
+    use super::raster::{clipped_alpha, MAX_RASTER_BYTES};
     if !(32..=MAX_ATLAS_WIDTH).contains(&max_width) {
         return None;
     }
+    let mut total = 0usize;
     for tile in tiles {
-        let size = tile.size();
-        let side = usize::try_from(size).ok()?;
-        let pixels = side.checked_mul(side)?.checked_mul(4)?;
-        if !matches!(size, 16 | 32) || tile.rect.width() != tile.rect.height() || tile.rgba.len() != pixels {
-            return None;
-        }
+        if !tile.valid() || tile.side > max_width { return None; }
+        total = total.checked_add(tile.rgba.len())?;
+        if total > MAX_RASTER_BYTES { return None; }
     }
     let mut placed: Vec<AtlasRect> = vec![AtlasRect { x: 0, y: 0, size: 0 }; tiles.len()];
     let (mut x, mut y, mut row_height, mut widest) = (0u32, 0u32, 0u32, 0u32);
-    for size in [32u32, 16] {
-        // a new size starts a new row
+    for size in [128u32, 64, 32, 16] {
         if row_height != 0 {
             y = y.checked_add(row_height)?;
             x = 0;
             row_height = 0;
         }
         for (tile, slot) in tiles.iter().zip(placed.iter_mut()) {
-            if tile.size() != size {
-                continue;
-            }
+            if tile.side != size { continue; }
             if x.checked_add(size)? > max_width {
                 y = y.checked_add(row_height)?;
                 x = 0;
@@ -370,12 +387,12 @@ pub fn pack_atlas(tiles: &[DepthTile], max_width: u32) -> Option<TileAtlas> {
         }
     }
     let height = y.checked_add(row_height)?;
-    if height > MAX_ATLAS_HEIGHT {
-        return None;
-    }
+    if height > MAX_ATLAS_HEIGHT { return None; }
     let width = widest;
     let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
-    let mut rgba = vec![0u8; w.checked_mul(h)?.checked_mul(4)?];
+    let bytes = w.checked_mul(h)?.checked_mul(4)?;
+    if bytes > MAX_RASTER_BYTES { return None; }
+    let mut rgba = vec![0u8; bytes];
     for (tile, rect) in tiles.iter().zip(placed.iter()) {
         let (size, rx, ry) = (usize::try_from(rect.size).ok()?, usize::try_from(rect.x).ok()?, usize::try_from(rect.y).ok()?);
         let row_bytes = size.checked_mul(4)?;
@@ -383,7 +400,11 @@ pub fn pack_atlas(tiles: &[DepthTile], max_width: u32) -> Option<TileAtlas> {
             let from = row.checked_mul(row_bytes)?;
             let src = tile.rgba.get(from..from.checked_add(row_bytes)?)?;
             let at = ry.checked_add(row)?.checked_mul(w)?.checked_add(rx)?.checked_mul(4)?;
-            rgba.get_mut(at..at.checked_add(row_bytes)?)?.copy_from_slice(src);
+            let dst = rgba.get_mut(at..at.checked_add(row_bytes)?)?;
+            dst.copy_from_slice(src);
+            if clip_alpha {
+                for alpha in dst.iter_mut().skip(3).step_by(4) { *alpha = clipped_alpha(*alpha); }
+            }
         }
     }
     Some(TileAtlas { width, height, rgba, rects: placed })
