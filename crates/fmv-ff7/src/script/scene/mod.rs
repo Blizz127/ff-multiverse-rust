@@ -59,6 +59,7 @@ mod scratch_scene_tests;
 pub use data::*;
 pub use fade::{FadeBlend, FadeColor, FadeOp, FadeState};
 pub use jump::{jump_frames, JumpMotion};
+pub(crate) use jump::landing_height;
 pub use offset::OffsetMotion;
 pub use play::{auto_witnesses, auto_witnesses_with_resources, cast_places, cast_places_with_resources, run_section_to_end, run_section_to_end_with_resources, run_to_end, run_to_end_with_resources, run_to_end_with_resources_strict, trigger_npc, Ground, Outcome, SceneError, ScenePlay, TriggerNpc, Writes, ANNOUNCED_STATE_OPS, FULL_RESTORE_OPS, SKIPPED_STATE_OPS};
 pub use vm::{AnimHow, Beat, CameraOp, GilOp, SceneResources, Resources, ResourceOutcome, Limits, MoveHow, SceneJump, SceneVars, Stage, Stats, Then, Timed, Vm, Where, Window, FRAMES_PER_SECOND};
