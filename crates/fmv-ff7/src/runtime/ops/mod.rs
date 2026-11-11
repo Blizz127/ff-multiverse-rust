@@ -12,6 +12,7 @@ pub use motion::MotionState;
 pub use party::PartyState;
 pub use stage::StageState;
 pub use windows::WindowsState;
+pub use windows::{number_kind, NumberDisplay, ReplaceParam, WindowContents, DEFAULT_MENU_COLORS};
 
 use super::{Ask, Command, CommandState, Event, FieldRuntime, Flow, Line, MoveMode, Model, OpenWindow, Sync, MAIN_PRIORITY, NO_CHARACTER};
 use crate::script::decode_at;
