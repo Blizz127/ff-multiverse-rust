@@ -323,11 +323,12 @@ resolved or that the scheduler is already implemented.
 
 ## Field-visit state contract (runtime unimplemented)
 
-The idle storage foundation now implements this record and atomic Enter/Advance updates
-with story/resources. It does not implement the running field lifecycle or activate the
-train lesson/return. Existing checkpoint operations preserve visits and cannot create or
-clear their active-continuation links; login refuses stored visits until the runtime can
-restore them. See [the current foundation](DISC1-IMPLEMENTATION.md#native-party-and-field-visit-foundation).
+The storage foundation implements this record, atomic idle Enter/Advance updates and staged
+same-field AttachVisit/AdvanceVisit/CompleteVisit scene batches. It does not implement the
+running field lifecycle or activate the train lesson/return. Only the explicit visit batches
+may change their active links; older checkpoint operations preserve visits. Login refuses
+stored visits until the runtime can restore them. See
+[the current foundation](DISC1-IMPLEMENTATION.md#native-party-and-field-visit-foundation).
 The remaining integration complements the scheduler design: retaining a scratch image
 alone does not restore an interrupted field runtime.
 
@@ -424,21 +425,53 @@ may invalidate that guarantee. Only transaction conflicts become stale refusals;
 recovery failures retain their fatal storage errors. Runtime callers must still hold the
 account and publish only after durable confirmation and the required playback ACK.
 
-The bridge is exercised through tests while `World::join` continues to reject stored
-visits. Active scenes need a later atomic batch extension: current standalone visit
-commits reject checkpoints/reservations, while scene batches forbid changing visits.
-No split commit can safely join these paths. Accepted entry, anchor reconstruction and
-the continuous field runtime remain prerequisites for gameplay activation.
+The separate staged active bridge now supports one unreserved owner in a same-field,
+noncombat scene through the existing atomic scene batch:
 
-The next bounded transaction step is a singleton owner attachment/completion pair for a
-same-field, noncombat scene: atomically attach a Resume-0 checkpoint and matching visit
-link, then atomically commit the checked result and clear both. Each advances the visit
-revision once. Witness visits remain independent; this must not enable checked battle
-prefixes, shared travel or map transfers. Keep existing link validation and receipt-before-CAS
-ordering. New optional batch fields must omit absent values when serialized, preserving
-existing selected-result receipt hashes. A duplicate attachment after completion returns
-the newer idle state and must never reattach the old checkpoint. This extension is planned,
-not implemented by the idle bridge.
+- `AttachVisit` saves a Resume-0 checkpoint and matching visit link. Story, resources,
+  scratch, entry and anchor remain unchanged; only the link and revision advance.
+- `AdvanceVisit` persists exactly the next window acknowledgment, including plain windows.
+  Replay validates its instruction identity, order and exact choice; no answer is defaulted.
+  Only the accepted prefix and visit revision change. Authored effects remain speculative.
+- `CompleteVisit` accepts no new input. The saved prefix must already reach `Finished`;
+  completion applies the checked story/gil/scratch effects and clears checkpoint/link together.
+  The final ACK is saved before completion, so a crash between them needs no new answer.
+  Zero-window scenes can complete directly after Attach.
+
+The private versioned replay retains the complete original visit, account, accepted origin
+and accepted window prefix. Its stable host digest binds the original story/gil/seed,
+scene instance, source/init/profile identity, semantic definition, original scratch values
+and masks, and execution limits. Dynamic origins are rebound before fingerprinting; missing
+or unexpected origins refuse. This binding does not itself establish accepted trigger or
+entry provenance. Every reconstructed boundary is audited for unknown or skipped state
+effects. Current visit metadata must equal the original plus its link and exactly
+`1 + accepted_window_count` revisions; no public interpreter outcome can replace execution.
+
+The active host explicitly permits 128 windows while legacy constructors keep their limits.
+Attach, Advance and recovery reserve enough revisions for remaining allowed ACKs and Complete;
+the last permitted ACK cannot save another unacknowledgeable window. This does not prove every
+branch of a scene fits the budget or avoids unsupported effects: production profile admission
+must still establish that. Battle prefixes, shared travel and MAPJUMPs remain excluded, and
+witnesses retain independent visits. Standalone visit commits still reject active metadata.
+
+Each batch preserves receipt-before-CAS ordering and returns current state on an exact retry.
+A duplicate Attach after Complete must not reattach; duplicate Complete must preserve later
+rewards. Absent `next_visit` fields are omitted from selected-result encoding so older receipt
+hashes remain valid. A scene with N windows adds N+2 retained batch receipts; the existing
+combined scene/batch limit is 2,048. Safe receipt retirement or compaction remains unresolved.
+
+Focused validation passes 560 server tests, 361 persistence tests and all three owned
+field-visit server tests. The active Jessie cases cover answers 2/3 at affection 0, 2 and 30,
+reopen after the first and final ACKs before Complete, and exact retry after a later reward.
+These fixtures have the train lesson bit known set. The first-talk branch that transfers
+to `rootmap` is outside this same-field bridge and remains unregistered.
+The full workspace passes 4,430 tests across 109 targets (388 optional tests ignored),
+including 1,515 client tests; the separate graphics panel offscreen test also passes.
+`World::join` continues to
+reject stored visits. Gameplay activation also requires accepted entry/origin provenance,
+actor/camera/background/audio reconstruction, runtime scratch injection and an account hold
+through the ordered saver acknowledgment. Recovery must consume returned current state and
+preserve the existing login save-epoch fence; opaque anchor preservation is not restoration.
 
 Checked wide accesses preserve the original selector before aliasing: `1,3,5,11,13,15`
 read/write one byte; `2,4,6,7,12,14` use two little-endian bytes. PC helpers `0x60FD6C`

@@ -3,6 +3,8 @@
 //! nor claim that ambient threads, models or RNG history can be restored from these bytes.
 //! Owned field assets are read in place; only numeric effects and their source hash are saved.
 
+mod active;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -91,7 +91,7 @@ impl FieldVisitSaveJob {
     }
 }
 
-fn validate_visit(visit: &FieldVisitV1) -> Result<(), SceneSaveError> {
+pub(crate) fn validate_visit(visit: &FieldVisitV1) -> Result<(), SceneSaveError> {
     if visit.schema_version != 1 || visit.visit_id == [0; 16] || visit.source_identity == [0; 32]
         || visit.entry.operation == [0; 16] || visit.active_continuation.is_some()
         || visit.field.is_empty() || visit.field.len() > MAX_FIELD_VISIT_FIELD_BYTES

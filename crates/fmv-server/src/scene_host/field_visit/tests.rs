@@ -1,6 +1,8 @@
 //! Synthetic semantic decisions only: these fixtures neither admit a field visit nor
 //! restore an anchor, run a field-entry profile, write a store, or contact game clients.
 
+mod active;
+
 use super::IdleVisitSource;
 use fmv_core::{AccountId, GameId, InventoryEntry};
 use fmv_ff7::field::FieldFile;

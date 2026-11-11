@@ -11,7 +11,7 @@ use fmv_ff7::field::FieldFile;
 use fmv_ff7::script::{FieldScript, FieldScratch, FieldScratchError, FieldScratchOutcome};
 use fmv_ff7::script::dialogue::{run_talk_exact_with_scratch, End, ExactError};
 use fmv_ff7::script::scene::{run_to_end_with_scratch_strict, SceneDef, SceneError,
-    SceneResources, ScriptRef, SKIPPED_STATE_OPS, REPLAY_VERSION};
+    Outcome, SceneResources, ScriptRef, SKIPPED_STATE_OPS, REPLAY_VERSION};
 use fmv_ff7::story::{canon_party, compare_exchange_progression, party_after,
     party_visibility_matches, StoryState};
 use fmv_persist::{FieldVisitOperation, FieldVisitOperationKind, SceneState,
@@ -109,19 +109,9 @@ impl<'a> IdleVisitSource<'a> {
         }
         let outcome = run_to_end_with_scratch_strict(self.field, def, &story, seed,
             SceneResources { gil: Some(gil) }, &scratch, answers)?;
-        if outcome.end != End::Finished || outcome.jump.is_some() || !outcome.is_complete()
-            || !outcome.unknown_persistent_reads.is_empty()
-            || [&outcome.setup_stats, &outcome.stats].iter().any(|stats| stats.ignored.keys().any(|op| SKIPPED_STATE_OPS.contains(op)))
-            || outcome.writes.untracked.keys().any(|(bank, _)| fmv_ff7::story::canonical_persistent_bank(*bank).is_some())
-            || outcome.resources.gil_before != Some(gil) {
-            return Err(IdleVisitError::Result);
-        }
-        let after_gil = outcome.resources.gil_after.ok_or(IdleVisitError::Result)?;
-        let effect = outcome.scratch.as_ref().ok_or(IdleVisitError::Result)?.as_ref().map_err(|error| IdleVisitError::Scratch(*error))?;
-        let mut after = story.clone();
-        outcome.writes.apply_extended_to(&mut after, &story).ok_or(IdleVisitError::Result)?;
-        if !outcome.party_is_the_storys(&story, &after) { return Err(IdleVisitError::Result); }
-        self.finish(expected, operation, &scratch, effect, after, after_gil, now)
+        if outcome.end != End::Finished { return Err(IdleVisitError::Result); }
+        let (after, after_gil, effect) = checked_effect(&outcome, &story, gil)?;
+        self.finish(expected, operation, &scratch, &effect, after, after_gil, now)
     }
 
     /// The exact ordinary talk path has no economic or battle input. Unsupported resource
@@ -156,26 +146,57 @@ impl<'a> IdleVisitSource<'a> {
     fn finish(&self, expected: &SceneState, operation: [u8; 16], before_scratch: &FieldScratch,
         effect: &FieldScratchOutcome, after_story: StoryState, after_gil: u32, now: u64)
         -> Result<FieldVisitSaveJob, IdleVisitError> {
-        let mut after_scratch = before_scratch.clone();
-        effect.apply_to(&mut after_scratch, before_scratch)?;
-        let mut next = expected.clone();
-        let before_blob = &expected.pair.story.blob;
-        let after_blob = after_story.encode();
-        if compare_exchange_progression(before_blob, before_blob, &after_blob).as_deref() != Some(after_blob.as_slice()) {
-            return Err(IdleVisitError::Result);
-        }
-        next.pair.story.blob = after_blob;
-        let character = next.pair.character.as_mut().ok_or(IdleVisitError::State)?;
-        if !super::persistable_field_gil(character.gil, after_gil) { return Err(IdleVisitError::Result); }
-        character.gil = after_gil;
-        let visit = next.field_visit.as_mut().ok_or(IdleVisitError::State)?;
-        visit.revision = visit.revision.checked_add(1).ok_or(IdleVisitError::State)?;
-        visit.scratch_values = *after_scratch.values();
-        visit.scratch_known_masks = *after_scratch.known_masks();
+        let next = next_state(expected, before_scratch, effect, after_story, after_gil)?;
         Ok(FieldVisitSaveJob::new(FieldVisitOperation { id: operation, kind: FieldVisitOperationKind::Advance },
             expected.clone(), next, now)?)
     }
+
 }
+
+/// Shared accounting for an internally evaluated complete result or window prefix. A caller
+/// must separately check the actual boundary; this never blesses a supplied public outcome.
+fn checked_effect(outcome: &Outcome, story: &StoryState, gil: u32)
+    -> Result<(StoryState, u32, FieldScratchOutcome), IdleVisitError> {
+    if outcome.jump.is_some() || !outcome.is_complete() || !outcome.unknown_persistent_reads.is_empty()
+        || [&outcome.setup_stats, &outcome.stats].iter().any(|stats| stats.ignored.keys().any(|op| SKIPPED_STATE_OPS.contains(op)))
+        || outcome.writes.untracked.keys().any(|(bank, _)| fmv_ff7::story::canonical_persistent_bank(*bank).is_some())
+        || outcome.resources.gil_before != Some(gil) {
+        return Err(IdleVisitError::Result);
+    }
+    let after_gil = outcome.resources.gil_after.ok_or(IdleVisitError::Result)?;
+    if !super::persistable_field_gil(gil, after_gil) { return Err(IdleVisitError::Result); }
+    let effect = outcome.scratch.as_ref().ok_or(IdleVisitError::Result)?.as_ref()
+        .map_err(|error| IdleVisitError::Scratch(*error))?;
+    let mut after = story.clone();
+    outcome.writes.apply_extended_to(&mut after, story).ok_or(IdleVisitError::Result)?;
+    if !outcome.party_is_the_storys(story, &after) { return Err(IdleVisitError::Result); }
+    Ok((after, after_gil, effect.clone()))
+}
+
+fn next_state(expected: &SceneState, before_scratch: &FieldScratch, effect: &FieldScratchOutcome,
+    after_story: StoryState, after_gil: u32) -> Result<SceneState, IdleVisitError> {
+    let mut after_scratch = before_scratch.clone();
+    effect.apply_to(&mut after_scratch, before_scratch)?;
+    let mut next = expected.clone();
+    let before_blob = &expected.pair.story.blob;
+    let after_blob = after_story.encode();
+    if compare_exchange_progression(before_blob, before_blob, &after_blob).as_deref() != Some(after_blob.as_slice()) {
+        return Err(IdleVisitError::Result);
+    }
+    next.pair.story.blob = after_blob;
+    let character = next.pair.character.as_mut().ok_or(IdleVisitError::State)?;
+    if !super::persistable_field_gil(character.gil, after_gil) { return Err(IdleVisitError::Result); }
+    character.gil = after_gil;
+    let visit = next.field_visit.as_mut().ok_or(IdleVisitError::State)?;
+    visit.revision = visit.revision.checked_add(1).ok_or(IdleVisitError::State)?;
+    visit.scratch_values = *after_scratch.values();
+    visit.scratch_known_masks = *after_scratch.known_masks();
+    Ok(next)
+}
+
+mod active;
+#[cfg(test)]
+pub(crate) use active::ActiveVisitBoundary;
 
 #[cfg(test)]
 mod tests;

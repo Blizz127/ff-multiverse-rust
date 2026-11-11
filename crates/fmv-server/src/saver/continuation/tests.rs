@@ -1,5 +1,7 @@
 //! Synthetic co-op checkpoints through the ordered saver and the real durable store.
 
+mod visit;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +67,7 @@ fn prepare_job(before: &[SceneState]) -> SceneBatchJob {
     SceneBatchJob {
         operation: operation(SceneOperationKind::PrepareBattle),
         members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember {
+            next_visit: None,
             expected: expected.clone(),
             next_story: (slot == 0).then(|| vec![2, 0, 255, 0]),
             next_gil: (slot == 0).then(|| character(expected).gil - 1),
@@ -92,6 +95,7 @@ fn resolve_job(before: &[SceneState]) -> SceneBatchJob {
     SceneBatchJob {
         operation: operation(SceneOperationKind::ResolveBattle),
         members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember {
+            next_visit: None,
             expected: expected.clone(),
             next_story: (slot == 0).then(|| vec![3, 0, 255, 0, 9]),
             next_gil: None,
@@ -117,6 +121,7 @@ fn finish_job(before: &[SceneState]) -> SceneBatchJob {
     SceneBatchJob {
         operation: SceneOperation { ordinal: checkpoint.consumed_battles, ..operation(SceneOperationKind::Finish) },
         members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember {
+            next_visit: None,
             expected: expected.clone(),
             next_story: None,
             next_gil: None,
@@ -147,6 +152,41 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 fn reopen(dir: &tempfile::TempDir, store: Arc<Store>) -> Store {
     drop(store);
     Store::open(dir.path().join("state")).unwrap()
+}
+
+#[test]
+fn absent_next_visit_keeps_the_exact_pre_visit_decision_encoding_and_hash() {
+    // Recorded decision shape from before SceneBatchMember gained next_visit. This is a
+    // complete singleton Resume operation, including zeroed receipt-only timestamps/schema.
+    const OLD_JSON: &str = r#"{"operation":{"instance":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"ordinal":0,"attempt":0,"kind":"Complete"},"members":[{"expected":{"pair":{"story":{"schema_version":0,"account_id":7,"game":"Fixture","blob":"00ff","updated_at":0},"character":{"schema_version":0,"account_id":7,"game":"Fixture","character":0,"level":5,"exp":0,"ap":0,"gil":24,"updated_at":0}},"checkpoint":{"instance":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"scene_key":"fixture/old","source_hash":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"replay_version":1,"original_story":[0,255],"original_gil":24,"seed":9,"replay":[4,0,255],"phase":{"Resume":{"segment":0}},"consumed_battles":0},"reservation":null},"next_story":[1,255],"next_gil":23,"checkpoint":null,"reservation":null,"battle":null}]}"#;
+    let account = AccountId(7);
+    let expected = SceneState {
+        pair: fmv_persist::ProgressPair {
+            story: Progression { schema_version: 0, account_id: account, game: GAME, blob: vec![0, 255], updated_at: 0 },
+            character: Some(CharacterProgress { schema_version: 0, gil: 24, ..CharacterProgress::new(account, GAME, 0, 5, 0) }),
+        },
+        checkpoint: Some(SceneCheckpoint { instance: [1; 32], scene_key: "fixture/old".into(), source_hash: [3; 32],
+            replay_version: 1, original_story: vec![0, 255], original_gil: 24, seed: 9, replay: vec![4, 0, 255],
+            phase: ScenePhase::Resume { segment: 0 }, consumed_battles: 0 }),
+        reservation: None, field_visit: None,
+    };
+    let mut job = SceneBatchJob {
+        operation: SceneOperation { instance: [1; 32], ordinal: 0, attempt: 0, kind: SceneOperationKind::Complete },
+        members: vec![SceneBatchMember { expected, next_story: Some(vec![1, 255]), next_gil: Some(23),
+            checkpoint: None, reservation: None, battle: None, next_visit: None }],
+    };
+    assert_eq!(serde_json::to_vec(&job).unwrap(), OLD_JSON.as_bytes(), "None must not serialize as null or reorder earlier fields");
+    let mut legacy_digest = blake3::Hasher::new();
+    legacy_digest.update(b"fmv-scene-batch-decision-v1\0");
+    legacy_digest.update(OLD_JSON.as_bytes());
+    let expected_hash = *legacy_digest.finalize().as_bytes();
+    assert_eq!(job.selected_result().unwrap(), expected_hash);
+    job.members[0].expected.pair.story.schema_version = 1;
+    job.members[0].expected.pair.story.updated_at = NOW;
+    let character = job.members[0].expected.pair.character.as_mut().unwrap();
+    character.schema_version = 3;
+    character.updated_at = NOW + 4;
+    assert_eq!(job.selected_result().unwrap(), expected_hash, "legacy timestamp/schema normalization is unchanged");
 }
 
 #[test]

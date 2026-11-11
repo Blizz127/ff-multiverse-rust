@@ -82,6 +82,7 @@ mod ordinary;
 pub(crate) use ordinary::{persist_story_battle, persist_story_cas, StoryBattleJob, StoryBattleMember, StoryCasJob};
 mod field_visit;
 pub(crate) use field_visit::{persist_field_visit, FieldVisitSaveJob};
+pub(crate) use field_visit::validate_visit as validate_field_visit;
 
 /// How long to wait before each further attempt at a write that failed with an I/O error.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];

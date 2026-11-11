@@ -463,7 +463,7 @@ impl World {
     fn continuation_job(&self, c: &Continuation, record: &SceneRun, action: &Action) -> Option<SceneBatchJob> {
         if !self.continuation_carry_allowed(&record.scene, &c.payload) { return None; }
         let owner_index = c.states.iter().position(|s| s.pair.story.account_id == c.owner)?;
-        let mut members = c.states.iter().map(|state| SceneBatchMember { expected: state.clone(), next_story: None,
+        let mut members = c.states.iter().map(|state| SceneBatchMember { next_visit: None, expected: state.clone(), next_story: None,
             next_gil: None, checkpoint: state.checkpoint.clone(), reservation: state.reservation.clone(), battle: None }).collect::<Vec<_>>();
         let mut operation = SceneOperation { instance: c.instance, ordinal: c.consumed(), attempt: 0, kind: SceneOperationKind::Finish };
         match action {

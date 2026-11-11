@@ -76,6 +76,15 @@ pub enum SceneOperationKind {
     Complete,
     /// An ordinary battle's complete terminal outcome, without a resumable scene checkpoint.
     BattleOutcome,
+    /// Attach one idle field visit to an unreserved, noncombat Resume-0 checkpoint.
+    /// The progress pair and visit contents stay unchanged except for its revision/link.
+    AttachVisit,
+    /// Record a newly accepted noncombat window prefix while keeping all gameplay state
+    /// unchanged. The ordinal is the adapter-validated accepted window count, starting at 1.
+    AdvanceVisit,
+    /// Commit that same-field noncombat scene's checked afterimage and clear its link.
+    /// The visit's entry, source, identity and reconstruction anchor remain unchanged.
+    CompleteVisit,
 }
 
 /// Stable identity of one durable step. Retries reuse it; an authored repeated battle
@@ -96,7 +105,8 @@ pub struct SceneState {
     pub checkpoint: Option<SceneCheckpoint>,
     pub reservation: Option<SceneReservation>,
     /// Explicit durable field-entry state. Absence means no entry was recorded, never
-    /// evidence of a zero initializer. Existing scene operations preserve it unchanged.
+    /// evidence of a zero initializer. Only explicit visit lifecycle operations change it;
+    /// the ordinary scene operations preserve it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_visit: Option<crate::FieldVisitV1>,
 }
@@ -175,8 +185,12 @@ fn validate_operation(operation: &SceneOperation, result: &[u8]) -> Result<()> {
     if operation.instance == [0; 32] || operation.ordinal > MAX_BATTLES || operation.attempt > MAX_ATTEMPTS {
         return Err(invalid("invalid scene instance or operation boundary"));
     }
-    if operation.kind == SceneOperationKind::BattleOutcome && (operation.ordinal != 0 || operation.attempt != 0) {
-        return Err(invalid("ordinary battle outcomes have one terminal operation per instance"));
+    if matches!(operation.kind, SceneOperationKind::BattleOutcome | SceneOperationKind::AttachVisit | SceneOperationKind::CompleteVisit)
+        && (operation.ordinal != 0 || operation.attempt != 0) {
+        return Err(invalid("ordinary outcomes and idle visit operations require boundary zero"));
+    }
+    if operation.kind == SceneOperationKind::AdvanceVisit && (operation.ordinal == 0 || operation.attempt != 0) {
+        return Err(invalid("advancing a visit requires a positive accepted window prefix and attempt zero"));
     }
     if result.len() > MAX_BLOB_BYTES { return Err(invalid("batch selected result exceeds the blob limit")); }
     Ok(())
@@ -326,6 +340,59 @@ fn roster_of(states: &[SceneState], instance: [u8; 32], ordinal: u32, attempt: u
     Ok(roster)
 }
 
+/// A narrow same-field noncombat lifecycle. The adapter binds the checkpoint source/replay
+/// to the visit's field and reconstruction profile; those are distinct opaque identities.
+/// No generic checkpoint operation may use this exemption to edit a visit.
+fn validate_visit_transition(operation: &SceneOperation, before: &[SceneState], after: &[SceneState]) -> Result<Option<usize>> {
+    let ([old], [new]) = (before, after) else { return Err(invalid("visit scene operations require a singleton owner")); };
+    if operation.attempt != 0 || old.reservation.is_some() || new.reservation.is_some()
+        || (if operation.kind == SceneOperationKind::AdvanceVisit { operation.ordinal == 0 } else { operation.ordinal != 0 }) {
+        return Err(invalid("visit scene operations require an unreserved noncombat owner"));
+    }
+    let prior = old.field_visit.as_ref().ok_or_else(|| invalid("visit scene has no existing visit"))?;
+    let next = new.field_visit.as_ref().ok_or_else(|| invalid("visit scene cannot discard its visit"))?;
+    if prior.revision.checked_add(1) != Some(next.revision)
+        || prior.visit_id != next.visit_id || prior.field != next.field || prior.source_identity != next.source_identity
+        || prior.entry != next.entry || prior.anchor != next.anchor {
+        return Err(invalid("visit scene must retain its identity, source, entry and anchor and advance exactly one revision"));
+    }
+    if prior.scratch_known_masks.iter().zip(&next.scratch_known_masks).any(|(old, new)| old & !new != 0) {
+        return Err(invalid("visit scene cannot forget known scratch bits"));
+    }
+    let checkpoint = match operation.kind {
+        SceneOperationKind::AttachVisit => {
+            if old.checkpoint.is_some() || old.pair != new.pair
+                || prior.scratch_values != next.scratch_values || prior.scratch_known_masks != next.scratch_known_masks {
+                return Err(invalid("attaching a visit must preserve its idle progress pair and scratch exactly"));
+            }
+            new.checkpoint.as_ref().ok_or_else(|| invalid("attached visit has no checkpoint"))?
+        }
+        SceneOperationKind::AdvanceVisit => {
+            let previous = old.checkpoint.as_ref().ok_or_else(|| invalid("visit advance has no attached checkpoint"))?;
+            let checkpoint = new.checkpoint.as_ref().ok_or_else(|| invalid("visit advance cannot clear its checkpoint"))?;
+            if old.pair != new.pair || prior.scratch_values != next.scratch_values || prior.scratch_known_masks != next.scratch_known_masks
+                || !same_original(previous, checkpoint) || previous.phase != checkpoint.phase
+                || previous.consumed_battles != checkpoint.consumed_battles || previous.replay == checkpoint.replay {
+                return Err(invalid("visit advance may change only its replay payload and visit revision"));
+            }
+            previous
+        }
+        SceneOperationKind::CompleteVisit => {
+            if new.checkpoint.is_some() { return Err(invalid("completing a visit must clear its checkpoint")); }
+            old.checkpoint.as_ref().ok_or_else(|| invalid("visit completion has no attached checkpoint"))?
+        }
+        _ => return Err(invalid("operation cannot change a field visit")),
+    };
+    if checkpoint.instance != operation.instance || checkpoint.source_hash == [0; 32]
+        || checkpoint.phase != (ScenePhase::Resume { segment: 0 }) || checkpoint.consumed_battles != 0
+        || checkpoint.original_story != old.pair.story.blob
+        || old.pair.character.as_ref().is_none_or(|character| checkpoint.original_gil != character.gil) {
+        return Err(invalid("visit scene checkpoint must identify this noncombat instance and its exact original progress"));
+    }
+    // validate_states already checked both exact checkpoint/visit links, including None.
+    Ok(Some(0))
+}
+
 /// Check visible transitions independently of disk. The complete old roster is checked
 /// separately against the private committed roster before an after-image is built.
 fn validate_transition(operation: &SceneOperation, before: &[SceneState], after: &[SceneState]) -> Result<Option<usize>> {
@@ -333,6 +400,9 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
     validate_states(after)?;
     if before.len() != after.len() || before.iter().zip(after).any(|(a, b)| identity(a) != identity(b)) {
         return Err(invalid("batch after-images must have the same accounts and order"));
+    }
+    if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
+        return validate_visit_transition(operation, before, after);
     }
     if before.iter().zip(after).any(|(a, b)| a.field_visit != b.field_visit) {
         return Err(invalid("existing scene operations must preserve field visits unchanged"));
@@ -452,7 +522,8 @@ fn validate_transition(operation: &SceneOperation, before: &[SceneState], after:
                 }
             }
         }
-        SceneOperationKind::ContinueLanding | SceneOperationKind::Complete | SceneOperationKind::BattleOutcome => return Err(invalid("invalid scene operation transition")),
+        SceneOperationKind::ContinueLanding | SceneOperationKind::Complete | SceneOperationKind::BattleOutcome
+            | SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit => return Err(invalid("invalid scene operation transition")),
     }
     Ok(Some(owner))
 }
@@ -600,7 +671,11 @@ impl Store {
             return Err(conflict("ordinary battle outcome cannot overlap an active scene continuation"));
         }
         let applied = receipt_status(&current, &receipt, &result)?;
-        if applied { self.ensure_scene_batch_format(&writer)?; }
+        if applied {
+            if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
+                self.ensure_field_visit_format(&writer)?;
+            } else { self.ensure_scene_batch_format(&writer)?; }
+        }
         Ok(applied)
     }
 
@@ -623,7 +698,9 @@ impl Store {
             return Err(conflict("ordinary battle outcome cannot overlap an active scene continuation"));
         }
         if receipt_status(&before, &receipt, &result)? {
-            self.ensure_scene_batch_format(&_writer)?;
+            if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
+                self.ensure_field_visit_format(&_writer)?;
+            } else { self.ensure_scene_batch_format(&_writer)?; }
             return Ok(SceneBatchCommitted { commit: SceneCommit::AlreadyApplied,
                 current: before.iter().zip(&accounts).map(|(image, account)| image.state(*account, game)).collect() });
         }
@@ -654,12 +731,14 @@ impl Store {
                 SceneOperationKind::PrepareBattle => new.reservation.as_ref().map(|r| r.slot),
                 SceneOperationKind::ResolveBattle => old.character.as_ref().and_then(|r| r.reservation.as_ref()).map(|r| r.slot),
                 SceneOperationKind::Finish => Some(old.character.as_ref().and_then(|r| r.reservation.as_ref()).map_or(0, |r| r.slot)),
-                SceneOperationKind::ContinueLanding | SceneOperationKind::Complete => Some(0),
+                SceneOperationKind::ContinueLanding | SceneOperationKind::Complete
+                    | SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit => Some(0),
                 SceneOperationKind::BattleOutcome => Some(index as u16),
             }.ok_or_else(|| invalid("missing participant slot"))?;
             character.progress = new.pair.character.clone().ok_or_else(|| invalid("missing character after-image"))?;
             character.checkpoint = new.checkpoint.clone();
             character.reservation = new.reservation.clone();
+            character.field_visit = new.field_visit.clone();
             character.scene_roster = next_roster.clone();
             character.batch_receipts.insert(receipt.clone(), BatchReceipt { result: result.clone(), members: accounts.len() as u16, slot });
             character.stamp();
@@ -674,7 +753,9 @@ impl Store {
         let path = self.root.join(INTENT_FILE);
         let bytes = encoded(&path, &file, MAX_BATCH_INTENT_BYTES)?;
         hook(0)?;
-        self.ensure_scene_batch_format(&_writer)?;
+        if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
+            self.ensure_field_visit_format(&_writer)?;
+        } else { self.ensure_scene_batch_format(&_writer)?; }
         self.transaction_poisoned.store(true, Ordering::Release);
         fsio::atomic_write(&path, &bytes)?;
         hook(1)?;
@@ -710,7 +791,8 @@ impl Store {
                 SceneOperationKind::PrepareBattle => new.reservation.as_ref().map(|r| r.slot),
                 SceneOperationKind::ResolveBattle => old.reservation.as_ref().map(|r| r.slot),
                 SceneOperationKind::Finish => Some(old.reservation.as_ref().map_or(0, |r| r.slot)),
-                SceneOperationKind::ContinueLanding | SceneOperationKind::Complete => Some(0),
+                SceneOperationKind::ContinueLanding | SceneOperationKind::Complete
+                    | SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit => Some(0),
                 SceneOperationKind::BattleOutcome => Some(index as u16),
             }.ok_or_else(|| invalid("batch receipt has no slot"))?;
             let added = BatchReceipt { result: intent.result.clone(), members: intent.rows.len() as u16, slot };

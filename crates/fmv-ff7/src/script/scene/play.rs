@@ -494,9 +494,16 @@ impl ScenePlay {
     /// scratch, persistent story, party state, or resources, even temporarily. Field visit
     /// persistence and admission remain the caller's responsibility.
     pub fn with_scratch(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32, resources: SceneResources, scratch: &FieldScratch) -> Result<Self, SceneError> {
+        Self::with_scratch_and_limits(field, def, story, seed, resources, scratch, Limits::default())
+    }
+
+    /// Checked visit execution with an explicit host budget. The host must bind its limit
+    /// policy to durable replay and keep it consistent with the accepted transcript bound.
+    pub fn with_scratch_and_limits(field: &FieldFile, def: &SceneDef, story: &StoryState, seed: u32,
+        resources: SceneResources, scratch: &FieldScratch, limits: Limits) -> Result<Self, SceneError> {
         Self::check_scratch_inputs(story, def)?;
         let script = FieldScript::from_field(field).map_err(|e| SceneError::Script(e.to_string()))?;
-        Self::with_script(field, def, story, seed, Limits::default(), &script, resources, Some(scratch))
+        Self::with_script(field, def, story, seed, limits, &script, resources, Some(scratch))
     }
 
     /// Build a scene from a replacement script section and the original field's walkmesh.

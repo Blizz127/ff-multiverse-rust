@@ -132,6 +132,7 @@ fn full_story_round_trip(native_party: bool) {
         let prepare = SceneBatchJob {
             operation: SceneOperation { instance: INSTANCE, ordinal, attempt: 0, kind: SceneOperationKind::PrepareBattle },
             members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember {
+                next_visit: None,
                 expected: expected.clone(), next_story: (slot == 0).then(|| latest.clone()), next_gil: None,
                 checkpoint: (slot == 0).then(|| prepared.clone()), battle: None,
                 reservation: Some(SceneReservation { instance: INSTANCE, ordinal, attempt: 0, slot: slot as u16 }),
@@ -152,6 +153,7 @@ fn full_story_round_trip(native_party: bool) {
         let resolve = SceneBatchJob {
             operation: SceneOperation { kind: SceneOperationKind::ResolveBattle, ..prepare.operation },
             members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember {
+                next_visit: None,
                 expected: expected.clone(), next_story: None, next_gil: None,
                 checkpoint: (slot == 0).then(|| resumed.clone()), reservation: expected.reservation.clone(),
                 battle: Some(SceneBattleSettlement { character: slot as u8, consumed_items: vec![], final_limit: None,
@@ -193,7 +195,7 @@ fn full_story_round_trip(native_party: bool) {
     let landed = checkpoint(&original, &payload, ScenePhase::Landing { destination: serde_json::to_vec(&landing).unwrap() }, 3);
     fits(&landed, &payload);
     let finish = SceneBatchJob { operation: SceneOperation { instance: INSTANCE, ordinal: 3, attempt: 0, kind: SceneOperationKind::Finish },
-        members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember { expected: expected.clone(),
+        members: before.iter().enumerate().map(|(slot, expected)| SceneBatchMember { next_visit: None, expected: expected.clone(),
             next_story: None, next_gil: None, checkpoint: (slot == 0).then(|| landed.clone()), reservation: None, battle: None }).collect() };
     persist_scene_batch(&store, GameId::Fixture, None, &finish, 20).unwrap();
     drop(store);

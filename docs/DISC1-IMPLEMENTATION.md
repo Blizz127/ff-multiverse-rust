@@ -42,7 +42,7 @@ not establish complete original-engine visual or timing parity.
 | Battle system | Deterministic subset; bridge fights carry HP/MP, limits and persistent statuses | Remaining enemy behavior, statuses, summons, limits and original progression fidelity |
 | Persistent gameplay | Character progress, inventory and durable scene transactions | Ordinary field HP/MP, canon party state, equipment/materia, shops and remaining scripted resources |
 | World traversal, minigames, movies | No complete end-to-end subsystem | Required Disc 1 modes and transitions |
-| Graphics | Scrolling camera, optional persisted FXAA and 2x scene rendering; authored backgrounds/fades/shake, offsets and palettes; calibrated PC clipping | Original-game comparisons, native scheduling and broader field/effect coverage |
+| Graphics | Scrolling camera, optional persisted FXAA and 2x scene rendering; new F5/L3 field settings panel exposes existing FXAA, native/2x and restore-defaults controls; authored backgrounds/fades/shake, offsets and palettes; calibrated PC clipping | Panel client validation is pending; no new rendering algorithm this wave. Original-game comparisons, native scheduling and broader field/effect coverage remain |
 
 The exact reactor route currently skips the optional Restore materia pickup. Its authored
 `SMTRA(53,0)` requires a materia/AP inventory addition and a bank 13:31 result alongside moment
@@ -224,8 +224,9 @@ refuses temporary persistent, party, gil or knowledge changes even if later rest
 `FieldVisitSaveJob` freezes timestamps and both images once, then submits the exact operation
 through the real saver FIFO. Its acknowledgment returns the current full state on duplicates,
 preserving later rewards. Only completed idle operations are supported: battle/travel,
-active continuation metadata and unknown or skipped state effects refuse. Gameplay admission,
-anchor reconstruction and active-continuation transactions remain unimplemented.
+active continuation metadata and unknown or skipped state effects refuse. Active scenes use
+the separate staged batch path below; gameplay admission and anchor reconstruction remain
+unimplemented.
 
 The idle-bridge checkpoint passes 4,385 workspace tests across 108 targets, with no failures
 and 386 optional tests ignored. This includes 968 FF7 unit tests, 14 synthetic semantic
@@ -240,6 +241,38 @@ fixed the fixture while preserving unknown-read refusal. The final server rerun 
 all 542 tests. Workspace Clippy with all targets passes with only the three pre-existing
 audio-test, standing-animation and avatar-test warnings.
 
+The staged active bridge now supports a singleton owner in a same-field, noncombat scene.
+`AttachVisit` saves the original inputs and links a Resume-0 checkpoint without publishing
+speculative effects. Each `AdvanceVisit` durably records exactly one accepted window ACK,
+including plain windows, while retaining the original story, resources and scratch.
+`CompleteVisit` requires the stored prefix already to reach `Finished`; it atomically applies
+the checked effects and clears the checkpoint/link. The final ACK is saved separately before
+completion, so recovery needs no new answer. A zero-window scene needs no Advance.
+
+The private replay binds the original account/visit, story, gil, seed, accepted origin,
+source/profile, semantic scene definition and execution limits. Every replay boundary is
+checked again; arbitrary interpreter outputs are not accepted. The active host uses a bound
+128-window budget and reserves revisions for remaining ACKs and completion. Standalone idle
+writes still reject active metadata, and older batch operations cannot change a visit.
+Witness visits remain independent; this does not enable checked battles or travel.
+
+The active-visit wave's focused suites pass 560 server tests and 361 persistence tests.
+All three owned field-visit server tests pass against the owned Steam archive. Active Jessie
+coverage includes answers 2/3 at affection 0, 2 and 30, reopening after the first ACK and
+after the final ACK before Complete, and an exact retry after a later reward. These fixtures
+have the train lesson bit known set; the first-talk branch transfers to `rootmap` and remains
+outside this same-field bridge.
+
+The full workspace run passes 4,430 tests across 109 targets, with no failures and 388
+optional tests ignored. The client suite passes 1,515 tests. The graphics panel's explicit
+offscreen test also passes on llvmpipe; all four default/fallback images were inspected at
+320x240 and 1100x680, including the session-only save-failure notice. This is software-GPU
+coverage, not an Alienware window/controller acceptance run.
+Workspace Clippy with all targets passes with only the three existing audio-test,
+standing-animation and avatar-test warnings. After test-only lint cleanup, all eight visit
+storage tests, three owned field-visit tests and four graphics panel tests pass again; the
+four final panel images are byte-identical to the inspected images.
+
 The first visit write requires character envelope 4 and index compatibility 5. Opening or
 compacting an older store does not select that format. Explicit compatibility selection is
 also available for a future party-v4 writer; storage does not inspect an adapter's opaque
@@ -247,12 +280,13 @@ story bytes to infer it. Detached archives from index-5 stores use manifest 3, i
 party-only stores with no visit-bearing character. Snapshot copy limits distinguish the
 existing 4 MiB character-record bound from the 1 MiB ordinary-record bound.
 
-This is storage support, not a running field-visit lifecycle. Enter/Advance refuses active
-scene checkpoints/reservations, and existing scene batches cannot change a visit or orphan
-its continuation link. No server path creates these visits yet; login explicitly refuses
-visit-bearing snapshots until anchor reconstruction, runtime VM scratch injection, accepted entry
-and atomic active-continuation transitions are implemented. The train lesson remains
-unregistered, and existing accounts are not converted.
+This remains staged transaction support, not a running field-visit lifecycle. No production
+server path creates these visits; login explicitly refuses visit-bearing snapshots. Activation
+still needs accepted entry/trigger provenance, runtime scratch injection and reconstruction of
+actors, camera, background and audio. Scene profiles must establish supported paths within the
+128-window bound; receipt growth and safe compaction remain unresolved. Preserving opaque
+entry/anchor bytes does not prove they can be restored. The train lesson remains unregistered,
+and existing accounts are not converted.
 
 Storage checkpoint `075eb34`: the workspace run plus corrected-target reruns passed 4,180 tests;
 378 optional tests were ignored. The two initial failures were stale expectations:
