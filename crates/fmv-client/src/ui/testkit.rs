@@ -51,6 +51,9 @@ impl Offscreen {
         Some(Self { device, queue, gpu, format })
     }
 
+    /// The same texture eligibility cap the window supplies to its field view.
+    pub fn max_texture_dimension_2d(&self) -> u32 { self.device.limits().max_texture_dimension_2d }
+
     /// Render `scene` and then `overlay` into a `w` x `h` target; tightly packed RGBA8, top row
     /// first. Colours are not sRGB-converted (the target is plain `Rgba8Unorm`).
     pub fn render(&mut self, w: u32, h: u32, scene: &Scene<'_>, overlay: &DrawList) -> Vec<u8> {

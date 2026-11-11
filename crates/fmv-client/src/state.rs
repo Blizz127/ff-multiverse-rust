@@ -142,9 +142,9 @@ impl OwnPlayer {
         }
     }
 
-    /// While a durable scene holds input, its server snapshot is an authoritative placement,
-    /// including the facing and animation at final control handoff. Keep the movement sequence
-    /// and rate clock, but retire prediction/resync state and do not echo this placement back.
+    /// A held server snapshot or an accepted ordinary scene's trigger pose authoritatively
+    /// places the player, including facing and animation. Keep the movement sequence and rate
+    /// clock, but retire prediction/resync state and do not echo this placement back.
     fn adopt_held_pose(&mut self, pos: Pos, facing: f32, anim: AnimState) {
         self.pos = pos;
         self.facing = facing;
@@ -726,7 +726,12 @@ impl ClientState {
             // game and says what is owed back (see `crate::scene`).
             msg @ (ServerMsg::SceneStart { .. } | ServerMsg::SceneStep { .. } | ServerMsg::SceneEnded { .. } | ServerMsg::SceneRefused { .. }
                 | ServerMsg::SceneBattleStarted { .. } | ServerMsg::SceneBattleResumed { .. } | ServerMsg::SceneGameOver { .. }) => {
-                self.scene.on_message(&self.area.key, msg);
+                if let Some(origin) = self.scene.on_message_with_presentation_origin(&self.area.key, msg) {
+                    // A move can cross the trigger and predict past it before the scene arrives.
+                    // Its accepted origin stops only the owner, after local source validation;
+                    // an EntityUpdate alone would defer this correction while movement is fresh.
+                    self.own.adopt_held_pose(origin.pos, origin.facing, AnimState::Idle);
+                }
                 if let Some(reason) = self.scene.failure() { return Some(reason.to_string()); }
             }
             // The countdown the server runs for our story (the server's word, never ends the session): the HUD draws
@@ -1778,3 +1783,6 @@ mod tests {
 
 #[cfg(test)]
 mod story_pending_tests;
+
+#[cfg(test)]
+mod presentation_origin_tests;

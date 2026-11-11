@@ -74,7 +74,7 @@ fn checkpoint(original: &[u8], payload: &Payload, phase: ScenePhase, consumed_ba
 fn frame(checkpoint: &SceneCheckpoint, payload: &Payload) -> Result<Vec<u8>, fmv_protocol::ProtoError> {
     fmv_protocol::encode(&ServerMsg::SceneStart { run: SceneRunId(u64::MAX), scene: checkpoint.scene_key.clone(),
         seed: checkpoint.seed, progress: checkpoint.original_story.clone(), gil: checkpoint.original_gil,
-        replay: Some(payload.replay.clone()), owner: EntityId(u64::MAX), you: SceneRole::Watcher,
+        replay: Some(payload.replay.clone()), presentation_origin: None, owner: EntityId(u64::MAX), you: SceneRole::Watcher,
         participants: (0..fmv_persist::MAX_SCENE_BATCH_ACCOUNTS).map(|slot| SceneParticipant {
             entity: EntityId(u64::MAX - slot as u64), spot: slot as u8,
         }).collect() })

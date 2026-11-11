@@ -1017,6 +1017,11 @@ impl App {
         self.close_graphics_panel();
         self.talk.close();
         self.view = crate::field_view(self.ff7.as_deref(), &self.session);
+        if let Some(renderer) = self.renderer.as_ref() {
+            if let Err(error) = self.view.set_background_texture_limit(renderer.max_texture_dimension_2d()) {
+                eprintln!("field background texture eligibility: {error}");
+            }
+        }
         // A new field: the view is put on the player at once, not scrolled there from the last field's place.
         self.camera.snap();
         self.base_title = base_title(&self.session.info);
@@ -1028,6 +1033,9 @@ impl App {
     /// and hands them over when the player joins). The window gets the game's title on the next
     /// tick.
     pub(crate) fn adopt_surface(&mut self, window: Arc<Window>, renderer: Renderer) {
+        if let Err(error) = self.view.set_background_texture_limit(renderer.max_texture_dimension_2d()) {
+            eprintln!("field background texture eligibility: {error}");
+        }
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.last_tick = Instant::now();
@@ -1312,7 +1320,14 @@ impl App {
                 label_anchor(built.as_ref(), view, draw.own_who, subject, at)
             }
         };
-        let hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
+        let mut hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
+        if let Some(story) = story {
+            // Cast names replace the hidden field NPC labels and move with the drawn actors.
+            // Existing player labels follow them in draw order, so a player's name stays on top.
+            let mut labels = scene::cast_labels(story, built.as_ref(), view);
+            labels.append(&mut hud_input.labels);
+            hud_input.labels = labels;
+        }
         hud::draw_hud_with(&hud_input, hud::progress_line(state, render_t).as_ref(), vw, vh, &mut overlay);
         crate::ui::countdown::draw(&state.countdown, vw, vh, self.session.info.fixture, now, &mut overlay);
         self.talk.draw(vw, vh, now, &mut overlay);
@@ -1493,6 +1508,9 @@ impl ApplicationHandler for App {
             Ok(mut r) => {
                 r.set_graphics(std::mem::take(&mut self.graphics));
                 eprintln!("renderer: {}", r.describe());
+                if let Err(error) = self.view.set_background_texture_limit(r.max_texture_dimension_2d()) {
+                    eprintln!("field background texture eligibility: {error}");
+                }
                 self.renderer = Some(r);
             }
             Err(e) => return self.fail(el, format!("cannot start the renderer: {e}")),

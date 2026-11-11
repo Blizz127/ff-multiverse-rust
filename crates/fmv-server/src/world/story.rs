@@ -43,6 +43,7 @@ use fmv_protocol::{ServerMsg, StoryAdvance};
 use super::{is_full, World};
 
 mod save;
+mod presentation;
 pub(super) use save::{StoryFollowup, StorySaves};
 
 /// What a battle that a story point started does when it is WON: the step of the point, for the player that reached
@@ -181,11 +182,15 @@ impl World {
             if self.start_point_scene(entity, point, &step, now, on_entry, Some(formation)) {
                 return Reached::Held;
             }
+            // A source-bound presentation must not disappear into the battle fallback if
+            // its accepted origin cannot be reconstructed. Walking preflights that origin.
+            if self.point_requires_presentation_origin(entity, &step) { return Reached::Nothing; }
             return if self.start_story_battle(entity, point, formation, clock) { Reached::Applied } else { Reached::Nothing };
         }
         if self.start_point_scene(entity, point, &step, now, on_entry, None) {
             return Reached::Held;
         }
+        if self.point_requires_presentation_origin(entity, &step) { return Reached::Nothing; }
         if self.apply_story_step(entity, point, step) { Reached::Held } else { Reached::Applied }
     }
 

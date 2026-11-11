@@ -81,7 +81,7 @@ fn me(pos: Pos) -> EntitySnapshot {
 }
 
 fn start_msg(you: SceneRole) -> ServerMsg {
-    ServerMsg::SceneStart {
+    ServerMsg::SceneStart { presentation_origin: None,
         run: SceneRunId(1),
         scene: SCENE_ID.into(),
         seed: 5,

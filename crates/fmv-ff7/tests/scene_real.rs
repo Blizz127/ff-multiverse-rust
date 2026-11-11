@@ -822,11 +822,11 @@ fn every_story_entry_stands_on_the_floor_the_fields_ways_out_are_on() {
 /// an arrival scene is offered at moments no other arrival scene of its field is (two could not both start).
 #[test]
 fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
-    use fmv_ff7::script::scene::{scenes, BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID};
+    use fmv_ff7::script::scene::{scenes, BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID, STATION_GUARD_SCENE_ID};
     let all = scenes();
-    assert_eq!(all.len(), 18);
+    assert_eq!(all.len(), 19);
     assert_eq!(all[14..].iter().map(|scene| scene.id.as_str()).collect::<Vec<_>>(),
-        [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID], "door and train append after the shipped bridge and cargo slots");
+        [BRIDGE_SCENE_ID, CARGO_TRAIN_SCENE_ID, CARGO_DOOR_SCENE_ID, TRAIN_SCENE_ID, STATION_GUARD_SCENE_ID], "station guards append after the shipped bridge, cargo, door and train slots");
     for (i, a) in all.iter().enumerate() {
         assert!(all.iter().skip(i + 1).all(|b| b.id != a.id), "{}", a.id);
         assert_eq!(a.starts_on_arrival(), a.trigger.talk_radius == 0 && !a.is_point_cutscene() && a.line_trigger().is_none());
@@ -857,7 +857,8 @@ fn the_offered_scenes_are_told_apart_and_start_one_way_each() {
     for s in all.iter().filter(|s| s.starts_on_arrival()) {
         assert!(!fmv_ff7::is_reviewed_field(&s.field), "{}: an arrival scene's field is not a reviewed field", s.id);
     }
-    assert!(fmv_ff7::script::scene::is_scene_field("MD8_1") && !fmv_ff7::script::scene::is_scene_field("md1stin"));
+    assert!(fmv_ff7::script::scene::is_scene_field("MD8_1") && fmv_ff7::script::scene::is_scene_field("md1stin"));
+    assert!(!fmv_ff7::script::scene::is_scene_field("not-a-field"));
 }
 
 #[test]

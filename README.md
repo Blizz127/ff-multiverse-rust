@@ -87,7 +87,7 @@ for example) are announced with every snapshot. See "Walking between fields" bel
 
 Not done yet: field scripts as a whole (what is carried out is the exits a line's walk-on script decides, the
 ladders and jumps of the lines, and the story steps the scripts make where the server can see them: a walk, a press of
-OK, a talk, a scripted battle, see "Walking between fields"; no cutscenes), NPC animation and conversations beyond the
+OK, a talk, a scripted battle and registered story scenes, see "Walking between fields" and "Story scenes"), NPC animation and conversations beyond the
 story steps, the field sounds that no script names (footsteps, and the sounds of cutscenes and of talks; the music, a battle's
 sounds and what the fields' scripts play by themselves and for a ladder, a jump or the lift are done, see "Sound"). The
 window's camera scrolls as FF7's does (see "The field camera" under Quickstart). The increment-by-increment
@@ -309,7 +309,8 @@ pressed in) switches the field camera between FF7's scrolling screen and the who
 player names (over the head of a model, or the marker), your party (leader starred) in the top
 right, the area name (`FF7 md1stin`), the connection status (players, round-trip time) and a
 pending invite; a FIXTURE area wears the label `FIXTURE (synthetic, not FF7)`. The window title
-still shows your party size and a pending invite.
+still shows your party size and a pending invite. Visible story cast also keep overhead names such as
+Cloud, Barret and Jessie; these follow their drawn heads and replace duplicate area NPC labels.
 
 *The field camera* (`fmv-client`, `src/camera.rs`). FF7 never shows a whole field at once: its screen is a 320x240 window
 into the background that follows the player and stops at the field's **camera range** (the triggers section; a field whose
@@ -430,9 +431,8 @@ overview, and the battle before and after from one scene at one instant (29 062 
 them on the two players' bodies and none anywhere else: the canon pair, the enemies and every weapon are bit for bit as
 they were).
 
-*Faces and scale of the field models (measured 2026-11-09).* Every character of `char.lgp`, the cast and the
-three placeholder bodies alike, gets its face from three decals on the head bone: two eye quads (the same eye
-twice) and a mouth. The data shifts a decal's texture coordinates by whole numbers (the right eye's `u` runs 1.00 to
+*Faces and scale of the field models (measured 2026-11-09).* Original humanoid field models use small head
+decals for their eyes and mouths. The data shifts a decal's texture coordinates by whole numbers (the right eye's `u` runs 1.00 to
 1.97, a mouth's `v` 5.00 to 5.94), which the game's wrap-around addressing ignores; this client's sampler
 clamps (so a decal at the edge of its texture does not blend with the opposite edge), and a clamped coordinate past
 1 reads the transparent edge, so **the right eye and the mouth of every model were not drawn: one eye, Cloud's included**. The
@@ -451,6 +451,8 @@ colour (a tanned beach extra), kept by the colour look; it is not the tint. The 
 `offscreen_field_lineup_bodies_beside_cloud_and_an_npc` (Cloud, the field's character and the three bodies at one
 spot, front and three-quarter, their own colours over the player look, orange and blue) and the numbers
 `real_looks_survey_heights_parts_and_faces`; `fmv_ff7::playable` has the table.
+Textured clothing on canonical field replacements now uses ordinary depth, as the player bodies already do;
+head textures retain their face-overlay treatment. The original archive's material flags are preserved.
 
 The picture of an FF7 field is drawn **tile by tile with a depth
 per tile**, in the same depth-tested pass as the models, as the game does it: a layer-2 tile is
@@ -465,6 +467,11 @@ object is one value for the whole tile, so an object that reaches far in depth u
 approximation; see `crates/fmv-client/src/avatar/mod.rs` for the measured numbers and the remaining
 limits. A field with nothing in front of the characters, or a window with no models, shows the
 flat picture as before.
+Palette index 0 respects each palette page's transparency flag, preserving opaque details that previously
+became holes or black speckles in reactor backgrounds. A raw palette colour word of zero also uses that page's
+entry-0 RGB, matching Makou Reactor's PC palette decoding; other indices stay opaque, and explicit black (`0x8000`)
+stays black. The station regression restores 1,551 visible pixels while preserving genuine transparent holes.
+Both corrections apply to the foreground depth tiles as well as the flat background.
 
 *In a battle.* **B** asks the server for a debug battle (refused unless it runs with
 `--debug-encounters`; random encounters start battles by themselves in a field that has an
@@ -478,6 +485,9 @@ party member runs up, swings, and hops back (attack), gathers a spell with its c
 its targets: see "Battle effects" below), holds its guard, flinches when it is hit and
 falls when it is beaten, and rejoices when the battle is won; an enemy runs up and plays the clip
 `scene.bin` names for the attack it uses, flinches with its hurt clip and, when beaten, fades away.
+Bodies with weapons now sample both animation tracks at the same authored frame, keeping weapons aligned
+with their hands during idle, attacks and falls. These rigs use the authored pose cadence instead of independently
+interpolating body and weapon between frames.
 The presentation is only that: **nothing waits on an animation.** The gauges, the menu and the
 command that is applied follow the battle at once; the numbers float up when the blow lands (never
 more than 0.6 s after the server said it) and **so do the HP and MP in the party panel, the HP of the enemies' bars and
@@ -1495,7 +1505,7 @@ the linked arrival and receive the final position before release; their story pr
 Explicit initial stories, exact ordinary story writes and continuation transactions raise the account-store format
 fence to version 4, so earlier servers (including the previous version-3 reader) refuse to open that store.
 Detached archives from these stores use manifest version 2 so older restore tools also refuse them; new readers
-retain support for older archives. Use matching protocol-21 client and server builds.
+retain support for older archives. Use matching protocol-22 client and server builds.
 The extended-save switch is off by default; these
 implementation checks use temporary stores and do not change the live preview store.
 Continuation replay contract 3 includes authored model offsets, palette operations and corrected byte extraction,
@@ -1604,6 +1614,10 @@ talk), and the server applies each point's step, read statically from the field'
 conversation at a point, that conversation is now played too, as a **cutscene** (`SceneDef::presents`: the moment the
 point moves the story to, or `SceneDef::presents_bit` for an existing saved flag):
 
+* **`ff7/md1stin/station-guards`** (the station, moment 1, requires `--story-extended-save`): crossing the original guard
+  trigger plays the two guards' scripted approach before battle 300. Your character stays at the accepted crossing
+  position, and the existing battle completion and save path handles the result. This is the guard approach only:
+  the earlier opening/movie sequence and the scripted victory tail remain unfinished.
 * **`ff7/md1_1/team-talk`** (the reactor's gate, the point to 7): Biggs, Jessie, Cloud and Barret, twelve windows.
 * **`ff7/md1_2/run-ahead`**: Biggs, Jessie and Wedge follow their own timed paths through the approach, then disappear.
   This is a silent entry scene before the existing step to 8; it adds no dialogue or saved flags. Their NPC slots remain
@@ -1885,7 +1899,7 @@ on a real store (the whole state directory is byte for byte what it was before t
 `scripts/scene-smoke.sh` over real processes. `mds7pb_1` is not one of `REVIEWED_FIELDS` either, so its story points are
 withheld anyway: that is a second layer, not the first.
 
-### The wire (protocol v21)
+### The wire (protocol v22)
 
 New in `fmv_protocol::scene`: `ClientMsg::{SceneStep, SceneEnd, SceneLeave, SceneDebugPreview}`,
 `ServerMsg::{SceneStart, SceneStep, SceneEnded, SceneRefused}`, `SceneRunId`, `SceneRole`, `SceneParticipant`,
@@ -1908,6 +1922,11 @@ The nonzero token identifies a particular durable hold. The client installs the 
 acknowledges it on the same ordered connection; the server waits for that acknowledgment and durable storage before
 releasing control. A stale token, snapshot, area transfer or unrelated scene completion cannot release the hold.
 Battle commands remain usable while a story battle holds field controls. Matching clients and servers are required.
+
+Protocol 22 adds the required nullable `SceneStart.presentation_origin`. An ordinary scene whose script reads the
+player position receives the server-accepted trigger pose; durable continuations retain their origin in `replay`.
+The two origin forms cannot be combined. The station guard approach uses this pose to preserve the player
+character and prevent a long movement step from skipping the original triangle trigger.
 
 ### Checking it
 
@@ -2095,7 +2114,7 @@ event's sound plays, and, when the run ends, `audio: field sounds played: 4 soun
 ## Mods (Echo-S, Cosmo Memory and Ninostyle)
 
 Community mods for 7th Heaven can be layered over your own FF7. **The accurate base game comes first and
-the mods are layers on top of it, each switched off on its own; all layers are ON by default when their files are
+the mods are layers on top of it, each switched off on its own; the archive layers below are ON by default when their files are
 found.** Whatever a layer lacks, the original plays, so nothing is silent or blank because a layer is on.
 
 | Layer | What it is | It replaces | Switch |
@@ -2108,10 +2127,20 @@ found.** Whatever a layer lacks, the original plays, so nothing is silent or bla
 
 The creator previews the selected body beside the form when the window has enough space; smaller windows retain the body picker.
 The model layer uses the Chibi base, L@zar0 and Efryt field folders and the default battle models. Equipment-dependent dynamic
-field weapons are not supported. The settings file accepts `"models": false`, and `FMV_MODS_MODELS=off` is also supported.
+field weapons are not supported. The default field style retains FF7's original proportions, using Chibi replacements when
+installed. The settings file accepts `"models": false`, and `FMV_MODS_MODELS=off` is also supported.
 
-Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"), not upscaled field backgrounds; there is no
-background layer.
+Cosmo Memory is a *sound* overhaul (its own `mod.xml`: "Complete sound overhaul"). Upscaled backgrounds use the separate trial below.
+
+**Optional 4× backgrounds (limited SYW trial).** Set `FMV_BACKGROUND_DIR` to a local pack root containing
+`field/nmkin_1/nmkin_1_00_00.png`, plus `nmkin_1_01_00.png`, `nmkin_1_02_00.png`, `nmkin_1_03_00.png` and
+`nmkin_1_15_00.png` in that same directory. All five must be static 1024 × 1024, 8-bit RGBA PNGs preserving the
+original source-page arrangement. The trial supports **`nmkin_1` only** and is off when the variable is unset;
+other fields retain native backgrounds. Only texture pixels change: native tile geometry, depth, animation selection,
+blending and camera scale remain in use. Missing or invalid pages, unsupported crops or allocation/GPU texture limits
+select the native background for the whole field frame, including its foreground depth tiles. A live palette change also
+selects native pixels until the original palette is restored. This is separate from the Graphics panel's scene resolution.
+The PNGs remain external owned assets and are never included in source or builds.
 
 **The files** are yours to fetch, onto each machine separately; the client only ever reads them (nothing is extracted, copied,
 written or sent, and they are never committed or put in a library). The audio and text archives in use are

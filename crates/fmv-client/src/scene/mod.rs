@@ -65,7 +65,7 @@ mod continuation_tests;
 
 pub use bot::{pick_probe, Act, SceneBot, SceneBotConfig, Senses};
 pub use client::{clean_id, SceneBackground, SceneClient};
-pub use draw::{camera_shot, cast_players, label_hidden, participant_label_hidden, place_witnesses, speaker_spot, visible_npcs};
+pub use draw::{camera_shot, cast_labels, cast_players, label_hidden, participant_label_hidden, place_witnesses, speaker_spot, visible_npcs};
 pub use keys::{route_key, SceneRoute};
 pub use player::{SceneCmd, SceneSound, SoundAction};
 pub use source::Ff7Scenes;

@@ -2127,7 +2127,8 @@ fn a_scene_is_data_and_can_be_played_with_another_cast() {
     assert_eq!(def.speaker_entity("Marlene"), None);
     assert_eq!(scene(PROOF_SCENE_ID).map(|s| s.id), Some(PROOF_SCENE_ID.to_string()));
     assert_eq!(scenes_in_field("MDS7PB_1").len(), 1);
-    assert!(scenes_in_field("md1stin").is_empty());
+    assert_eq!(scenes_in_field("md1stin").into_iter().map(|def| def.id).collect::<Vec<_>>(),
+        [STATION_GUARD_SCENE_ID.to_string()]);
     // the witness has a spot for the owner and for each of two watchers, all different
     assert_eq!(def.witness.len(), 3);
     // another cast keeps the script's entities and changes the actors that play them

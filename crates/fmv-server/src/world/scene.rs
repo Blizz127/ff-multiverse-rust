@@ -158,6 +158,12 @@ pub trait SceneHost: Send + Sync {
     /// Whether the source identity must capture the accepted trigger-crossing pose. Authored
     /// point scenes with their own cast placement do not inherit a mutable player position.
     fn requires_origin(&self, _scene: &str) -> bool { false }
+    /// An ordinary presentation reads an actor's accepted trigger pose. This is independent
+    /// of durable replay and never opts an ordinary cutscene into saving its own effects.
+    fn requires_presentation_origin(&self, _scene: &str) -> bool { false }
+    /// Validate that an ordinary presentation's accepted pose belongs to this field/source.
+    fn presentation_origin_valid(&self, _scene: &str, _field: &str, _progress: &[u8],
+        _origin: &fmv_protocol::SceneOrigin) -> bool { false }
     /// Reconstruct the exact accepted transcript to its next boundary. `None` starts a new
     /// replay and returns its source identity; an existing replay must match that identity.
     fn evaluate_continuation(&self, _scene: &str, _original_progress: &[u8], _seed: u32,
@@ -262,6 +268,8 @@ struct SceneRun {
     preview: bool,
     /// A cutscene's story point, whose step is applied when the run ends (`World::start_point_scene`). `None` for every other run.
     then: Option<PointThen>,
+    /// Accepted ordinary-presentation pose, distinct from a durable replay origin.
+    presentation_origin: Option<fmv_protocol::SceneOrigin>,
 }
 
 /// What a cutscene run holds back until it ends: the story point whose step it presents.
@@ -308,6 +316,22 @@ pub(super) struct SceneWorld {
     pub(super) storage_failed: bool,
     /// The trigger NPCs asked of the host, by `(scene index, progression)`: the host decodes game files to answer.
     triggers: BTreeMap<(usize, Vec<u8>), Option<TriggerInfo>>,
+}
+
+impl SceneWorld {
+    /// Read-only source access for the world's movement preflight.
+    pub(super) fn host(&self) -> Option<&dyn SceneHost> { self.host.as_deref() }
+
+    /// Whether the configured registry contains this source in this field.
+    pub(super) fn contains(&self, scene: &str, field: &str) -> bool {
+        self.list.iter().any(|info| info.id == scene && info.field == field)
+    }
+
+    /// Fields without origin-bound presentations keep the ordinary movement path.
+    pub(super) fn requires_presentation_origin_in(&self, field: &str) -> bool {
+        self.host().is_some_and(|host| self.list.iter().any(|info|
+            info.field == field && host.requires_presentation_origin(&info.id)))
+    }
 }
 
 /// The cache of trigger NPCs holds at most this many entries (a progression is a handful of bytes, but a client chooses them).
@@ -463,7 +487,7 @@ impl World {
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
-        let record = SceneRun {
+        let record = SceneRun { presentation_origin: None,
             scene: info.id.clone(),
             owner: entity,
             watchers,
@@ -496,7 +520,7 @@ impl World {
         let watchers = self.watchers_for(entity, player.account, player.snapshot.pos);
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
-        let record = SceneRun { scene, owner: entity, watchers,
+        let record = SceneRun { presentation_origin: None, scene, owner: entity, watchers,
             seed: run.0.wrapping_mul(0x9E37_79B9) as u32, progress: player.progression.clone(),
             gil: player.progress.map_or(0, |progress| progress.gil), answers: Vec::new(), steps: 0,
             started: now, last_activity: now, writes_story: true, preview: false, then: None };
@@ -523,27 +547,37 @@ impl World {
         let Some(host) = self.scenes.host.as_ref() else { return false };
         let Some(p) = self.players.get(&entity) else { return false };
         let Some(scene) = host.victory_scene(&p.area, &before, &step.progress, formation) else { return false };
+        // Origin-dependent victory tails remain gated until battle handoff retains their
+        // original pose and independently running actors after authored control release.
+        if host.requires_presentation_origin(&scene) { return false; }
         self.start_cutscene(entity, scene, before, now, None)
     }
 
     fn start_cutscene(&mut self, entity: EntityId, scene: String, before: Vec<u8>, now: Instant, then: Option<PointThen>) -> bool {
-        let (account, pos) = {
+        let (account, pos, field, facing) = {
             let Some(p) = self.players.get(&entity) else { return false };
             if p.preview.is_some() || p.scene.is_some() || p.battle.is_some() || p.transit.is_some()
                 || (p.story_pending.is_some() && !self.ordinary_story_resuming(entity)) {
                 return false;
             }
-            (p.account, p.snapshot.pos)
+            (p.account, p.snapshot.pos, p.area.clone(), p.snapshot.facing)
         };
         if self.account_in_battle(account) { return false; }
-        if !self.scenes.list.iter().any(|s| s.id == scene) {
+        if !self.scenes.list.iter().any(|s| s.id == scene && s.field == field) {
             return false;
         }
+        let Some(host) = self.scenes.host.as_ref() else { return false; };
+        let presentation_origin = if host.requires_presentation_origin(&scene) {
+            let origin = fmv_protocol::SceneOrigin { pos, facing, triangle: None };
+            if origin.validate().is_err() || !host.presentation_origin_valid(&scene, &field, &before, &origin) { return false; }
+            Some(origin)
+        } else { None };
         let watchers = self.watchers_for(entity, account, pos);
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
         let record = SceneRun {
+            presentation_origin,
             scene,
             owner: entity,
             watchers,
@@ -558,7 +592,29 @@ impl World {
             preview: false,
             then,
         };
-        self.start_run(run, record, &mut Vec::new());
+        if record.presentation_origin.is_some() {
+            // Publish the accepted stopped pose before either participant starts the
+            // presentation. SceneStart also lets the owner retire in-flight prediction;
+            // watchers need this snapshot for the owner's ordinary, unscripted body.
+            let snapshot = self.players.get_mut(&entity).map(|player| {
+                player.snapshot.anim = fmv_core::AnimState::Idle;
+                player.dirty = true;
+                player.snapshot.clone()
+            });
+            let mut failed = Vec::new();
+            if let Some(snapshot) = snapshot {
+                let msg = ServerMsg::EntityUpdate { tick: self.tick, entities: vec![snapshot] };
+                if let Some(instance) = self.instances.instance_of(account) {
+                    self.tell_instance(instance, Arc::new(msg), &mut failed);
+                } else {
+                    self.send_to(entity, msg, &mut failed);
+                }
+            }
+            self.start_run(run, record, &mut failed);
+            self.drop_failed(failed);
+        } else {
+            self.start_run(run, record, &mut Vec::new());
+        }
         true
     }
 
@@ -646,6 +702,7 @@ impl World {
                 progress: record.progress.clone(),
                 gil: record.gil,
                 replay: self.scenes.continuations.get(&run).map(|c| c.payload.replay.clone()),
+                presentation_origin: record.presentation_origin,
                 owner: record.owner,
                 participants: participants.clone(),
                 you: role,
@@ -1210,7 +1267,7 @@ impl World {
         let run = SceneRunId(self.scenes.next_run.max(1));
         self.scenes.next_run = run.0.saturating_add(1);
         let seed = u32::try_from(run.0.wrapping_mul(0x9E37_79B9) & 0xFFFF_FFFF).unwrap_or(1);
-        let record = SceneRun { scene: info.id, owner: entity, watchers: vec![], seed, progress,
+        let record = SceneRun { presentation_origin: None, scene: info.id, owner: entity, watchers: vec![], seed, progress,
             gil: player.progress.map_or(0, |p| p.gil), answers: vec![], steps: 0,
             started: now, last_activity: now, writes_story: true, preview: false, then: None };
         self.start_run(run, record, &mut Vec::new());

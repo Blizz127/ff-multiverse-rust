@@ -30,7 +30,7 @@ fn offscreen_real_ff7_bridge_choices_and_battle_resumes() {
         shadow.next_strict(None).unwrap();
         let run = SceneRunId(1);
         rig.state.apply(0.0, ServerMsg::SceneStart {
-            run, scene: def.id.clone(), seed: SEED, progress: story.encode(), gil: 600, replay: Some(replay),
+            run, scene: def.id.clone(), seed: SEED, progress: story.encode(), gil: 600, replay: Some(replay), presentation_origin: None,
             owner: EntityId(1), participants: (0..3).map(|spot| SceneParticipant { entity: EntityId(u64::from(spot) + 1), spot }).collect(),
             you: SceneRole::Owner,
         });
@@ -171,7 +171,7 @@ fn offscreen_real_ff7_cargo_arrival_cast() {
     let mut rig = make_rig_with_snapshot(&real, def, true, story, 600);
     rig.state.apply(0.0, ServerMsg::SceneStart {
         run: SceneRunId(1), scene: rig.def.id.clone(), seed: SEED, progress: rig.story.encode(), gil: rig.gil,
-        replay: Some(fmv_protocol::SceneReplay { source: rig.play.replay_identity().fingerprint, origin: None, events: Vec::new() }),
+        replay: Some(fmv_protocol::SceneReplay { source: rig.play.replay_identity().fingerprint, origin: None, events: Vec::new() }), presentation_origin: None,
         owner: EntityId(1), participants: (0..3).map(|spot| SceneParticipant { entity: EntityId(u64::from(spot) + 1), spot }).collect(),
         you: SceneRole::Owner,
     });

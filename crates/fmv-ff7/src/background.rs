@@ -141,6 +141,7 @@ use crate::field::{Background, Camera, FieldError, FieldFile, Palette, TileSprit
 pub mod depth;
 pub mod state;
 pub mod palette;
+pub mod raster;
 mod entry;
 #[cfg(test)]
 mod palette_real_tests;

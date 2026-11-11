@@ -326,7 +326,7 @@ fn a_later_scene_cannot_reclassify_an_acknowledged_ordinary_defeat() {
     assert!(state.apply(10.01, pending(ID, Pos::new(10.0, 20.0, 30.0), 0.75)).is_none());
     assert!(state.apply(10.02, encounter(true)).is_none());
     assert!(state.apply(11.0, defeat()).is_none());
-    let scene_start = ServerMsg::SceneStart {
+    let scene_start = ServerMsg::SceneStart { presentation_origin: None,
         run: fmv_protocol::SceneRunId(12), scene: "test/late/scene".into(), seed: 1,
         progress: StoryState::at(39).encode(), gil: 0, replay: None,
         owner: EntityId(1), participants: vec![], you: fmv_protocol::SceneRole::Owner,

@@ -59,7 +59,8 @@
 //!   culled like three-dimensional models.
 
 use bytemuck::{Pod, Zeroable};
-use fmv_ff7::background::depth::{pack_atlas, DepthTile, TileAtlas, ENGINE_FAR_PLANE, ENGINE_NEAR_PLANE};
+use fmv_ff7::background::depth::{pack_atlas, pack_tile_pixels, DepthTile, TileAtlas, ENGINE_FAR_PLANE, ENGINE_NEAR_PLANE};
+use fmv_ff7::background::raster::TilePixels;
 use fmv_ff7::background::{decode_background_tiles_with_depth_options, BackgroundOptions, BlendMode, ScreenRect};
 use fmv_ff7::field::FieldFile;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +74,12 @@ pub const DEPTH_FAR: f32 = ENGINE_FAR_PLANE;
 /// (the downlevel minimum is 2048); the height follows from the tile count and is checked against
 /// the device when the atlas is uploaded.
 pub const ATLAS_MAX_WIDTH: u32 = 2048;
+
+/// Bounds the temporary visibility mask as well as the resulting atlas. The mask uses
+/// seven bytes per raster pixel (an owner id and RGB), independently of logical field size.
+const MAX_HIDDEN_MASK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCENERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCENERY_SIDE: usize = 8192;
 
 static NEXT_SCENERY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -177,23 +184,26 @@ fn quad(rect: ScreenRect, at: (u32, u32, u32), tex: (u32, u32), depth: f32) -> [
 /// colour of what covers it (see the module docs, "Hidden texels"). The tiles are in paint order, so
 /// the owner of a pixel is the last opaque tile with a drawn texel there, as in the flat picture and
 /// as the depth test decides it. Blended tiles neither cover nor are changed.
-fn bake_hidden_texels(tiles: &[DepthTile], atlas: &mut TileAtlas, canvas: ScreenRect) {
-    let (Ok(cw), Ok(ch)) = (usize::try_from(canvas.width()), usize::try_from(canvas.height())) else { return };
-    let Some(pixels) = cw.checked_mul(ch) else { return };
+fn bake_hidden_texels(tiles: &[DepthTile], pixels: &[TilePixels<'_>], atlas: &mut TileAtlas, canvas: ScreenRect, scale: u32, clip_alpha: bool) -> Option<()> {
+    let (cw, ch) = (usize::try_from(canvas.width()).ok()?.checked_mul(scale as usize)?,
+        usize::try_from(canvas.height()).ok()?.checked_mul(scale as usize)?);
+    let count = cw.checked_mul(ch)?;
+    if count.checked_mul(7)? > MAX_HIDDEN_MASK_BYTES { return None; }
     let aw = atlas.width as usize;
     // The canvas index of texel `(x, y)` of a tile, if it is on the canvas.
     let place = |t: &DepthTile, x: usize, y: usize| -> Option<usize> {
-        let px = usize::try_from(i64::from(t.rect.min_x) - i64::from(canvas.min_x) + i64::try_from(x).ok()?).ok()?;
-        let py = usize::try_from(i64::from(t.rect.min_y) - i64::from(canvas.min_y) + i64::try_from(y).ok()?).ok()?;
+        let px = usize::try_from((i64::from(t.rect.min_x) - i64::from(canvas.min_x)) * i64::from(scale) + i64::try_from(x).ok()?).ok()?;
+        let py = usize::try_from((i64::from(t.rect.min_y) - i64::from(canvas.min_y)) * i64::from(scale) + i64::try_from(y).ok()?).ok()?;
         (px < cw && py < ch).then_some(py * cw + px)
     };
-    let mut owner = vec![0u32; pixels];
-    let mut colour = vec![[0u8; 3]; pixels];
-    for (i, t) in tiles.iter().enumerate().filter(|(_, t)| t.blend.is_none()) {
-        let size = t.size() as usize;
+    let mut owner = vec![0u32; count];
+    let mut colour = vec![[0u8; 3]; count];
+    let drawn = |alpha| if clip_alpha { alpha >= 128 } else { alpha != 0 };
+    for (i, (t, raster)) in tiles.iter().zip(pixels).enumerate().filter(|(_, (t, _))| t.blend.is_none()) {
+        let size = raster.side as usize;
         let tag = u32::try_from(i + 1).unwrap_or(u32::MAX);
-        for (n, texel) in t.rgba.chunks_exact(4).enumerate() {
-            if texel[3] == 0 {
+        for (n, texel) in raster.rgba.chunks_exact(4).enumerate() {
+            if !drawn(texel[3]) {
                 continue;
             }
             if let Some(at) = place(t, n % size, n / size) {
@@ -202,12 +212,12 @@ fn bake_hidden_texels(tiles: &[DepthTile], atlas: &mut TileAtlas, canvas: Screen
             }
         }
     }
-    for (i, (t, rect)) in tiles.iter().zip(&atlas.rects).enumerate().filter(|(_, (t, _))| t.blend.is_none()) {
-        let size = t.size() as usize;
+    for (i, ((t, raster), rect)) in tiles.iter().zip(pixels).zip(&atlas.rects).enumerate().filter(|(_, ((t, _), _))| t.blend.is_none()) {
+        let size = raster.side as usize;
         let tag = u32::try_from(i + 1).unwrap_or(u32::MAX);
-        for (n, texel) in t.rgba.chunks_exact(4).enumerate() {
+        for (n, texel) in raster.rgba.chunks_exact(4).enumerate() {
             let (x, y) = (n % size, n / size);
-            let Some(at) = place(t, x, y).filter(|_| texel[3] != 0) else { continue };
+            let Some(at) = place(t, x, y).filter(|_| drawn(texel[3])) else { continue };
             if owner[at] == tag {
                 continue;
             }
@@ -217,6 +227,7 @@ fn bake_hidden_texels(tiles: &[DepthTile], atlas: &mut TileAtlas, canvas: Screen
             }
         }
     }
+    Some(())
 }
 
 /// The atlas as premultiplied RGBA8 with one opaque black row appended (see [`Scenery::atlas`]).
@@ -227,7 +238,9 @@ fn premultiplied_with_black_row(atlas: &TileAtlas) -> Option<Vec<u8>> {
     if atlas.rgba.len() != w.checked_mul(h)?.checked_mul(4)? {
         return None;
     }
-    let mut out = Vec::with_capacity(w.checked_mul(h.checked_add(1)?)?.checked_mul(4)?);
+    let bytes = w.checked_mul(h.checked_add(1)?)?.checked_mul(4)?;
+    if bytes > MAX_SCENERY_BYTES || w > MAX_SCENERY_SIDE || h.checked_add(1)? > MAX_SCENERY_SIDE { return None; }
+    let mut out = Vec::with_capacity(bytes);
     for px in atlas.rgba.chunks_exact(4) {
         let a = u16::from(px[3]);
         let scale = |c: u8| u8::try_from((u16::from(c) * a + 127) / 255).unwrap_or(u8::MAX);
@@ -246,17 +259,48 @@ impl Scenery {
     /// picture is then exactly right and cheaper), the canvas is empty, or the tiles do not fit an
     /// atlas.
     pub fn choose(tiles: &[DepthTile], canvas: ScreenRect) -> (Option<Self>, String) {
-        if canvas.width() <= 0 || canvas.height() <= 0 {
+        let pixels: Vec<_> = tiles.iter().map(|tile| TilePixels {
+            side: u32::try_from(i64::from(tile.rect.max_x) - i64::from(tile.rect.min_x)).unwrap_or(0), rgba: &tile.rgba,
+        }).collect();
+        Self::prepare(tiles, &pixels, canvas, 1, false)
+    }
+
+    /// Keep the native quads, depths and blend order while sampling separate raster tiles.
+    /// A common 1×, 2× or 4× scale is required: an invalid or oversized selection is refused
+    /// as a whole, so the caller can fall back to both native rendering paths together.
+    pub(crate) fn choose_with_pixels(tiles: &[DepthTile], pixels: &[TilePixels<'_>], canvas: ScreenRect, scale: u32) -> (Option<Self>, String) {
+        Self::prepare(tiles, pixels, canvas, scale, true)
+    }
+
+    fn prepare(tiles: &[DepthTile], pixels: &[TilePixels<'_>], canvas: ScreenRect, scale: u32, clip_alpha: bool) -> (Option<Self>, String) {
+        let width = i64::from(canvas.max_x) - i64::from(canvas.min_x);
+        let height = i64::from(canvas.max_y) - i64::from(canvas.min_y);
+        if width <= 0 || height <= 0 {
             return (None, "no picture, so nothing goes in front of the characters".to_string());
+        }
+        if !matches!(scale, 1 | 2 | 4) || width * i64::from(scale) > MAX_SCENERY_SIDE as i64
+            || height * i64::from(scale) > MAX_SCENERY_SIDE as i64 {
+            return (None, "background raster canvas exceeds its size limit".to_string());
+        }
+        if tiles.len() != pixels.len()
+            || tiles.iter().zip(pixels).any(|(tile, raster)| {
+                let side = i64::from(tile.rect.max_x) - i64::from(tile.rect.min_x);
+                let height = i64::from(tile.rect.max_y) - i64::from(tile.rect.min_y);
+                !matches!(side, 16 | 32) || height != side || side * i64::from(scale) != i64::from(raster.side)
+            }) {
+            return (None, "background raster does not fit its logical tile atlas".to_string());
         }
         let in_front = tiles.iter().filter(|t| matches!(t.layer, 2 | 4)).count();
         if in_front == 0 {
             return (None, "nothing in front of the characters".to_string());
         }
-        let Some(mut atlas) = pack_atlas(tiles, ATLAS_MAX_WIDTH) else {
+        let packed = if clip_alpha { pack_tile_pixels(pixels, ATLAS_MAX_WIDTH) } else { pack_atlas(tiles, ATLAS_MAX_WIDTH) };
+        let Some(mut atlas) = packed else {
             return (None, "the tiles do not fit one atlas; characters over the whole picture".to_string());
         };
-        bake_hidden_texels(tiles, &mut atlas, canvas);
+        if bake_hidden_texels(tiles, pixels, &mut atlas, canvas, scale, clip_alpha).is_none() {
+            return (None, "the background visibility mask exceeds its memory limit".to_string());
+        }
         let Some(pixels) = premultiplied_with_black_row(&atlas) else {
             return (None, "the tile atlas is malformed; characters over the whole picture".to_string());
         };

@@ -134,7 +134,7 @@ impl SceneBuilder for Builder {
 }
 
 fn start(role: SceneRole, replay: SceneReplay) -> ServerMsg {
-    ServerMsg::SceneStart {
+    ServerMsg::SceneStart { presentation_origin: None,
         run: RUN, scene: "test/arena/duel".into(), seed: 5, progress: StoryState::at(39).encode(), gil: 7,
         replay: Some(replay), owner: EntityId(1), participants: vec![SceneParticipant { entity: EntityId(1), spot: 0 }], you: role,
     }

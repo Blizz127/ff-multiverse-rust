@@ -36,6 +36,8 @@ bytemuck.workspace = true
 # Game controllers (SDL-style button/axis names, hot-plug) for the launcher's Steam Game Mode device
 # check: src/gamepad.rs turns pad input into the same key events the keyboard path handles.
 gilrs = "0.11"
+# Optional local replacement background pages (same PNG version already used by fmv-ff7).
+png = "0.18"
 
 [dev-dependencies]
 # Paused-clock liveness tests (deterministic under load). `test-util` only enables tokio's

@@ -612,14 +612,15 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// canon companions, whose turns a v17 server leaves to the player; v18: it cannot decode a story scene's messages;
 /// v19: earlier peers lack the owner's authoritative gil snapshot for resource-dependent scene branches;
 /// v20: earlier peers lack durable scene replay, battle continuation and authoritative carried combat resources;
-/// v21: earlier peers lack ordered story-save acknowledgments and authored battle terminal/audio policy).
+/// v21: earlier peers lack ordered story-save acknowledgments and authored battle terminal/audio policy;
+/// v22: earlier peers cannot bind ordinary presentation scenes to the accepted trigger origin).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 21);
+    assert_eq!(PROTOCOL_VERSION, 22);
     let server = TestServer::start(fast(None)).await;
-    for old_version in [20u16, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
+    for old_version in [21u16, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;
-        // A v8 to v20 Hello asks for a character (and reads as a v21 Hello); the older ones carried a colour and a look.
+        // A v8 to v21 Hello asks for a character (and reads as a v22 Hello); the older ones carried a colour and a look.
         let hello = if old_version >= 8 {
             format!(
                 r#"{{"Hello":{{"protocol_version":{old_version},"client_build":"old","auth":{{"Register":{{"display_name":"Old{old_version}"}}}},"character":{{"tint":[1,2,3],"body":null,"slot":null}}}}}}"#

@@ -20,6 +20,8 @@ use crate::world::{SceneHost, SceneInfo, SceneResult, SceneTransaction, TriggerI
 
 mod continuation;
 mod points;
+#[cfg(test)]
+mod presentation_origin_tests;
 // This checked evaluator is staged behind the existing field-visit admission fence.
 // It is exercised through the real saver in tests; runtime reconstruction is still required.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -249,6 +251,34 @@ impl SceneHost for Ff7SceneHost {
         self.def(scene).is_some_and(|def| def.origin_actor().is_some())
     }
 
+    fn requires_presentation_origin(&self, scene: &str) -> bool {
+        self.def(scene).is_some_and(SceneDef::requires_presentation_origin)
+    }
+
+    fn presentation_origin_valid(&self, scene: &str, field: &str, progress: &[u8],
+        origin: &fmv_protocol::SceneOrigin) -> bool {
+        use fmv_ff7::script::{dialogue::End, scene::{SceneBoundary, ScenePlay, Then, with_trigger_position}};
+        let (Some(def), Some(story)) = (self.def(scene), StoryState::decode(progress)) else { return false; };
+        if !self.extended_save || !def.requires_presentation_origin() || def.field != field || !story.supports_extended()
+            || !executable_story(&story) || !def.trigger.moments.contains(&story.moment)
+            || origin.validate().is_err() { return false; }
+        let Some(area) = self.field(field) else { return false; };
+        let Ok(bound) = with_trigger_position(area.field_file(), def, origin.pos, origin.facing, origin.triangle) else { return false; };
+        // The reviewed station pair has no dialogue or resource-dependent branch. Running its
+        // own source proves the accepted triangle actually reaches the authored battle branch;
+        // a different valid floor may bind but must not authorize this presentation.
+        let Ok(mut play) = ScenePlay::with_resources(area.field_file(), &bound, &story, 0, SceneResources { gil: Some(0) }) else { return false; };
+        let beat = play.next(None);
+        let complete = if def.resume_after_battle.is_some() {
+            matches!(beat.then, Then::End { how: End::Finished, .. })
+        } else {
+            matches!(beat.then, Then::End { how: End::Battle, .. })
+                && matches!(play.boundary(), Some(SceneBoundary::Battle(checkpoint)) if checkpoint.formation == 300)
+        };
+        complete && [play.setup_stats(), play.stats()].into_iter().all(|stats|
+            !stats.setup_incomplete && stats.unknown.is_empty() && stats.unresolved == 0 && stats.dropped_requests == 0)
+    }
+
     fn requires_landing(&self, scene: &str) -> bool {
         self.def(scene).is_some_and(SceneDef::requires_landing)
     }
@@ -282,7 +312,9 @@ impl SceneHost for Ff7SceneHost {
 
     fn point_scene(&self, field: &str, before: &[u8], after: &[u8]) -> Option<String> {
         let (before, after) = (StoryState::decode(before)?, StoryState::decode(after)?);
-        self.defs.iter().find(|d| d.presents_step(field, &before, &after)).map(|d| d.id.clone())
+        self.defs.iter().find(|d| d.presents_step(field, &before, &after)
+            && (!d.requires_presentation_origin() || (self.extended_save && executable_story(&before))))
+            .map(|d| d.id.clone())
     }
 
     fn point_continuation(&self, field: &str, before: &[u8], point: u32) -> Option<String> {

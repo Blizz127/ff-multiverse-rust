@@ -17,6 +17,7 @@
 
 use crate::avatar::scenery::Scenery;
 use crate::avatar::stage::{Stage, StageCamera};
+use crate::background_pack::PngFieldPack;
 use fmv_ff7::background::calibrate_depth_mapping;
 use fmv_adapter_api::{AreaRuntime, Bounds};
 use fmv_core::Pos;
@@ -230,6 +231,32 @@ impl FieldView {
     /// [`FieldView::ff7`] with the choice of whether to prepare the depth-tested scenery
     /// (`scenery`) made by the caller.
     pub fn ff7_with(adapter: &Ff7Adapter, key: &str, scenery: bool) -> Result<Self, String> {
+        let pack = match PngFieldPack::from_env() {
+            Ok(pack) => pack,
+            Err(error) => {
+                eprintln!("field {key}: background pack unavailable ({error}); using the original textures");
+                None
+            },
+        };
+        Self::ff7_with_pack(adapter, key, scenery, pack.as_ref())
+    }
+
+    /// Set the renderer's texture cap before drawing or uploading this field. Before a
+    /// renderer exists, replacement textures use the conservative 2048 downlevel limit.
+    /// Both paths change as one frame; later scripted updates retain the same cap.
+    pub(crate) fn set_background_texture_limit(&mut self, limit: u32) -> Result<(), String> {
+        let Some(background) = self.background.as_mut() else { return Ok(()); };
+        if let Some(frame) = background.with_texture_limit(limit)? {
+            eprintln!("field background: {}", frame.note);
+            self.backdrop = Some(frame.backdrop);
+            if let Some(stage) = self.stage.as_mut() { stage.scenery = frame.scenery; }
+        }
+        Ok(())
+    }
+
+    /// Explicit pack selection for the live builder and isolated comparisons. `None` always
+    /// uses native pixels; it does not consult process environment or change game data.
+    pub(crate) fn ff7_with_pack(adapter: &Ff7Adapter, key: &str, scenery: bool, pack: Option<&PngFieldPack>) -> Result<Self, String> {
         let area = adapter.load_field(key).map_err(|e| format!("cannot load field {key} for rendering: {e}"))?;
         let cameras = area.cameras().map_err(|e| format!("field {key} has no readable camera: {e}"))?;
         let camera = cameras.first().ok_or_else(|| format!("field {key} has no camera"))?;
@@ -275,15 +302,43 @@ impl FieldView {
         if let Some(r) = range {
             view.description.push_str(&format!("; camera range {}x{}", r.max.x - r.min.x, r.max.y - r.min.y));
         }
-        // The picture as depth-tested tiles, on the rectangle of the flat picture.
+        // Build the first frame through the same selector as later group/palette changes.
+        // Pixel resolution does not change the field's logical rectangle, camera or models.
         let prepare_scenery = scenery;
-        let (scenery, note) = match (scenery, canvas) {
-            (true, Some(canvas)) => {
-                let (scenery, note) = Scenery::from_field_with_options(area.field_file(), canvas, &options);
-                (scenery.map(Arc::new), note)
-            }
-            (true, None) => (None, "no picture, so nothing goes in front of the characters".to_string()),
-            (false, _) => (None, "characters are drawn as markers".to_string()),
+        let (scenery, note) = match canvas {
+            Some(canvas) => {
+                let textures = pack.and_then(|pack| {
+                    let result = area.field_file().palette().map_err(|e| e.to_string())
+                        .and_then(|palette| pack.load_field(key, &palette).map_err(|e| e.to_string()));
+                    match result {
+                        Ok(textures) => textures,
+                        Err(error) => {
+                            eprintln!("field {key}: background pack unavailable ({error}); using the original textures");
+                            None
+                        },
+                    }
+                });
+                let initial = DynamicBackground::new_with_textures(key, area.field_file(), canvas, prepare_scenery,
+                    background_state, textures).and_then(|mut background| {
+                        let frame = background.initial_frame()?;
+                        Ok((background, frame))
+                    });
+                match initial {
+                    Ok((background, frame)) => {
+                        view.backdrop = Some(frame.backdrop);
+                        view.background = Some(background);
+                        (frame.scenery, frame.note)
+                    },
+                    Err(error) => {
+                        let (scenery, note) = if prepare_scenery {
+                            let (scenery, note) = Scenery::from_field_with_options(area.field_file(), canvas, &options);
+                            (scenery.map(Arc::new), note)
+                        } else { (None, "characters are drawn as markers".to_string()) };
+                        (scenery, format!("{note}; scripted background unavailable ({error})"))
+                    },
+                }
+            },
+            None => (None, "no picture, so nothing goes in front of the characters".to_string()),
         };
         view.description.push_str(&format!("; {note}"));
         let depth = area.field_file().background().map(|background| {
@@ -300,12 +355,6 @@ impl FieldView {
             run_speed: area.run_speed(),
             scenery,
         });
-        if let Some(canvas) = canvas {
-            match DynamicBackground::new(key, area.field_file(), canvas, prepare_scenery, background_state) {
-                Ok(background) => view.background = Some(background),
-                Err(error) => view.description.push_str(&format!("; scripted background unavailable ({error})")),
-            }
-        }
         Ok(view)
     }
 

@@ -23,6 +23,7 @@ const TRIGGER_AT: (f32, f32) = (200.0, -100.0);
 
 /// One `finish` call: scene, story, seed, answers.
 type Finish = (String, Vec<u8>, u32, Vec<u8>);
+type PresentationOrigin = (String, String, Vec<u8>, fmv_protocol::SceneOrigin);
 
 /// The story the fake host has an entry for (see [`FakeHost::entry`]).
 const FAR_ALONG: &[u8] = &[7, 7];
@@ -42,6 +43,10 @@ struct FakeHost {
     transaction: Mutex<Option<SceneTransaction>>,
     resources: Mutex<Vec<u32>>,
     refuse: Mutex<bool>,
+    /// Ordinary point presentations that need the accepted crossing pose.
+    presentation_origin: Mutex<bool>,
+    presentation_origin_refuse: Mutex<bool>,
+    presentation_origins: Mutex<Vec<PresentationOrigin>>,
 }
 
 impl SceneHost for FakeHost {
@@ -50,6 +55,16 @@ impl SceneHost for FakeHost {
             SceneInfo { id: SCENE.to_string(), field: YARD.to_string(), arrival: Pos::new(150.0, -100.0, 0.0), arrival_facing: 0.0, arrival_hint: None },
             SceneInfo { id: POINT_SCENE.to_string(), field: HALL.to_string(), arrival: Pos::new(200.0, 0.0, 0.0), arrival_facing: 0.0, arrival_hint: None },
         ]
+    }
+    fn requires_presentation_origin(&self, scene: &str) -> bool {
+        scene == POINT_SCENE && *self.presentation_origin.lock().unwrap()
+    }
+    fn presentation_origin_valid(&self, scene: &str, field: &str, progress: &[u8],
+        origin: &fmv_protocol::SceneOrigin) -> bool {
+        self.presentation_origins.lock().unwrap().push((scene.to_owned(), field.to_owned(), progress.to_vec(), *origin));
+        !*self.presentation_origin_refuse.lock().unwrap() && scene == POINT_SCENE && field == HALL
+            && progress.is_empty() && origin.validate().is_ok()
+            && (150.0..=250.0).contains(&origin.pos.x) && (-50.0..=50.0).contains(&origin.pos.y)
     }
     fn point_scene(&self, field: &str, before: &[u8], after: &[u8]) -> Option<String> {
         (*self.cutscene.lock().unwrap() && field == HALL && before.is_empty() && after == STORY_ADVANCED).then(|| POINT_SCENE.to_string())
@@ -1491,3 +1506,5 @@ fn victory_scene_cannot_delay_repeat_or_undo_the_saved_battle_step() {
         assert_eq!(w.players.get(&a.entity).unwrap().progression, STORY_ADVANCED);
     }
 }
+
+mod presentation_origin;

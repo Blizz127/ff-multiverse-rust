@@ -121,7 +121,7 @@ fn native_rig(host: Arc<NativeHost>) -> Rig {
     let mut owner = join(&mut world, state.clone(), vec![state], now);
     owner.drain();
     let run = SceneRunId(71);
-    world.start_run(run, SceneRun { scene: NATIVE_SCENE.into(), owner: owner.entity, watchers: vec![], seed: 19,
+    world.start_run(run, SceneRun { presentation_origin: None, scene: NATIVE_SCENE.into(), owner: owner.entity, watchers: vec![], seed: 19,
         progress: host.original.clone(), gil: 240, answers: vec![], steps: 0, started: now, last_activity: now,
         writes_story: true, preview: false, then: None }, &mut vec![]);
     assert!(owner.drain().iter().any(|message| matches!(message, ServerMsg::SceneStart { replay: Some(_), .. })));

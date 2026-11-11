@@ -19,7 +19,7 @@ fn a_door_guest_waits_for_shared_arrival_then_returns_to_control_without_a_story
     assert_eq!(rig.world.party_invite(rig.owner.entity, guest.entity, rig.now), crate::world::PartyOutcome::Done);
     let invite = rig.world.parties.invites().next().unwrap().id;
     assert_eq!(rig.world.party_accept(guest.entity, invite, rig.now), crate::world::PartyOutcome::Done);
-    rig.world.start_run(rig.run, SceneRun { scene: DOOR.into(), owner: rig.owner.entity,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: DOOR.into(), owner: rig.owner.entity,
         watchers: vec![guest.entity], seed: 19, progress: DOOR_STORY.to_vec(), gil: 240,
         answers: vec![], steps: 0, started: rig.now, last_activity: rig.now,
         writes_story: true, preview: false, then: None }, &mut vec![]);
@@ -149,7 +149,7 @@ fn an_owner_rejoining_after_the_arrival_commit_refreshes_the_retained_guests_par
     assert_eq!(rig.world.party_invite(rig.owner.entity, guest.entity, rig.now), crate::world::PartyOutcome::Done);
     let invite = rig.world.parties.invites().next().unwrap().id;
     assert_eq!(rig.world.party_accept(guest.entity, invite, rig.now), crate::world::PartyOutcome::Done);
-    rig.world.start_run(rig.run, SceneRun { scene: DOOR.into(), owner: rig.owner.entity,
+    rig.world.start_run(rig.run, SceneRun { presentation_origin: None, scene: DOOR.into(), owner: rig.owner.entity,
         watchers: vec![guest.entity], seed: 19, progress: DOOR_STORY.to_vec(), gil: 240,
         answers: vec![], steps: 0, started: rig.now, last_activity: rig.now,
         writes_story: true, preview: false, then: None }, &mut vec![]);

@@ -26,6 +26,7 @@ mod accounts;
 mod audio;
 mod avatar;
 mod backdrop;
+mod background_pack;
 mod battle;
 mod bot;
 mod camera;

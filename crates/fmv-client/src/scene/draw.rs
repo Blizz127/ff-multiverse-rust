@@ -8,6 +8,7 @@
 //! * [`cast_players`]: every cast member that is placed and not hidden, as an avatar of the cast's look (a playable
 //!   canon model: it stands, and walks in its walk clip while a move is on), under a key from a range that cannot meet an
 //!   entity's or an NPC's ([`CAST_WHO_BASE`]);
+//! * [`cast_labels`]: the visible cast's names over their drawn heads, replacing the area's old NPC labels;
 //! * [`place_witnesses`]: every participant of the run, the local player and the others, drawn on its WITNESS spot (the
 //!   scene's name for where somebody stands) instead of where it really is, with its own look and the field's model scale
 //!   like every other avatar (it is a player body: the same pipeline as the cast). The local player's real place is never
@@ -27,7 +28,7 @@ use crate::avatar::{AvatarPlayer, Who};
 use crate::backdrop::FieldView;
 use crate::render::view_to_window;
 use crate::state::NpcView;
-use crate::ui::hud::Subject;
+use crate::ui::hud::{Label, LabelKind, Subject};
 use fmv_core::{AnimState, EntityId, Pos};
 use fmv_ff7::script::scene::Look;
 use fmv_protocol::SCENE_NPC_ID_BASE;
@@ -96,9 +97,7 @@ pub fn cast_players(scene: &ScenePlayer) -> Vec<AvatarPlayer<'_>> {
 }
 
 pub fn cast_players_from(scene: PresentationRef<'_>) -> Vec<AvatarPlayer<'_>> {
-    scene
-        .cast_draws()
-        .into_iter()
+    visible_cast(scene)
         .map(|c| {
             let (appearance, npc) = match c.look {
                 Look::Appearance(id) => (Some(id.as_str()), None),
@@ -120,6 +119,54 @@ pub fn cast_players_from(scene: PresentationRef<'_>) -> Vec<AvatarPlayer<'_>> {
             }
         })
         .collect()
+}
+
+/// Names for the cast that is actually on show. The area's replaced NPC labels remain hidden;
+/// these follow the scene's model head, or its marker if the model could not be drawn.
+pub fn cast_labels(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView) -> Vec<Label> {
+    cast_labels_from(scene.presentation(), built, view)
+}
+
+pub fn cast_labels_from(scene: PresentationRef<'_>, built: Option<&Built>, view: &FieldView) -> Vec<Label> {
+    visible_cast(scene).filter_map(|actor| {
+        let member = scene.def().member(actor.entity)?;
+        let name = cast_name(scene.def(), member);
+        if name.trim().is_empty() { return None; }
+        let at = built.and_then(|b| b.anchors.get(&cast_who(actor.entity)).copied())
+            .or_else(|| view.to_view(actor.render_pos))?;
+        Some(Label { x: at.x, y: at.y, text: name.to_string(), kind: LabelKind::Npc })
+    }).collect()
+}
+
+/// Some reviewed presentations retain the controlled actor in the VM to read its actual
+/// trigger position. The participant's own body already represents it on screen.
+fn visible_cast<'a>(scene: PresentationRef<'a>) -> impl Iterator<Item = super::player::CastDraw<'a>> {
+    let participant = scene.def().presentation_player_actor();
+    scene.cast_draws().into_iter().filter(move |actor| Some(actor.entity) != participant)
+}
+
+/// A scene's displayed speaker name takes precedence over a model's identity (for example,
+/// "Flower girl" before the story names her). Script aliases are only the last fallback.
+fn cast_name<'a>(def: &'a fmv_ff7::script::scene::SceneDef, member: &'a fmv_ff7::script::scene::CastMember) -> &'a str {
+    if let Some((name, _)) = def.speakers.iter().find(|(name, entity)| *entity == member.entity && !name.trim().is_empty()) {
+        return name;
+    }
+    match &member.look {
+        Look::Appearance(id) => {
+            if let Some(model) = fmv_ff7::playable::resolve_appearance(id) { return model.display_name; }
+        }
+        Look::Model { hrc, .. } => {
+            if let Some(model) = fmv_ff7::playable::PLAYABLE_FIELD_MODELS.iter().find(|model| model.hrc.eq_ignore_ascii_case(hrc)) {
+                return model.display_name;
+            }
+            // These named cast skeletons are shared by the reactor and train scenes. Their
+            // script aliases vary by field (Jessie is av_j, av_c or jessy), but their looks do not.
+            if hrc.eq_ignore_ascii_case("bwfd") { return "Biggs"; }
+            if hrc.eq_ignore_ascii_case("axdc") { return "Jessie"; }
+            if hrc.eq_ignore_ascii_case("bxbe") { return "Wedge"; }
+        }
+    }
+    &member.name
 }
 
 /// Put every participant of the run on its witness spot: the avatar of the player (the local one or another) whose key is
@@ -149,7 +196,7 @@ pub fn speaker_spot(scene: &ScenePlayer, built: Option<&Built>, view: &FieldView
     bounds.min.x += x; bounds.max.x += x;
     bounds.min.y -= y; bounds.max.y -= y;
     let pixels = |p: Pos| view_to_window(&bounds, vw, vh, p.x, p.y);
-    let casts = scene.cast_draws();
+    let casts: Vec<_> = visible_cast(scene.presentation()).collect();
     let person = |who: Who, stands: Pos| -> Option<((f32, f32), (f32, f32))> {
         let head = pixels(*built.anchors.get(&who)?);
         let feet = pixels(view.to_view(stands)?);
@@ -182,7 +229,7 @@ pub fn camera_shot(scene: &ScenePlayer, view: &FieldView) -> SceneShot {
 
 pub fn camera_shot_from(scene: PresentationRef<'_>, view: &FieldView) -> SceneShot {
     let clock = scene.camera_clock();
-    let casts = scene.cast_draws();
+    let casts: Vec<_> = visible_cast(scene).collect();
     let drawn = |c: &super::player::CastDraw<'_>| view.to_view(c.pos).map(|p| [p.x, p.y]);
     let lead = casts.iter().find(|c| is_lead(c.look)).and_then(drawn);
     let aim = match clock.state {
@@ -200,3 +247,7 @@ fn is_lead(look: &Look) -> bool {
         Look::Model { hrc, .. } => hrc.eq_ignore_ascii_case("aaaa"),
     }
 }
+
+#[cfg(test)]
+#[path = "draw_labels_tests.rs"]
+mod label_tests;

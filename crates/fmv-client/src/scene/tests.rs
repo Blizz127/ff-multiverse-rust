@@ -27,6 +27,8 @@ use winit::keyboard::KeyCode;
 
 #[path = "offset_tests.rs"]
 mod offsets;
+#[path = "presentation_origin_tests.rs"]
+mod presentation_origin;
 
 const AREA: &str = "arena";
 const SCENE: &str = "test/arena/duel";
@@ -233,7 +235,7 @@ pub(crate) fn talk() -> Vec<Beat> {
 }
 
 fn start(run: SceneRunId, you: SceneRole, spots: &[(u64, u8)]) -> ServerMsg {
-    ServerMsg::SceneStart {
+    ServerMsg::SceneStart { presentation_origin: None,
         run,
         scene: SCENE.to_string(),
         seed: 5,
@@ -2064,7 +2066,7 @@ fn a_scene_of_another_field_or_a_story_that_cannot_be_read_is_not_played_either(
     let mut rig = rig_with(talk(), false);
     rig.client.on_message(
         AREA,
-        ServerMsg::SceneStart { run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], gil: 7, replay: None, owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
+        ServerMsg::SceneStart { presentation_origin: None, run: RUN, scene: SCENE.into(), seed: 5, progress: vec![9, 9, 9, 9], gil: 7, replay: None, owner: EntityId(1), participants: vec![], you: SceneRole::Watcher },
     );
     assert!(!rig.client.is_active());
     assert_eq!(*rig.built.borrow(), 0, "nothing was built from a story that is not readable");
