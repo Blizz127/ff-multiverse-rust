@@ -12,6 +12,7 @@ use fmv_persist::{
     restore_snapshot, CharacterProgress, FieldVisitEntryV1, FieldVisitOperation,
     FieldVisitOperationKind, FieldVisitV1, PersistError, Progression, SceneCheckpoint, SceneCommit,
     SceneOperation, SceneOperationKind, ScenePhase, SceneReservation, SceneState, Store,
+    MAX_FIELD_VISIT_ANCHOR_BYTES, MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_FIELD_BYTES,
 };
 use serde_json::json;
 
@@ -300,12 +301,12 @@ fn malformed_entries_refuse_before_writing_any_record_or_selecting_the_format() 
         ("wrong entry id", |v| v.entry.operation = [2; 16]),
         ("nonzero first revision", |v| v.revision = 1),
         ("empty field", |v| v.field.clear()),
-        ("field too long", |v| v.field = "x".repeat(257)),
+        ("field too long", |v| v.field = "x".repeat(MAX_FIELD_VISIT_FIELD_BYTES + 1)),
         ("control character", |v| v.field.push('\n')),
         ("empty arrival", |v| v.entry.arrival.clear()),
-        ("arrival too large", |v| v.entry.arrival = vec![1; 1_025]),
+        ("arrival too large", |v| v.entry.arrival = vec![1; MAX_FIELD_VISIT_ENTRY_BYTES + 1]),
         ("empty ready anchor", |v| v.anchor.clear()),
-        ("ready anchor too large", |v| v.anchor = vec![1; 1_025]),
+        ("ready anchor too large", |v| v.anchor = vec![1; MAX_FIELD_VISIT_ANCHOR_BYTES + 1]),
         ("unknown nonzero bits", |v| { v.scratch_values[31] = 1; v.scratch_known_masks[31] = 0; }),
         ("dangling continuation", |v| v.active_continuation = Some([8; 32])),
         ("zero schema", |v| v.schema_version = 0),
@@ -338,9 +339,9 @@ fn visit_boundary_encodings_and_unknown_masks_round_trip_without_inventing_known
     let account = seeded(&store, "Bounds", 8);
     let before = store.get_scene_state(account, GAME).unwrap();
     let mut next = before.clone();
-    let mut value = visit(11, 1, &"x".repeat(256));
-    value.entry.arrival = vec![255; 1_024];
-    value.anchor = vec![255; 1_024];
+    let mut value = visit(11, 1, &"x".repeat(MAX_FIELD_VISIT_FIELD_BYTES));
+    value.entry.arrival = vec![255; MAX_FIELD_VISIT_ENTRY_BYTES];
+    value.anchor = vec![255; MAX_FIELD_VISIT_ANCHOR_BYTES];
     value.scratch_known_masks = [0; 256];
     value.scratch_known_masks[31] = 0b0101;
     value.scratch_values[31] = 0b0100;

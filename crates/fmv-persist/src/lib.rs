@@ -157,7 +157,7 @@ pub use store::field_visit::{FieldVisitV1, FieldVisitEntryV1, FieldVisitOperatio
 pub use model::{
     game_key, parse_game_key, AccountInfo, AvatarId, AvatarProfile, CharacterProgress, NewCharacterProgress, NewProgression, Progression,
     Registered, INDEX_LOG_VERSION, MAX_APPEARANCE_REF_BYTES, MAX_APPEARANCE_REF_CHARS,
-    MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_INDEX_BYTES,
+    MAX_ARCHETYPE_BYTES, MAX_BLOB_BYTES, MAX_CHARACTER_RECORD_BYTES, MAX_CHARACTER_PROGRESS_SCHEMA_VERSION, MAX_INDEX_BYTES,
     MAX_RECORD_BYTES, MAX_TOKEN_BYTES, SCHEMA_VERSION,
 };
 pub use snapshot::{restore_snapshot, SnapshotInfo};

@@ -311,7 +311,8 @@ fn largest_visit_and_full_receipt_images_fit_the_documented_independent_caps() {
     let operation = operation(FieldVisitOperationKind::Advance, 254);
     let request = request_digest(&operation, &before.state(account, GAME), &after.state(account, GAME)).unwrap();
     after.character.as_mut().unwrap().last_visit_commit = Some(VisitReceipt { operation: operation.id, request: request.clone() });
-    let intent = VisitIntent { operation, account, game: GAME, requested_character_schema: 4, request, before, after };
+    let requested_character_schema = after.character.as_ref().unwrap().progress.schema_version;
+    let intent = VisitIntent { operation, account, game: GAME, requested_character_schema, request, before, after };
     store.validate_visit_intent(&intent).unwrap();
     for images in [&intent.before, &intent.after] {
         store.encode_visit_images(images, account, GAME).unwrap();

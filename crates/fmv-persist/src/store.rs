@@ -77,6 +77,8 @@ use crate::snapshot::{self, SnapshotInfo};
 
 mod player_character;
 mod progression_cas;
+#[cfg(test)]
+mod large_visit_compatibility;
 pub(crate) mod field_visit;
 pub(crate) mod scene;
 pub mod restyle;
@@ -1191,6 +1193,7 @@ impl Store {
         fsio::ensure_dir(&self.progression_dir(progression.account_id.0))?;
         let mut stored = progression.clone();
         stored.schema_version = SCHEMA_VERSION;
+        self.ensure_character_format(&_counters, progression.account_id, progression.game)?;
         fsio::write_json(&path, &stored, MAX_RECORD_BYTES)
     }
 
@@ -1236,6 +1239,7 @@ impl Store {
             return Err(PersistError::BlobTooLarge { len: next.blob.len(), max: MAX_BLOB_BYTES });
         }
         next.schema_version = SCHEMA_VERSION;
+        self.ensure_character_format(&_counters, account, game)?;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
         fsio::write_json(&path, &next, MAX_RECORD_BYTES)?;
         Ok(next)
@@ -1283,7 +1287,10 @@ impl Store {
         let _counters = self.writer()?;
         let _progress = self.progress_write();
         if !self.index().contains_account(account.0) { return Err(PersistError::UnknownAccount(account)); }
-        if let Some(record) = self.read_character_progress(account, game)? { return Ok(record); }
+        if let Some(record) = self.read_character_progress(account, game)? {
+            self.ensure_character_format(&_counters, account, game)?;
+            return Ok(record);
+        }
         let mut record = make();
         if record.account_id != account || record.game != game {
             return Err(PersistError::InvalidField { field: "account_id", reason: "initial record belongs to another account or game".into() });
@@ -1291,7 +1298,7 @@ impl Store {
         record.validate()?;
         record.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
-        self.write_character_record(&path, record)
+        self.write_character_record(&_counters, &path, record)
     }
 
     fn read_character_progress(
@@ -1349,7 +1356,7 @@ impl Store {
         fsio::ensure_dir(&self.progression_dir(record.account_id.0))?;
         let mut stored = record.clone();
         stored.schema_version = SCHEMA_VERSION;
-        self.write_character_record(&path, stored).map(|_| ())
+        self.write_character_record(&_counters, &path, stored).map(|_| ())
     }
 
     /// Read-modify-write of the account's [`CharacterProgress`] for `game`, as one step that no
@@ -1399,7 +1406,7 @@ impl Store {
         next.validate()?;
         next.schema_version = SCHEMA_VERSION;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
-        self.write_character_record(&path, next)
+        self.write_character_record(&_counters, &path, next)
     }
 
     /// Raise the recognized index fence to an explicitly selected minimum compatibility.
@@ -1423,10 +1430,27 @@ impl Store {
         self.ensure_index_format(counters, index::DURABLE_STORY_INDEX_VERSION)
     }
 
-    /// The caller already holds the writer and progress gates. Protect visit metadata from
-    /// earlier writers before its first durable write or successful acknowledgment.
-    fn ensure_field_visit_format(&self, counters: &Counters) -> Result<()> {
-        self.ensure_index_format(counters, index::FIELD_VISIT_INDEX_VERSION)
+    /// Larger visit payloads require the new reader/writer bounds before any write or
+    /// successful acknowledgment. The caller already holds the writer and progress gates.
+    fn ensure_large_field_visit_format(&self, counters: &Counters) -> Result<()> {
+        self.ensure_index_format(counters, index::LARGE_FIELD_VISIT_INDEX_VERSION)
+    }
+
+    /// Ordinary story writes and successful existing-character acknowledgments retain
+    /// the character envelope. Larger visit data must keep its reader/writer fence even
+    /// though this particular operation does not rewrite that envelope. Pure reads remain
+    /// read-only, and older small-record writes keep their historical format selection.
+    /// The caller holds both writer and progress gates and has validated its new record.
+    fn ensure_character_format(&self, counters: &Counters, account: AccountId, game: GameId) -> Result<()> {
+        let path = self.character_path(account.0, game)?;
+        let Some(record) = scene::CharacterRecord::read(&path)? else { return Ok(()); };
+        if record.progress.account_id != account || record.progress.game != game {
+            return Err(PersistError::corrupt(&path, "character record belongs to another account or game"));
+        }
+        if record.minimum_index_version() >= index::LARGE_FIELD_VISIT_INDEX_VERSION {
+            self.ensure_large_field_visit_format(counters)?;
+        }
+        Ok(())
     }
 
     /// Select a supported minimum without changing records or lowering a prior fence.
@@ -1434,7 +1458,7 @@ impl Store {
     /// the uncertainty latch; a legacy minimum of 2 leaves existing version-2/3 stores alone.
     fn ensure_index_format(&self, counters: &Counters, minimum: u32) -> Result<()> {
         self.ensure_transaction_healthy()?;
-        if !(crate::model::INDEX_LOG_VERSION..=index::FIELD_VISIT_INDEX_VERSION).contains(&minimum) {
+        if !(crate::model::INDEX_LOG_VERSION..=index::LARGE_FIELD_VISIT_INDEX_VERSION).contains(&minimum) {
             return Err(PersistError::InvalidField { field: "store_compatibility", reason: "unsupported index compatibility minimum".into() });
         }
         let mut log = self.log();

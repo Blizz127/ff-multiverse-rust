@@ -788,7 +788,7 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         assert_eq!(&fs::read(&path).unwrap(), bytes, "{what}");
     }
 
-    // Schema versions: 0 never existed; field-visit envelopes use v4, so v5 is future.
+    // Schema versions: 0 never existed; enlarged field-visit envelopes use v5, so v6 is future.
     put_raw(&root, a, "Ff7", &doc(|v| v["schema_version"] = json!(0)));
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
@@ -798,12 +798,12 @@ fn damaged_files_are_errors_never_panics_and_never_replaced_by_defaults() {
         &root,
         a,
         "Ff7",
-        &doc(|v| v["schema_version"] = json!(5)),
+        &doc(|v| v["schema_version"] = json!(fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION + 1)),
     );
     assert!(matches!(
         store.get_character_progress(a, GameId::Ff7),
         Err(PersistError::FutureSchema { found, supported, .. })
-            if found == 5 && supported == 4
+            if found == fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION + 1 && supported == fmv_persist::MAX_CHARACTER_PROGRESS_SCHEMA_VERSION
     ));
     // ... and an update refuses to build on such a record rather than overwrite it.
     let mut called = false;

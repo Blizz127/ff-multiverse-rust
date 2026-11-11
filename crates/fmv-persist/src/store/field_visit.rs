@@ -20,15 +20,19 @@ use crate::model::{MAX_CHARACTER_RECORD_BYTES, MAX_RECORD_BYTES};
 mod compatibility;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod large_tests;
 
 pub const MAX_FIELD_VISIT_FIELD_BYTES: usize = 256;
-pub const MAX_FIELD_VISIT_ENTRY_BYTES: usize = 1024;
-pub const MAX_FIELD_VISIT_ANCHOR_BYTES: usize = 1024;
-/// Compact visit JSON: two fixed 512-character scratch strings, at most 8 KiB for
+pub const MAX_FIELD_VISIT_ENTRY_BYTES: usize = 8192;
+pub const MAX_FIELD_VISIT_ANCHOR_BYTES: usize = 8192;
+/// The historical per-payload limit retained by character schema 4 / index format 5.
+const LEGACY_FIELD_VISIT_PAYLOAD_BYTES: usize = 1024;
+/// Compact visit JSON: two fixed 512-character scratch strings, at most 64 KiB for
 /// the two opaque byte arrays (four JSON characters per byte), 1536 bytes for a fully
 /// escaped field name (six per input byte), and under 2 KiB for fixed ids/keys/numbers.
 /// The explicit cap leaves headroom while keeping every snapshot bounded independently.
-pub const MAX_FIELD_VISIT_BYTES: usize = 16 * 1024;
+pub const MAX_FIELD_VISIT_BYTES: usize = 80 * 1024;
 
 /// The accepted entry, supplied only after the adapter validates its provenance. `arrival`
 /// is a bounded canonical encoding of the authored transition and durable entry placement.
@@ -47,8 +51,9 @@ pub struct FieldVisitEntryV1 {
 ///
 /// `anchor` includes a reviewed reconstruction profile AND durable placement, not merely
 /// coordinates. The game adapter validates both opaque encodings and source identity before
-/// any gameplay. Storage alone does not authorize a VM resume. Native party data remains
-/// inside the opaque story blob and is committed with the visit, never duplicated here.
+/// any gameplay. Storage alone does not authorize a VM resume. The opaque entry input may
+/// retain the original story for reconstruction; current authoritative story and native party
+/// data remain in the separate story record committed atomically with this visit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldVisitV1 {
@@ -106,6 +111,10 @@ fn invalid(reason: &str) -> PersistError { PersistError::InvalidField { field: "
 fn conflict(reason: &str) -> PersistError { PersistError::TransactionConflict(reason.into()) }
 
 impl FieldVisitV1 {
+    pub(crate) fn requires_large_format(&self) -> bool {
+        self.entry.arrival.len() > LEGACY_FIELD_VISIT_PAYLOAD_BYTES || self.anchor.len() > LEGACY_FIELD_VISIT_PAYLOAD_BYTES
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         if self.schema_version != 1 || self.visit_id == [0; 16] || self.source_identity == [0; 32]
             || self.entry.operation == [0; 16] || self.active_continuation == Some([0; 32]) {
@@ -222,7 +231,8 @@ impl Store {
     /// An explicit trash restore rekeys account ids: it preserves receipt bytes, but an old
     /// request adapted to the new account conflicts. Continue from its current revision with
     /// a new operation id; do not reinterpret an old account's request as a fresh mutation.
-    /// A successful first use or duplicate requires index5 before acknowledgment. Validation
+    /// A successful first use or duplicate requires index5 (index6 for enlarged payloads)
+    /// before acknowledgment. Validation
     /// failures do not opt a legacy store into the new format. Uncertain I/O requires reopen.
     pub fn commit_field_visit(&self, operation: &FieldVisitOperation, expected: &SceneState, next: &SceneState) -> Result<FieldVisitCommitted> {
         self.commit_field_visit_with_hook(operation, expected, next, |_| Ok(()))
@@ -240,7 +250,7 @@ impl Store {
         if record.has_continuation() { return Err(conflict("account has an active scene continuation")); }
         if let Some(receipt) = record.last_visit_commit.as_ref().filter(|receipt| receipt.operation == operation.id) {
             if receipt.request != request { return Err(conflict("visit operation already has a different exact request")); }
-            self.ensure_field_visit_format(&writer)?;
+            self.ensure_index_format(&writer, crate::index::FIELD_VISIT_INDEX_VERSION.max(before.minimum_index_version()))?;
             return Ok(FieldVisitCommitted { commit: SceneCommit::AlreadyApplied, current: before.state(account, game) });
         }
         if before.state(account, game) != *expected { return Err(conflict("visit, story, resources or continuation precondition changed")); }
@@ -263,7 +273,7 @@ impl Store {
         bytes.push(b'\n');
         if bytes.len() as u64 > MAX_VISIT_INTENT_BYTES { return Err(PersistError::TooLarge { path, size: bytes.len() as u64, max: MAX_VISIT_INTENT_BYTES }); }
         hook(0)?;
-        self.ensure_field_visit_format(&writer)?;
+        self.ensure_index_format(&writer, crate::index::FIELD_VISIT_INDEX_VERSION.max(file.intent.before.minimum_index_version()).max(file.intent.after.minimum_index_version()))?;
         self.transaction_poisoned.store(true, Ordering::Release);
         fsio::atomic_write(&path, &bytes)?;
         hook(1)?;
@@ -332,6 +342,10 @@ impl Store {
             return Err(PersistError::corrupt(path, "visit intent kind, schema or checksum mismatch"));
         }
         let intent = &file.intent;
+        let required = intent.before.minimum_index_version().max(intent.after.minimum_index_version());
+        if self.index().format_version() < required {
+            return Err(PersistError::corrupt(path, "visit intent lacks its required character format fence"));
+        }
         self.validate_visit_intent(intent).map_err(|e| PersistError::corrupt(path, e.to_string()))?;
         self.encode_visit_images(&intent.before, intent.account, intent.game)?;
         self.encode_visit_images(&intent.after, intent.account, intent.game)?;

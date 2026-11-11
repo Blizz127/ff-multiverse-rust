@@ -238,7 +238,7 @@ fn damaged_or_future_pending_manifest_headers_cannot_bypass_the_outer_recovery_f
             match damage {
                 "kind" => manifest["kind"] = serde_json::json!("not-a-trash-entry"),
                 "foreign file" => manifest["files"] = serde_json::json!(["accounts/999999.json"]),
-                "future schema" => manifest["schema_version"] = serde_json::json!(4),
+                "future schema" => manifest["schema_version"] = serde_json::json!(5),
                 "missing schema" => { manifest.as_object_mut().unwrap().remove("schema_version"); }
                 "string schema" => manifest["schema_version"] = serde_json::json!("2"),
                 "truncated" => {},
@@ -251,7 +251,7 @@ fn damaged_or_future_pending_manifest_headers_cannot_bypass_the_outer_recovery_f
             let before = files(&root);
             let opened = Store::open(&root);
             if damage == "future schema" {
-                assert!(matches!(opened, Err(PersistError::FutureSchema { found: 4, supported: 3, .. })),
+                assert!(matches!(opened, Err(PersistError::FutureSchema { found: 5, supported: 4, .. })),
                     "a future archive version is refused even when index v{version} is current");
             } else {
                 assert!(opened.is_err(), "pending {damage} under index v{version} cannot fall through to live-account cleanup");
@@ -259,5 +259,95 @@ fn damaged_or_future_pending_manifest_headers_cannot_bypass_the_outer_recovery_f
             assert_eq!(files(&root), before, "{damage}: the real manifest and live records survive refusal");
             assert!(prepared.dir.is_dir());
         }
+    }
+}
+
+#[test]
+fn legacy_schema_two_character_only_archives_keep_index_two_through_restore_and_recovery() {
+    for interrupt in [false, true] {
+        let (_guard, root) = state_dir();
+        let store = Store::open(&root).unwrap();
+        let (account, _) = store.create_account("Legacy receipts", NOW).unwrap();
+        let progress = CharacterProgress::new(account, GameId::Ff7, 1, 7, NOW);
+        store.put_character_progress(&progress).unwrap();
+        // A historical schema-2 envelope predates the stronger transaction writer fence.
+        // No story file exists: only these character bytes decide the record requirement.
+        let path = store.character_path(account.0, GameId::Ff7).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(2);
+        value["scene_receipts"] = serde_json::to_value(BTreeMap::from([("a".repeat(64), "b".repeat(64))])).unwrap();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut expected = CharacterRecord::read(&path).unwrap().unwrap();
+        let deleted = store.delete_account(account, NOW + 1).unwrap();
+        let entry = root.join(TRASH_DIR).join(&deleted.entry);
+        let original = without_manifest(&entry);
+        assert_eq!(read_manifest(&entry).unwrap().schema_version, 1);
+        assert_eq!(store.index().format_version(), 2);
+        if interrupt {
+            FAIL_RESTORE_RENAME.with(|flag| flag.set(true));
+            assert!(store.restore_account(&deleted.entry, NOW + 2).is_err());
+        }
+        drop(store);
+        let store = Store::open(&root).unwrap();
+        assert_eq!(store.index().format_version(), 2, "legacy recovery must not impose a newer writer fence");
+        assert_eq!(without_manifest(&entry), original);
+        let restored = store.restore_account(&deleted.entry, NOW + 3).unwrap();
+        assert!(restored.unfinished.is_empty());
+        assert_eq!(store.index().format_version(), 2);
+        assert_eq!(read_manifest(&root.join(TRASH_DIR).join(&restored.entry)).unwrap().schema_version, 1);
+        expected.progress.account_id = restored.account_id;
+        let actual = CharacterRecord::read(&store.character_path(restored.account_id.0, GameId::Ff7).unwrap()).unwrap().unwrap();
+        assert_eq!(actual, expected, "legacy receipts survive the account rekey exactly");
+    }
+}
+
+#[test]
+fn historical_schema_three_characters_delete_and_recover_under_index_three() {
+    for stage in ["complete", "abandon", "unmoved", "moved"] {
+        let (_guard, root) = state_dir();
+        let store = Store::open(&root).unwrap();
+        let (account, _) = store.create_account("Historical batch", NOW).unwrap();
+        store.put_character_progress(&CharacterProgress::new(account, GameId::Ff7, 1, 7, NOW)).unwrap();
+        {
+            let counters = store.writer().unwrap();
+            store.ensure_index_format(&counters, crate::index::SCENE_BATCH_INDEX_VERSION).unwrap();
+        }
+        // A completed historical batch has receipts, but no active continuation.
+        let path = store.character_path(account.0, GameId::Ff7).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(3);
+        let receipt = serde_json::json!({ "result": "b".repeat(64), "members": 1, "slot": 0 });
+        value["batch_receipts"] = serde_json::to_value(BTreeMap::from([("a".repeat(64), receipt)])).unwrap();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut expected = CharacterRecord::read(&path).unwrap().unwrap();
+        let original = fs::read(&path).unwrap();
+        let entry = if stage == "complete" {
+            store.delete_account(account, NOW + 1).unwrap().entry
+        } else {
+            let prepared = store.prepare_delete(account, NOW + 1).unwrap();
+            if stage != "abandon" { store.commit_delete(account).unwrap(); }
+            if stage == "moved" {
+                assert!(move_into_entry(&root, &prepared.dir, &prepared.manifest).failed.is_empty());
+            }
+            prepared.base
+        };
+        assert_eq!(store.index().format_version(), 3);
+        drop(store);
+        let store = Store::open(&root).unwrap();
+        assert_eq!(store.index().format_version(), 3, "{stage}: historical recovery does not require index4");
+        let entry = if stage == "abandon" {
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(store.trash_entries().unwrap().is_empty());
+            store.delete_account(account, NOW + 2).unwrap().entry
+        } else { entry };
+        let dir = root.join(TRASH_DIR).join(&entry);
+        assert_eq!(read_manifest(&dir).unwrap().schema_version, 1);
+        assert_eq!(fs::read(dir.join(progression_rel(account.0, "Ff7.character.json"))).unwrap(), original);
+        let restored = store.restore_account(&entry, NOW + 3).unwrap();
+        assert!(restored.unfinished.is_empty());
+        assert_eq!(store.index().format_version(), 4, "an explicit new restore still selects the index4 fence");
+        expected.progress.account_id = restored.account_id;
+        let actual = CharacterRecord::read(&store.character_path(restored.account_id.0, GameId::Ff7).unwrap()).unwrap().unwrap();
+        assert_eq!(actual, expected);
     }
 }

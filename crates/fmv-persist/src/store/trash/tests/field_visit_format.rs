@@ -160,7 +160,7 @@ fn active_v3_archives_refuse_lower_index_versions_before_abandoning_or_finishing
 }
 
 #[test]
-fn future_active_manifest_four_is_refused_even_under_index_five() {
+fn large_visit_active_manifest_four_is_refused_under_index_five() {
     for stage in ["delete", "restore"] {
         let (_guard, root) = state_dir();
         let store = Store::open(&root).unwrap();
@@ -180,7 +180,7 @@ fn future_active_manifest_four_is_refused_even_under_index_five() {
         write_manifest(&entry, &manifest).unwrap();
         drop(store);
         let before = files(&root);
-        assert!(Store::open(&root).is_err(), "future {stage} manifest must never reach legacy cleanup");
+        assert!(Store::open(&root).is_err(), "{stage} manifest4 requires index6 before recovery may change anything");
         assert_eq!(files(&root), before);
     }
 }

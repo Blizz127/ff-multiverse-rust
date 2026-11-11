@@ -63,6 +63,7 @@ impl Store {
             // A previously imported or directly stored v3 blob may predate this fence.
             // A successful exact-write acknowledgment must protect it from older writers.
             self.ensure_scene_batch_format(&writer)?;
+            self.ensure_character_format(&writer, account, game)?;
             return Ok((SceneCommit::AlreadyApplied, current));
         }
         if current.story.blob != expected_blob {
@@ -78,6 +79,7 @@ impl Store {
             return Err(PersistError::TooLarge { path, size: bytes.len() as u64, max: MAX_RECORD_BYTES });
         }
         self.ensure_scene_batch_format(&writer)?;
+        self.ensure_character_format(&writer, account, game)?;
         fsio::ensure_dir(&self.progression_dir(account.0))?;
         self.transaction_poisoned.store(true, Ordering::Release);
         write(&path, &bytes)?;

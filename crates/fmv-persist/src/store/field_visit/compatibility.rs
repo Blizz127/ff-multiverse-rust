@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use fmv_core::{GameId, InventoryEntry};
 
 use crate::index::{self, StoreCompatibility, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION,
-    INDEX_LOG_FILE, SCENE_BATCH_INDEX_VERSION};
+    INDEX_LOG_FILE, LARGE_FIELD_VISIT_INDEX_VERSION, SCENE_BATCH_INDEX_VERSION};
 use crate::model::INDEX_LOG_VERSION;
 use crate::store::{Store, FAIL_SCENE_FORMAT_AFTER_RENAME};
 use crate::{CharacterProgress, NewPlayerCharacter, PersistError, Progression, Registered};
@@ -178,8 +178,8 @@ fn an_uncertain_field_visit_fence_blocks_progress_and_registration_until_reopen(
 fn unsupported_minima_refuse_before_poison_or_any_filesystem_change() {
     // Also check a store already at the maximum: invalid input must not take the
     // otherwise harmless lower-minimum fastpath.
-    for version in [INDEX_LOG_VERSION, FIELD_VISIT_INDEX_VERSION] {
-        for minimum in [0, 1, FIELD_VISIT_INDEX_VERSION + 1, u32::MAX] {
+    for version in [INDEX_LOG_VERSION, FIELD_VISIT_INDEX_VERSION, LARGE_FIELD_VISIT_INDEX_VERSION] {
+        for minimum in [0, 1, LARGE_FIELD_VISIT_INDEX_VERSION + 1, u32::MAX] {
             let (_dir, store, registered) = legacy_fixture(version);
             let before = records(&store, &registered);
             let before_layout = layout(&store, Some(&registered));

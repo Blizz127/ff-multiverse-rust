@@ -3,6 +3,9 @@
 //! retaining the original story/resources/scratch. Complete commits the replayed effects
 //! and clears the active link together. No runtime admission or anchor reconstruction.
 
+#[cfg(test)]
+mod size_bounds;
+
 use fmv_core::AccountId;
 use fmv_ff7::script::{FieldScratch, FieldScratchOutcome};
 use fmv_ff7::script::dialogue::End;

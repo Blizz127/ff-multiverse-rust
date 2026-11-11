@@ -42,7 +42,7 @@ fn uncertain_ordinary_item_writes_fence_retries_and_reopen_with_at_most_one_debi
             // The same locks held by ensure/put/update_character_progress.
             let _writer = store.writer().unwrap();
             let _progress = store.progress_write();
-            store.write_character_record_with_writer(&path, after.clone(), |path, bytes| {
+            store.write_character_record_with_writer(&_writer, &path, after.clone(), |path, bytes| {
                 fsio::atomic_write_with_checkpoints(path, bytes, |at| {
                     if at == stage { Err(std::io::Error::other("injected item save interruption")) } else { Ok(()) }
                 })
@@ -86,7 +86,7 @@ fn invalid_ordinary_character_shape_refuses_before_the_fence_or_writer() {
     let result = {
         let _writer = store.writer().unwrap();
         let _progress = store.progress_write();
-        store.write_character_record_with_writer(&path, invalid, |_, _| {
+        store.write_character_record_with_writer(&_writer, &path, invalid, |_, _| {
             wrote.set(true);
             panic!("invalid records must be refused before any write")
         })

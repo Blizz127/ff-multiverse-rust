@@ -20,6 +20,9 @@ use crate::error::{PersistError, Result};
 /// the version: [`CharacterProgress::inventory`] was added that way. (What that costs a build
 /// that is rolled back is documented there.)
 pub const SCHEMA_VERSION: u32 = 1;
+/// Highest private character-envelope schema understood by this build. Ordinary records
+/// stay at version 1; version 5 is selected only for a visit with enlarged opaque payloads.
+pub const MAX_CHARACTER_PROGRESS_SCHEMA_VERSION: u32 = 5;
 /// Default format version of a new account index (`index.log`, and the small `index.json`
 /// marker beside it). Explicit durable story writes raise the log header to version 4,
 /// while retaining the legacy marker at version 2. Version 3 introduced scene batches and
@@ -46,15 +49,16 @@ pub const MAX_BLOB_BYTES: usize = 256 * 1024;
 /// [`MAX_SCENE_RECEIPTS`](crate::MAX_SCENE_RECEIPTS) durable receipt hashes fit alongside them;
 /// those receipts are never evicted. Ordinary receipts require schema 2; batch receipts,
 /// checkpoints and reservations require schema 3. Visits and their bounded last-operation
-/// receipt require schema 4 and index header 5; earlier durable batches require header 4.
+/// receipt require schema 4 and index header 5. An entry or anchor larger than 1024 bytes
+/// selects schema 5 and index header 6; earlier durable batches require header 4.
 /// These recognized fences make earlier writers refuse the whole store. Records without
 /// metadata retain schema 1.
 /// A checkpoint's replay has up to 256 KiB of bytes; pretty JSON puts each on an indented
 /// line. This cap includes that expansion, a complete inventory and all 2,048 receipts.
-/// A conservative character bound is `12 * 256 KiB + 16 * (2 * 8 KiB)` for replay,
-/// original story and landing arrays, `256 * 2048` for receipts, and 64 KiB for inventory,
-/// visit metadata and the remaining fields: 3,997,696 bytes. The actual widest validated envelope is exercised
-/// in `store::scene::batch::tests::size_bounds`, including the deeper intent indentation.
+/// The actual widest validated envelope is exercised in
+/// `store::scene::batch::tests::size_bounds`; `store::field_visit::large_tests` additionally
+/// combines the enlarged visit, maximum checkpoint, full inventory and receipt history.
+/// These checks serialize the real record, including its pretty-JSON indentation.
 /// Raising the bound changes no serialization, receipt identity or recovery checksum.
 pub const MAX_CHARACTER_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 /// Longest accepted `base_archetype` (bytes).
@@ -382,7 +386,7 @@ impl NewProgression {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterProgress {
     /// Record format version. The store stamps the base [`SCHEMA_VERSION`], or its private
-    /// receipt/checkpoint/visit envelope's version (2, 3 or 4); callers cannot downgrade that metadata.
+    /// receipt/checkpoint/visit envelope's version (2 through 5); callers cannot downgrade that metadata.
     pub schema_version: u32,
     pub account_id: AccountId,
     pub game: GameId,

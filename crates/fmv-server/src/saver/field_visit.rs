@@ -10,7 +10,7 @@ use fmv_adapter_api::GameAdapter;
 use fmv_core::{AccountId, GameId, MAX_INVENTORY_STACKS};
 use fmv_persist::{FieldVisitCommitted, FieldVisitOperation, FieldVisitOperationKind, FieldVisitV1,
     PersistError, SceneState, Store, MAX_FIELD_VISIT_ANCHOR_BYTES, MAX_FIELD_VISIT_BYTES,
-    MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, SCHEMA_VERSION};
+    MAX_FIELD_VISIT_ENTRY_BYTES, MAX_FIELD_VISIT_FIELD_BYTES, MAX_CHARACTER_PROGRESS_SCHEMA_VERSION, SCHEMA_VERSION};
 use fmv_protocol::MAX_STORY_PROGRESS_BYTES;
 
 use super::SceneSaveError;
@@ -58,7 +58,7 @@ impl FieldVisitSaveJob {
             }
             let character = state.pair.character.as_ref().ok_or(SceneSaveError::MissingCharacter)?;
             if character.account_id != self.account() || character.game != game
-                || !(1..=4).contains(&character.schema_version) || character.level == 0 {
+                || !(1..=MAX_CHARACTER_PROGRESS_SCHEMA_VERSION).contains(&character.schema_version) || character.level == 0 {
                 return Err(SceneSaveError::InvalidRequest);
             }
             if let Some(inventory) = &character.inventory {

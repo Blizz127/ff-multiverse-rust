@@ -26,6 +26,8 @@
 //! batches. Explicit durable story writes now raise the header to 4, excluding earlier
 //! writers that lack exact ordinary story/battle commits and uncertain-write fencing.
 //! Field-visit state requires version 5 so prior writers cannot discard its metadata.
+//! Visits with larger entry or anchor images require version 6, excluding writers with
+//! the earlier bounds. Small visits keep their existing format and compatibility fence.
 //! Reading and compaction preserve each existing supported header. The entries that
 //! follow retain the same format:
 //!
@@ -90,8 +92,10 @@ pub(crate) const SCENE_BATCH_INDEX_VERSION: u32 = 3;
 /// Character schema 3 and batch intent schema 2 are unchanged; version 4 excludes prior
 /// writers whose ordinary story/reward and uncertain-write behavior is incompatible.
 pub(crate) const DURABLE_STORY_INDEX_VERSION: u32 = 4;
-/// Current recognized index maximum and the minimum fence for account-owned field visits.
+/// The minimum fence for account-owned field visits within the original size bounds.
 pub(crate) const FIELD_VISIT_INDEX_VERSION: u32 = 5;
+/// Current recognized index maximum and the fence for larger field-visit images.
+pub(crate) const LARGE_FIELD_VISIT_INDEX_VERSION: u32 = 6;
 
 /// Explicit minimum reader/writer compatibility for a store. Selecting a level only raises
 /// its recognized index fence; it does not initialize, validate or register game records.
@@ -102,6 +106,8 @@ pub enum StoreCompatibility {
     DurableStory,
     /// Account-owned field visits and their atomic progress updates (index version 5).
     FieldVisit,
+    /// Field visits with larger entry or reconstruction images (index version 6).
+    LargeFieldVisit,
 }
 
 impl StoreCompatibility {
@@ -109,6 +115,7 @@ impl StoreCompatibility {
         match self {
             Self::DurableStory => DURABLE_STORY_INDEX_VERSION,
             Self::FieldVisit => FIELD_VISIT_INDEX_VERSION,
+            Self::LargeFieldVisit => LARGE_FIELD_VISIT_INDEX_VERSION,
         }
     }
 }
@@ -358,7 +365,7 @@ fn header_line(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
-    if !(INDEX_LOG_VERSION..=FIELD_VISIT_INDEX_VERSION).contains(&version) {
+    if !(INDEX_LOG_VERSION..=LARGE_FIELD_VISIT_INDEX_VERSION).contains(&version) {
         return Err(PersistError::corrupt(path, "unsupported index output version"));
     }
     encode_line(
@@ -371,7 +378,7 @@ fn header_line_version(path: &Path, version: u32) -> Result<Vec<u8>> {
 }
 
 fn check_header(path: &Path, line: &[u8]) -> Result<u32> {
-    check_header_upto(path, line, FIELD_VISIT_INDEX_VERSION)
+    check_header_upto(path, line, LARGE_FIELD_VISIT_INDEX_VERSION)
 }
 
 fn check_header_upto(path: &Path, line: &[u8], maximum: u32) -> Result<u32> {
@@ -956,7 +963,7 @@ mod tests {
 
     #[test]
     fn recognized_header_fences_reject_prior_readers_and_preserve_each_version_during_open_and_compaction() {
-        for version in [INDEX_LOG_VERSION, SCENE_BATCH_INDEX_VERSION, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION] {
+        for version in [INDEX_LOG_VERSION, SCENE_BATCH_INDEX_VERSION, DURABLE_STORY_INDEX_VERSION, FIELD_VISIT_INDEX_VERSION, LARGE_FIELD_VISIT_INDEX_VERSION] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let path = root.join(INDEX_LOG_FILE);
@@ -968,7 +975,8 @@ mod tests {
             assert_eq!(check_header(&path, first).unwrap(), version);
             if version > INDEX_LOG_VERSION {
                 // The preceding reader used this recognized-version check before reading
-                // accounts or touching transaction recovery: max3 rejects4 and max4 rejects5.
+                // accounts or touching transaction recovery: each old maximum rejects the
+                // next fence, including max5 rejecting larger visit images under version6.
                 assert!(matches!(check_header_upto(&path, first, version - 1),
                     Err(PersistError::FutureSchema { .. })));
             }
@@ -993,6 +1001,20 @@ mod tests {
                 assert!(write_compacted_version(&path, &replayed.index, 1, 1, version - 1).is_err(),
                     "an explicit downgrade is refused too");
             }
+        }
+    }
+
+    #[test]
+    fn a_header_beyond_large_visit_support_is_refused_without_repair_or_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_LOG_FILE);
+        let future = encode_line(&Header { schema_version: LARGE_FIELD_VISIT_INDEX_VERSION + 1,
+            kind: LOG_KIND.into() }, &path).unwrap();
+        fs::write(&path, &future).unwrap();
+        assert!(matches!(open_index(dir.path(), &mut Vec::new(), || Ok(false)), Err(PersistError::FutureSchema { .. })));
+        assert_eq!(fs::read(&path).unwrap(), future, "a newer store is not a repairable tail or an empty index");
+        for unsupported in [0, 1, LARGE_FIELD_VISIT_INDEX_VERSION + 1, u32::MAX] {
+            assert!(header_line_version(&path, unsupported).is_err());
         }
     }
 

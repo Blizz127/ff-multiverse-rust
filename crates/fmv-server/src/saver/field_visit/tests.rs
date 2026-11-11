@@ -1,6 +1,8 @@
 //! Idle field-visit decisions through the real FIFO and durable receipt path. The fixtures
 //! supply already validated synthetic results; they do not enable any field runtime.
 
+mod large;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -283,7 +285,7 @@ fn construction_refuses_unbounded_noncanonical_or_nonidle_images_before_they_can
     let valid = decision(&before, 12, NOW + 2);
     let durable = files(dir.path());
     for bad in ["operation", "story", "expected story", "expected visit", "next visit", "field", "arrival", "anchor", "visit schema", "identity",
-        "source", "unknown", "revision", "knowledge loss", "inventory", "character account", "character game",
+        "source", "unknown", "revision", "knowledge loss", "inventory", "character account", "character game", "character schema", "character zero schema",
         "reservation", "checkpoint", "active continuation"] {
         let mut op = valid.operation();
         let mut expected = valid.expected().clone();
@@ -297,6 +299,8 @@ fn construction_refuses_unbounded_noncanonical_or_nonidle_images_before_they_can
             "inventory" => next.pair.character.as_mut().unwrap().inventory = Some(vec![InventoryEntry::new(0, 1); MAX_INVENTORY_STACKS + 1]),
             "character account" => next.pair.character.as_mut().unwrap().account_id = AccountId(account.0 + 1),
             "character game" => next.pair.character.as_mut().unwrap().game = GameId::Fixture,
+            "character schema" => next.pair.character.as_mut().unwrap().schema_version = MAX_CHARACTER_PROGRESS_SCHEMA_VERSION + 1,
+            "character zero schema" => next.pair.character.as_mut().unwrap().schema_version = 0,
             "reservation" => next.reservation = Some(SceneReservation { instance: [7; 32], ordinal: 0, attempt: 0, slot: 0 }),
             "checkpoint" => next.checkpoint = Some(SceneCheckpoint {
                 instance: [7; 32], scene_key: "fixture/held".into(), source_hash: [8; 32], replay_version: 1,

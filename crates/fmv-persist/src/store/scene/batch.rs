@@ -7,6 +7,9 @@
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "large_visit_tests.rs"]
+mod large_visit_tests;
 
 use fmv_core::{AccountId, GameId};
 use serde::{Deserialize, Serialize};
@@ -544,6 +547,12 @@ fn receipt_status(images: &[Images], receipt: &str, result: &str) -> Result<bool
     Ok(true)
 }
 
+fn operation_minimum_index(operation: &SceneOperation) -> u32 {
+    if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
+        crate::index::FIELD_VISIT_INDEX_VERSION
+    } else { crate::index::DURABLE_STORY_INDEX_VERSION }
+}
+
 impl Store {
     /// Read a coherent roster which can accept one ordinary terminal battle outcome.
     /// Call before starting its engine or accepting item commands. The world must keep the
@@ -672,9 +681,8 @@ impl Store {
         }
         let applied = receipt_status(&current, &receipt, &result)?;
         if applied {
-            if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
-                self.ensure_field_visit_format(&writer)?;
-            } else { self.ensure_scene_batch_format(&writer)?; }
+            let minimum = current.iter().map(Images::minimum_index_version).fold(operation_minimum_index(operation), u32::max);
+            self.ensure_index_format(&writer, minimum)?;
         }
         Ok(applied)
     }
@@ -698,9 +706,8 @@ impl Store {
             return Err(conflict("ordinary battle outcome cannot overlap an active scene continuation"));
         }
         if receipt_status(&before, &receipt, &result)? {
-            if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
-                self.ensure_field_visit_format(&_writer)?;
-            } else { self.ensure_scene_batch_format(&_writer)?; }
+            let minimum = before.iter().map(Images::minimum_index_version).fold(operation_minimum_index(operation), u32::max);
+            self.ensure_index_format(&_writer, minimum)?;
             return Ok(SceneBatchCommitted { commit: SceneCommit::AlreadyApplied,
                 current: before.iter().zip(&accounts).map(|(image, account)| image.state(*account, game)).collect() });
         }
@@ -753,9 +760,9 @@ impl Store {
         let path = self.root.join(INTENT_FILE);
         let bytes = encoded(&path, &file, MAX_BATCH_INTENT_BYTES)?;
         hook(0)?;
-        if matches!(operation.kind, SceneOperationKind::AttachVisit | SceneOperationKind::AdvanceVisit | SceneOperationKind::CompleteVisit) {
-            self.ensure_field_visit_format(&_writer)?;
-        } else { self.ensure_scene_batch_format(&_writer)?; }
+        let minimum = file.intent.rows.iter().flat_map(|row| [&row.before, &row.after])
+            .map(Images::minimum_index_version).fold(operation_minimum_index(operation), u32::max);
+        self.ensure_index_format(&_writer, minimum)?;
         self.transaction_poisoned.store(true, Ordering::Release);
         fsio::atomic_write(&path, &bytes)?;
         hook(1)?;
@@ -839,8 +846,9 @@ impl Store {
         if file.schema_version != BATCH_INTENT_VERSION || file.kind != "fmv-scene-batch-transaction" || file.checksum != digest(&file.intent)? {
             return Err(PersistError::corrupt(path, "scene batch intent kind, version or checksum mismatch"));
         }
-        if file.intent.rows.iter().flat_map(|row| [&row.before, &row.after]).any(|images| images.character.as_ref().is_some_and(|record| record.progress.schema_version >= super::CHARACTER_VISIT_VERSION))
-            && self.index().format_version() < crate::index::FIELD_VISIT_INDEX_VERSION {
+        let required = file.intent.rows.iter().flat_map(|row| [&row.before, &row.after])
+            .map(Images::minimum_index_version).max().unwrap_or(crate::model::INDEX_LOG_VERSION);
+        if required >= crate::index::FIELD_VISIT_INDEX_VERSION && self.index().format_version() < required {
             return Err(PersistError::corrupt(path, "visit-bearing batch intent lacks its required index format fence"));
         }
         let retires_landing = file.intent.operation.kind == SceneOperationKind::Complete

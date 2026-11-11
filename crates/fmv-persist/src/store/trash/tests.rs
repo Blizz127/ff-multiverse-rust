@@ -14,6 +14,7 @@ use crate::model::Registered;
 
 mod format;
 mod field_visit_format;
+mod large_visit_format;
 
 const NOW: u64 = 1_700_000_000;
 
