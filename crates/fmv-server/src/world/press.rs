@@ -151,13 +151,22 @@ impl World {
             // A character the area does not have is no character addressed: the press is where the player stands.
             let addressed = npc.and_then(|id| area.npc_position(id, &phase));
             let talking = addressed.is_some();
-            let points: Vec<u32> = area
-                .story_points_in_phase(&phase)
+            let in_phase = area.story_points_in_phase(&phase);
+            let talk: Vec<u32> = if talking {
+                in_phase.iter().filter(|point| matches!(point.trigger, StoryTrigger::Talk { .. }) && point.is_pressed_at(pos, addressed)).map(|point| point.id).collect()
+            } else {
+                Vec::new()
+            };
+            // OK where the player stands: what a press does when no character was addressed, AND when the one the client
+            // addressed has nothing to say here (a character standing next to a panel, like Jessie beside the first
+            // reactor's lift button, must not swallow the panel's press: the original only talks when there is a talk).
+            let here: Vec<u32> = in_phase
                 .iter()
-                .filter(|point| matches!(point.trigger, StoryTrigger::Talk { .. }) == talking && point.is_pressed_at(pos, addressed))
+                .filter(|point| !matches!(point.trigger, StoryTrigger::Talk { .. }) && point.is_pressed_at(pos, None))
                 .map(|point| point.id)
                 .collect();
-            let link = if talking { None } else { area.links().iter().position(|l| l.needs_ok && l.is_touched_at(pos)) };
+            let link = area.links().iter().position(|l| l.needs_ok && l.is_touched_at(pos));
+            let points = if talk.is_empty() { here } else { talk.into_iter().chain(here).collect() };
             (points, link)
         };
         // The story: each point is judged on the story as it was before the press, and the first that applies is the
