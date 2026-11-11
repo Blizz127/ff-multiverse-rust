@@ -51,6 +51,12 @@ moment 14 to 27 and writes additional tracked flags. Its success therefore prove
 route, not every optional resource action. The original pickup disappears after the boss and
 cannot be recovered later on this route.
 
+Jessie's reactor-rescue presentation now distinguishes an unknown rescued bit from a
+known clear bit. After signed moment 27, unknown state withholds only her NPC and talk
+point, preserving her slot and other NPC identities without inventing a trapped pose.
+Known clear/set behavior and earlier signed-moment branches are unchanged; inspection
+does not initialize the saved flag or enable native-party accounts.
+
 ## Durable-state foundations and remaining scope
 
 Version 3 stores byte/word aliases, known masks, clears and numeric updates. Literal and bit
@@ -151,6 +157,13 @@ combat still waits for each connected player's area handshake. These checks exer
 the internal native paths; they do not activate version-4 accounts or field visits.
 Workspace Clippy with all targets passed after two lint corrections; its three
 remaining warnings are the pre-existing audio, standing-animation and avatar-test ones.
+
+Follow-up checkpoint `10946e0` adds the bounded PC movie-camera parser and includes
+Jessie's unknown-phase fix (`d084168`). All 891 FF7 unit tests passed, with 10 optional
+tests ignored. Explicit owned-data runs passed the three Jessie placement/idle checks
+and the movie-camera check of all 197 `mainplr` and 192 `ontrain` records. FF7 Clippy
+with all targets passed with only the existing standing-animation warning. Movie
+playback and field-visit activation remain outside this checkpoint.
 
 These paths still use the existing scene scheduler and scratch initialization model.
 Native-party support alone does not establish a restored field visit. In particular,

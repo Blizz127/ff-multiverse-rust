@@ -208,6 +208,14 @@ The pinned PSX source calls the corresponding word RGB24 mode; that is evidence 
 different platform, not a verified PC interpretation. `MVCAM` and `BGMOVIE` write
 separate module control bytes, not this record word.
 
+`fmv-ff7::movie_camera` now parses these headerless records without allocating. It
+borrows the input, checks length and frame access independently, and preserves the
+nine signed basis values, signed translation/pan/zoom, and opaque words at `0x12`
+and `0x26`. Its 65,536-record ceiling is a parser resource policy, not a movie duration
+or native format limit. Zero matrices and zoom remain zero; an out-of-range record
+is an error rather than a playback-completion signal. The parser does not choose a
+projection or advance a movie clock.
+
 Still unresolved are the first camera-sampling phase after playback starts, the global
 PC meaning of record word `0x26`, per-field/per-movie update cadence, alternate movie
 update modes, and synchronization with rendering, audio and concurrent scripts. Startup
@@ -368,6 +376,18 @@ Run field initialization once per visit, not for every scene; starting another s
 not discard the retained runtime.
 The current `jessie_train_talk_scene(bool)`/`Given` input is a probe convenience, not this
 production contract. Expose scratch outcomes separately from persistent story writes.
+
+The next interpreter increment is an opt-in checked-scratch path, with the current
+constructors retaining their legacy behavior. It must accept an explicit `FieldScratch`
+image, export a separate immutable before/after result and actual assignment masks, and
+keep unknown-read faults across setup and battle return. A later write cannot validate an
+earlier guessed read. For an existing visit, setup must be neutral in values and knowledge,
+including temporary changes that it restores; entry initialization is a separate authored
+execution. Reject scratch `Given` overrides and ambiguous trigger seeds initially. In
+particular, the current GETAI seed path loses the original selector when canonicalizing
+5/6, so it cannot yet prove the width of a checked panel read. Checked replay identity
+must include its mode and initial scratch values/masks. This interpreter work alone does
+not enable registration, scene admission, visit persistence or reconnect restoration.
 
 Owned `tin_1` scripts make the atomicity requirement concrete: Jessie 34:1 checks 5:31
 at offset 9089; answer 3 subtracts three affection at 9196; both answers set 5:31 at
