@@ -28,6 +28,7 @@ fn main() {
         return;
     };
     let (mut frames, mut every, mut at, mut ok_every, mut moment) = (600u64, 150u64, None, 0u64, None);
+    let (mut after, mut then_tri) = (0u64, None::<usize>);
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
@@ -36,6 +37,8 @@ fn main() {
             "--ok-every" => ok_every = v.parse().unwrap_or(0),
             "--moment" => moment = v.parse::<u16>().ok(),
             "--at" => at = v.split_once(',').and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?))),
+            "--after" => after = v.parse().unwrap_or(0),
+            "--then-tri" => then_tri = v.parse::<usize>().ok(),
             _ => {}
         }
     }
@@ -65,7 +68,15 @@ fn main() {
         }
     };
     dump(&rt, "after init");
+    let walk = field.walkmesh().ok();
+    let tri_centre = |t: usize| walk.as_ref().and_then(|w| w.triangles.get(t)).map(|v| ((i32::from(v[0].x) + i32::from(v[1].x) + i32::from(v[2].x)) / 3, (i32::from(v[0].y) + i32::from(v[1].y) + i32::from(v[2].y)) / 3));
     for f in 1..=frames {
+        if f == after.max(1) {
+            if let Some(c) = then_tri.and_then(tri_centre) {
+                println!("frame {f}: player moves to the centre of triangle {:?} at {c:?}", then_tri);
+                at = Some(c);
+            }
+        }
         let player = at.map(|(x, y)| PlayerInput { x, y, ok: ok_every > 0 && f % ok_every == 0, dir: 64, ..Default::default() });
         rt.tick(player);
         for ev in rt.drain_events() {

@@ -543,6 +543,13 @@ impl FieldRuntime {
             if !host_driven {
                 let finished = (st.counter >> 4) >= st.last_frame;
                 match status {
+                    // A model moving under script control (a walk, jump or ladder) plays the clip its motion chose.
+                    AnimStatus::DefaultLoop if mode != MoveMode::None => {
+                        st.last_frame = whole(&self.anim, anim);
+                        if (st.counter >> 4) >= st.last_frame {
+                            st.counter = 0;
+                        }
+                    }
                     AnimStatus::DefaultLoop => {
                         if anim != st.default_id {
                             anim = st.default_id;

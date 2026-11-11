@@ -1593,7 +1593,8 @@ mod tests {
         let mut rt = runtime(s);
         let frames = frames_until(&mut rt, 0x37, 60).expect("the climb ends");
         let m = model(&rt, 0);
-        assert_eq!((m.z, m.triangle, m.dir, m.anim), (80, 4, 128, 2));
+        // (the clip is the animation family's after the climb: a finished ladder returns to the default loop)
+        assert_eq!((m.z, m.triangle, m.dir), (80, 4, 128));
         assert!((20..=24).contains(&frames), "80 units / 4 = 20 steps ({frames})");
     }
 

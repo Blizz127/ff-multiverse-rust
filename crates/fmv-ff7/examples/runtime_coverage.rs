@@ -119,7 +119,7 @@ fn main() {
                 break;
             }
         }
-        broken_entities += (0..rt.entity_count()).filter(|&e| rt.entity_state(e).is_none()).count() as u64;
+        broken_entities += (0..rt.entity_count()).filter(|&e| rt.entity_broken(e)).count() as u64;
         total.merge(rt.coverage());
     }
 

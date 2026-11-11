@@ -656,12 +656,12 @@ mod tests {
 
     #[test]
     fn gil_is_copied_into_two_words() {
-        // CHGLD: both halves into bank 2 (word) at 0x10 and 0x12.
-        let mut rt = rt_with(&[0x3B, 0x22, 0x10, 0x12]);
+        // CHGLD: both halves into bank 2 (word) at 0x40 and 0x42 (bank 1's 16-23 are the engine's clocks).
+        let mut rt = rt_with(&[0x3B, 0x22, 0x40, 0x42]);
         rt.gil = Some(0x0001_2345);
         rt.tick(None);
-        assert_eq!(word(&rt, 0x10), 0x2345);
-        assert_eq!(word(&rt, 0x12), 1);
+        assert_eq!(word(&rt, 0x40), 0x2345);
+        assert_eq!(word(&rt, 0x42), 1);
     }
 
     #[test]

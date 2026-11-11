@@ -536,6 +536,12 @@ impl FieldRuntime {
         self.names.get(e).map(String::as_str)
     }
 
+    /// Whether entity `e` stopped for good (an undecodable instruction, an init that never reached its RET, or a
+    /// RET with nothing to resume).
+    pub fn entity_broken(&self, e: usize) -> bool {
+        self.ents.get(e).is_some_and(|x| x.broken)
+    }
+
     /// Entity `e`'s active priority and PC.
     pub fn entity_state(&self, e: usize) -> Option<(u8, usize)> {
         self.ents.get(e).map(|x| (x.priority, x.pc))
