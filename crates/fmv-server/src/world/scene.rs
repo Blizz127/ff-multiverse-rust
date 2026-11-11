@@ -458,6 +458,7 @@ impl World {
     /// `Interact` naming scene NPC `npc`: start its scene for `entity` if it is on offer and in reach (module docs). Anything
     /// else is no press at all, as for a character the area does not have.
     pub(super) fn press_scene(&mut self, entity: EntityId, npc: u32, now: Instant) {
+        if self.in_live_field(entity) { return; }
         let (Some(host), Some(index)) = (self.scenes.host.clone(), scene_index(npc)) else { return };
         let Some(info) = self.scenes.list.get(index).cloned() else { return };
         if host.automatic(&info.id) { return; }
@@ -1253,6 +1254,7 @@ impl World {
 
     /// Start an offered arrival scene for this player only, after the area's entry story has run.
     pub(super) fn automatic_scene_entered(&mut self, entity: EntityId, now: Instant) {
+        if self.in_live_field(entity) { return; }
         let Some(host) = self.scenes.host.clone() else { return };
         let Some(player) = self.players.get(&entity) else { return };
         if player.preview.is_some() || player.transit.is_some() || player.battle.is_some() || player.scene.is_some()

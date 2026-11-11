@@ -223,9 +223,18 @@ impl World {
         self.live.runs.contains_key(&id).then_some(id)
     }
 
-    /// Whether `entity` stands in a live field (its moves skip the static story points and script exits).
+    /// Whether `entity` stands in a live field (its moves skip the static story points and script exits, and no curated
+    /// scene or story point starts for it: the field's own scripts play the story). True from the moment it arrives,
+    /// before the field's first frame.
     pub(super) fn in_live_field(&self, entity: EntityId) -> bool {
-        self.live_run_of(entity).is_some()
+        let Some(player) = self.players.get(&entity) else { return false };
+        if player.preview.is_some() {
+            return false;
+        }
+        if player.placement.as_ref().is_some_and(|p| governor_of(&p.key.phase).is_some() && p.key.area.key == player.area) {
+            return true;
+        }
+        self.areas.get(&player.area).is_some_and(|area| self.live_phase_of(area, player.account, &player.progression).is_some())
     }
 
     /// Whether a script holds `entity` still: only the governor, whose avatar is the field's player character.
@@ -252,7 +261,7 @@ impl World {
     /// An OK press of `entity` in a live field: the next frame sees it. Returns whether it was taken.
     pub(super) fn live_press(&mut self, entity: EntityId) -> bool {
         let Some(account) = self.players.get(&entity).map(|p| p.account) else { return false };
-        if self.live_run_of(entity).is_none() {
+        if !self.in_live_field(entity) {
             return false;
         }
         self.live.ok.insert(account);

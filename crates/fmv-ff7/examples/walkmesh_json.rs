@@ -41,7 +41,7 @@ fn main() {
         .map(|t| {
             t.gateways
                 .iter()
-                .map(|g| format!("{{\"a\":[{},{}],\"b\":[{},{}],\"to\":{}}}", g.exit_a[0], g.exit_a[1], g.exit_b[0], g.exit_b[1], g.target_field_id))
+                .map(|g| format!("{{\"a\":[{},{}],\"b\":[{},{}],\"z\":{},\"to\":{}}}", g.exit_a[0], g.exit_a[1], g.exit_b[0], g.exit_b[1], (i32::from(g.exit_a[2]) + i32::from(g.exit_b[2])) / 2, g.target_field_id))
                 .collect()
         })
         .unwrap_or_default();

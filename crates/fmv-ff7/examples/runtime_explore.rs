@@ -456,7 +456,7 @@ fn main() {
                 let stand = (m.x + ox, m.y + oy, m.z);
                 if on_reach(&rt, stand) {
                     let face = direction_of(i64::from(-ox), i64::from(-oy));
-                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {}; face {face}; ok", stand.0, stand.1)));
+                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {} {}; face {face}; ok", stand.0, stand.1, stand.2)));
                     break;
                 }
             }
@@ -470,10 +470,10 @@ fn main() {
             let (a_side, b_side) = (side(-6), side(6));
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
             if on_reach(&rt, a_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("xy {} {}; to {} {}", a_side.0, a_side.1, b_side.0, b_side.1)));
+                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("xy {} {} {}; to {} {}", a_side.0, a_side.1, a_side.2, b_side.0, b_side.1)));
             }
             if on_reach(&rt, b_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("xy {} {}; to {} {}", b_side.0, b_side.1, a_side.0, a_side.1)));
+                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("xy {} {} {}; to {} {}", b_side.0, b_side.1, b_side.2, a_side.0, a_side.1)));
             }
             // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
             // in front of the player), or on its middle when neither side can be stood on.
@@ -482,12 +482,12 @@ fn main() {
                 let stand = side(k);
                 if on_reach(&rt, stand) {
                     let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
-                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {}; face {face}; ok", stand.0, stand.1)));
+                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {} {}; face {face}; ok", stand.0, stand.1, stand.2)));
                     stood = true;
                 }
             }
             if !stood && on_reach(&rt, mid) {
-                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, format!("xy {} {}; ok", mid.0, mid.1)));
+                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, format!("xy {} {} {}; ok", mid.0, mid.1, mid.2)));
             }
         }
 

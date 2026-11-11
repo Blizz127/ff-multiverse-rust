@@ -6,7 +6,7 @@ A route file is an ordered list of entries, one per line: `FIELD: STEP; STEP; ..
 the player, no window is open, no battle runs), then plays the steps:
 
     tri N        walk to the centre of walkmesh triangle N (planned over the walkmesh's links)
-    xy X Y       walk to the point (X, Y) (planned the same way, then straight to the point)
+    xy X Y [Z]   walk to the point (X, Y) (planned the same way, then straight to the point; Z picks the level)
     to X Y       walk straight to (X, Y)
     gate N       walk across gateway slot N
     face DIR     face a field direction (0-255; 64 is +x)
@@ -74,6 +74,15 @@ class Mesh:
                 best = (key, i)
         return best[1] if best else 0
 
+    def height(self, i, x, y):
+        (ax, ay, az), (bx, by, bz), (cx, cy, cz) = self.tris[i]
+        d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if d == 0:
+            return az
+        l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / d
+        l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / d
+        return l1 * az + l2 * bz + (1 - l1 - l2) * cz
+
     def path(self, start, goal):
         prev = {start: None}
         q = deque([start])
@@ -115,6 +124,7 @@ def main():
     ap.add_argument("--name", default="Router")
     ap.add_argument("--speed", type=float, default=200.0, help="walking speed, field units per second")
     ap.add_argument("--stall", type=float, default=60.0, help="give up after this long without progress")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     route = load_route(args.route)
     c = livebot.Conn(args.addr)
@@ -133,9 +143,9 @@ def main():
     status = "time"
     end = time.monotonic() + args.seconds
 
-    def plan(x, y, straight_end=True):
+    def plan(x, y, straight_end=True, z=None):
         start = mesh.locate(pos["x"], pos["y"], pos.get("z"))
-        goal = mesh.locate(x, y)
+        goal = mesh.locate(x, y, z)
         return (mesh.path(start, goal) or []) + ([(x, y)] if straight_end else [])
 
     while time.monotonic() < end:
@@ -219,6 +229,8 @@ def main():
                     pos = {"x": pos["x"] + dx / d * step, "y": pos["y"] + dy / d * step, "z": pos["z"]}
                 if d > 0:
                     facing = math.atan2(dy, dx)
+                # stay on the level we walk on (layered fields): the height follows the triangle under us
+                pos["z"] = mesh.height(mesh.locate(pos["x"], pos["y"], pos.get("z")), pos["x"], pos["y"])
                 seq += 1
                 c.send({"MoveIntent": {"seq": seq, "pos": pos, "facing": facing, "anim": "Walk" if legs else "Idle"}})
             time.sleep(0.01)
@@ -244,10 +256,13 @@ def main():
             continue
         step = steps.pop(0)
         last_move = now
+        if args.verbose:
+            print(f"    at {round(pos['x'])},{round(pos['y'])},{round(pos.get('z', 0))} tri {mesh.locate(pos['x'], pos['y'], pos.get('z'))}: {' '.join(step)}", flush=True)
         if step[0] == "tri":
-            legs = plan(*mesh.centre(int(step[1])), straight_end=False) or [mesh.centre(int(step[1]))]
+            goal = int(step[1])
+            legs = mesh.path(mesh.locate(pos["x"], pos["y"], pos.get("z")), goal) or [mesh.centre(goal)]
         elif step[0] == "xy":
-            legs = plan(float(step[1]), float(step[2]))
+            legs = plan(float(step[1]), float(step[2]), z=float(step[3]) if len(step) > 3 else None)
         elif step[0] == "to":
             legs = [(float(step[1]), float(step[2]))]
         elif step[0] == "gate":
@@ -259,7 +274,9 @@ def main():
             if (pos["x"] - mx) * nx + (pos["y"] - my) * ny > 0:
                 nx, ny = -nx, -ny
             before = (mx - nx * 30, my - ny * 30)
-            legs = plan(*before) + [(mx + nx * 40, my + ny * 40)]
+            legs = plan(*before, z=g.get("z")) + [(mx + nx * 40, my + ny * 40)]
+            if args.verbose:
+                print(f"    gate {g} legs {[(round(x), round(y)) for x, y in legs]}", flush=True)
         elif step[0] == "face":
             facing = (int(step[1]) - 64) / 256 * math.tau
             seq += 1

@@ -98,6 +98,8 @@ impl World {
     /// A point whose cutscene holds the player is the last judged here. Exact progression resumes
     /// the captured remaining ids after acknowledgment; legacy progression retains its entry rescan.
     pub(super) fn enter_story(&mut self, entity: EntityId, now: Instant) {
+        // A live field's own scripts play what happens on entry.
+        if self.in_live_field(entity) { return; }
         if self.ordinary_story_held(entity) { return; }
         let entering: Vec<u32> = {
             let Some(player) = self.players.get(&entity).filter(|p| p.battle.is_none() && p.transit.is_none()) else { return };

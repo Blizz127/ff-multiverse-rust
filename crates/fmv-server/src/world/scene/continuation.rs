@@ -244,6 +244,7 @@ impl World {
 
     /// Run only after the adapter accepted the movement. A line scene owns the remainder of this move.
     pub(in crate::world) fn check_scene_line(&mut self, entity: EntityId, from: Pos, to: Pos, now: Instant) -> bool {
+        if self.in_live_field(entity) { return false; }
         let Some(player) = self.players.get(&entity) else { return false; };
         if player.scene.is_some() || player.battle.is_some() || player.transit.is_some() || player.preview.is_some() || player.story_pending.is_some()
             || self.account_in_battle(player.account)
