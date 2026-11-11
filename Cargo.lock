@@ -734,6 +734,7 @@ dependencies = [
  "fmv-ff7-battle",
  "fmv-fixture",
  "fmv-library",
+ "fmv-media",
  "fmv-mods",
  "fmv-protocol",
  "gilrs",

@@ -20,6 +20,8 @@ fmv-library.workspace = true
 fmv-ff7-battle = { path = "../fmv-ff7-battle" }
 # Music and effects: the mixer, the null sink and the cpal output device (path dependency).
 fmv-audio = { path = "../fmv-audio" }
+# Exact decoded frame metadata for the isolated movie GPU presentation primitive.
+fmv-media = { path = "../fmv-media" }
 # The optional community-mod layers over the owner's own content (Echo-S's script, voices and music; Cosmo Memory's sounds):
 # a read-only reader for the owner's own .iro archives (path dependency).
 fmv-mods = { path = "../fmv-mods" }
