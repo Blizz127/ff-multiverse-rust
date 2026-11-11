@@ -29,6 +29,7 @@ fn main() {
     };
     let (mut frames, mut every, mut at, mut ok_every, mut moment) = (600u64, 150u64, None, 0u64, None);
     let (mut after, mut then_tri) = (0u64, None::<usize>);
+    let (mut banks_file, mut walk_tri) = (None::<String>, None::<usize>);
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
@@ -39,6 +40,8 @@ fn main() {
             "--moment" => moment = v.parse::<u16>().ok(),
             "--at" => at = v.split_once(',').and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?))),
             "--after" => after = v.parse().unwrap_or(0),
+            "--banks" => banks_file = Some(v),
+            "--walk-tri" => walk_tri = v.parse::<usize>().ok(),
             "--set" => {
                 if let Some((sa, val)) = v.split_once('=') {
                     if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
@@ -56,6 +59,9 @@ fn main() {
     let field = load_field(&mut lgp, &name).expect("field");
     let section = field.section(fmv_ff7::field::section::SCRIPT).expect("script");
     let mut banks = Banks::from_story(&StoryState::fresh_reset()).expect("complete");
+    if let Some(b) = banks_file.as_deref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|h| Banks::from_hex(h.trim())) {
+        banks = b;
+    }
     if let Some(m) = moment {
         let [lo, hi] = m.to_le_bytes();
         banks.set(0, lo);
@@ -92,7 +98,17 @@ fn main() {
                 at = Some(c);
             }
         }
-        let player = at.map(|(x, y)| PlayerInput { x, y, ok: ok_every > 0 && f % ok_every == 0, dir: 64, ..Default::default() });
+        if let (true, Some(target)) = (f > after.max(1), walk_tri.and_then(tri_centre)) {
+            // follow the scripts while they hold the player, else walk 24 units a frame toward the triangle's centre
+            let cur = if rt.player_scripted() { rt.pc_model().map(|m| (m.x, m.y)) } else { at }.or_else(|| rt.pc_model().map(|m| (m.x, m.y)));
+            if let Some((x, y)) = cur {
+                let (dx, dy) = (f64::from(target.0 - x), f64::from(target.1 - y));
+                let d = (dx * dx + dy * dy).sqrt();
+                at = Some(if rt.player_scripted() || d <= 24.0 { if rt.player_scripted() { (x, y) } else { target } } else { (x + (dx / d * 24.0) as i32, y + (dy / d * 24.0) as i32) });
+            }
+        }
+        let z = rt.pc_model().map_or(0, |m| m.z);
+        let player = at.map(|(x, y)| PlayerInput { x, y, z, ok: ok_every > 0 && f % ok_every == 0, dir: 64, ..Default::default() });
         rt.tick(player);
         for ev in rt.drain_events() {
             match &ev {

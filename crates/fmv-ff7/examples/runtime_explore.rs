@@ -358,6 +358,7 @@ fn main() {
     let (mut start_field, mut steps, mut start_moment, mut route_out) = ("md1stin".to_string(), 200u32, None::<u16>, None::<String>);
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     let mut start_tri: Option<usize> = None;
+    let (mut save_best, mut banks_file) = (None::<String>, None::<String>);
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
@@ -366,6 +367,8 @@ fn main() {
             "--moment" => start_moment = v.parse().ok(),
             "--route-out" => route_out = Some(v),
             "--tri" => start_tri = v.parse().ok(),
+            "--save-best" => save_best = Some(v),
+            "--banks" => banks_file = Some(v),
             "--set" => {
                 if let Some((sa, val)) = v.split_once('=') {
                     if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
@@ -381,6 +384,9 @@ fn main() {
     let mut lgp = LgpArchive::open_path(&flevel_path(&dir)).expect("flevel");
     let maplist = Maplist::from_archive(&mut lgp).expect("maplist");
     let mut banks = Banks::from_story(&StoryState::fresh_reset()).expect("complete");
+    if let Some(b) = banks_file.as_deref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|h| Banks::from_hex(h.trim())) {
+        banks = b;
+    }
     if let Some(m) = start_moment {
         let [lo, hi] = m.to_le_bytes();
         banks.set(0, lo);
@@ -478,6 +484,10 @@ fn main() {
         let now = moment_of(&rt.mem.banks);
         if now > best.0 && !settle.0.game_over {
             best = (now, via.clone(), field_name.clone());
+            // The story on entering the furthest field (before it settled), for the trace tool.
+            if let Some(path) = &save_best {
+                let _ = std::fs::write(path, format!("{}\n", banks.to_hex()));
+            }
         }
         let carry_out = Some((rt.save_data().clone(), rt.gil));
         let enter = |to: &str, jump: (u16, i16, i16, i16), banks: Banks, via: Option<Rc<Step>>| State {

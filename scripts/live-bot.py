@@ -68,12 +68,15 @@ def main():
     ap.add_argument("--press-every", type=float, default=0, help="press OK every N seconds (0: never)")
     ap.add_argument("--answers", default="", help="comma-separated answers for questions, in order")
     ap.add_argument("--approach", action="store_true", help="walk toward the nearest cast member and press OK there")
+    ap.add_argument("--token-file", help="log in with the token in this file; register and save it there when it is missing")
     args = ap.parse_args()
     answers = [int(a) for a in args.answers.split(",") if a.strip()]
 
     c = Conn(args.addr)
-    c.send({"Hello": {"protocol_version": PROTOCOL, "client_build": "live-bot", "auth": {"Register": {"display_name": args.name}},
-                      "character": {"tint": [200, 120, 60], "body": None, "slot": None}}})
+    import os
+    token = open(args.token_file).read().strip() if args.token_file and os.path.exists(args.token_file) else None
+    auth = {"Token": token} if token else {"Register": {"display_name": args.name}}
+    c.send({"Hello": {"protocol_version": PROTOCOL, "client_build": "live-bot", "auth": auth, "character": {"tint": [200, 120, 60], "body": None, "slot": None}}})
     entity, pos, facing, area, seq = None, {"x": 0.0, "y": 0.0, "z": 0.0}, 0.0, None, 0
     cast, locked, last_press, end = [], False, time.monotonic(), time.monotonic() + args.seconds
     pending = []  # (due, msg)
@@ -87,6 +90,9 @@ def main():
             body = msg[k] if isinstance(msg, dict) else None
             if k == "Welcome":
                 entity = body["entity"]
+                if args.token_file and body.get("issued_token"):
+                    with open(args.token_file, "w") as f:
+                        f.write(body["issued_token"])
                 print(f"WELCOME entity={entity}", flush=True)
             elif k in ("AreaManifest", "AreaChange"):
                 area = body["area"]
