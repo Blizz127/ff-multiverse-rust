@@ -7,6 +7,8 @@
 use super::*;
 use crate::script::Instruction;
 
+pub(crate) mod entry;
+
 /// Which authored instructions cause a cut. Locks are always observed, but never cut.
 /// Each selected instruction yields separately, including repeated instructions at one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

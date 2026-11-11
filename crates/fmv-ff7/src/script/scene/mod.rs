@@ -69,3 +69,4 @@ pub use train_arrival::{TrainArrival, TrainArrivalEntry, TrainArrivalReady, Trai
     TRAIN_ARRIVAL_LANDING, replay_train_arrival, train_arrival_ready};
 
 pub use play::control::{ControlPolicy, ControlOp, ControlState, ControlCheckpoint, ControlBoundary, ControlAck, ControlInput, ControlBeat, ControlError, ControlScenePlay};
+pub use play::control::entry::{EntryScenePlay, EntryBeat, EntryYield, EntryError, EntryInput, EntryAudio, MovieToken, MovieRequest, MovieRequestKind, MovieAsset, MovieAck, MovieCounterProfile, MovieCounterObservation};

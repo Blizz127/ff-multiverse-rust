@@ -61,6 +61,8 @@ use crate::script::{decode_at, field_wide_bytes, FieldScript, FieldScratch, Fiel
 use crate::story::{tracked_var, NativePartyOp, NativeStoryBuilder, NativeStoryJournal, PartyOp, StoryState, MOMENT_ADDRESS, MOMENT_BANK};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(super) mod entry;
+
 /// Field frames per second (the clock of [`Timed::at`]).
 pub const FRAMES_PER_SECOND: u32 = 30;
 
@@ -434,6 +436,8 @@ enum State {
     WaitOffset(u8),
     /// Waiting for its entity's priority slot.
     WaitSlot,
+    /// Opt-in entry driver: only this issuer waits on a movie handshake.
+    WaitExternal,
     /// In an idle loop: runs again when anything changes (the epoch it parked at is the one stored).
     Parked(u64),
     Done,
@@ -700,6 +704,7 @@ pub struct Vm {
     control_state: ControlState,
     control_ordinal: u64,
     control_cut: Option<ExecutedControl>,
+    entry: Option<entry::EntryVm>,
     resources: ResourceOutcome,
     stats: Stats,
 }
@@ -774,6 +779,7 @@ impl Vm {
             control_state: ControlState::default(),
             control_ordinal: 0,
             control_cut: None,
+            entry: None,
             resources: ResourceOutcome::default(),
             stats: Stats::default(),
         }
@@ -1635,11 +1641,17 @@ impl Vm {
     }
 
     /// The runnable thread that is earliest (ties: the one that has waited longest in the queue).
-    fn pick(&mut self) -> Option<usize> {
+    fn pick(&mut self) -> Option<usize> { self.pick_through(None) }
+
+    fn pick_through(&mut self, horizon: Option<(u32, bool)>) -> Option<usize> {
         let (epoch, clock) = (self.epoch, self.clock);
         for t in &mut self.threads {
             if let State::Parked(at) = t.state {
                 if at != epoch {
+                    let time = t.time.max(clock);
+                    if horizon.is_some_and(|(horizon, inclusive)| time > horizon || (!inclusive && time == horizon)) {
+                        continue;
+                    }
                     // Something changed: the loop looks again, from the moment of the change.
                     t.state = State::Run;
                     t.seen.clear();
@@ -1664,6 +1676,7 @@ impl Vm {
                 },
                 _ => return None,
             };
+            if horizon.is_some_and(|(horizon, inclusive)| time > horizon || (!inclusive && time == horizon)) { return None; }
             Some((i, time, t.seq))
         }).min_by_key(|(_, time, seq)| (*time, *seq))?;
         // Do not move a waiter's stored time forward until it wins: another script
@@ -1967,6 +1980,7 @@ impl Vm {
             self.native_story.as_ref().map_or(0, |native| native.events().len()),
             self.party_main, self.party_bank, self.resources.gil_after,
         ));
+        self.observe_entry_audio(entity, &ins);
         let flow = self.exec(script, idx, entity, &ins, &mut class);
         if matches!(ins.opcode, 0x33 | 0x4A) {
             if let Some(disabled) = ins.literal("disabled").and_then(|value| u8::try_from(value).ok()) {
@@ -2049,6 +2063,9 @@ impl Vm {
     fn exec(&mut self, script: &FieldScript<'_>, idx: usize, entity: usize, ins: &Instruction, class: &mut Class) -> Flow {
         let me = Self::own(entity);
         let op = ins.opcode;
+        if self.entry.is_some() && matches!(op, 0xF8..=0xFA) {
+            return self.exec_entry_movie(idx, entity, ins);
+        }
         match op {
             0x00 => {
                 self.finish_thread(idx);
