@@ -356,6 +356,8 @@ pub struct FieldRuntime {
     pub(crate) stage: StageState,
     pub(crate) windows_ext: WindowsState,
     pub(crate) party_ext: PartyState,
+    /// Whether the player's direction keys drive a ladder climb, as in the original (off: ladders climb by themselves).
+    pub ladder_keys: bool,
     /// The save's gil, when the host knows it (`GOLDu`/`GOLDd` change it; `CHGLD` reads it).
     pub gil: Option<u32>,
 }
@@ -415,6 +417,7 @@ impl FieldRuntime {
             stage: StageState::default(),
             windows_ext: WindowsState::default(),
             party_ext: PartyState::default(),
+            ladder_keys: false,
             gil: None,
         };
         runtime.reset_all_windows();
@@ -621,6 +624,12 @@ impl FieldRuntime {
         self.state.pc_model.and_then(|m| self.models.get(m))
     }
 
+    /// Whether the scripts, not the player, place the player's character now: control is locked (`UC`) or its model is
+    /// in a scripted move (a walk, jump or ladder). The host then follows [`FieldRuntime::pc_model`].
+    pub fn player_scripted(&self) -> bool {
+        self.state.character_lock || self.pc_model().is_some_and(|m| m.move_mode != MoveMode::None)
+    }
+
     /// The entity a model belongs to and its talk script, for a host that resolves talking itself.
     pub fn request_talk(&mut self, model: usize) {
         if let Some(m) = self.models.get_mut(model) {
@@ -654,7 +663,7 @@ impl FieldRuntime {
             self.player = Some(p);
         }
         let pc_model = self.state.pc_model;
-        if !self.state.character_lock {
+        if !self.player_scripted() {
             if let Some(m) = pc_model.and_then(|m| self.models.get_mut(m)) {
                 m.x = p.x;
                 m.y = p.y;

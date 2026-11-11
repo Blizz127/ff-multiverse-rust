@@ -90,7 +90,7 @@ fn run(rt: &mut FieldRuntime, frames: u32, path: &[Pos], mut at: Pos, dir: u8, o
         if let Some(p) = path.get(f as usize) {
             at = *p;
         }
-        if rt.state.character_lock {
+        if rt.player_scripted() {
             if let Some(m) = rt.pc_model() {
                 at = (m.x, m.y, m.z);
             }
@@ -133,7 +133,7 @@ fn run(rt: &mut FieldRuntime, frames: u32, path: &[Pos], mut at: Pos, dir: u8, o
             }
         }
     }
-    if rt.state.character_lock {
+    if rt.player_scripted() {
         if let Some(m) = rt.pc_model() {
             at = (m.x, m.y, m.z);
         }
@@ -472,7 +472,7 @@ fn main() {
             let (mut out, mut end) = run(&mut probe, PROBE_FRAMES, &path, stand, face, ok);
             let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
             let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
-            if (moved_story || moved_scratch || out.windows > 0 || probe.state.character_lock) && out.jump.is_none() && !out.game_over {
+            if (moved_story || moved_scratch || out.windows > 0 || probe.player_scripted()) && out.jump.is_none() && !out.game_over {
                 let (more, e) = run(&mut probe, FOLLOW_FRAMES, &[], end, face, false);
                 out.absorb(more);
                 end = e;

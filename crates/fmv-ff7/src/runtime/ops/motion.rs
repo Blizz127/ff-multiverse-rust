@@ -1298,7 +1298,9 @@ impl FieldRuntime {
         let mesh = self.walkmesh.clone();
         let surface = self.motion.surface.get(mesh.as_ref());
         let pc = self.state.pc_model;
-        let keys = if self.state.character_lock { None } else { self.player.map(|p| p.keys_held) };
+        // Ladders climb by themselves unless the host hands the pad over (`ladder_keys`): a multiplayer host sends
+        // positions, not direction keys, so a key-driven ladder would never move.
+        let keys = if self.state.character_lock || !self.ladder_keys { None } else { self.player.map(|p| p.keys_held) };
         let mut anomalies = 0u64;
         // Bring every model's state in line first (a preempted motion is dropped here).
         for m in 0..count {

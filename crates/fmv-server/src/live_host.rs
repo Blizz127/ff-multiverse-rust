@@ -153,7 +153,7 @@ impl LiveField for Ff7Live {
     }
 
     fn control_locked(&self) -> bool {
-        self.rt.state.character_lock
+        self.rt.player_scripted()
     }
 
     fn player_place(&self) -> Option<(Pos, f32)> {
@@ -185,7 +185,7 @@ impl LiveField for Ff7Live {
     }
 
     fn idle(&self) -> bool {
-        self.rt.command().is_none() && !self.rt.window_open() && !self.rt.state.character_lock
+        self.rt.command().is_none() && !self.rt.window_open() && !self.rt.player_scripted()
     }
 
     fn clocks(&self) -> (u32, u32) {
