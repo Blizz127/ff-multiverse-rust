@@ -96,7 +96,7 @@ fn main() {
         rt.tick(player);
         for ev in rt.drain_events() {
             match &ev {
-                Event::Window { window, dialog, ask, entity } => {
+                Event::Window { window, dialog, ask, entity, .. } => {
                     println!("frame {f}: WINDOW {window} dialog {dialog} ask {ask:?} by {}", rt.entity_name(*entity).unwrap_or(""));
                     rt.close_window(*window);
                     rt.answer(*window, 0);
@@ -108,6 +108,7 @@ fn main() {
                     }
                 }
                 Event::Presentation { .. } => {}
+                Event::Control { .. } => println!("frame {f}: {ev:?} fade {:?}", rt.stage_fade_color()),
                 other => println!("frame {f}: {other:?}"),
             }
         }

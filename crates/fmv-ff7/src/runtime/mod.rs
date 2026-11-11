@@ -582,6 +582,11 @@ impl FieldRuntime {
     /// instruction completes on its next visit.
     pub fn complete_command(&mut self) {
         if let CommandState::Pending(c) = std::mem::replace(&mut self.command, CommandState::Idle) {
+            // A finished (or skipped) movie stands at its last frame: scripts that poll the frame (`MVIEF`) to fade the
+            // field in or start the music as the movie ends see it end (md1stin's opening waits for frame 20 and 664).
+            if matches!(c, Command::Movie { .. }) {
+                self.set_movie_frame(i16::MAX);
+            }
             self.command = CommandState::Done(c);
         }
     }
