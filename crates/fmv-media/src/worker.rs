@@ -143,6 +143,15 @@ impl MovieWorker {
             Ok(event) => return Ok(Some(event)),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
+        self.poll_status()?;
+        Ok(None)
+    }
+
+    /// Nonblocking terminal-error check that consumes no frame events. A consumer
+    /// holding a future frame must still observe failure while applying frame-queue
+    /// backpressure (including pause/stall expiry). Success here does NOT mean EOF:
+    /// only the separately queued, count-checked DecodedEof event establishes that.
+    pub fn poll_status(&mut self) -> Result<(), MediaError> {
         if !self.finished {
             match self.result.try_recv() {
                 Ok(result) => {
@@ -156,7 +165,7 @@ impl MovieWorker {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        Ok(None)
+        Ok(())
     }
 }
 

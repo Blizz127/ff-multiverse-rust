@@ -5,6 +5,7 @@
 
 use crate::metadata::VideoMetadata;
 use crate::MediaError;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,22 @@ impl PlaybackTimeline {
             - 1
     }
 
+    /// The last frame due at the exact nonnegative rational time `numerator / denominator`
+    /// seconds. For an audio clock these can be consumed sample frames and their sample rate.
+    /// The denominator must be positive; even full-width `u128` inputs compare without
+    /// overflowing, rounding to nanoseconds, or changing the timeline's presentation state.
+    pub fn target_ordinal_ratio(
+        &self,
+        numerator: u128,
+        denominator: u128,
+    ) -> Result<usize, MediaError> {
+        validate_denominator(denominator)?;
+        // The validated first PTS is zero, so at least one frame is due at every valid time.
+        Ok(self.video.frames.partition_point(|frame| {
+            self.compare_tick_to_ratio(frame.pts, numerator, denominator) != Ordering::Greater
+        }) - 1)
+    }
+
     /// Accept decoder EOF only when its complete frame count matches the inspected metadata.
     pub fn mark_decoded_eof(&mut self, frame_count: usize) -> Result<(), MediaError> {
         if frame_count != self.video.frames.len() {
@@ -88,6 +105,31 @@ impl PlaybackTimeline {
             && self.elapsed_units(elapsed) >= self.tick_units(self.end_ticks)
     }
 
+    /// The same completion requirements as [`Self::presented_eof`], at an exact rational
+    /// number of seconds. A zero denominator is rejected even before decoder EOF or final
+    /// presentation; this query never acknowledges a frame or advances a clock.
+    pub fn presented_eof_ratio(
+        &self,
+        numerator: u128,
+        denominator: u128,
+    ) -> Result<bool, MediaError> {
+        validate_denominator(denominator)?;
+        Ok(self.decoded_eof
+            && self.presented == Some(self.video.frames.len() - 1)
+            && self.compare_tick_to_ratio(self.end_ticks, numerator, denominator)
+                != Ordering::Greater)
+    }
+
+    fn compare_tick_to_ratio(&self, ticks: i64, numerator: u128, denominator: u128) -> Ordering {
+        // Validated nonnegative i64 ticks times a u32 numerator fit within 95 bits.
+        compare_ratios(
+            ticks as u128 * u128::from(self.video.time_base.numerator),
+            u128::from(self.video.time_base.denominator),
+            numerator,
+            denominator,
+        )
+    }
+
     fn elapsed_units(&self, elapsed: Duration) -> u128 {
         // Even Duration::MAX in nanoseconds times a u32 denominator fits u128.
         elapsed.as_nanos() * u128::from(self.video.time_base.denominator)
@@ -96,6 +138,38 @@ impl PlaybackTimeline {
     fn tick_units(&self, ticks: i64) -> u128 {
         // Validation makes ticks nonnegative. i64::MAX * u32::MAX * 1e9 fits u128.
         ticks as u128 * u128::from(self.video.time_base.numerator) * NANOS_PER_SECOND
+    }
+}
+
+fn validate_denominator(denominator: u128) -> Result<(), MediaError> {
+    if denominator == 0 {
+        Err(MediaError::Invalid(
+            "playback time denominator must be positive".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Compare nonnegative fractions with positive denominators, without a cross product.
+/// Equal integer parts leave only the proper fractions to compare. Taking their reciprocals
+/// reverses the order; repeating this is Euclid's algorithm, so the remainders reach zero.
+fn compare_ratios(mut a: u128, mut b: u128, mut c: u128, mut d: u128) -> Ordering {
+    debug_assert!(b > 0 && d > 0);
+    let mut reversed = false;
+    loop {
+        let order = (a / b).cmp(&(c / d));
+        if order != Ordering::Equal {
+            return if reversed { order.reverse() } else { order };
+        }
+        let (left, right) = (a % b, c % d);
+        if left == 0 || right == 0 {
+            let order = left.cmp(&right);
+            return if reversed { order.reverse() } else { order };
+        }
+        (a, b) = (b, left);
+        (c, d) = (d, right);
+        reversed = !reversed;
     }
 }
 
@@ -277,5 +351,137 @@ mod tests {
         assert!(!timeline.presented_eof(Duration::from_secs((i64::MAX - 1) as u64)));
         assert!(timeline.presented_eof(Duration::from_secs(i64::MAX as u64)));
         assert!(timeline.presented_eof(Duration::MAX));
+    }
+
+    #[test]
+    fn rational_clock_selects_exact_thirds_and_consumed_audio_sample_boundaries() {
+        let timeline = make_timeline(1, 3, &[(0, 1), (1, 1), (2, 1)]);
+        for (numerator, denominator, expected) in [
+            (0, 1, 0),
+            (1, 3, 1),
+            (2, 3, 2),
+            (7_349, 22_050, 0),
+            (7_350, 22_050, 1),
+            (14_699, 22_050, 1),
+            (14_700, 22_050, 2),
+            (22_050, 22_050, 2),
+        ] {
+            assert_eq!(
+                timeline
+                    .target_ordinal_ratio(numerator, denominator)
+                    .unwrap(),
+                expected,
+                "{numerator}/{denominator} seconds"
+            );
+        }
+        assert_eq!(
+            timeline.target_ordinal(Duration::from_nanos(333_333_333)),
+            0,
+            "truncating a third of a second would select the previous frame"
+        );
+    }
+
+    #[test]
+    fn rational_completion_requires_presentation_and_the_opening_video_endpoint_after_audio() {
+        // The inspected opening's final frame ends at 119466/1000 seconds. Its decoded audio has
+        // 2632960 sample frames at 22050 Hz, which ends earlier; neither EOF alone
+        // nor the shorter audio clock can stand in for the final video's full duration.
+        let mut timeline = make_timeline(1, 1_000, &[(0, 66), (119_400, 66)]);
+        assert!(!timeline.presented_eof_ratio(119_466, 1_000).unwrap());
+        timeline.mark_decoded_eof(2).unwrap();
+        assert!(!timeline.presented_eof_ratio(119_466, 1_000).unwrap());
+        timeline.mark_presented(1).unwrap();
+        assert_eq!(timeline.target_ordinal_ratio(2_632_960, 22_050).unwrap(), 1);
+        assert!(!timeline.presented_eof_ratio(2_632_960, 22_050).unwrap());
+        assert!(!timeline
+            .presented_eof_ratio(119_465_999, 1_000_000)
+            .unwrap());
+        assert!(timeline.presented_eof_ratio(119_466, 1_000).unwrap());
+        assert!(timeline
+            .presented_eof_ratio(119_466_000, 1_000_000)
+            .unwrap());
+    }
+
+    #[test]
+    fn rational_queries_reject_zero_denominators_without_changing_completion() {
+        let mut timeline = make_timeline(1, 3, &[(0, 1), (1, 1)]);
+        for complete in [false, true] {
+            if complete {
+                timeline.mark_decoded_eof(2).unwrap();
+                timeline.mark_presented(1).unwrap();
+            }
+            let before = (timeline.decoded_eof, timeline.presented);
+            for numerator in [0, 1, u128::MAX] {
+                assert!(timeline.target_ordinal_ratio(numerator, 0).is_err());
+                assert!(timeline.presented_eof_ratio(numerator, 0).is_err());
+            }
+            assert_eq!((timeline.decoded_eof, timeline.presented), before);
+            assert_eq!(timeline.presented_eof_ratio(2, 3).unwrap(), complete);
+            assert_eq!(timeline.target_ordinal_ratio(1, 3).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn rational_clock_accepts_full_u128_inputs_without_overflow_or_lost_boundary_bits() {
+        let mut timeline = make_timeline(1, 3, &[(0, 1), (1, 1), (2, 1)]);
+        let third = u128::MAX / 3; // 2^128 - 1 is exactly divisible by 3.
+        assert_eq!(
+            timeline.target_ordinal_ratio(third - 1, u128::MAX).unwrap(),
+            0
+        );
+        assert_eq!(timeline.target_ordinal_ratio(third, u128::MAX).unwrap(), 1);
+        assert_eq!(
+            timeline
+                .target_ordinal_ratio(2 * third - 1, u128::MAX)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            timeline.target_ordinal_ratio(2 * third, u128::MAX).unwrap(),
+            2
+        );
+        timeline.mark_decoded_eof(3).unwrap();
+        timeline.mark_presented(2).unwrap();
+        assert!(!timeline
+            .presented_eof_ratio(u128::MAX - 1, u128::MAX)
+            .unwrap());
+        assert!(timeline.presented_eof_ratio(u128::MAX, u128::MAX).unwrap());
+        assert!(timeline.presented_eof_ratio(u128::MAX, 1).unwrap());
+
+        let mut large = make_timeline(u32::MAX, 1, &[(0, 1), (i64::MAX - 1, 1)]);
+        let last = (i64::MAX - 1) as u128 * u128::from(u32::MAX);
+        assert_eq!(large.target_ordinal_ratio(last - 1, 1).unwrap(), 0);
+        assert_eq!(large.target_ordinal_ratio(last, 1).unwrap(), 1);
+        assert_eq!(large.target_ordinal_ratio(u128::MAX, u128::MAX).unwrap(), 0);
+        large.mark_decoded_eof(2).unwrap();
+        large.mark_presented(1).unwrap();
+        assert!(!large.presented_eof_ratio(last, 1).unwrap());
+        assert!(large.presented_eof_ratio(u128::MAX, 1).unwrap());
+    }
+
+    #[test]
+    fn continued_fraction_comparison_handles_large_equivalent_and_adjacent_ratios() {
+        let max = u128::MAX;
+        for (a, b, c, d, expected) in [
+            (0, max, 0, 1, Ordering::Equal),
+            (max, max, 1, 1, Ordering::Equal),
+            (max / 3, max, 1, 3, Ordering::Equal),
+            (max, max - 1, max - 1, max, Ordering::Greater),
+            (max - 1, max, max - 2, max - 1, Ordering::Greater),
+            (max - 1, max - 2, max, max - 1, Ordering::Greater),
+        ] {
+            assert_eq!(compare_ratios(a, b, c, d), expected);
+            assert_eq!(compare_ratios(c, d, a, b), expected.reverse());
+        }
+        // For small values, ordinary exact integer cross products provide an independent oracle.
+        for a in 0u128..16 {
+            for b in 1u128..16 {
+                for c in 0u128..16 {
+                    for d in 1u128..16 {
+                        assert_eq!(compare_ratios(a, b, c, d), (a * d).cmp(&(c * b)));
+                    }
+                }
+            }
+        }
     }
 }
