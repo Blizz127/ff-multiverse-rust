@@ -35,6 +35,7 @@ pub mod memory;
 mod ops;
 pub use ops::{is_implemented, menu, AnimState, MotionState, PartyState, StageState, WindowsState};
 pub use ops::{number_kind, NumberDisplay, ReplaceParam, WindowContents, DEFAULT_MENU_COLORS};
+pub use ops::{CharacterVitals, PartySaveData};
 #[cfg(test)]
 mod owned_tests;
 #[cfg(test)]
