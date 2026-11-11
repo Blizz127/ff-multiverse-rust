@@ -238,6 +238,21 @@ fn main() {
         // What the field does by itself over a probe's time: a probe's effect is what differs from this.
         let mut baseline = rt.clone();
         let _ = run(&mut baseline, PROBE_FRAMES, at, None);
+        // Scratch bytes that follow where the player stands (a script copying the player's triangle every frame) are not
+        // progress: find them by standing idle at two other places.
+        let mut noise = [false; 256];
+        for t in [0usize, walk.triangles.len() / 2, walk.triangles.len().saturating_sub(1)] {
+            if t >= walk.triangles.len() {
+                continue;
+            }
+            let (x, y) = c_of(&walk, t);
+            let mut other = rt.clone();
+            let _ = run(&mut other, PROBE_FRAMES, Some((x, y, at.map_or(0, |a| a.2))), None);
+            for (i, n) in noise.iter_mut().enumerate() {
+                *n |= other.mem.scratch[i] != baseline.mem.scratch[i];
+            }
+        }
+        let scratch_moved = |probe: &FieldRuntime| (0..256).any(|i| !noise[i] && probe.mem.scratch[i] != baseline.mem.scratch[i]);
         // Try every triangle, standing and with OK.
         let mut best: Option<(i32, usize, bool, FieldRuntime, Outcome)> = None;
         // Every scored action, as a state to come back to: (score, field it leaves the player in, story, arrival).
@@ -249,7 +264,7 @@ fn main() {
                 let mut probe = rt.clone();
                 let mut out = run(&mut probe, PROBE_FRAMES, Some(c), ok.then_some(2));
                 let changed = story_changed(&probe, &rt);
-                if (changed || out.windows > 0 || probe.mem.scratch != baseline.mem.scratch) && out.jump.is_none() {
+                if (changed || out.windows > 0 || scratch_moved(&probe)) && out.jump.is_none() {
                     // The scene it started may end in a map jump: let it play on.
                     let more = run(&mut probe, 3600, Some(c), None);
                     out.jump = more.jump;
@@ -264,7 +279,7 @@ fn main() {
                     (false, true, _) => 4,
                     (true, false, _) => 3,
                     (false, false, true) => 2,
-                    _ if probe.mem.scratch != baseline.mem.scratch => 1,
+                    _ if scratch_moved(&probe) => 1,
                     _ => 0,
                 };
                 // A jump back to a field already visited at this moment is a step back.
@@ -302,7 +317,7 @@ fn main() {
                 }
                 let moved = moment(&probe) > moment(&rt);
                 let changed = story_changed(&probe, &rt);
-                let score = match (out.jump.is_some(), moved, changed) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if probe.mem.scratch != baseline.mem.scratch => 1, _ => 0 };
+                let score = match (out.jump.is_some(), moved, changed) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if scratch_moved(&probe) => 1, _ => 0 };
                 let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
@@ -342,7 +357,7 @@ fn main() {
                     out.windows += more.windows;
                 }
                 let moved = moment(&probe) > moment(&rt);
-                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if probe.mem.scratch != baseline.mem.scratch => 1, _ => 0 };
+                let score = match (out.jump.is_some(), moved, story_changed(&probe, &rt)) { (true, true, _) => 5, (false, true, _) => 4, (true, false, _) => 3, (false, false, true) => 2, _ if scratch_moved(&probe) => 1, _ => 0 };
                 let back = out.jump.is_some_and(|j| visited.iter().any(|v| Some(v.as_str()) == maplist.name(j.0)) && !moved);
                 let _ = back;
                 let landed = out.jump.and_then(|j| maplist.name(j.0)).map_or_else(|| field_name.clone(), str::to_string);
