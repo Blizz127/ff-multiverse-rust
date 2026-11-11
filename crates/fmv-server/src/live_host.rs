@@ -105,7 +105,13 @@ impl LiveField for Ff7Live {
         let mut out = Vec::new();
         for event in self.rt.drain_events() {
             match event {
-                Event::Window { window, dialog, ask, .. } => out.push(LiveEvent::Window { window, dialog: u16::from(dialog), ask }),
+                Event::Window { window, dialog, ask, entity, offset } => out.push(LiveEvent::Window {
+                    window,
+                    dialog: u16::from(dialog),
+                    ask,
+                    entity: u16::try_from(entity).unwrap_or(u16::MAX),
+                    offset: u32::try_from(offset).unwrap_or(u32::MAX),
+                }),
                 Event::WindowDone { window } | Event::WindowClosedByScript { window } => out.push(LiveEvent::WindowClosed { window }),
                 Event::Command(command) => out.push(self.command(command)),
                 Event::Control { locked } => out.push(LiveEvent::Note(format!("control locked={locked}"))),

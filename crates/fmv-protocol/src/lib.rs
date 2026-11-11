@@ -966,6 +966,12 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ask: Option<LiveAsk>,
         answerable: bool,
+        /// The script entity and the section offset of the `MESSAGE`/`ASK` that opened it: a mod layer that renumbers
+        /// the field's dialogs (Echo-S) finds its own line and voice by the instruction.
+        #[serde(default)]
+        entity: u16,
+        #[serde(default)]
+        offset: u32,
     },
     /// New in v23. Live window `window` is closed.
     LiveWindowClosed { area: AreaId, window: u8 },

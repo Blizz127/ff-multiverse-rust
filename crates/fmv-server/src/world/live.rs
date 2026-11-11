@@ -79,7 +79,7 @@ pub struct LiveInput {
 /// What a frame did that the world must carry out or tell.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveEvent {
-    Window { window: u8, dialog: u16, ask: Option<(u8, u8)> },
+    Window { window: u8, dialog: u16, ask: Option<(u8, u8)>, entity: u16, offset: u32 },
     WindowClosed { window: u8 },
     /// Go to another area (`target` is `None` when the field id names no area the adapter has).
     MapJump { target: Option<AreaKey>, field_id: u16, arrival: Pos, facing: f32, hint: Option<u32> },
@@ -402,11 +402,11 @@ impl World {
         let mut jump = None;
         for event in events {
             match event {
-                LiveEvent::Window { window, dialog, ask } => {
+                LiveEvent::Window { window, dialog, ask, entity, offset } => {
                     run.windows.insert(window);
                     if let Some(area) = &area_id {
                         for (entity, governor) in self.instance_members(id, run.governor) {
-                            let msg = ServerMsg::LiveWindow { area: area.clone(), window, dialog, ask: ask.map(|(first, last)| LiveAsk { first, last }), answerable: governor };
+                            let msg = ServerMsg::LiveWindow { area: area.clone(), window, dialog, ask: ask.map(|(first, last)| LiveAsk { first, last }), answerable: governor, entity, offset };
                             self.send_to(entity, msg, &mut failed);
                         }
                     }

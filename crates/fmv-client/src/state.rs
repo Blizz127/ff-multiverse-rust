@@ -821,9 +821,9 @@ impl ClientState {
                     self.apply_cast(now, npcs);
                 }
             }
-            ServerMsg::LiveWindow { area, window, dialog, ask, answerable } => {
+            ServerMsg::LiveWindow { area, window, dialog, ask, answerable, entity, offset } => {
                 if area == self.area {
-                    self.live.on_window(crate::live::LiveWindowView::new(window, dialog, ask, answerable));
+                    self.live.on_window(crate::live::LiveWindowView::new(window, dialog, ask, answerable).opened_by(entity, offset));
                 }
             }
             ServerMsg::LiveWindowClosed { area, window } => {

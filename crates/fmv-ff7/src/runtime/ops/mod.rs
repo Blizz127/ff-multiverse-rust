@@ -694,7 +694,8 @@ impl FieldRuntime {
         match &self.windows[w].open {
             None => {
                 self.windows[w].open = Some(OpenWindow { entity: e, dialog, ask: None, closed: false });
-                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: None });
+                let offset = self.pc();
+                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: None, offset });
                 Flow::Yield
             }
             Some(open) if open.entity == e && open.dialog == dialog && open.closed => {
@@ -716,7 +717,8 @@ impl FieldRuntime {
             None => {
                 let ask = Ask { first, last, var, answer: None };
                 self.windows[w].open = Some(OpenWindow { entity: e, dialog, ask: Some(ask), closed: false });
-                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: Some((first, last)) });
+                let offset = self.pc();
+                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: Some((first, last)), offset });
                 Flow::Yield
             }
             Some(open) if open.entity == e && open.dialog == dialog && open.closed => {

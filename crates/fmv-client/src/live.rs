@@ -25,11 +25,21 @@ pub struct LiveWindowView {
     pub serial: u64,
     /// This window's answer (or dismissal) has been queued for the server; it stays shown until the server closes it.
     pub answered: bool,
+    /// The script entity and section offset of the instruction that opened it (for a mod layer's own numbering).
+    pub entity: u16,
+    pub offset: u32,
 }
 
 impl LiveWindowView {
+    /// The same window with the instruction that opened it.
+    pub fn opened_by(mut self, entity: u16, offset: u32) -> Self {
+        self.entity = entity;
+        self.offset = offset;
+        self
+    }
+
     pub fn new(window: u8, dialog: u16, ask: Option<LiveAsk>, answerable: bool) -> Self {
-        Self { window, dialog, ask, answerable, serial: 0, answered: false }
+        Self { window, dialog, ask, answerable, serial: 0, answered: false, entity: 0, offset: 0 }
     }
 }
 

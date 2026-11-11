@@ -224,8 +224,9 @@ pub struct Ask {
 /// What the host should know about, in the order it happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// A window opened. `ask` is `Some` for a question.
-    Window { window: u8, entity: usize, dialog: u8, ask: Option<(u8, u8)> },
+    /// A window opened. `ask` is `Some` for a question. `offset` is the section offset of the instruction that opened it
+    /// (a mod layer with its own dialog numbering finds its own line by the instruction).
+    Window { window: u8, entity: usize, dialog: u8, ask: Option<(u8, u8)>, offset: usize },
     /// The window an instruction opened was dismissed and its instruction completed.
     WindowDone { window: u8 },
     /// A window was closed by a script (`WCLSE`).
