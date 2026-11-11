@@ -106,6 +106,8 @@ const LINGER_BUDGET: usize = 256 * 1024;
 /// TCP keepalive: seconds between probes once the connection has been idle for
 /// `ServerConfig::keepalive`, and how many unanswered probes end it.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a closing connection waits for its player's last spot to be written (see `location_saver`).
+const LOCATION_FLUSH_GRACE: Duration = Duration::from_secs(2);
 const KEEPALIVE_RETRIES: u32 = 3;
 
 /// State shared by the accept loop, the tick loop and every connection.
@@ -128,6 +130,9 @@ pub(crate) struct Shared {
     /// Saves what battles pay to the store (`None`: this server runs no battles). Stopped, and waited
     /// for, when the server shuts down (see `Server::serve`).
     pub saver: Option<crate::saver::Saver>,
+    /// Saves where players stand (MMO-style: see `world::resume`). Stopped, and waited for, after the saver when the
+    /// server shuts down.
+    pub locations: Option<crate::location_saver::LocationSaver>,
     /// Per-address connection cap, registration rate limits and the log throttle.
     pub limits: Limits,
     /// The accounts deleted (or being deleted) in this run. Used only inside the world lock: see `deletion`.
@@ -515,7 +520,7 @@ impl Conn {
 
         // 2. Who is this? Registration or token login, against the persistent store.
         let scene_save_epoch = shared.with_world(|world| world.scene_save_epoch());
-        let Login { account, avatar, progression, issued_token, progress, scene_state, scene_group, card } = self.authenticate(auth, character).await?;
+        let Login { account, avatar, progression, issued_token, progress, scene_state, scene_group, card, location } = self.authenticate(auth, character).await?;
         let registered = issued_token.is_some();
         if registered {
             // Until the Welcome with its token is known to be written, this account is released
@@ -624,6 +629,8 @@ impl Conn {
                 if shared.deleted.contains(account) {
                     return Err(Close::reject(RejectCode::InvalidToken, UNKNOWN_TOKEN));
                 }
+                // The spot it saved last (MMO-style saving: `world::resume`), judged by `join`.
+                world.prepare_resume(account, location);
                 world
                     .join_with_scene_epoch(new, Instant::now(), scene_save_epoch)
                     .map(|spawn| (spawn, world.player_count()))
@@ -1068,7 +1075,17 @@ impl Conn {
         }
         // Leaving the world drops the world's queue handle; dropping ours then closes the queue,
         // which lets the writer drain what is left and exit.
-        drop(self.guard.take());
+        let left = self.guard.take();
+        let was_in_world = left.is_some();
+        drop(left);
+        // Leaving queued where the player stood (MMO-style saving: `world::resume`); it is on disk before this
+        // connection closes (the writer, which closes the socket once our queue handle is gone, keeps sending what is
+        // queued meanwhile), so logging straight back in finds it.
+        if was_in_world {
+            if let Some(flushed) = self.shared.locations.as_ref().and_then(|locations| locations.flush()) {
+                let _ = tokio::time::timeout(LOCATION_FLUSH_GRACE, flushed).await;
+            }
+        }
         drop(self.tx);
         let registered = self.registered.take();
         // A dropped connection's writer is not worth waiting for, unless a registration's

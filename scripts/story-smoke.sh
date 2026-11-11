@@ -185,7 +185,10 @@ run_story() {
   wait_clients $((10 + CLIENT_GRACE))
   local l2="$WORK/r2-client-A.log"
   judge_exit r2 A
-  log_has "$s2" "to=md8_1 (where its story stands)" || problem "the returning account was not sent to md8_1: $(last_line_with "$s2" "story entry" || true)"
+  # Back on the spot it left in md8_1 (MMO-style saving): session 1 ended there, after the scene's story was committed, so
+  # the spot was saved with that story and must be used (a "saved spot not used" here would mean every scene breaks resume).
+  log_has "$s2" "resumed account=" && log_has "$s2" " area=md8_1 at=(" ||
+    problem "the returning account was not put back on its spot in md8_1: $(last_line_with "$s2" "saved spot" || last_line_with "$s2" "story entry" || true)"
   if log_has "$s2" "starts with the debug story"; then
     problem "the returning account was given the debug story again"
   fi

@@ -164,6 +164,7 @@ pub use snapshot::{restore_snapshot, SnapshotInfo};
 pub use store::restyle::{Restyle, RestyleAdded, RestyleError, RestyleReport};
 pub use store::trash::{Deleted, Restored, TrashEntry, TrashState};
 pub use store::{Store, StoreOptions, DEFAULT_MAX_ACCOUNTS};
+pub use store::location::{SavedLocation, MAX_LOCATION_AREA_BYTES, MAX_LOCATION_RECORD_BYTES, MAX_LOCATION_STORY_BYTES};
 pub use store::scene::{ProgressPair, SceneCommit, SceneBatchCommitted, SceneCheckpoint, SceneOperation,
     SceneOperationKind, ScenePhase, SceneReservation, SceneState, MAX_ARRIVAL_METADATA_STEPS, MAX_SCENE_RECEIPTS,
     MAX_SCENE_BATCH_ACCOUNTS, MAX_SCENE_CHECKPOINT_BYTES, MAX_SCENE_REPLAY_BYTES};

@@ -261,11 +261,12 @@ start_player() {
   CPID[$label]=$!
 }
 
-# tree_digest <dir>: every file under <dir> (except lock files, which change with a login) and its sha256, sorted: the
-# state of a directory as bytes.
+# tree_digest <dir>: every file under <dir> and its sha256, sorted: the state of a directory as bytes. Except lock files,
+# which change with a login, and the saved spots (`<Game>.location.json`), which every login and walk rewrites by design
+# (MMO-style saving: crates/fmv-server/src/world/resume.rs).
 tree_digest() {
   local dir="$1"
-  (cd -- "$dir" && find . -type f ! -iname '*lock*' -print0 | sort -z | xargs -0 -r sha256sum)
+  (cd -- "$dir" && find . -type f ! -iname '*lock*' ! -name '*.location.json' -print0 | sort -z | xargs -0 -r sha256sum)
 }
 
 # judge_exit <run> <label>: record a problem unless the client ended with status 0 (not killed).

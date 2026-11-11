@@ -146,6 +146,7 @@ mod inventory;
 pub mod ff7;
 mod limits;
 mod progress;
+mod location_saver;
 mod saver;
 pub mod scene_host;
 mod world;
@@ -332,6 +333,15 @@ impl Server {
         );
         world.set_progress_saver(saver.handle());
         let saver = Some(saver);
+        // Where players stand, saved constantly and given back at login (MMO-style: see `world::resume`). Where a story
+        // stands is the scene host's story entry.
+        let locations = location_saver::LocationSaver::spawn(Arc::clone(&store));
+        let entry_of: Option<world::StoryEntryFn> = config.scenes.as_ref().map(|scenes| {
+            let host = Arc::clone(&scenes.host);
+            Arc::new(move |story: &[u8]| host.entry(story).map(|exit| exit.target)) as world::StoryEntryFn
+        });
+        world.configure_resume(locations.handle(), area_id.game, entry_of);
+        let locations = Some(locations);
         let listener = TcpListener::bind(config.bind)
             .await
             .map_err(|source| ServerError::Bind { addr: config.bind, source })?;
@@ -411,6 +421,7 @@ impl Server {
             build,
             store,
             saver,
+            locations,
             limits,
             deleted: Default::default(),
             _ephemeral_state: ephemeral_state,
@@ -545,6 +556,10 @@ impl Server {
         if let Some(saver) = &shared.saver {
             saver.shutdown(shared.cfg.shutdown_grace).await;
         }
+        // Every leaving player queued its last spot when its connection closed.
+        if let Some(locations) = &shared.locations {
+            locations.shutdown(shared.cfg.shutdown_grace).await;
+        }
         Ok(())
     }
 }
@@ -641,6 +656,7 @@ async fn tick_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                     world.advance_scenes(now);
                     world.advance_countdowns(now);
                     world.manage_areas(now);
+                    world.save_locations(now);
                 });
             }
             () = wait_flag(&mut shutdown) => break,

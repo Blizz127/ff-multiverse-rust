@@ -677,6 +677,8 @@ impl World {
         let mut failed = Vec::new();
         self.announce_entry(entity, now, &mut failed);
         self.drop_failed(failed);
+        // It stands somewhere new: save it (see `resume`).
+        self.location_arrived(entity, now);
         TravelReply::Done
     }
 

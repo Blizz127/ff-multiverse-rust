@@ -116,8 +116,11 @@ mod follow;
 mod instances;
 mod party;
 mod press;
+mod resume;
 mod scene;
 mod story;
+
+pub(crate) use resume::StoryEntryFn;
 pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
@@ -366,6 +369,8 @@ pub struct World {
     countdowns: BTreeMap<AccountId, countdown::Countdown>,
     /// The `now` of the last [`World::advance_countdowns`]: what a countdown's time left is measured against.
     clock: Instant,
+    /// MMO-style saving: where players stand, saved constantly, and the spots logins put them back on (see `resume`).
+    resume: resume::Resume,
 }
 
 impl World {
@@ -406,6 +411,7 @@ impl World {
             story_saves: story::StorySaves::default(),
             countdowns: BTreeMap::new(),
             clock: Instant::now(),
+            resume: resume::Resume::default(),
         })
     }
 
@@ -530,15 +536,21 @@ impl World {
                 new.progression = story;
             }
         }
-        // Everyone joins the entry area, which is always loaded.
+        // Everyone joins the entry area, which is always loaded: on the spot it saved there (see `resume`), else on a
+        // spawn point.
         let home = self.home.clone();
+        let saved_home = if recovering { None } else { self.resume_home_spot(new.account, &new.progression) };
         let mut pos = self.areas.get_mut(&home).map_or_else(Pos::default, areas::AreaState::next_spawn_point);
         let mut facing = 0.0;
-        // A completed continuation no longer has a checkpoint. If its authored control field
-        // is also this server's home, place its saved story there before the first snapshot
-        // and entry scripts; the usual cross-field handshake below cannot correct a same-field
-        // spawn. In particular this recovers a Complete written just before a server crash.
-        if !recovering {
+        if let Some((spot, spot_facing)) = saved_home {
+            // On the spot it saved in the entry area (MMO-style saving: see `resume`).
+            pos = spot;
+            facing = spot_facing;
+        } else if !recovering {
+            // A completed continuation no longer has a checkpoint. If its authored control field
+            // is also this server's home, place its saved story there before the first snapshot
+            // and entry scripts; the usual cross-field handshake below cannot correct a same-field
+            // spawn. In particular this recovers a Complete written just before a server crash.
             if let Some(entry) = self.saved_story_entry(&new.progression)
                 .filter(|entry| entry.target.eq_ignore_ascii_case(&home)) {
                 let Some(area) = self.areas.get(&home) else { return Err(JoinError::StorageUnavailable); };
@@ -612,8 +624,10 @@ impl World {
             self.tell_story(entity, None, &mut failed);
         }
         self.drop_failed(failed);
-        // A story that a scene took somewhere no walk leads back from stands there again (`scene::SceneHost::entry`).
-        if !recovering { self.enter_at_story(entity, now); }
+        // Back to the spot it saved (see `resume`); else a story that a scene took somewhere no walk leads back from
+        // stands there again (`scene::SceneHost::entry`). A login that recovers an unfinished scene is placed by that
+        // scene's continuation instead, never by either.
+        if recovering { self.resume_track(entity) } else { self.enter_at_saved_spot_or_story(entity, now) }
         Ok(pos)
     }
 
@@ -633,6 +647,8 @@ impl World {
     fn remove_player(&mut self, entity: EntityId, failed: &mut Vec<(EntityId, bool)>) -> Option<Player> {
         let player = self.players.remove(&entity)?;
         self.by_account.remove(&player.account);
+        // Where it stood is saved before anything of it goes (see `resume`).
+        self.location_left(entity, &player);
         // A presentation it owned is dropped; a queued durable scene continues to its acknowledgment.
         self.scene_player_gone(entity, player.scene);
         // A player in transit is in no instance: the one it left was told already.

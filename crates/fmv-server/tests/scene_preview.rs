@@ -235,14 +235,18 @@ async fn a_scene_preview_never_touches_a_stored_story_whatever_the_scene_writes_
     let told = a.client.drain_for(Duration::from_millis(300)).await;
     assert_eq!(story_updates(&told), [(vec![5], false)], "told the saved story at login, as no step");
     assert!(scene_run(&told).is_none(), "no scene replays on its own");
-    assert!(a.moved_freely((-90.0, 0.0)).await, "nothing is stuck");
-    a.walk(100.0, 150.0).await;
-    a.walk(350.0, 150.0).await;
-    let arrived = a.arrive().await;
-    let npcs = arrived.iter().find_map(|m| if let ServerMsg::AreaSnapshot { npcs, .. } = m { Some(npcs.clone()) } else { None }).expect("the yard's snapshot");
+    // MMO-style saving: session 3 left it standing in the yard where the scene played, so the login puts it back there.
+    let (area, arrival) = told
+        .iter()
+        .find_map(|m| if let ServerMsg::AreaChange { area, arrival, .. } = m { Some((area.key.clone(), *arrival)) } else { None })
+        .expect("sent back to the spot it left");
+    assert_eq!((area.as_str(), arrival.x, arrival.y), (YARD, 150.0, -100.0), "on the spot it left");
+    a.client.send(&join_msg(YARD)).await;
+    let arrived = a.client.until("the snapshot", |m| matches!(m, ServerMsg::AreaSnapshot { .. }).then(|| m.clone())).await;
+    let ServerMsg::AreaSnapshot { npcs, .. } = arrived else { unreachable!() };
     assert!(!npcs.iter().any(|n| n.id >= SCENE_NPC_ID_BASE), "the scene is not on offer to a story that has had it: {npcs:?}");
-    a.walk(150.0, -100.0).await;
     a.client.drain_for(Duration::from_millis(300)).await;
+    assert!(a.moved_freely((145.0, -100.0)).await, "nothing is stuck");
     a.client.send(&ClientMsg::Interact { npc: Some(SCENE_NPC_ID_BASE) }).await;
     let pressed = a.client.drain_for(Duration::from_millis(400)).await;
     assert!(scene_run(&pressed).is_none(), "an OK where the trigger stood starts nothing: {pressed:?}");
