@@ -63,3 +63,22 @@ sidecar record next to the MMO location record. It is not kept in the fenced sto
 and rollback stays a plain cold swap. A fresh account starts from the new-game image. An existing account whose story
 has unknown bits is never filled with defaults in place (no player progress resets); only fully known stories
 convert.
+
+## Running it
+
+```
+fmv-server --field-runtime ...        # live fields; new accounts start from the complete reset story
+python3 -I scripts/live-bot.py HOST:PORT --seconds 45 --press-every 1.5 --approach   # protocol-23 route bot
+FMV_FF7_DATA=<data> cargo run -p fmv-ff7 --release --example runtime_trace -- md1stin --at 3875,29195   # one field, headless
+```
+
+**Status, 2026-11-11:** over TCP, md1stin's opening plays from its own scripts:
+- the opening movie request (53);
+- the party set to Cloud;
+- the guards' and passengers' placements;
+- Barret's arrival;
+- the director's first window;
+- control handed back at story moment 1, saved as an exact story transaction.
+
+Scripted movement, animation, background, camera and fades are being implemented, one instruction family per file.
+The curated scene route stays the default until the live route reaches further.

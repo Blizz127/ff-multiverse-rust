@@ -77,7 +77,11 @@ def main():
     entity, pos, facing, area, seq = None, {"x": 0.0, "y": 0.0, "z": 0.0}, 0.0, None, 0
     cast, locked, last_press, end = [], False, time.monotonic(), time.monotonic() + args.seconds
     pending = []  # (due, msg)
+    last_ping = 0.0
     while time.monotonic() < end:
+        if time.monotonic() - last_ping >= 1.0:
+            last_ping = time.monotonic()
+            c.send({"Ping": {"nonce": int(last_ping * 1000)}})
         for msg in c.poll():
             k = kind(msg)
             body = msg[k] if isinstance(msg, dict) else None
