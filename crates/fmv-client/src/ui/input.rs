@@ -105,7 +105,7 @@ pub fn pad_menu_input(key: PadKey, pressed: bool, repeat: bool, screen: PadScree
             PadScreen::List => nav(NavKey::Delete),
             _ => None,
         },
-        PadKey::Leave | PadKey::Battle | PadKey::Walk | PadKey::Camera => None,
+        PadKey::Leave | PadKey::Battle | PadKey::Walk | PadKey::Camera | PadKey::Graphics => None,
     }
 }
 
@@ -248,7 +248,7 @@ mod tests {
             ] {
                 assert_eq!(mapped(key, screen), nav(want), "{key:?} on {screen:?}");
             }
-            for key in [PadKey::Leave, PadKey::Battle, PadKey::Walk, PadKey::Camera] {
+            for key in [PadKey::Leave, PadKey::Battle, PadKey::Walk, PadKey::Camera, PadKey::Graphics] {
                 assert_eq!(mapped(key, screen), None, "{key:?} does nothing in the menu ({screen:?})");
             }
             for key in PadKey::ALL {

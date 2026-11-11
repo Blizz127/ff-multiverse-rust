@@ -330,7 +330,15 @@ clear afterward; actors beyond that range stay out of view, while the native HUD
 with a GPU or lavapipe, by `scene::shots::offscreen_real_ff7_the_field_camera` (`camera-*.png`: the player in `md1_1`,
 the player at the range's corner, the team talk's scroll).
 
-*Optional graphics.* **F3** switches FXAA on or off in a field or battle. Off is the default and keeps
+*Optional graphics.* **F5**, or a controller's **left stick pressed in (L3/LS)**, opens Graphics while
+you have control in the field. Arrows or the D-pad choose a row, left/right or **Enter/A** change a
+setting, and **Esc/B** or F5/L3 close it. The panel shows edge smoothing, scene resolution, the
+resolution currently in use, and **Restore defaults** (smoothing off and native resolution). Your
+character stands still while it is open; the game continues. Dialogue, story scenes, battles, field
+changes and loss of window focus close the panel. Release held movement controls before moving again.
+The panel is drawn at native UI resolution, with the same sharp text as the HUD.
+
+**F3** switches FXAA on or off in a field or battle. Off is the default and keeps
 exactly the existing render path. FXAA smooths contrasting edges in the completed field or battle image, including
 fallback battles; the HUD, dialogue and menus are drawn afterward so their text stays sharp. This is a spatial
 filter: it may soften background detail and does not reconstruct missing detail or use previous frames.
@@ -350,6 +358,7 @@ a failure to save still changes the current session and displays a notice. GPU r
 unchanged UI pixels and model framing, foreground depth, resizing, fallback, and exact restoration when disabled:
 `cargo test -p fmv-client offscreen_fxaa -- --ignored` and
 `cargo test -p fmv-client offscreen_supersample -- --ignored` (the real-field comparisons also need owned FF7 data).
+The panel's offscreen check is `cargo test -p fmv-client offscreen_graphics_panel -- --ignored`.
 
 *Talking.* In an FF7 field, **Enter** or **Space** (the controller's **A**) next to a character, facing
 it, opens that character's own dialogue in a blue window at the bottom of the screen. The text is the

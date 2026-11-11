@@ -14,6 +14,7 @@ use crate::battle::{battle_vertices, draw_battle_overlay, draw_battle_text, draw
 use crate::cli::exit;
 use crate::gamemode::DeviceMode;
 use crate::gamepad::{PadMode, Pads};
+use crate::graphics::panel::{Action as GraphicsAction, Panel as GraphicsPanel};
 use crate::interp::render_time;
 use crate::net::PartyCommand;
 use crate::npc::{npc_models, npc_players, npc_who};
@@ -438,6 +439,8 @@ enum KeyRoute {
 /// Where a key goes. The sound keys and the battle keys come after the party keys and before walking,
 /// and the direction keys are the battle's only `in_battle`, so the field keeps its arrows and WASD.
 fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> KeyRoute {
+    // The graphics overlay handles F5 before any gameplay dispatch, including its releases.
+    if code == KeyCode::F5 { return KeyRoute::Ignored; }
     if code == KeyCode::Escape {
         return if pressed && !repeat { KeyRoute::Escape } else { KeyRoute::Ignored };
     }
@@ -553,6 +556,98 @@ impl Input {
     }
 }
 
+/// Physical keyboard movement keys held across a local modal boundary. Keep the aliases
+/// separate: releasing Up must not release a still-held W. Keys used to navigate the panel
+/// also need a release before they can move the player after it closes.
+#[derive(Debug, Default)]
+struct GraphicsKeyboard {
+    held: u16,
+    suppressed: u16,
+    /// A release may have happened while the window could not receive it. A fresh physical
+    /// press proves that release; an OS repeat or a focus-generated press does not.
+    focus_uncertain: u16,
+}
+
+impl GraphicsKeyboard {
+    fn bit(code: KeyCode) -> u16 {
+        match code {
+            KeyCode::KeyW => 1, KeyCode::ArrowUp => 2,
+            KeyCode::KeyS => 4, KeyCode::ArrowDown => 8,
+            KeyCode::KeyA => 16, KeyCode::ArrowLeft => 32,
+            KeyCode::KeyD => 64, KeyCode::ArrowRight => 128,
+            KeyCode::ShiftLeft => 256, KeyCode::ShiftRight => 512,
+            _ => 0,
+        }
+    }
+
+    /// Observe even consumed presses/releases. True means this press must not reach either
+    /// a panel or gameplay until this physical key has been released.
+    fn event(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> bool {
+        let bit = Self::bit(code);
+        if pressed {
+            if !repeat && self.focus_uncertain & bit != 0 {
+                self.suppressed &= !bit;
+                self.focus_uncertain &= !bit;
+            }
+            self.held |= bit;
+            self.suppressed & bit != 0
+        } else {
+            self.held &= !bit;
+            self.suppressed &= !bit;
+            self.focus_uncertain &= !bit;
+            false
+        }
+    }
+
+    fn suppress_held(&mut self) { self.suppressed |= self.held; }
+
+    fn focus_lost(&mut self) {
+        self.suppress_held();
+        self.focus_uncertain |= self.held;
+    }
+
+    /// Winit can synthesize releases on focus loss and presses on focus gain. Neither is
+    /// evidence of a physical release; restored holds remain suppressed until real input.
+    fn synthetic_event(&mut self, code: KeyCode, pressed: bool) {
+        if pressed {
+            let bit = Self::bit(code);
+            self.held |= bit;
+            self.suppressed |= bit;
+            self.focus_uncertain |= bit;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphicsRoute { Pass, Consume, Open, Panel, Close }
+
+/// A graphics key never falls through to movement, talking, battle or quit confirmation.
+fn graphics_route(open: bool, available: bool, code: KeyCode, pressed: bool, repeat: bool) -> GraphicsRoute {
+    if open {
+        if !available || (code == KeyCode::F5 && pressed && !repeat) { GraphicsRoute::Close }
+        else { GraphicsRoute::Panel }
+    } else if code == KeyCode::F5 {
+        if available && pressed && !repeat { GraphicsRoute::Open } else { GraphicsRoute::Consume }
+    } else { GraphicsRoute::Pass }
+}
+
+fn graphics_available(state: &ClientState, talk_open: bool, now: f64) -> bool {
+    !talk_open && !state.field_controls_held() && !state.scene.is_active()
+        && !state.battle.in_battle() && !state.battle.lingering(now) && !state.ordinary_game_over()
+}
+
+/// A modal toggle/explicit close owns its whole controller batch. L3 sorts after A in the
+/// pad's stable key order, so processing ordinary presses first could otherwise interact
+/// with a character just before opening Graphics or change a setting just before closing it.
+fn graphics_pad_priority(events: &[crate::gamepad::PadEvent], open: bool) -> Option<usize> {
+    let toggle = events.iter().position(|event| event.pressed && !event.repeat && event.key.key_code() == KeyCode::F5);
+    if toggle.is_some() { return toggle; }
+    if open {
+        events.iter().position(|event| event.pressed && !event.repeat
+            && matches!(event.key.key_code(), KeyCode::Escape | KeyCode::Backspace))
+    } else { None }
+}
+
 /// One line about a request the player just made (for stderr).
 fn describe_request(cmd: PartyCommand) -> String {
     match cmd {
@@ -630,6 +725,9 @@ pub(crate) struct App {
     scene_started: u64,
     story_pending_epoch: u64,
     graphics: crate::graphics::Settings,
+    graphics_panel: Option<GraphicsPanel>,
+    graphics_keyboard: GraphicsKeyboard,
+    focused: bool,
 }
 
 impl App {
@@ -672,6 +770,9 @@ impl App {
             scene_started: 0,
             story_pending_epoch: 0,
             graphics: crate::graphics::Settings::default(),
+            graphics_panel: None,
+            graphics_keyboard: GraphicsKeyboard::default(),
+            focused: true,
         }
     }
 
@@ -697,7 +798,30 @@ impl App {
     /// make the same key events (`PadKey::key_code`) and so go through this one dispatch.
     fn key_event(&mut self, el: &ActiveEventLoop, code: KeyCode, pressed: bool, repeat: bool, source: InputSource) {
         let now = self.session.now();
+        let suppressed = source == InputSource::Keyboard && self.graphics_keyboard.event(code, pressed, repeat);
+        // Releases are never lost, even if a modal consumed the associated press.
+        if !pressed { self.input.set(code, false); }
+        let was_open = self.graphics_panel.is_some();
         self.sync_story_pending_input();
+        self.sync_graphics_panel();
+        if suppressed || !self.focused || (was_open && self.graphics_panel.is_none()) { return; }
+        let available = self.focused && self.renderer.is_some() && graphics_available(&self.session.state, self.talk.is_open(), now);
+        match graphics_route(self.graphics_panel.is_some(), available, code, pressed, repeat) {
+            GraphicsRoute::Open => {
+                self.capture_graphics_input();
+                self.notice = None;
+                self.graphics_panel = Some(GraphicsPanel::new());
+                return;
+            }
+            GraphicsRoute::Close => { self.close_graphics_panel(); return; }
+            GraphicsRoute::Consume => return,
+            GraphicsRoute::Panel => {
+                let action = self.graphics_panel.as_mut().and_then(|panel| panel.key(code, pressed, repeat));
+                self.graphics_action(action);
+                return;
+            }
+            GraphicsRoute::Pass => {}
+        }
         match game_over_route(&self.session.state, code, pressed, repeat) {
             GameOverRoute::Disconnect => { self.quit(el); return; }
             GameOverRoute::Held => {
@@ -787,7 +911,38 @@ impl App {
     fn sync_story_pending_input(&mut self) {
         if observe_story_pending(&mut self.story_pending_epoch, self.session.state.story_pending_epoch(), &mut self.input) {
             self.talk.close();
+            self.close_graphics_panel();
         }
+    }
+
+    fn capture_graphics_input(&mut self) {
+        self.input = Input::default();
+        self.graphics_keyboard.suppress_held();
+        self.pads.suppress_directions_until_release();
+        self.quit_armed_until = None;
+    }
+
+    fn close_graphics_panel(&mut self) {
+        if self.graphics_panel.take().is_some() { self.capture_graphics_input(); }
+    }
+
+    fn sync_graphics_panel(&mut self) {
+        if !self.focused || !graphics_available(&self.session.state, self.talk.is_open(), self.session.now()) {
+            self.close_graphics_panel();
+        }
+    }
+
+    fn graphics_action(&mut self, action: Option<GraphicsAction>) {
+        let Some(action) = action else { return };
+        if action == GraphicsAction::Close { self.close_graphics_panel(); return; }
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let notice = match action {
+            GraphicsAction::AntiAliasing => renderer.toggle_anti_aliasing().to_string(),
+            GraphicsAction::RenderScale => renderer.toggle_render_scale(),
+            GraphicsAction::Defaults => renderer.restore_graphics_defaults(),
+            GraphicsAction::Close => return,
+        };
+        if let Some(panel) = self.graphics_panel.as_mut() { panel.set_notice(notice); }
     }
 
     /// Read the game controllers and send what they did through [`App::key_event`]. In a battle (or
@@ -797,10 +952,24 @@ impl App {
         let battle = &self.session.state.battle;
         // A save hold alone keeps Field mode: toggling modes would synthesize fresh presses
         // for a still-held diagonal stick when the save completes.
-        let menu = battle.in_battle() || battle.lingering(self.session.now()) || self.session.state.ordinary_game_over() || self.talk.is_open() || self.session.state.scene.is_active();
+        let menu = self.graphics_panel.is_some() || battle.in_battle() || battle.lingering(self.session.now()) || self.session.state.ordinary_game_over() || self.talk.is_open() || self.session.state.scene.is_active();
         let mode = if menu { PadMode::Menu } else { PadMode::Field };
-        for event in self.pads.poll(now, mode) {
+        let events = self.pads.poll(now, mode);
+        let priority = graphics_pad_priority(&events, self.graphics_panel.is_some());
+        if let Some(index) = priority {
+            let event = &events[index];
+            let panel_open = self.graphics_panel.is_some();
             self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
+            if panel_open != self.graphics_panel.is_some() { return; }
+        }
+        for (index, event) in events.into_iter().enumerate() {
+            if priority == Some(index) { continue; }
+            let panel_open = self.graphics_panel.is_some();
+            self.key_event(el, event.key.key_code(), event.pressed, event.repeat, InputSource::Pad);
+            // Remaining events were collected under the previous modal focus. In particular,
+            // a held navigation repeat or another button from this batch must not leak into
+            // gameplay after B/L3 closes the panel. Boundary capture already cleared walking.
+            if panel_open != self.graphics_panel.is_some() { break; }
         }
     }
 
@@ -844,6 +1013,7 @@ impl App {
 
     /// The session entered another area: draw it (a new view, a new title).
     fn rebuild_view(&mut self) {
+        self.close_graphics_panel();
         self.talk.close();
         self.view = crate::field_view(self.ff7.as_deref(), &self.session);
         // A new field: the view is put on the player at once, not scrolled there from the last field's place.
@@ -1027,7 +1197,9 @@ impl App {
             self.scene_started = self.session.state.scene.started();
             self.input = Input::default();
             self.talk.close();
+            self.close_graphics_panel();
         }
+        self.sync_graphics_panel();
         // The music follows the area and the battle (before the battle's early return below: a fight is
         // exactly when it changes).
         self.audio.update_from(&self.session);
@@ -1046,7 +1218,7 @@ impl App {
         let (speed, moving) = movement_pace(self.view.stage.as_ref(), self.input.walking(), self.session.area.max_speed());
         // The keys mean directions on the SCREEN; the area is walked in its own axes. Under a dialogue
         // window the player stands still (no keys: idle, and the intent is sent as usual).
-        let keys = if self.talk.is_open() || self.session.state.scene.is_active() { (0.0, 0.0) } else { self.input.dir() };
+        let keys = if self.graphics_panel.is_some() || self.talk.is_open() || self.session.state.scene.is_active() { (0.0, 0.0) } else { self.input.dir() };
         let dir = if keys == (0.0, 0.0) {
             keys
         } else {
@@ -1153,6 +1325,9 @@ impl App {
         }
         if state.ordinary_game_over() {
             draw_game_over(vw, vh, &mut overlay);
+        }
+        if let Some(panel) = &self.graphics_panel {
+            panel.draw(renderer.graphics_status(), (vw, vh), &mut overlay);
         }
         let result = renderer.render_layers_effects(&scene, built.as_ref().map(|b| &b.frame), Some(&overlay), self.camera.clip_range(view.range), state.scene.fade());
         let gpu_error = renderer.first_gpu_error();
@@ -1342,16 +1517,25 @@ impl ApplicationHandler for App {
                         repeat,
                         ..
                     },
+                is_synthetic,
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
+                if is_synthetic {
+                    self.graphics_keyboard.synthetic_event(code, pressed);
+                    if !pressed { self.input.set(code, false); }
+                    return;
+                }
                 self.key_event(el, code, pressed, repeat, InputSource::Keyboard);
             }
             WindowEvent::Focused(focused) => {
+                self.focused = focused;
                 // Controllers are only heard while the window has the focus (see `crate::gamepad`).
                 self.pads.set_focused(focused);
                 // Releases while unfocused are never delivered: do not keep walking.
                 if !focused {
+                    self.close_graphics_panel();
+                    self.graphics_keyboard.focus_lost();
                     self.input = Input::default();
                 }
             }
@@ -1385,7 +1569,7 @@ mod tests {
     #[test]
     fn a_story_save_hold_blocks_field_actions_but_keeps_battle_and_local_controls() {
         for key in [KeyCode::KeyW, KeyCode::ArrowUp, KeyCode::Enter, KeyCode::Space,
-            KeyCode::F6, KeyCode::KeyB, KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL] {
+            KeyCode::F5, KeyCode::F6, KeyCode::KeyB, KeyCode::KeyP, KeyCode::KeyY, KeyCode::KeyL] {
             assert_eq!(story_pending_route(key, true, false, false), KeyRoute::Ignored, "{key:?} cannot begin a field action");
         }
         for key in [KeyCode::Escape, KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4,
@@ -1401,6 +1585,117 @@ mod tests {
         assert_eq!(story_pending_route(KeyCode::Escape, true, false, true), KeyRoute::Escape);
         assert_eq!(story_pending_route(KeyCode::KeyB, true, false, true), KeyRoute::Ignored, "a hold never asks for a second battle");
         assert_eq!(story_pending_route(KeyCode::KeyL, true, false, true), KeyRoute::Ignored, "battle input does not allow a party mutation");
+    }
+
+    #[test]
+    fn graphics_focus_consumes_keys_before_talking_battles_or_quit_confirmation() {
+        assert_eq!(graphics_route(false, true, KeyCode::F5, true, false), GraphicsRoute::Open);
+        for (pressed, repeat) in [(false, false), (true, true)] {
+            assert_eq!(graphics_route(false, true, KeyCode::F5, pressed, repeat), GraphicsRoute::Consume);
+        }
+        assert_eq!(graphics_route(false, false, KeyCode::F5, true, false), GraphicsRoute::Consume);
+        assert_eq!(route_key(KeyCode::F5, true, false, false), KeyRoute::Ignored);
+        assert_eq!(graphics_route(true, true, KeyCode::F5, true, false), GraphicsRoute::Close);
+        for code in [KeyCode::Enter, KeyCode::Space, KeyCode::Escape, KeyCode::Backspace,
+            KeyCode::KeyW, KeyCode::KeyP, KeyCode::KeyB, KeyCode::F6] {
+            assert_eq!(graphics_route(true, true, code, true, false), GraphicsRoute::Panel,
+                "{code:?} never reaches an NPC, battle, preview or quit route behind the overlay");
+            assert_eq!(graphics_route(true, false, code, true, false), GraphicsRoute::Close,
+                "a new gameplay modal dismisses graphics and consumes the crossing event");
+        }
+        let mut panel = GraphicsPanel::new();
+        assert_eq!(panel.key(KeyCode::Escape, true, false), Some(GraphicsAction::Close));
+        assert_eq!(panel.key(KeyCode::Backspace, true, false), Some(GraphicsAction::Close));
+        assert_eq!(graphics_route(false, true, KeyCode::Enter, true, false), GraphicsRoute::Pass,
+            "normal gameplay dispatch returns after the overlay has closed");
+    }
+
+    #[test]
+    fn graphics_keyboard_requires_release_for_old_walking_and_panel_navigation_keys() {
+        let mut keyboard = GraphicsKeyboard::default();
+        for code in [KeyCode::KeyW, KeyCode::ArrowUp, KeyCode::ShiftLeft] {
+            assert!(!keyboard.event(code, true, false));
+        }
+        keyboard.suppress_held(); // Opening the panel retires the old movement.
+        assert!(keyboard.event(KeyCode::KeyW, true, false));
+        assert!(!keyboard.event(KeyCode::ArrowUp, false, false));
+        assert!(keyboard.event(KeyCode::KeyW, true, false), "the Up alias does not release W");
+        assert!(!keyboard.event(KeyCode::ArrowUp, true, false), "released input may navigate again");
+        assert!(!keyboard.event(KeyCode::ArrowRight, true, false), "a fresh panel navigation key");
+        keyboard.suppress_held(); // Closing it must not turn held navigation into walking.
+        for code in [KeyCode::KeyW, KeyCode::ArrowUp, KeyCode::ArrowRight, KeyCode::ShiftLeft] {
+            assert!(keyboard.event(code, true, false), "{code:?} is still physically held");
+            assert!(!keyboard.event(code, false, false));
+            assert!(!keyboard.event(code, true, false), "a fresh {code:?} works after release");
+        }
+        assert!(!keyboard.event(KeyCode::Enter, true, false), "nonmovement actions are not latched");
+    }
+
+    #[test]
+    fn focus_generated_keyboard_events_cannot_release_a_modal_hold_or_resume_walking() {
+        let mut keyboard = GraphicsKeyboard::default();
+        assert!(!keyboard.event(KeyCode::KeyW, true, false));
+        keyboard.suppress_held();
+        // Some platforms send this before Focused(false). It must not erase the hold.
+        keyboard.synthetic_event(KeyCode::KeyW, false);
+        assert!(keyboard.event(KeyCode::KeyW, true, true));
+        keyboard.focus_lost();
+        keyboard.synthetic_event(KeyCode::KeyW, true);
+        assert!(keyboard.event(KeyCode::KeyW, true, true), "refocusing with W held cannot walk");
+        assert!(!keyboard.event(KeyCode::KeyW, false, false));
+        assert!(!keyboard.event(KeyCode::KeyW, true, false), "a physical release and press rearms W");
+
+        keyboard.focus_lost();
+        keyboard.synthetic_event(KeyCode::KeyW, false);
+        // W was released while another window owned focus, so no release was delivered.
+        // A genuinely fresh physical press after returning proves that intervening release.
+        assert!(!keyboard.event(KeyCode::KeyW, true, false));
+        keyboard.suppress_held();
+        assert!(keyboard.event(KeyCode::KeyW, true, true), "a later modal still suppresses repeats");
+
+        // A key first noticed by the platform on refocus is also held, not a new action.
+        keyboard.synthetic_event(KeyCode::ArrowRight, true);
+        assert!(keyboard.event(KeyCode::ArrowRight, true, true));
+        assert!(!keyboard.event(KeyCode::ArrowRight, false, false));
+        assert!(!keyboard.event(KeyCode::ArrowRight, true, false));
+    }
+
+    #[test]
+    fn controller_modal_boundaries_precede_simultaneous_gameplay_or_setting_presses() {
+        use crate::gamepad::{PadEvent, PadKey};
+        let press = |key| PadEvent { key, pressed: true, repeat: false };
+        let open = [press(PadKey::Confirm), press(PadKey::Invite), press(PadKey::Graphics)];
+        assert_eq!(graphics_pad_priority(&open, false), Some(2), "L3 takes focus before A can talk or X can invite");
+        assert_eq!(graphics_pad_priority(&open, true), Some(2), "L3 closes before A can change a setting");
+        for close in [PadKey::Back, PadKey::Escape] {
+            let events = [press(PadKey::Confirm), press(close)];
+            assert_eq!(graphics_pad_priority(&events, true), Some(1));
+            assert_eq!(graphics_pad_priority(&events, false), None, "ordinary controls keep their existing ordering");
+        }
+        for event in [PadEvent { key: PadKey::Graphics, pressed: false, repeat: false },
+            PadEvent { key: PadKey::Graphics, pressed: true, repeat: true }] {
+            assert_eq!(graphics_pad_priority(&[press(PadKey::Confirm), event], false), None);
+        }
+    }
+
+    #[test]
+    fn graphics_opens_only_during_idle_field_control() {
+        let mut idle = state_with_peers(&[]);
+        assert!(graphics_available(&idle, false, 0.0));
+        assert!(!graphics_available(&idle, true, 0.0), "ordinary dialogue owns focus");
+        idle.apply(0.0, ServerMsg::StoryPending {
+            id: 1, area: AreaId { game: GameId::Fixture, key: "k".into() },
+            pos: Pos::default(), facing: 0.0,
+        });
+        assert!(!graphics_available(&idle, false, 0.0), "a durable hold owns field control");
+        idle.apply(0.0, ServerMsg::StoryCommitted { id: 1 });
+        assert!(graphics_available(&idle, false, 0.0));
+        let mut battle = state_in_a_preemptive_battle();
+        assert!(!graphics_available(&battle, false, 0.0));
+        battle.apply(10.0, ServerMsg::BattleEnd {
+            battle_id: fmv_protocol::BattleId(1), outcome: fmv_protocol::battle::Outcome::Victory, rewards: vec![],
+        });
+        assert!(!graphics_available(&battle, false, 10.0), "the result panel still owns focus");
     }
 
     #[test]
@@ -1952,6 +2247,7 @@ mod tests {
             (PadKey::Escape, KeyRoute::Escape, KeyRoute::Escape),
             (PadKey::Walk, KeyRoute::Movement, KeyRoute::Movement),
             (PadKey::Camera, KeyRoute::Camera, KeyRoute::Camera),
+            (PadKey::Graphics, KeyRoute::Ignored, KeyRoute::Ignored), // Modal routing handles F5 before gameplay.
         ];
         assert_eq!(table.len(), PadKey::ALL.len(), "every key is in the table");
         for (key, field, battle) in table {

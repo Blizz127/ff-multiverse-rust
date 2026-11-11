@@ -22,8 +22,10 @@
 //! | Start / Menu | Esc | quit prompt: a second press quits | back a level, never quits | Esc: back, cancel, or quit |
 //! | right bumper (R1/RB) | B | ask for a debug battle | - | - |
 //! | left trigger (L2/LT), held | Shift | walk instead of run | - | - |
+//! | right stick pressed in (R3/RS) | F2 | switch the field camera | - | - |
+//! | left stick pressed in (L3/LS) | F5 | graphics settings | - | - |
 //!
-//! Everything else (the Guide/Steam button, the stick clicks, L1, R2, the right stick) does nothing.
+//! Everything else (the Guide/Steam button, L1, R2, the right stick axes) does nothing.
 //!
 //! # Sticks, repeat, focus
 //!
@@ -86,11 +88,13 @@ pub enum PadKey {
     Walk,
     /// The right stick pressed in (R3): F2, the field camera (FF7's screen or the whole field).
     Camera,
+    /// The left stick pressed in (L3): F5, the local graphics settings.
+    Graphics,
 }
 
 impl PadKey {
     /// Every key, in the order events are produced.
-    pub const ALL: [PadKey; 13] = [
+    pub const ALL: [PadKey; 14] = [
         PadKey::Up,
         PadKey::Down,
         PadKey::Left,
@@ -104,6 +108,7 @@ impl PadKey {
         PadKey::Escape,
         PadKey::Walk,
         PadKey::Camera,
+        PadKey::Graphics,
     ];
     /// The four directions: the only keys that repeat.
     pub const DIRECTIONS: [PadKey; 4] = [PadKey::Up, PadKey::Down, PadKey::Left, PadKey::Right];
@@ -131,6 +136,7 @@ impl PadKey {
             PadKey::Escape => KeyCode::Escape,
             PadKey::Walk => KeyCode::ShiftRight,
             PadKey::Camera => KeyCode::F2,
+            PadKey::Graphics => KeyCode::F5,
         }
     }
 }
@@ -151,6 +157,7 @@ pub fn button_key(button: Button) -> Option<PadKey> {
         Button::RightTrigger => PadKey::Battle,
         Button::LeftTrigger2 => PadKey::Walk,
         Button::RightThumb => PadKey::Camera,
+        Button::LeftThumb => PadKey::Graphics,
         _ => return None,
     })
 }
@@ -269,14 +276,26 @@ struct PadState {
     stick: (f32, f32),
     /// The directions the stick is holding (also the memory of its hysteresis).
     stick_keys: KeySet,
+    /// D-pad buttons held when a local modal closes: release them before using them again.
+    suppressed_directions: KeySet,
+    /// A stick held through a modal needs physical neutral, independently of menu axis selection.
+    suppressed_stick: bool,
+}
+
+impl PadState {
+    fn stick_neutral(&self) -> bool {
+        self.stick.0.abs() < STICK_RELEASE && self.stick.1.abs() < STICK_RELEASE
+    }
 }
 
 /// The pure heart: raw pad inputs in, [`PadEvent`]s out.
 #[derive(Debug)]
 pub struct PadLogic {
     pads: BTreeMap<usize, PadState>,
-    /// What the consumers have been told is held.
+    /// What the consumers have been told is held, excluding releases queued below.
     held: KeySet,
+    /// Releases required by a modal boundary, before any fresh press in the next poll.
+    pending_releases: KeySet,
     /// Is the window focused? Unfocused, nothing is held (everything was released).
     enabled: bool,
     /// Keys that were already down when the focus came back: ignored until they are let go.
@@ -292,6 +311,7 @@ impl Default for PadLogic {
         Self {
             pads: BTreeMap::new(),
             held: KeySet::EMPTY,
+            pending_releases: KeySet::EMPTY,
             enabled: true,
             suppressed: KeySet::EMPTY,
             last_raw: KeySet::EMPTY,
@@ -308,6 +328,7 @@ impl PadLogic {
                 if let Some(key) = button_key(button) {
                     let state = self.pads.entry(pad).or_default();
                     state.buttons = if pressed { state.buttons.with(key) } else { state.buttons.without(key) };
+                    if !pressed { state.suppressed_directions = state.suppressed_directions.without(key); }
                 }
             }
             RawInput::Axis(axis, value) => {
@@ -316,6 +337,12 @@ impl PadLogic {
                     Axis::LeftStickX => self.pads.entry(pad).or_default().stick.0 = value,
                     Axis::LeftStickY => self.pads.entry(pad).or_default().stick.1 = value,
                     _ => {}
+                }
+                if let Some(state) = self.pads.get_mut(&pad) {
+                    if state.suppressed_stick && state.stick_neutral() {
+                        state.suppressed_stick = false;
+                        state.stick_keys = KeySet::EMPTY;
+                    }
                 }
             }
             RawInput::Gone => {
@@ -333,25 +360,49 @@ impl PadLogic {
         self.enabled = focused;
     }
 
+    /// Let go of directions at the next update and require the held physical input to be
+    /// released before it can act again. A stick waits for neutral on both axes, so changing
+    /// from a menu's single axis back to field diagonals cannot invent a new walking press.
+    /// Each pad and its D-pad/stick are independent; unrelated buttons keep their state.
+    pub fn suppress_directions_until_release(&mut self) {
+        for key in PadKey::DIRECTIONS {
+            if self.held.has(key) { self.pending_releases = self.pending_releases.with(key); }
+            self.held = self.held.without(key);
+        }
+        self.repeat_due = [None; 4];
+        for pad in self.pads.values_mut() {
+            for key in PadKey::DIRECTIONS {
+                if pad.buttons.has(key) { pad.suppressed_directions = pad.suppressed_directions.with(key); }
+            }
+            pad.suppressed_stick |= !pad.stick_neutral();
+        }
+    }
+
     /// The events since the last update: first the releases, then the presses (so a change of
     /// direction reads as "let go of up, press down"), then the repeats of held directions.
     pub fn update(&mut self, now: Instant, mode: PadMode) -> Vec<PadEvent> {
         let diagonals = mode == PadMode::Field;
         let mut raw = KeySet::EMPTY;
+        let mut available = KeySet::EMPTY;
         for pad in self.pads.values_mut() {
             pad.stick_keys = stick_keys(pad.stick.0, pad.stick.1, pad.stick_keys, diagonals);
             raw = raw | pad.buttons | pad.stick_keys;
+            pad.suppressed_directions = pad.suppressed_directions & pad.buttons;
+            if pad.stick_neutral() { pad.suppressed_stick = false; }
+            available = available | (pad.buttons & !pad.suppressed_directions)
+                | if pad.suppressed_stick { KeySet::EMPTY } else { pad.stick_keys };
         }
         self.last_raw = raw;
         self.suppressed = self.suppressed & raw;
-        let target = if self.enabled { raw & !self.suppressed } else { KeySet::EMPTY };
+        let target = if self.enabled { available & !self.suppressed } else { KeySet::EMPTY };
 
         let mut events = Vec::new();
         for key in PadKey::ALL {
-            if self.held.has(key) && !target.has(key) {
+            if self.pending_releases.has(key) || self.held.has(key) && !target.has(key) {
                 events.push(PadEvent { key, pressed: false, repeat: false });
             }
         }
+        self.pending_releases = KeySet::EMPTY;
         for key in PadKey::ALL {
             if !self.held.has(key) && target.has(key) {
                 events.push(PadEvent { key, pressed: true, repeat: false });
@@ -423,6 +474,11 @@ impl Pads {
     /// The window gained or lost the focus (see [`PadLogic::set_focused`]).
     pub fn set_focused(&mut self, focused: bool) {
         self.logic.set_focused(focused);
+    }
+
+    /// A local modal closes without resuming movement that was already held inside it.
+    pub fn suppress_directions_until_release(&mut self) {
+        self.logic.suppress_directions_until_release();
     }
 
     /// Read what the controllers did since the last call and return the key events it comes to.
@@ -515,13 +571,13 @@ mod tests {
             (Button::RightTrigger, PadKey::Battle),
             (Button::LeftTrigger2, PadKey::Walk),
             (Button::RightThumb, PadKey::Camera),
+            (Button::LeftThumb, PadKey::Graphics),
         ] {
             assert_eq!(button_key(button), Some(key), "{button:?}");
         }
         // Everything else does nothing: Steam owns the Guide button, the rest is unclaimed.
         for button in [
             Button::Mode,
-            Button::LeftThumb,
             Button::LeftTrigger,
             Button::RightTrigger2,
             Button::C,
@@ -551,6 +607,7 @@ mod tests {
                 KeyCode::Escape,
                 KeyCode::ShiftRight,
                 KeyCode::F2,
+                KeyCode::F5,
             ]
         );
         for (i, a) in codes.iter().enumerate() {
@@ -631,7 +688,7 @@ mod tests {
         assert!(logic.update(now + ms(48), PadMode::Field).is_empty());
         // A button that does nothing makes nothing.
         press(&mut logic, 0, Button::Mode);
-        press(&mut logic, 0, Button::LeftThumb);
+        press(&mut logic, 0, Button::LeftTrigger);
         assert!(logic.update(now + ms(64), PadMode::Field).is_empty());
     }
 
@@ -751,6 +808,107 @@ mod tests {
         // A battle begins: the same push is now one direction, and the other is let go.
         let events = flat(logic.update(now + ms(16), PadMode::Menu));
         assert_eq!(events, [(PadKey::Up, false, false)], "the stronger axis (right) stays");
+    }
+
+    #[test]
+    fn closing_a_modal_requires_stick_neutral_even_when_menu_diagonals_change() {
+        let (mut logic, now) = (PadLogic::default(), t0());
+        stick(&mut logic, 0, 0.8, 0.75);
+        assert_eq!(flat(logic.update(now, PadMode::Menu)), [(PadKey::Right, true, false)]);
+        logic.suppress_directions_until_release();
+        assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)), [(PadKey::Right, false, false)],
+            "the formerly hidden Up component must not become a walking press");
+        assert!(logic.update(now + ms(32), PadMode::Field).is_empty());
+        // Rotating the still-displaced stick is not a physical release, nor is switching
+        // which axis a menu chooses. Half a release on one axis is not neutral either.
+        for (step, (x, y, mode)) in [(-0.8, -0.75, PadMode::Field), (0.0, -0.8, PadMode::Menu),
+            (0.39, 0.4, PadMode::Field)].into_iter().enumerate() {
+            stick(&mut logic, 0, x, y);
+            assert!(logic.update(now + ms(48 + step as u64 * 16), mode).is_empty());
+        }
+        stick(&mut logic, 0, 0.39, 0.39);
+        assert!(logic.update(now + ms(112), PadMode::Field).is_empty());
+        stick(&mut logic, 0, 0.8, 0.75);
+        assert_eq!(flat(logic.update(now + ms(128), PadMode::Field)),
+            [(PadKey::Up, true, false), (PadKey::Right, true, false)]);
+    }
+
+    #[test]
+    fn a_suppressed_dpad_waits_for_release_without_suppressing_buttons_or_other_pads() {
+        let (mut logic, now) = (PadLogic::default(), t0());
+        press(&mut logic, 0, Button::DPadDown);
+        press(&mut logic, 0, Button::South);
+        assert_eq!(logic.update(now, PadMode::Menu).len(), 2);
+        logic.suppress_directions_until_release();
+        assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)), [(PadKey::Down, false, false)]);
+        press(&mut logic, 0, Button::LeftThumb);
+        assert_eq!(flat(logic.update(now + ms(32), PadMode::Field)), [(PadKey::Graphics, true, false)]);
+        assert!(logic.update(now + ms(500), PadMode::Menu).is_empty(), "held suppressed directions never repeat");
+        // Another controller's fresh input is still usable, including the same direction.
+        press(&mut logic, 1, Button::DPadDown);
+        assert_eq!(flat(logic.update(now + ms(516), PadMode::Field)), [(PadKey::Down, true, false)]);
+        release(&mut logic, 1, Button::DPadDown);
+        assert_eq!(flat(logic.update(now + ms(532), PadMode::Field)), [(PadKey::Down, false, false)]);
+        release(&mut logic, 0, Button::DPadDown);
+        press(&mut logic, 0, Button::DPadDown);
+        assert_eq!(flat(logic.update(now + ms(548), PadMode::Field)), [(PadKey::Down, true, false)],
+            "a physical release and fresh press between polls also re-arm the button");
+        release(&mut logic, 0, Button::South);
+        assert_eq!(flat(logic.update(now + ms(564), PadMode::Field)), [(PadKey::Confirm, false, false)],
+            "the unrelated Confirm button remained held throughout");
+    }
+
+    #[test]
+    fn modal_suppression_with_neutral_inputs_does_not_eat_the_next_press() {
+        let (mut logic, now) = (PadLogic::default(), t0());
+        stick(&mut logic, 0, 0.0, 0.0);
+        logic.update(now, PadMode::Menu);
+        logic.suppress_directions_until_release();
+        stick(&mut logic, 0, -0.9, 0.0);
+        press(&mut logic, 0, Button::DPadUp);
+        assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)),
+            [(PadKey::Up, true, false), (PadKey::Left, true, false)]);
+        logic.suppress_directions_until_release();
+        logic.feed(0, RawInput::Gone);
+        assert_eq!(flat(logic.update(now + ms(32), PadMode::Field)),
+            [(PadKey::Up, false, false), (PadKey::Left, false, false)]);
+        stick(&mut logic, 0, 0.8, 0.0);
+        assert_eq!(flat(logic.update(now + ms(48), PadMode::Field)), [(PadKey::Right, true, false)],
+            "a newly connected controller does not inherit the old device's hold");
+    }
+
+    #[test]
+    fn physical_stick_neutral_between_polls_resets_the_old_hold_threshold() {
+        let (mut logic, now) = (PadLogic::default(), t0());
+        stick(&mut logic, 0, 0.8, 0.0);
+        assert_eq!(flat(logic.update(now, PadMode::Menu)), [(PadKey::Right, true, false)]);
+        logic.suppress_directions_until_release();
+        stick(&mut logic, 0, 0.0, 0.0);
+        stick(&mut logic, 0, 0.5, 0.0);
+        assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)), [(PadKey::Right, false, false)],
+            "a new push must cross the press threshold, not reuse the suppressed hold's hysteresis");
+        stick(&mut logic, 0, 0.6, 0.0);
+        assert_eq!(flat(logic.update(now + ms(32), PadMode::Field)), [(PadKey::Right, true, false)]);
+    }
+
+    #[test]
+    fn a_fresh_direction_between_suppression_and_the_next_poll_releases_then_presses() {
+        for use_stick in [false, true] {
+            let (mut logic, now) = (PadLogic::default(), t0());
+            let up = |logic: &mut PadLogic, pressed: bool| {
+                if use_stick { stick(logic, 0, 0.0, if pressed { 0.8 } else { 0.0 }); }
+                else { logic.feed(0, RawInput::Button(Button::DPadUp, pressed)); }
+            };
+            up(&mut logic, true);
+            assert_eq!(flat(logic.update(now, PadMode::Menu)), [(PadKey::Up, true, false)]);
+            logic.suppress_directions_until_release();
+            up(&mut logic, false);
+            up(&mut logic, true);
+            assert_eq!(flat(logic.update(now + ms(16), PadMode::Field)),
+                [(PadKey::Up, false, false), (PadKey::Up, true, false)],
+                "the caller cleared walking at the modal boundary; a fresh physical input must re-arm it");
+            assert!(logic.update(now + ms(32), PadMode::Field).is_empty());
+        }
     }
 
     #[test]

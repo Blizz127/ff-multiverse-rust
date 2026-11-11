@@ -244,6 +244,14 @@ takes it as the same menu input. With no controller nothing changes.
 | right bumper (R1/RB) | B | ask for a debug battle | - | - |
 | left trigger (L2/LT), held | Shift | walk instead of run | - | - |
 | right stick pressed in (R3/RS) | F2 | the field camera: FF7's scrolling screen or the whole field | - | - |
+| left stick pressed in (L3/LS) | F5 | graphics settings while you have field control | - | - |
+
+In Graphics, the stick or D-pad selects a row; left/right or A changes a setting. B, Start or L3
+closes the panel. It exposes FXAA and native/2x scene resolution, shows when 2x uses a native fallback,
+and offers Restore defaults. Choices apply immediately and use the existing `graphics.json` preferences.
+Your character stands still, while the game continues; a dialogue, scene, battle, field change or loss
+of focus closes the panel. Held movement controls must be released before they can move your character again.
+Keyboard F3/F4 shortcuts remain available in the field and battles; F5 opens the same panel.
 
 Nothing else is bound (the Guide/Steam button belongs to Steam). Details: a stick axis presses at 60 %
 of its travel and lets go at 40 %; in menus and battles only the stronger axis counts and a held

@@ -1,8 +1,10 @@
 //! Optional presentation settings, separate from game state. F3 toggles edge smoothing and F4
 //! toggles the scene's render resolution. The original render path is the default; choices persist in the client's
 //! `graphics.json`, using the same atomic writer as the local character notes.
+//! [`panel`] exposes those same choices and a single restore-defaults action over the running game.
 
 pub mod fxaa;
+pub mod panel;
 pub mod supersample;
 #[cfg(test)]
 mod clip_tests;
@@ -95,16 +97,32 @@ impl Settings {
     /// Change the current session, then atomically remember it. An unwritable or invalid file
     /// never prevents play; the caller can tell the player their choice was not saved.
     pub fn toggle(&mut self) -> Result<AntiAliasing, std::io::Error> {
-        self.anti_aliasing = match self.anti_aliasing { AntiAliasing::Off => AntiAliasing::Fxaa, AntiAliasing::Fxaa => AntiAliasing::Off };
+        self.set_anti_aliasing(match self.anti_aliasing { AntiAliasing::Off => AntiAliasing::Fxaa, AntiAliasing::Fxaa => AntiAliasing::Off })
+    }
+
+    pub fn set_anti_aliasing(&mut self, mode: AntiAliasing) -> Result<AntiAliasing, std::io::Error> {
+        self.anti_aliasing = mode;
         self.save()?;
         Ok(self.anti_aliasing)
     }
 
     /// Like [`Settings::toggle`], changing resolution remains usable if it cannot be remembered.
     pub fn toggle_render_scale(&mut self) -> Result<RenderScale, std::io::Error> {
-        self.render_scale = match self.render_scale { RenderScale::Native => RenderScale::Double, RenderScale::Double => RenderScale::Native };
+        self.set_render_scale(match self.render_scale { RenderScale::Native => RenderScale::Double, RenderScale::Double => RenderScale::Native })
+    }
+
+    pub fn set_render_scale(&mut self, scale: RenderScale) -> Result<RenderScale, std::io::Error> {
+        self.render_scale = scale;
         self.save()?;
         Ok(self.render_scale)
+    }
+
+    /// Restore both original presentation choices with one atomic save, preserving unrelated
+    /// options. Both take effect for this session even when the file cannot be written.
+    pub fn restore_defaults(&mut self) -> Result<(), std::io::Error> {
+        self.anti_aliasing = AntiAliasing::Off;
+        self.render_scale = RenderScale::Native;
+        self.save()
     }
 
     fn save(&mut self) -> Result<(), std::io::Error> {
@@ -126,6 +144,48 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restoring_defaults_saves_both_choices_without_losing_unknown_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graphics.json");
+        std::fs::write(&path, r#"{"anti_aliasing":"fxaa","render_scale":"2x","future_option":{"value":42}}"#).unwrap();
+        let mut settings = Settings::load(dir.path());
+        settings.restore_defaults().unwrap();
+        let restored = Settings::load(dir.path());
+        assert_eq!((restored.anti_aliasing, restored.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!(restored.values["future_option"]["value"], 42);
+        // Explicit assignments select the requested value rather than toggling an existing one.
+        settings.set_anti_aliasing(AntiAliasing::Fxaa).unwrap();
+        settings.set_anti_aliasing(AntiAliasing::Fxaa).unwrap();
+        settings.set_render_scale(RenderScale::Double).unwrap();
+        settings.set_render_scale(RenderScale::Double).unwrap();
+        let saved = Settings::load(dir.path());
+        assert_eq!((saved.anti_aliasing, saved.render_scale), (AntiAliasing::Fxaa, RenderScale::Double));
+        assert_eq!(saved.values["future_option"], restored.values["future_option"]);
+    }
+
+    #[test]
+    fn defaults_apply_together_for_the_session_when_the_settings_file_cannot_be_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graphics.json");
+        let unknown = r#"{"anti_aliasing":"future","render_scale":"2x"}"#;
+        std::fs::write(&path, unknown).unwrap();
+        let mut settings = Settings::load(dir.path());
+        assert!(settings.set_anti_aliasing(AntiAliasing::Fxaa).is_err());
+        assert!(settings.set_render_scale(RenderScale::Double).is_err());
+        assert!(settings.restore_defaults().is_err());
+        assert_eq!((settings.anti_aliasing, settings.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), unknown);
+
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "keep").unwrap();
+        let mut settings = Settings { anti_aliasing: AntiAliasing::Fxaa, render_scale: RenderScale::Double,
+            path: Some(blocked.join("graphics.json")), ..Settings::default() };
+        assert!(settings.restore_defaults().is_err());
+        assert_eq!((settings.anti_aliasing, settings.render_scale), (AntiAliasing::Off, RenderScale::Native));
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "keep");
+    }
 
     #[test]
     fn the_original_path_is_default_and_a_choice_survives_relaunch_without_losing_other_options() {

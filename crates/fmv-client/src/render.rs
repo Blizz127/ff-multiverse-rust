@@ -1111,6 +1111,29 @@ impl Renderer {
         self.graphics = settings;
     }
 
+    /// The persisted choices and the resolution this window can actually allocate now.
+    pub fn graphics_status(&self) -> crate::graphics::panel::Status {
+        crate::graphics::panel::Status {
+            anti_aliasing: self.graphics.anti_aliasing,
+            render_scale: self.graphics.render_scale,
+            effective_scale: self.gpu.render_plan(self.size).effective,
+        }
+    }
+
+    /// Restore the original render path immediately, with one attempt to remember both choices.
+    pub fn restore_graphics_defaults(&mut self) -> String {
+        let saved = self.graphics.restore_defaults();
+        self.gpu.set_anti_aliasing(self.graphics.anti_aliasing);
+        self.gpu.set_render_scale(self.graphics.render_scale);
+        match saved {
+            Ok(()) => "Graphics defaults restored".to_string(),
+            Err(e) => {
+                eprintln!("graphics: {e}");
+                "Graphics defaults restored for this session; settings could not be saved".to_string()
+            }
+        }
+    }
+
     /// The choice applies immediately even if the local settings file cannot be written.
     pub fn toggle_anti_aliasing(&mut self) -> &'static str {
         let saved = self.graphics.toggle();
