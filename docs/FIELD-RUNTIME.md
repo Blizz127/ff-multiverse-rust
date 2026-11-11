@@ -98,5 +98,17 @@ route reaches. On the way it plays, from the original scripts alone:
 - the escape (md8_4 at 33, md8_1 at 36, md8_2 at 39);
 - the bridge battles, the cargo car (48) and the train (51).
 
+Later the same day, after carrying running fields across steps and judging probes against an idle baseline, it
+plays on from a new game past the curated route's end:
+- the train's ID scan and movie 24;
+- the Sector 7 station (moment 63), the platforms and the slums;
+- Seventh Heaven, the bar (69 to 72) and its basement meeting (**78**).
+
+The next step needs a talk with Tifa (moment 105) or the pinball lift back up to the bar.
+
 Teleporting the player to a triangle's centre is a test shortcut, not how a player moves. The live server path is
 checked separately with `scripts/live-route.py`.
+
+**Rollback (2026-11-11):** the format check (r560 as the old build, r601 as the new one) passes with a live-field
+account. r560 reads the live account's v3 story, `index.log` stays at schema 4 (the same as the device), and the saved
+spots resume after the round trip.
