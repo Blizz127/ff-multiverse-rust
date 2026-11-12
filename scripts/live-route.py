@@ -181,9 +181,13 @@ def main():
                 windows.discard(b["window"])
             elif k == "LiveControl":
                 locked = b["locked"]
+                if locked and steps is not None:
+                    legs, steps = [], []  # a script took over: what was left of this entry is void
             elif k == "LivePlace":
                 pos, facing = b["pos"], b["facing"]
                 legs = []
+                if steps is not None:
+                    steps = []
             elif k == "MoveRejected":
                 pos = b["corrected"]
                 legs = []

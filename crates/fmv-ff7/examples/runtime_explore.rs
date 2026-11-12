@@ -227,7 +227,7 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
 
 /// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
 /// walkmesh's links, never into a locked triangle, as points at most `STRIDE` units apart (one per frame).
-fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize) -> Option<Vec<Pos>> {
+fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize) -> Option<(Vec<Pos>, String)> {
     const STRIDE: f64 = 24.0;
     let n = walk.triangles.len();
     if from_tri >= n || to_tri >= n {
@@ -265,6 +265,7 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
     }
     corners.reverse();
     let mut out = Vec::new();
+    let mut legs = Vec::new();
     let mut cur = from;
     for c in corners {
         let (dx, dy, dz) = (f64::from(c.0 - cur.0), f64::from(c.1 - cur.1), f64::from(c.2 - cur.2));
@@ -273,9 +274,13 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
             let f = f64::from(k) / f64::from(steps);
             out.push((cur.0 + (dx * f) as i32, cur.1 + (dy * f) as i32, cur.2 + (dz * f) as i32));
         }
+        if c != cur {
+            legs.push(format!("to {} {}", c.0, c.1));
+        }
         cur = c;
     }
-    Some(out)
+    // (the same corners as bot steps: the bot walks exactly this way)
+    Some((out, legs.join("; ")))
 }
 
 /// One step of a route.
@@ -556,8 +561,8 @@ fn main() {
         let mut actions: Vec<(String, Vec<Pos>, Pos, u8, bool, String)> = Vec::new();
         for t in (0..walk.triangles.len()).filter(|t| reach[*t]) {
             let c = centre(&walk, t);
-            actions.push((format!("tri {t}"), Vec::new(), c, 0, false, format!("tri {t}")));
-            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true, format!("tri {t}; ok")));
+            actions.push((format!("tri {t}"), Vec::new(), c, 0, false, String::new()));
+            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true, "ok".to_string()));
         }
         let on_reach = |rt: &FieldRuntime, p: Pos| rt.triangle_at(p.0, p.1, p.2).is_some_and(|t| reach.get(usize::from(t)).copied().unwrap_or(false));
         let pc = rt.state.pc_model;
@@ -566,7 +571,7 @@ fn main() {
                 let stand = (m.x + ox, m.y + oy, m.z);
                 if on_reach(&rt, stand) {
                     let face = direction_of(i64::from(-ox), i64::from(-oy));
-                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {} {}; face {face}; ok", stand.0, stand.1, stand.2)));
+                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
                     break;
                 }
             }
@@ -580,10 +585,10 @@ fn main() {
             let (a_side, b_side) = (side(-6), side(6));
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
             if on_reach(&rt, a_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("xy {} {} {}; to {} {}", a_side.0, a_side.1, a_side.2, b_side.0, b_side.1)));
+                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("to {} {}", b_side.0, b_side.1)));
             }
             if on_reach(&rt, b_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("xy {} {} {}; to {} {}", b_side.0, b_side.1, b_side.2, a_side.0, a_side.1)));
+                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("to {} {}", a_side.0, a_side.1)));
             }
             // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
             // in front of the player), or on its middle when neither side can be stood on.
@@ -592,12 +597,12 @@ fn main() {
                 let stand = side(k);
                 if on_reach(&rt, stand) {
                     let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
-                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("xy {} {} {}; face {face}; ok", stand.0, stand.1, stand.2)));
+                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
                     stood = true;
                 }
             }
             if !stood && on_reach(&rt, mid) {
-                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, format!("xy {} {} {}; ok", mid.0, mid.1, mid.2)));
+                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, "ok".to_string()));
             }
         }
 
@@ -641,7 +646,7 @@ fn main() {
                 if debug { println!("      drop [{label}]: its start is on no triangle"); }
                 continue;
             };
-            let Some(approach) = way(&walk, &rt, at, here, first, first_tri) else {
+            let Some((approach, legs)) = way(&walk, &rt, at, here, first, first_tri) else {
                 if debug { println!("      drop [{label}]: no way from tri {here} to tri {first_tri}"); }
                 continue;
             };
@@ -649,14 +654,15 @@ fn main() {
             let mut out = Outcome::default();
             let (arrived, mut end) = walk_to(&mut probe, &approach, at, &mut out);
             let mut label = label;
-            let mut cmds = cmds;
+            // The bot walks the same corners, then does what the action does there.
+            let mut cmds = [legs.as_str(), cmds.as_str()].iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join("; ");
             if arrived {
                 let (more, e) = run_idle(&mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
                 out.absorb(more);
                 end = e;
             } else {
                 label = format!("walking towards [{label}], stopped at {},{}", end.0, end.1);
-                cmds = format!("xy {} {} {}", first.0, first.1, first.2);
+                cmds = legs.clone();
             }
             if out.jump.is_none() && !out.game_over && (busy(&probe) || !arrived || out.windows > 0 || story_key(&probe.mem.banks) != story_key(&rt.mem.banks) || scratch_key(&probe) != scratch_key(&baseline)) {
                 let (more, e) = run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
@@ -722,7 +728,7 @@ fn main() {
                 let spot = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().map(|(ox, oy)| (mid.0 + ox, mid.1 + oy, mid.2)).find(|p| on_reach(&rt, *p));
                 let Some(spot) = spot else { continue };
                 let Some(spot_tri) = rt.triangle_at(spot.0, spot.1, spot.2).map(usize::from) else { continue };
-                let Some(mut approach) = way(&walk, &rt, at, here, spot, spot_tri) else { continue };
+                let Some((mut approach, legs)) = way(&walk, &rt, at, here, spot, spot_tri) else { continue };
                 approach.push(mid);
                 let mut probe = rt.clone();
                 let mut out = Outcome::default();
@@ -736,7 +742,7 @@ fn main() {
                     let after = moment_of(&probe.mem.banks);
                     let label = format!("walking towards gate {gi}, stopped at {},{}", end.0, end.1);
                     let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
-                    let cmds = format!("{field_name}: xy {} {} {}", spot.0, spot.1, spot.2);
+                    let cmds = format!("{field_name}: {legs}; to {} {}", mid.0, mid.1);
                     let score = if after > now { 4 } else { 2 };
                     match out.jump {
                         Some(jump) => {
@@ -759,7 +765,7 @@ fn main() {
                     continue;
                 }
                 let jump = (g.target_field_id, g.destination[0], g.destination[1], g.destination[2]);
-                let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), cmds: format!("{field_name}: gate {gi}"), parent: via.clone() }));
+                let via = Some(Rc::new(Step { text: format!("{field_name}: gate {gi} (moment {now}) -> {to}"), cmds: format!("{field_name}: {}gate {gi}", if legs.is_empty() { String::new() } else { format!("{legs}; ") }), parent: via.clone() }));
                 let score = if visited.contains(&to) { 0 } else { 3 };
                 line.push(format!("[{score}] gate {gi} -> {to}"));
                 push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);

@@ -414,6 +414,8 @@ impl World {
             frames = 0;
         }
         let mut events = Vec::new();
+        // Where the scripts last put the governor's character during this tick's frames.
+        let mut placed: Option<(Pos, f32)> = None;
         for _ in 0..frames {
             if ok {
                 run.ok_hold = OK_HOLD_FRAMES;
@@ -429,6 +431,18 @@ impl World {
             ok = false;
             events.extend(run.field.advance(input));
             run.frames += 1;
+            // While the scripts place the governor's character, its avatar is where they put it, frame by frame: the frame
+            // after they let go must start from there, not from where the avatar stood before.
+            if run.field.control_locked() {
+                if let (Some((pos, facing)), Some(p)) = (run.field.player_place(), governor_entity.and_then(|e| self.players.get_mut(&e))) {
+                    if p.snapshot.pos != pos || p.snapshot.facing != facing {
+                        p.snapshot.pos = pos;
+                        p.snapshot.facing = facing;
+                        p.dirty = true;
+                        placed = Some((pos, facing));
+                    }
+                }
+            }
             if events.iter().any(|e| matches!(e, LiveEvent::MapJump { .. } | LiveEvent::Battle { .. } | LiveEvent::Movie { .. } | LiveEvent::GameOver)) {
                 break;
             }
@@ -525,18 +539,12 @@ impl World {
             run.locked = locked;
             self.tell_instance(id, Arc::new(ServerMsg::LiveControl { locked }), &mut failed);
         }
-        let place = if locked { run.field.player_place() } else { None };
-        if place != run.place {
-            if let (Some((pos, facing)), Some(entity)) = (place, governor_entity) {
-                if let Some(p) = self.players.get_mut(&entity) {
-                    p.snapshot.pos = pos;
-                    p.snapshot.facing = facing;
-                    p.dirty = true;
-                }
-                self.send_to(entity, ServerMsg::LivePlace { pos, facing }, &mut failed);
-            }
-            run.place = place;
+        // Tell the governor's client where the scripts put its character (the last place of this tick, also when the
+        // scripts have let go since).
+        if let (Some((pos, facing)), Some(entity)) = (placed, governor_entity) {
+            self.send_to(entity, ServerMsg::LivePlace { pos, facing }, &mut failed);
         }
+        run.place = placed.or(run.place.filter(|_| locked));
         // The story.
         let jumping = jump.is_some();
         if jumping || (run.field.idle() && run.waiting.is_none() && now.saturating_duration_since(run.last_save) >= SAVE_EVERY) {

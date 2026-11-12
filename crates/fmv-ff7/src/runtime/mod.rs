@@ -704,6 +704,11 @@ impl FieldRuntime {
         }
         let solid = i64::from(self.player_solid_range());
         let prev = self.previous_player.unwrap_or(p);
+        // The original checks lines, pushes and (in the host) gateways only for a player walking under its own control:
+        // a character the scripts hold or move triggers nothing by where it is put.
+        if self.player_scripted() {
+            return;
+        }
         let moved = (prev.x, prev.y) != (p.x, p.y);
         let here = (i64::from(p.x), i64::from(p.y), i64::from(p.z));
 

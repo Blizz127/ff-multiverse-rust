@@ -98,6 +98,12 @@ fn main() {
                 at = Some(c);
             }
         }
+        // while the scripts hold or move the player, the player is where they put it
+        if rt.player_scripted() {
+            if let Some(m) = rt.pc_model() {
+                at = Some((m.x, m.y));
+            }
+        }
         if let (true, Some(target)) = (f > after.max(1), walk_tri.and_then(tri_centre)) {
             // follow the scripts while they hold the player, else walk 24 units a frame toward the triangle's centre
             let cur = if rt.player_scripted() { rt.pc_model().map(|m| (m.x, m.y)) } else { at }.or_else(|| rt.pc_model().map(|m| (m.x, m.y)));
