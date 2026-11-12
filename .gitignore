@@ -26,3 +26,4 @@ import-sessions/
 /dist/
 # Local deployment env files can hold real host/port values; only placeholder templates are committed.
 /deploy/*.env
+__pycache__/
