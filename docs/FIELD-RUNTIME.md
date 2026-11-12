@@ -83,31 +83,38 @@ FMV_FF7_DATA=<data> cargo run -p fmv-ff7 --release --example runtime_trace -- md
 Scripted movement, animation, background, camera and fades are being implemented, one instruction family per file.
 The curated scene route stays the default until the live route reaches further.
 
-## The headless solver (`examples/runtime_explore.rs`)
+## The headless solver (`examples/runtime_explore.rs`) and the route bot
 
-The solver plays the story on the runtime alone, with no server or client involved. From a fresh story it settles each
-field, then probes every walkmesh triangle (standing, and with OK), every talkable model (facing it, with OK) and every
-line (walking across it, and standing on it with OK). It takes the action that best advances the story or leaves the
-field, carrying the story into the next field. Gateway choices are backtracked, and a probe that returns to a story
-already seen in a field gets no credit.
+The solver plays the story on the runtime alone, with no server or client. A state is a running field plus where
+the player stands. The search always expands the state with the furthest story moment. Expanding a state tries what a
+player could do from there:
 
-**2026-11-11:** it reaches **story moment 51**, the passenger train into Sector 7, the same point the curated scene
-route reaches. On the way it plays, from the original scripts alone:
-- the opening and battle 300;
-- the first reactor (door, lift, Jessie, bomb, Guard Scorpion 324, the countdown);
-- the escape (md8_4 at 33, md8_1 at 36, md8_2 at 39);
-- the bridge battles, the cargo car (48) and the train (51).
+- stand on a triangle, with and without OK;
+- talk to a model;
+- walk at or across a line, or press OK at it;
+- walk through a gateway.
 
-Later the same day, after carrying running fields across steps and judging probes against an idle baseline, it
-plays on from a new game past the curated route's end:
-- the train's ID scan and movie 24;
-- the Sector 7 station (moment 63), the platforms and the slums;
-- Seventh Heaven, the bar (69 to 72) and its basement meeting (**78**).
+A candidate is found by standing somewhere. It is then carried out by walking there along the walkmesh, one stride a
+frame, with the field running, so what happens on the way replaces the action. A walk never enters a triangle a script
+locked (`IDLCK`), never passes a solid model, and takes a gateway only while map jumps are allowed. Game over is not
+progress. `--route-out` writes the chain of actions as `scripts/live-route.py` entries, with the exact corners walked.
 
-The next step needs a talk with Tifa (moment 105) or the pinball lift back up to the bar.
+**Earlier numbers were wrong.** The first two versions of the solver (2026-11-11) stood on any triangle and took any
+gateway. They "reached" moments 78 and 197 by leaving Sector 7 through a gate a man stands in, and moment 33 by letting
+the reactor's bomb go off. Nothing the solver reports counts until `scripts/live-route.py` has replayed its route
+against a real `--field-runtime` server.
 
-Teleporting the player to a triangle's centre is a test shortcut, not how a player moves. The live server path is
-checked separately with `scripts/live-route.py`.
+**What the original engine does that the scripts rely on** (each was found by the solver or the bot getting stuck):
+
+- **Lines, pushes, talks and gateways** fire only for a player walking under its own control. A character the scripts
+  hold or move triggers nothing.
+- **A plain message** does not hold the player. Only a question does, or a script's own `UC`.
+- **A window marked "cannot be closed"** (the countdown clock) is passive.
+- **A finished movie** stands at its last frame for `MVIEF`.
+- **Ladders** wait for direction keys in the original. A multiplayer host sends positions, so they climb by
+  themselves here.
+- **Background triggers** (doors that open as the player nears) are engine data, not scripts.
+- **Solid models** block the way.
 
 **Rollback (2026-11-11):** the format check (r560 as the old build, r601 as the new one) passes with a live-field
 account. r560 reads the live account's v3 story, `index.log` stays at schema 4 (the same as the device), and the saved
