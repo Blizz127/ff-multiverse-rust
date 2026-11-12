@@ -161,6 +161,9 @@ page text. The original timing reference is pinned PSX source, not a measured or
 the runtime accepted an answer immediately: paired temporary TCP checks at the tunnel_2 duct stalled with0.2s
 answers but reached sbwy4_1 with1s answers; traces showed the fast path dropping a request while Tifa's prior script
 was active. Preserve native REQ drop semantics. The diagnostic1s delay is not a game policy or a native text model.
+On r649, the same isolated checkpoint passes the default0.2s TCP replay through the duct to sbwy4_1, saved at
+moment117; the zero-delay trace also reaches MAPJUMP164 without unsupported instructions. A fresh-state packaged
+startup/client smoke passes. These are focused headless checks, not a full new-game playthrough or visual receipt.
 
 For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
 route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`
