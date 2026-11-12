@@ -170,6 +170,21 @@ pub struct Line {
     touch_off: bool,
 }
 
+/// One of the field's background triggers (the trigger section's twelve): a line that shows or hides one background
+/// frame when the player walks up to it. Doors that open as the player approaches are these, not scripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BgTrigger {
+    pub a: (i16, i16, i16),
+    pub b: (i16, i16, i16),
+    pub group: u8,
+    pub frame: u8,
+    /// 0 show, 1 hide (both stay); 2 show, 3 hide while the player is at the line; 4 and 5 the same, undone only when
+    /// the player leaves on the line's facing side.
+    pub behavior: u8,
+    /// 0 none, 1 metal door, 2 wooden door, 3 swipe.
+    pub sound: u8,
+}
+
 /// A global command an instruction has issued and is waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -356,6 +371,8 @@ pub struct FieldRuntime {
     pub(crate) stage: StageState,
     pub(crate) windows_ext: WindowsState,
     pub(crate) party_ext: PartyState,
+    /// The field's background triggers.
+    bg_triggers: Vec<BgTrigger>,
     /// Whether the player's direction keys drive a ladder climb, as in the original (off: ladders climb by themselves).
     pub ladder_keys: bool,
     /// The save's gil, when the host knows it (`GOLDu`/`GOLDd` change it; `CHGLD` reads it).
@@ -417,6 +434,7 @@ impl FieldRuntime {
             stage: StageState::default(),
             windows_ext: WindowsState::default(),
             party_ext: PartyState::default(),
+            bg_triggers: Vec::new(),
             ladder_keys: false,
             gil: None,
         };
@@ -505,6 +523,15 @@ impl FieldRuntime {
     pub fn set_walkmesh(&mut self, walkmesh: std::sync::Arc<crate::field::Walkmesh>) {
         self.surface = Some(std::sync::Arc::new(crate::walk::Surface::new(&walkmesh)));
         self.walkmesh = Some(walkmesh);
+    }
+
+    /// Give the runtime the field's background triggers (before [`FieldRuntime::init`]). Each starts in the state
+    /// opposite to what it does: a door a trigger opens starts closed.
+    pub fn set_bg_triggers(&mut self, triggers: Vec<BgTrigger>) {
+        for t in triggers.iter().filter(|t| t.group != 0xFF) {
+            self.stage_background_set(t.group, t.frame, t.behavior % 2 == 1);
+        }
+        self.bg_triggers = triggers;
     }
 
     /// The walkmesh triangle under `(x, y)` nearest the height `z`, when the field has a walkmesh.
@@ -757,6 +784,9 @@ impl FieldRuntime {
         let from = (i64::from(prev.x), i64::from(prev.y), i64::from(prev.z));
         let to = here;
         let move_dir = if moved { direction_of(to.0 - from.0, to.1 - from.1) } else { p.dir };
+        if moved {
+            self.check_bg_triggers(from, move_dir, solid);
+        }
         for l in &mut self.lines {
             if !l.active {
                 continue;
@@ -793,6 +823,46 @@ impl FieldRuntime {
                     l.touching = false;
                     l.touch = false;
                 }
+            }
+        }
+    }
+
+    /// The background triggers the player walked up to or away from this frame (the original's rule; `from` is where
+    /// the player was, `dir` the way it moves).
+    fn check_bg_triggers(&mut self, from: (i64, i64, i64), dir: u8, solid: i64) {
+        for i in 0..self.bg_triggers.len() {
+            let t = self.bg_triggers[i];
+            if t.group == 0xFF {
+                continue;
+            }
+            let a = (i64::from(t.a.0), i64::from(t.a.1), i64::from(t.a.2));
+            let b = (i64::from(t.b.0), i64::from(t.b.1), i64::from(t.b.2));
+            let changed = match nearest_on_line(a, b, from) {
+                Some((d2, nearest)) if d2 < solid * solid => {
+                    let on_line = (from.0, from.1) == (nearest.0, nearest.1);
+                    let toward = i64::from(direction_of(nearest.0 - from.0, nearest.1 - from.1));
+                    if on_line || (toward - i64::from(dir) + 64).rem_euclid(256) < 128 {
+                        self.stage_background_set(t.group, t.frame, t.behavior % 2 == 0)
+                    } else {
+                        false
+                    }
+                }
+                _ => {
+                    // Away from the line: the momentary kinds undo themselves (4 and 5 only on the line's facing side).
+                    let side = (b.0 - a.0) * (from.1 - a.1) - (b.1 - a.1) * (from.0 - a.0);
+                    if t.behavior < 4 || side <= 0 {
+                        match t.behavior {
+                            2 | 4 => self.stage_background_set(t.group, t.frame, false),
+                            3 | 5 => self.stage_background_set(t.group, t.frame, true),
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if changed && t.sound != 0 {
+                self.events.push(Event::Presentation { entity: usize::MAX, mnemonic: "BGTRIGGER", bytes: vec![t.sound] });
             }
         }
     }

@@ -48,6 +48,16 @@ impl LiveFieldHost for Ff7LiveHost {
         let script = field.field_file().section(section::SCRIPT).ok()?;
         let mut rt = FieldRuntime::new(script, banks).ok()?;
         rt.set_walkmesh(Arc::new(field.walkmesh().clone()));
+        if let Ok(triggers) = field.field_file().triggers() {
+            let p = |v: [i16; 3]| (v[0], v[1], v[2]);
+            rt.set_bg_triggers(
+                triggers
+                    .triggers
+                    .iter()
+                    .map(|t| fmv_ff7::runtime::BgTrigger { a: p(t.corner_a), b: p(t.corner_b), group: t.bg_group_id, frame: t.bg_frame_id, behavior: t.behavior, sound: t.sound_id })
+                    .collect(),
+            );
+        }
         let loader = field.field_file().model_loader().ok();
         if let (Some(path), Some(loader)) = (&self.char_lgp, &loader) {
             if let Ok(mut lgp) = fmv_ff7::lgp::LgpArchive::open_path(path) {

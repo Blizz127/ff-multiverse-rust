@@ -252,6 +252,12 @@ impl FieldRuntime {
     // ---- host interface ------------------------------------------------------------------------------------
 
     /// Which background tiles the script shows (group masks).
+    /// Show or hide one background frame (the field's own door triggers do; see `FieldRuntime::set_bg_triggers`).
+    /// Returns whether it changed.
+    pub(in crate::runtime) fn stage_background_set(&mut self, group: u8, frame: u8, on: bool) -> bool {
+        self.stage.background.apply(if on { BackgroundOp::On { group, frame } } else { BackgroundOp::Off { group, frame } })
+    }
+
     pub fn stage_background(&self) -> &BackgroundState {
         &self.stage.background
     }

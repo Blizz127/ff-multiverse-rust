@@ -252,3 +252,27 @@ fn every_implemented_opcode_is_counted_as_executed() {
         assert!(!rt.coverage().unsupported.contains_key(name), "{name} is implemented but was skipped");
     }
 }
+
+#[test]
+fn a_background_trigger_opens_while_the_player_is_at_its_line_and_closes_when_it_leaves() {
+    // One model entity that is the player's character (PC 0 with Cloud leading the party), so the player moves it.
+    let init = [&[0xA1, 0x00][..], &[0xA0, 0x00]].concat();
+    let s = SynthScript::default().entity("cl", vec![script0(&init, IDLE)]);
+    let mut section = s;
+    section.scale = 512;
+    let mut banks = Banks::default();
+    banks.set(PARTY_SLOTS, 0);
+    let mut rt = FieldRuntime::new(&section.build(), banks).expect("runtime");
+    rt.set_bg_triggers(vec![BgTrigger { a: (0, -50, 0), b: (0, 50, 0), group: 3, frame: 1, behavior: 2, sound: 1 }]);
+    rt.init();
+    let shown = |rt: &FieldRuntime| rt.stage_background().masks()[3] & 0b10 != 0;
+    assert!(!shown(&rt), "a door its trigger opens starts closed");
+    for x in [-200, -150, -100, -60, -30, -20] {
+        rt.tick(Some(PlayerInput { x, y: 0, dir: 64, ..Default::default() }));
+    }
+    assert!(shown(&rt), "walking up to the line opens it");
+    for x in [-60, -100, -150, -200] {
+        rt.tick(Some(PlayerInput { x, y: 0, dir: 192, ..Default::default() }));
+    }
+    assert!(!shown(&rt), "walking away closes it again");
+}
