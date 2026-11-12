@@ -138,6 +138,7 @@ def main():
     leg_goal, leg_best, leg_best_at, tries, tries_goal, detour, rejected = None, 0.0, 0.0, 0, None, None, 0
     locked = in_battle = False
     cast = []
+    waited_for = None
     windows = set()
     pending = []
     idx, steps, entry_area = 0, None, None
@@ -242,9 +243,15 @@ def main():
                 elif now - leg_best_at > 1.0:
                     # No nearer for a second: someone stands in the way (or on the corner itself).
                     leg_best_at = now
+                    near = [f"{name} at {round(x)},{round(y)}" for name, x, y in cast if math.hypot(x - pos["x"], y - pos["y"]) < 160]
                     if on_detour:
                         legs.pop(0)
                         detour = None
+                    elif near and waited_for != legs[0]:
+                        # Someone is here: they may only be walking by. Give them a moment before going round.
+                        waited_for = legs[0]
+                        leg_best_at = now + 1.0
+                        print(f"  waiting at {round(pos['x'])},{round(pos['y'])} for {', '.join(near)}", flush=True)
                     elif tries >= 4 and d < 90:
                         print(f"  gave up on corner {round(tx)},{round(ty)} from {round(pos['x'])},{round(pos['y'])}", flush=True)
                         legs.pop(0)
@@ -254,7 +261,6 @@ def main():
                         n = d or 1.0
                         detour = (pos["x"] - dy / n * side + dx / n * 10, pos["y"] + dx / n * side + dy / n * 10)
                         legs.insert(0, detour)
-                        near = [f"{name} at {round(x)},{round(y)}" for name, x, y in cast if math.hypot(x - pos["x"], y - pos["y"]) < 160]
                         print(f"  in the way at {round(pos['x'])},{round(pos['y'])}: going round ({side:+d}); near: {', '.join(near) or 'nobody'}", flush=True)
                     time.sleep(0.01)
                     continue

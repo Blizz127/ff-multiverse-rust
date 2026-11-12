@@ -312,6 +312,25 @@ fn smooth(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, corners: &[Pos]) -> Vec
     const AHEAD: usize = 10;
     let mut path = Vec::new();
     let (mut cur, mut i) = (from, 0);
+    // Standing within someone's reach (they walked up, or stepped aside onto the player): the way on is blocked on
+    // every side but away from them. Step back out first.
+    if let Some(first) = corners.first() {
+        let (dx, dy) = (f64::from(first.0 - from.0), f64::from(first.1 - from.1));
+        let d = dx.hypot(dy).max(1.0);
+        let ahead = (from.0 + (dx / d * 6.0) as i32, from.1 + (dy / d * 6.0) as i32, from.2);
+        if let Some(who) = rt.step_contacts(from, ahead).first().and_then(|m| rt.models().get(*m)) {
+            let (ax, ay) = (f64::from(from.0 - who.x), f64::from(from.1 - who.y));
+            let a = ay.atan2(ax);
+            let out = [0.0f64, 0.5, -0.5, 1.0, -1.0].into_iter().flat_map(|turn| [56.0, 88.0, 120.0].map(|far| (a + turn, far))).find_map(|(angle, far)| {
+                let to = (from.0 + (angle.cos() * far) as i32, from.1 + (angle.sin() * far) as i32, from.2);
+                (stopped_by(walk, rt, from, to) == Ok(None)).then_some(to)
+            });
+            if let Some(out) = out {
+                path.push(out);
+                cur = out;
+            }
+        }
+    }
     while i < corners.len() {
         let last = (i + AHEAD).min(corners.len() - 1);
         if let Some(j) = (i..=last).rev().find(|j| stopped_by(walk, rt, cur, corners[*j]) == Ok(None)) {
