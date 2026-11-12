@@ -138,7 +138,8 @@ impl LiveField for Ff7Live {
         let members = self.rt.cast(self.loader.as_ref());
         let id = |model: usize| u32::try_from(model).unwrap_or(u32::MAX);
         LiveCastView {
-            lead: members.iter().find(|m| m.lead).map(|m| id(m.model)),
+            // (named even while the scripts hide it: a client then keeps the player's character off the stage too)
+            lead: self.rt.state.player_model.or(self.rt.state.pc_model).map(id),
             poses: members.iter().filter_map(|m| m.pose.as_ref().map(|(animation, frame)| fmv_protocol::LivePose { id: id(m.model), animation: animation.clone(), frame: *frame })).collect(),
             npcs: members
                 .into_iter()

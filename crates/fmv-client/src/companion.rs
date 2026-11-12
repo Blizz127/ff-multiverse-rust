@@ -70,11 +70,15 @@ impl Companion {
         }
         self.in_scene = true;
         self.settle = None;
-        let mut at = self.drawn.filter(|p| p.is_finite()).unwrap_or(own);
+        let known = self.drawn.filter(|p| p.is_finite());
+        let mut at = known.unwrap_or(own);
         if !lead.is_finite() {
             return Drawn { pos: at, facing: self.facing, anim: AnimState::Idle };
         }
-        if dist(at, lead) > SNAP {
+        // Coming on with the lead (it was off the stage, or is far off): the character is put on its place, it does
+        // not walk out of the lead or across the field.
+        let arrives = known.is_none() || dist(at, lead) > SNAP;
+        if arrives {
             at = lead;
             self.spot = None;
         }
@@ -82,6 +86,9 @@ impl Companion {
         let good = |p: Pos| (KEEP_NEAR..=KEEP_FAR).contains(&dist(p, lead)) && free(p);
         if !self.spot.is_some_and(good) {
             self.spot = Self::choose(at, lead, lead_facing, &free, walkable);
+        }
+        if let (true, Some(spot)) = (arrives, self.spot) {
+            at = spot;
         }
         // Nowhere free beside the lead (a ledge, a crowd): stay put if that is not inside it, else just behind it.
         let spot = self.spot.unwrap_or_else(|| {
@@ -125,6 +132,11 @@ impl Companion {
             }
         }
         best.map(|(_, p)| p)
+    }
+
+    /// One frame of a scene whose lead the scripts do not show: the player's character is off the stage with it.
+    pub fn offstage(&mut self, area: u64) {
+        *self = Companion { area, in_scene: true, ..Companion::default() };
     }
 
     /// One frame of free walking: the character is drawn at `own`, except for what is left of a scene's place.
@@ -179,7 +191,8 @@ mod tests {
     fn in_a_scene_it_walks_out_of_the_lead_to_a_free_place_behind_it_and_faces_its_way() {
         let mut c = Companion::default();
         let lead = Pos::new(100.0, 100.0, 5.0);
-        // The scene begins with both on one spot, the lead facing +x.
+        // The player walked here; the scene begins with both on one spot, the lead facing +x.
+        c.free(0, lead, 0.0, AnimState::Walk);
         let first = c.scene(0, lead, lead, 0.0, &[], &|_| true, 1.0 / 60.0);
         assert_eq!(first.anim, AnimState::Walk, "it starts to walk at once");
         let stood = run(&mut c, lead, lead, 0.0, &[], &|_| true, 120);
@@ -209,6 +222,21 @@ mod tests {
         let mut c = Companion::default();
         let stuck = run(&mut c, lead, lead, 0.0, &[], &|_| false, 120);
         assert!(dist(stuck.pos, lead) >= KEEP_NEAR - 1.0, "{stuck:?}");
+    }
+
+    #[test]
+    fn coming_on_with_a_lead_that_was_off_the_stage_it_stands_on_its_place_at_once() {
+        let mut c = Companion::default();
+        c.free(0, Pos::new(5000.0, 0.0, 0.0), 0.0, AnimState::Idle);
+        c.offstage(0);
+        let lead = Pos::new(0.0, 0.0, 0.0);
+        let on = c.scene(0, lead, lead, 0.0, &[], &|_| true, 1.0 / 60.0);
+        assert_eq!(on.anim, AnimState::Idle);
+        assert!((dist(on.pos, lead) - RING).abs() < 1.0, "{on:?}");
+        // The scene ending right after the lead went off again leaves nothing to walk off.
+        c.offstage(0);
+        let (free, ended) = c.free(0, lead, 0.3, AnimState::Idle);
+        assert_eq!((free.pos, free.facing, ended), (lead, 0.3, true));
     }
 
     #[test]

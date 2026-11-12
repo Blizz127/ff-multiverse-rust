@@ -190,7 +190,10 @@ impl Followers {
 
 /// The followers to draw in this frame of the field (see the module docs): an empty list while a scene runs, when switched
 /// off, or when the party's leader is not in this instance.
-pub fn players(state: &ClientState, npcs: &[NpcView], scene_running: bool, render_t: f64) -> Vec<AvatarPlayer<'static>> {
+///
+/// `staged`: a live field's scripts hold the scene. They own the stage then (a hero they do not show is not there), so
+/// nobody is drawn, but the trail goes on: when the scene ends the followers stand behind where it ended.
+pub fn players(state: &ClientState, npcs: &[NpcView], scene_running: bool, staged: bool, render_t: f64) -> Vec<AvatarPlayer<'static>> {
     let mut followers = state.followers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !enabled() || followers.off || scene_running {
         followers.clear();
@@ -219,6 +222,9 @@ pub fn players(state: &ClientState, npcs: &[NpcView], scene_running: bool, rende
         .filter_map(|c| hero_appearance(c).map(|a| (c, a)))
         .collect();
     let poses = followers.frame(state.area_changes(), leader_id, pos, facing, anim, heroes.len());
+    if staged {
+        return Vec::new();
+    }
     heroes
         .into_iter()
         .zip(poses)

@@ -137,6 +137,7 @@ def main():
     # many ways round were tried, and whether the first leg is such a way round.
     leg_goal, leg_best, leg_best_at, tries, tries_goal, detour, rejected = None, 0.0, 0.0, 0, None, None, 0
     locked = in_battle = False
+    cast = []
     windows = set()
     pending = []
     idx, steps, entry_area = 0, None, None
@@ -175,6 +176,9 @@ def main():
                 for e in b["entities"]:
                     if e["id"] == entity:
                         pos, facing = e["pos"], e["facing"]
+            elif k == "LiveCast":
+                # (the bot is the lead: the cast's copy of it stands where the bot does)
+                cast = [(n["name"], n["pos"]["x"], n["pos"]["y"]) for n in b["npcs"] if n["id"] != b.get("lead")]
             elif k == "LiveWindow":
                 windows.add(b["window"])
                 ask = b.get("ask")
@@ -250,7 +254,8 @@ def main():
                         n = d or 1.0
                         detour = (pos["x"] - dy / n * side + dx / n * 10, pos["y"] + dx / n * side + dy / n * 10)
                         legs.insert(0, detour)
-                        print(f"  in the way at {round(pos['x'])},{round(pos['y'])}: going round ({side:+d})", flush=True)
+                        near = [f"{name} at {round(x)},{round(y)}" for name, x, y in cast if math.hypot(x - pos["x"], y - pos["y"]) < 160]
+                        print(f"  in the way at {round(pos['x'])},{round(pos['y'])}: going round ({side:+d}); near: {', '.join(near) or 'nobody'}", flush=True)
                     time.sleep(0.01)
                     continue
                 step = args.speed * min(now - last_move, 0.2)

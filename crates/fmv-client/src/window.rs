@@ -1518,18 +1518,23 @@ pub(crate) fn field_draw(
     }));
     // The story's party walking behind its leader (see `followers`; none while a scene's cast plays them), drawn under the
     // local player, which stays last.
-    players.extend(crate::followers::players(state, &npcs, story.is_some(), render_t));
+    players.extend(crate::followers::players(state, &npcs, story.is_some(), live_scene && lead_id.is_some(), render_t));
     // The player's own character: in a live field's scene it stands beside the lead, not in it.
     let own_pose = {
         let mut companion = state.companion.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (own, area) = (state.own.pos(), state.area_changes());
         match lead {
+            // The scripts hold the scene and do not show the lead: the player's character is off the stage with it.
+            None if live_scene && lead_id.is_some() => {
+                companion.offstage(area);
+                None
+            }
             Some((lead_pos, lead_facing)) => {
                 let others: Vec<Pos> =
                     npcs.iter().filter(|n| Some(n.id) != lead_id).map(|n| n.pos).chain(remotes.iter().map(|v| v.pose.pos)).collect();
                 // (ground: inside one of the walkmesh triangles the view shows; a view without any knows of none)
                 let walkable = |p: Pos| view.triangles.is_empty() || view.to_view(p).is_some_and(|q| view.triangles.iter().any(|t| in_triangle(t, q)));
-                companion.scene(area, own, lead_pos, lead_facing, &others, &walkable, dt)
+                Some(companion.scene(area, own, lead_pos, lead_facing, &others, &walkable, dt))
             }
             None => {
                 let (pose, ended) = companion.free(area, own, state.own.facing(), state.own.anim());
@@ -1538,30 +1543,35 @@ pub(crate) fn field_draw(
                     let facing = lead_id.and_then(|id| cast.iter().find(|n| n.id == id)).map_or(state.own.facing(), |n| n.facing);
                     state.followers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hold_first(own, facing);
                 }
-                pose
+                Some(pose)
             }
         }
     };
     let own_who = Who(state.self_entity().0);
-    players.push(AvatarPlayer {
-        who: own_who,
-        pos: own_pose.pos,
-        facing: own_pose.facing,
-        anim: own_pose.anim,
-        scene_frame: None, scene_clip: None, scene_return: None,
-        appearance: state.own_appearance(),
-        npc: None,
-        tint: own_tint,
-        own: true,
-        party: state.party.party_size() > 0,
-    });
+    if let Some(own_pose) = own_pose {
+        players.push(AvatarPlayer {
+            who: own_who,
+            pos: own_pose.pos,
+            facing: own_pose.facing,
+            anim: own_pose.anim,
+            scene_frame: None, scene_clip: None, scene_return: None,
+            appearance: state.own_appearance(),
+            npc: None,
+            tint: own_tint,
+            own: true,
+            party: state.party.party_size() > 0,
+        });
+    }
     if let Some(story) = story {
         scene::place_witnesses(&mut players, story);
         // Apply visibility before both model and fallback-marker construction. Cast ids occupy
         // their own namespace; only actual participants named by the scene can be hidden.
         players.retain(|p| !story.hides_participant(fmv_core::EntityId(p.who.0)));
     }
-    let own_at = players.iter().find(|p| p.own).and_then(|p| view.to_view(p.pos));
+    // What the camera keeps in view: the player's character, and in a live field's scene the lead, as in the original
+    // (the player's real place is the lead's then, whether or not either is on the stage).
+    let own_at = players.iter().find(|p| p.own).map(|p| p.pos).filter(|_| !live_scene).unwrap_or(state.own.pos());
+    let own_at = view.to_view(own_at);
     let built = match (avatars, view.stage.as_ref()) {
         (Some(avatars), Some(stage)) => Some(avatars.frame(view, stage, &players, dt)),
         _ => None,
