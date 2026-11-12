@@ -146,6 +146,12 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
                 }
             }
             if busy(rt) || rt.player_step_blocked(at, p) {
+                if std::env::var_os("FMV_EXPLORE_JUMPS").is_some() {
+                    for m in rt.step_contacts(at, p) {
+                        let who = &rt.models()[m];
+                        println!("        stopped at {},{},{} stepping to {},{} by model {m} ({}) at {},{},{} solid range {} (player's {})", at.0, at.1, at.2, p.0, p.1, rt.entity_name(who.entity).unwrap_or(""), who.x, who.y, who.z, who.solid_range, rt.player_solid_range());
+                    }
+                }
                 rt.player_bumped(at, p);
                 let (more, end) = run_idle(rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
                 out.absorb(more);
@@ -255,19 +261,21 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
     seen
 }
 
-/// The model that stops the straight walk from `a` to `b`, if one does; `Err` when the walk leaves the walkmesh or
-/// enters a locked triangle instead.
-fn stopped_by(rt: &FieldRuntime, a: Pos, b: Pos) -> Result<Option<usize>, ()> {
+/// The model that stops the straight walk from `a` to `b`, if one does; `Err` when the walk leaves the walkmesh,
+/// enters a locked triangle, or passes between two triangles that are not linked (a wall inside the mesh) instead.
+fn stopped_by(walk: &Walkmesh, rt: &FieldRuntime, a: Pos, b: Pos) -> Result<Option<usize>, ()> {
     let (dx, dy, dz) = (f64::from(b.0 - a.0), f64::from(b.1 - a.1), f64::from(b.2 - a.2));
-    let n = (dx.hypot(dy) / 8.0).ceil().max(1.0) as i32;
+    let n = (dx.hypot(dy) / 6.0).ceil().max(1.0) as i32;
     let mut prev = a;
+    let mut tri = rt.triangle_at(a.0, a.1, a.2).ok_or(())?;
     for k in 1..=n {
         let f = f64::from(k) / f64::from(n);
         let q = (a.0 + (dx * f) as i32, a.1 + (dy * f) as i32, a.2 + (dz * f) as i32);
-        match rt.triangle_at(q.0, q.1, q.2) {
-            Some(t) if !rt.triangle_locked(t) => {}
-            _ => return Err(()),
+        let t = rt.triangle_at(q.0, q.1, q.2).filter(|t| !rt.triangle_locked(*t)).ok_or(())?;
+        if t != tri && !walk.access.get(usize::from(tri)).is_some_and(|links| links.contains(&t)) {
+            return Err(());
         }
+        tri = t;
         if let Some(m) = rt.step_contacts(prev, q).first() {
             return Ok(Some(*m));
         }
@@ -278,8 +286,8 @@ fn stopped_by(rt: &FieldRuntime, a: Pos, b: Pos) -> Result<Option<usize>, ()> {
 
 /// A corner to walk by on the way from `a` to `b` when someone solid stands on the straight line: beside them, on
 /// whichever side leaves room to pass. `None` when nobody is in the way, or there is no room on either side.
-fn detour(rt: &FieldRuntime, a: Pos, b: Pos) -> Option<Pos> {
-    let m = stopped_by(rt, a, b).ok()??;
+fn detour(walk: &Walkmesh, rt: &FieldRuntime, a: Pos, b: Pos) -> Option<Pos> {
+    let m = stopped_by(walk, rt, a, b).ok()??;
     let who = rt.models().get(m)?;
     let (dx, dy) = (f64::from(b.0 - a.0), f64::from(b.1 - a.1));
     let d = dx.hypot(dy).max(1.0);
@@ -289,12 +297,42 @@ fn detour(rt: &FieldRuntime, a: Pos, b: Pos) -> Option<Pos> {
     for margin in [8.0, 24.0, 48.0] {
         for side in [1.0, -1.0] {
             let by = ((f64::from(who.x) + px * side * (keep + margin)) as i32, (f64::from(who.y) + py * side * (keep + margin)) as i32, a.2);
-            if stopped_by(rt, a, by) == Ok(None) && stopped_by(rt, by, b) == Ok(None) {
+            if stopped_by(walk, rt, a, by) == Ok(None) && stopped_by(walk, rt, by, b) == Ok(None) {
                 return Some(by);
             }
         }
     }
     None
+}
+
+/// The corners a player actually walks by: `corners` (a triangle-by-triangle path from `from`) with every corner
+/// left out that a straight walk over linked triangles makes unnecessary, and a corner added beside whoever stands
+/// on the way where there is room to pass them. Where there is none the path goes on into them: the walk stops there.
+fn smooth(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, corners: &[Pos]) -> Vec<Pos> {
+    const AHEAD: usize = 10;
+    let mut path = Vec::new();
+    let (mut cur, mut i) = (from, 0);
+    while i < corners.len() {
+        let last = (i + AHEAD).min(corners.len() - 1);
+        if let Some(j) = (i..=last).rev().find(|j| stopped_by(walk, rt, cur, corners[*j]) == Ok(None)) {
+            path.push(corners[j]);
+            (cur, i) = (corners[j], j + 1);
+            continue;
+        }
+        // Nothing ahead is in plain sight: go round whoever hides the nearest corner that has a way round.
+        match (i..=(i + 3).min(corners.len() - 1)).find_map(|j| detour(walk, rt, cur, corners[j]).map(|by| (j, by))) {
+            Some((j, by)) => {
+                path.push(by);
+                path.push(corners[j]);
+                (cur, i) = (corners[j], j + 1);
+            }
+            None => {
+                path.push(corners[i]);
+                (cur, i) = (corners[i], i + 1);
+            }
+        }
+    }
+    path
 }
 
 /// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
@@ -335,17 +373,7 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
         t = p;
     }
     corners.reverse();
-    // Round whoever stands on the way, where there is room to pass them (else the walk will stop at them).
-    let mut clear_corners = Vec::new();
-    let mut cur = from;
-    for c in corners {
-        if let Some(round) = detour(rt, cur, c) {
-            clear_corners.push(round);
-        }
-        clear_corners.push(c);
-        cur = c;
-    }
-    let corners = clear_corners;
+    let corners = smooth(walk, rt, from, &corners);
     let mut out = Vec::new();
     let mut legs = Vec::new();
     let mut cur = from;
