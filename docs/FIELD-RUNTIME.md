@@ -114,7 +114,14 @@ against a real `--field-runtime` server.
 - **Ladders** wait for direction keys in the original. A multiplayer host sends positions, so they climb by
   themselves here.
 - **Background triggers** (doors that open as the player nears) are engine data, not scripts.
-- **Solid models** block the way.
+- **Solid models** block the way. A player walking into one ends beside it and so slides round it (the server moves
+  the step out along the line from the model's centre and answers with the corrected place). A fixed route must
+  therefore cope with being pushed off its line: the bot keeps heading for the same corner and steps aside when it
+  gets no nearer.
+- **Control handed to someone else while the player is held** (`CC` under `UC`) does not make the player that
+  character. In the bar a child is lifted onto a shoulder and made the "controlled" model until the scene ends. The
+  player's own character is the model that was controlled when the player last had control
+  (`FieldRuntime::player_model`); hosts place and follow that one, and the cast leaves only that one out.
 
 **Rollback (2026-11-11):** the format check (r560 as the old build, r601 as the new one) passes with a live-field
 account. r560 reads the live account's v3 story, `index.log` stays at schema 4 (the same as the device), and the saved
