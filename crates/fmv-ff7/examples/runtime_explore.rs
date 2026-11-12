@@ -741,11 +741,14 @@ fn main() {
             };
             const ALONG: [f64; 5] = [0.5, 0.25, 0.75, 0.1, 0.9];
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
-            if let Some(t) = ALONG.into_iter().find(|t| on_reach(&rt, side(*t, -6))) {
+            // (a crossing is a walk: over linked ground from one side to the other. A line at a ledge's edge has no far
+            // side to walk to, and a probe put there would stand on whatever lies under it)
+            let crossable = |from: Pos, to: Pos| on_reach(&rt, from) && stopped_by(&walk, &rt, from, to).is_ok();
+            if let Some(t) = ALONG.into_iter().find(|t| crossable(side(*t, -6), side(*t, 6))) {
                 let (from, to) = (side(t, -6), side(t, 6));
                 actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
             }
-            if let Some(t) = ALONG.into_iter().find(|t| on_reach(&rt, side(*t, 6))) {
+            if let Some(t) = ALONG.into_iter().find(|t| crossable(side(*t, 6), side(*t, -6))) {
                 let (from, to) = (side(t, 6), side(t, -6));
                 actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).rev().map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
             }
