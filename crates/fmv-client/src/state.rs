@@ -85,7 +85,17 @@ pub struct OwnPlayer {
     /// The server's latest word on where our entity is (from an `EntityUpdate`), kept until we
     /// are quiet enough to adopt it. Cleared by every new intent, which supersedes it.
     server_pos: Option<Pos>,
+    /// The server refused a step this way (someone solid stands there): the heading, and the seconds left during
+    /// which walking on that way is not even tried. Without it a player holding the stick into a character is pulled
+    /// back by every refusal, a stride at a time.
+    bumped: Option<(f32, f32)>,
 }
+
+/// How long a refused heading stays refused, and how far from it a new heading counts as another one.
+const BUMP_HOLD_S: f32 = 1.0;
+const BUMP_CONE_RAD: f32 = 0.9;
+/// A refusal that leaves the player further than this from where it thought it was is a placement, not a bump.
+const BUMP_MAX_PULL: f32 = 96.0;
 
 impl OwnPlayer {
     pub fn new(pos: Pos) -> Self {
@@ -107,6 +117,7 @@ impl OwnPlayer {
             resync: false,
             resync_seq: None,
             server_pos: None,
+            bumped: None,
         }
     }
 
@@ -167,6 +178,9 @@ impl OwnPlayer {
             return false;
         }
         let refused_resync = self.resync_seq == Some(seq);
+        if self.anim != AnimState::Idle && corrected.dist_xy(self.pos) <= BUMP_MAX_PULL {
+            self.bumped = Some((self.facing, BUMP_HOLD_S));
+        }
         self.snap(corrected);
         self.resync_seq = None;
         if refused_resync {
@@ -198,6 +212,16 @@ impl OwnPlayer {
         }
         let (ux, uy) = (dir.0 / len, dir.1 / len);
         self.facing = uy.atan2(ux);
+        // A heading the server just refused is not walked again for a moment: the player turns that way and stands.
+        if let Some((heading, left)) = self.bumped {
+            let left = left - dt;
+            let same = normalize_angle(self.facing - heading).abs() < BUMP_CONE_RAD;
+            self.bumped = (same && left > 0.0).then_some((heading, left));
+            if self.bumped.is_some() {
+                self.anim = AnimState::Idle;
+                return false;
+            }
+        }
         let (dx, dy) = (ux * speed * dt, uy * speed * dt);
         let mut relocated = false;
         for (cx, cy) in [(dx, dy), (dx, 0.0), (0.0, dy)] {
@@ -1094,6 +1118,31 @@ mod tests {
         // Rejections of intents that were never sent are not about us either.
         s.apply(1.3, reject(77, Pos::new(1.0, 1.0, 0.0)));
         assert_eq!(s.own.pos(), Pos::new(10.0, 20.0, 0.0));
+    }
+
+    /// Someone solid stands in the way: the server refuses the step. Holding the same way then stands still (no
+    /// stride forward to be pulled back from) until the hold runs out; turning away walks at once.
+    #[test]
+    fn a_refused_heading_is_not_walked_again_for_a_moment() {
+        let area = area();
+        let mut s = state(Pos::new(0.0, 0.0, 0.0));
+        assert!(s.own.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0));
+        let sent = s.own.next_intent(1.0).unwrap();
+        s.apply(1.05, reject(sent.seq, Pos::new(0.0, 0.0, 0.0)));
+        assert_eq!(s.own.pos(), Pos::new(0.0, 0.0, 0.0));
+        for _ in 0..10 {
+            assert!(!s.own.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0), "the same way: stand");
+        }
+        assert_eq!(s.own.anim(), AnimState::Idle);
+        assert!(s.own.walk(area.as_ref(), (0.0, 1.0), 240.0, 1.0 / 20.0), "another way: walk");
+        assert!(s.own.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0), "turning away ended the hold");
+        // And the hold ends by itself.
+        let mut s = state(Pos::new(0.0, 0.0, 0.0));
+        assert!(s.own.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0));
+        let sent = s.own.next_intent(1.0).unwrap();
+        s.apply(1.05, reject(sent.seq, Pos::new(0.0, 0.0, 0.0)));
+        let stood = (0..40).take_while(|_| !s.own.walk(area.as_ref(), (1.0, 0.0), 240.0, 1.0 / 20.0)).count();
+        assert!((18..=21).contains(&stood), "about a second: {stood} frames");
     }
 
     /// Reviewer scenario: seq1@24 Walk (t=1.00), seq2@48 Walk (1.05), seq3@48 Idle (1.10). The
