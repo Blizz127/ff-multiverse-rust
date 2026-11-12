@@ -99,6 +99,18 @@ frame, with the field running, so what happens on the way replaces the action. A
 locked (`IDLCK`), never passes a solid model, and takes a gateway only while map jumps are allowed. Game over is not
 progress. `--route-out` writes the chain of actions as `scripts/live-route.py` entries, with the exact corners walked.
 
+The solver and `runtime_trace` read animation lengths from the owned `data/field/char.lgp`, as the live server does
+(missing lengths retain the runtime's fallback). Entry scenes are allowed up to 3,600 frames to settle; a field still
+holding control after that budget is reported as busy, without trying player actions. The cargo-car scene lasts
+longer than the old 900-frame entry budget: expanding it early incorrectly attributed its automatic progress to a
+walk that the player never took.
+
+The TCP bot's stall clock counts dialogue windows as progress. A scene can hold control for more than a minute while
+its dialogue advances; repeated cast or lock snapshots alone do not reset the watchdog. `--verbose` prints window
+IDs and control changes without game text. `--token-file PATH` saves a newly registered **test** account's token with
+mode 0600, or resumes it when the file already exists. Use the remaining route with that account on its throwaway
+server state; no route run should use the owner's saves.
+
 **Earlier numbers were wrong.** The first two versions of the solver (2026-11-11) stood on any triangle and took any
 gateway. They "reached" moments 78 and 197 by leaving Sector 7 through a gate a man stands in, and moment 33 by letting
 the reactor's bomb go off. Nothing the solver reports counts until `scripts/live-route.py` has replayed its route

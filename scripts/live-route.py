@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Play a written route through live fields (`fmv-server --field-runtime`), protocol 23: the acceptance bot.
+"""Play a written route through live fields (`fmv-server --field-runtime`), protocol 24: the acceptance bot.
 
 A route file is an ordered list of entries, one per line: `FIELD: STEP; STEP; ...` (what
 `runtime_explore --route-out` writes). The bot waits until it stands in FIELD and the field is idle (no script holds
@@ -24,6 +24,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -122,13 +123,19 @@ def main():
     ap.add_argument("--tool", required=True, help="the built walkmesh_json example")
     ap.add_argument("--seconds", type=float, default=900)
     ap.add_argument("--name", default="Router")
+    ap.add_argument("--token-file", help="resume a throwaway test account; register and save its token when missing")
     ap.add_argument("--speed", type=float, default=200.0, help="walking speed, field units per second")
     ap.add_argument("--stall", type=float, default=60.0, help="give up after this long without progress")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     route = load_route(args.route)
+    token_path = Path(args.token_file) if args.token_file else None
+    token = token_path.read_text().strip() if token_path and token_path.exists() else None
+    if token_path and token_path.exists() and not token:
+        ap.error("the token file is empty")
+    auth = {"Token": token} if token else {"Register": {"display_name": args.name}}
     c = livebot.Conn(args.addr)
-    c.send({"Hello": {"protocol_version": livebot.PROTOCOL, "client_build": "live-route", "auth": {"Register": {"display_name": args.name}},
+    c.send({"Hello": {"protocol_version": livebot.PROTOCOL, "client_build": "live-route", "auth": auth,
                       "character": {"tint": [80, 160, 220], "body": None, "slot": None}}})
     entity = area = mesh = None
     pos, facing, seq = None, 0.0, 0
@@ -164,6 +171,9 @@ def main():
             b = m[k] if isinstance(m, dict) else None
             if k == "Welcome":
                 entity = b["entity"]
+                if token_path and b.get("issued_token"):
+                    with os.fdopen(os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+                        f.write(b["issued_token"])
             elif k in ("AreaManifest", "AreaChange"):
                 area = b["area"]["key"]
                 if k == "AreaChange":
@@ -182,14 +192,21 @@ def main():
                 # (the bot is the lead: the cast's copy of it stands where the bot does)
                 cast = [(n["name"], n["pos"]["x"], n["pos"]["y"]) for n in b["npcs"] if n["id"] != b.get("lead")]
             elif k == "LiveWindow":
+                # A long scene can keep control for more than the stall budget while its dialogue advances.
+                # Count a new window as progress, never the repeated cast/lock snapshots of a stuck scene.
+                progress_at = now
                 windows.add(b["window"])
                 ask = b.get("ask")
+                if args.verbose:
+                    print(f"  WINDOW {b['window']} dialog={b['dialog']} ask={ask}", flush=True)
                 if b["answerable"]:
                     pending.append((now + 0.2, {"LiveAnswer": {"window": b["window"], "choice": 0 if ask else None}}))
             elif k == "LiveWindowClosed":
                 windows.discard(b["window"])
             elif k == "LiveControl":
                 locked = b["locked"]
+                if args.verbose:
+                    print(f"  CONTROL locked={locked}", flush=True)
                 if locked and steps is not None:
                     legs, steps = [], []  # a script took over: what was left of this entry is void
             elif k == "LivePlace":

@@ -37,7 +37,8 @@ use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-const SETTLE_FRAMES: u32 = 900;
+// Entry scenes (including the cargo car) can run longer than thirty seconds.
+const SETTLE_FRAMES: u32 = 3600;
 const PROBE_FRAMES: u32 = 300;
 const FOLLOW_FRAMES: u32 = 3600;
 /// Expansions allowed per (field, moment): a field whose actions only shuffle its scratch must not eat the search.
@@ -481,6 +482,7 @@ impl Ord for Queued {
 struct Loaded {
     field: FieldFile,
     walk: Arc<Walkmesh>,
+    animation_counts: Vec<Vec<u16>>,
 }
 
 fn main() {
@@ -519,6 +521,7 @@ fn main() {
         }
     }
     let mut lgp = LgpArchive::open_path(&flevel_path(&dir)).expect("flevel");
+    let mut chars = LgpArchive::open_path(dir.join("field/char.lgp")).ok();
     let maplist = Maplist::from_archive(&mut lgp).expect("maplist");
     let mut banks = Banks::from_story(&StoryState::fresh_reset()).expect("complete");
     if let Some(b) = banks_file.as_deref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|h| Banks::from_hex(h.trim())) {
@@ -542,7 +545,11 @@ fn main() {
             .or_insert_with(|| {
                 let field = load_field(lgp, name).ok()?;
                 let walk = Arc::new(field.walkmesh().ok()?);
-                Some(Rc::new(Loaded { field, walk }))
+                let animation_counts = match (chars.as_mut(), field.model_loader()) {
+                    (Some(chars), Ok(loader)) => fmv_ff7::runtime::AnimState::frame_counts_from(chars, &loader),
+                    _ => Vec::new(),
+                };
+                Some(Rc::new(Loaded { field, walk, animation_counts }))
             })
             .clone()
     };
@@ -595,6 +602,7 @@ fn main() {
                     }
                 }
                 rt.set_walkmesh(Arc::clone(&walk));
+                rt.set_animation_frame_counts(&loaded.animation_counts);
                 if let Some((save, gil)) = &carry {
                     rt.set_save_data(save.clone());
                     rt.gil = *gil;
@@ -621,7 +629,7 @@ fn main() {
             }
         }
         let before = moment_of(&rt.mem.banks);
-        let settle = if fresh { run_idle(&mut rt, SETTLE_FRAMES, 45, &[], at, 0, false) } else { (Outcome::default(), at) };
+        let settle = if fresh || busy(&rt) { run_idle(&mut rt, SETTLE_FRAMES, 45, &[], at, 0, false) } else { (Outcome::default(), at) };
         let moved = settle.1 != at;
         at = settle.1;
         let now = moment_of(&rt.mem.banks);
@@ -651,6 +659,12 @@ fn main() {
             println!("{step:>4} {field_name:<10} moment {before}->{now} on its own: battles {:?} movies {:?} windows {} -> {to}", settle.0.battles, settle.0.movies, settle.0.windows);
             let via = Some(Rc::new(Step { text: format!("{field_name}: (plays by itself, moment {before}->{now}) -> {to}"), cmds: String::new(), parent: via }));
             push(&mut heap, enter(&to, jump, rt.mem.banks.clone(), via), 5);
+            continue;
+        }
+        if busy(&rt) {
+            // A still-running scene is not a walking action. Otherwise its eventual progress is attributed to an
+            // arbitrary candidate walk, and the exported route tells the TCP bot to walk somewhere it never went.
+            println!("{step:>4} {field_name:<10} still busy after settling (moment {before}->{now}); no player actions tried");
             continue;
         }
         let here = tri.filter(|_| fresh && !moved).or_else(|| rt.triangle_at(at.0, at.1, at.2).map(usize::from));

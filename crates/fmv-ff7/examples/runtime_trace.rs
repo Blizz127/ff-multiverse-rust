@@ -76,6 +76,10 @@ fn main() {
     if let Ok(w) = field.walkmesh() {
         rt.set_walkmesh(std::sync::Arc::new(w));
     }
+    // Match the live server's animation timing: fallback lengths can hide script-ordering bugs.
+    if let (Ok(mut chars), Ok(loader)) = (LgpArchive::open_path(dir.join("field/char.lgp")), field.model_loader()) {
+        rt.set_animation_frame_counts(&fmv_ff7::runtime::AnimState::frame_counts_from(&mut chars, &loader));
+    }
     rt.init();
     let dump = |rt: &FieldRuntime, label: &str| {
         println!("-- {label}: frame {} moment {} party {:?} lock {}", rt.frame(), u16::from_le_bytes([rt.mem.banks.get(0), rt.mem.banks.get(1)]), rt.party(), rt.state.character_lock);
@@ -86,6 +90,7 @@ fn main() {
         }
         for (i, m) in rt.models().iter().enumerate() {
             println!("   model {i} entity {} at ({},{},{}) tri {} dir {} vis {} talk_off {}", m.entity, m.x, m.y, m.z, m.triangle, m.dir, m.visible, m.talk_off);
+            println!("      animation {:?}", rt.model_animation(i));
         }
     };
     dump(&rt, "after init");
