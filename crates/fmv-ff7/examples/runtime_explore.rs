@@ -696,14 +696,17 @@ fn main() {
             }
             let off = near.min(far);
             let diag = off * std::f64::consts::FRAC_1_SQRT_2;
-            for (ox, oy) in [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off), (-diag, -diag), (diag, diag), (-diag, diag), (diag, -diag)] {
-                let (ox, oy) = (ox as i32, oy as i32);
-                let stand = (m.x + ox, m.y + oy, m.z);
-                if on_reach(&rt, stand) {
-                    let face = direction_of(i64::from(-ox), i64::from(-oy));
-                    actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
-                    break;
-                }
+            // The two standing places nearest the player: whoever it is may be standing in the only way to the others.
+            let mut stands: Vec<(i64, Pos, u8)> = [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off), (-diag, -diag), (diag, diag), (-diag, diag), (diag, -diag)]
+                .into_iter()
+                .map(|(ox, oy)| (ox as i32, oy as i32))
+                .map(|(ox, oy)| ((m.x + ox, m.y + oy, m.z), direction_of(i64::from(-ox), i64::from(-oy))))
+                .filter(|(stand, _)| on_reach(&rt, *stand))
+                .map(|(stand, face)| (i64::from(stand.0 - at.0).pow(2) + i64::from(stand.1 - at.1).pow(2), stand, face))
+                .collect();
+            stands.sort();
+            for (_, stand, face) in stands.into_iter().take(2) {
+                actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
             }
         }
         for (li, l) in rt.lines().iter().enumerate().filter(|(_, l)| l.active) {
