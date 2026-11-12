@@ -432,6 +432,8 @@ pub struct ClientState {
     pub story: StoryMirror,
     /// The story's party walking behind its leader on the field (see `followers`): presentation only.
     pub(crate) followers: std::sync::Mutex<crate::followers::Followers>,
+    /// Where the player's own character stands in a live field's scenes (see `companion`): presentation only.
+    pub(crate) companion: std::sync::Mutex<crate::companion::Companion>,
     story_hold: Option<StoryHold>,
     story_last_hold: u64,
     story_hold_epoch: u64,
@@ -488,6 +490,7 @@ impl ClientState {
             progress: ProgressMirror::default(),
             story: StoryMirror::default(),
             followers: Default::default(),
+            companion: Default::default(),
             story_hold: None,
             story_last_hold: 0,
             story_hold_epoch: 0,
@@ -838,9 +841,9 @@ impl ClientState {
                 return Some("protocol error: the server announced a deleted character to a joined session".to_string());
             }
             // A live field (protocol 23, see `crate::live`): its cast replaces the area's NPCs.
-            ServerMsg::LiveCast { area, npcs, .. } => {
+            ServerMsg::LiveCast { area, npcs, lead, poses, .. } => {
                 if area == self.area {
-                    self.live.on_cast();
+                    self.live.on_cast(lead, poses.into_iter().map(|p| (p.id, p.animation, p.frame)));
                     let npcs = npcs.into_iter().take(MAX_NPCS_PER_AREA).filter_map(NpcView::from_snapshot).collect();
                     self.apply_cast(now, npcs);
                 }
@@ -1809,7 +1812,7 @@ mod tests {
     }
 
     fn cast(npcs: Vec<NpcSnapshot>) -> ServerMsg {
-        ServerMsg::LiveCast { area: plaza(), tick: 2, npcs }
+        ServerMsg::LiveCast { area: plaza(), tick: 2, npcs, lead: None, poses: Vec::new() }
     }
 
     fn at_x(mut n: NpcSnapshot, x: f32, facing: f32) -> NpcSnapshot {
@@ -1860,7 +1863,7 @@ mod tests {
     fn a_cast_for_another_area_changes_nothing() {
         let mut s = state(Pos::default());
         let epoch = s.npc_epoch();
-        s.apply(0.0, ServerMsg::LiveCast { area: AreaId { game: GameId::Fixture, key: "elsewhere".into() }, tick: 1, npcs: vec![npc_snapshot(0, "a")] });
+        s.apply(0.0, ServerMsg::LiveCast { area: AreaId { game: GameId::Fixture, key: "elsewhere".into() }, tick: 1, npcs: vec![npc_snapshot(0, "a")], lead: None, poses: Vec::new() });
         assert_eq!((s.npc_epoch(), s.npc_views().len(), s.live.live_area), (epoch, 0, false));
     }
 

@@ -1,4 +1,8 @@
-//! FF Multiverse wire protocol v23.
+//! FF Multiverse wire protocol v24.
+//!
+//! v24 puts the player's own script character into [`ServerMsg::LiveCast`] (`lead`) and adds `poses`, the animation
+//! frame of every cast member a script plays once or holds. An older client would draw that character twice and loop
+//! every one-shot animation, so it is refused at the handshake.
 //!
 //! v23 adds the live field runtime's messages: [`ServerMsg::LiveCast`], [`ServerMsg::LiveWindow`],
 //! [`ServerMsg::LiveWindowClosed`], [`ServerMsg::LiveControl`], [`ServerMsg::LivePlace`], [`ServerMsg::LiveMovie`],
@@ -500,7 +504,7 @@ pub use fmv_party::{
 };
 
 // Older peers cannot bind an ordinary point cutscene to its accepted activation pose.
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -592,6 +596,16 @@ pub struct NpcSnapshot {
     pub pos: Pos,
     /// Heading in radians, adapter space.
     pub facing: f32,
+}
+
+/// The animation frame a live field's cast member shows now (see [`ServerMsg::LiveCast`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePose {
+    /// The member's [`NpcSnapshot::id`].
+    pub id: u32,
+    /// The clip, named as [`NpcSnapshot::idle_animation`] names one.
+    pub animation: String,
+    pub frame: u16,
 }
 
 /// Who an account id in a party message is. Entities are only known for accounts that are
@@ -956,7 +970,20 @@ pub enum ServerMsg {
     SceneRefused { reason: SceneRefusal },
     /// New in v23. The live field's cast for this player's instance, which replaces the area's static NPCs: every
     /// visible model the field's scripts placed, where they are now. Sent when it changes.
-    LiveCast { area: AreaId, tick: u64, npcs: Vec<NpcSnapshot> },
+    ///
+    /// New in v24: the cast includes the player's own script character (FF7: Cloud), named by `lead`. The scripts
+    /// place it while they hold the scene; otherwise it stands where the governor does, and a client shows it as it
+    /// shows the story's party instead. `poses` gives the animation frame of every member a script plays once or
+    /// holds (the others loop the clip their snapshot names).
+    LiveCast {
+        area: AreaId,
+        tick: u64,
+        npcs: Vec<NpcSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lead: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        poses: Vec<LivePose>,
+    },
     /// New in v23. A field script opened window `window` showing dialog `dialog` of the area's field. `answerable` is
     /// true for the player whose answer counts (the party leader); everyone else watches.
     LiveWindow {
@@ -1138,7 +1165,7 @@ mod tests {
 
     #[test]
     fn the_version_is_twenty_two() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     // -----------------------------------------------------------------------------------------

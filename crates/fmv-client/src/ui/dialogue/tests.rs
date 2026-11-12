@@ -969,7 +969,7 @@ mod live_windows {
         let key = |talk: &mut Talk, state: &ClientState| field_key(talk, state, "plaza", 0.0, KeyCode::Enter, true, false);
         // Before any cast this is a static field: OK with nobody near is still a press, from the controller's own scan.
         assert_eq!(key(&mut talk, &state).interact, Some(None));
-        state.apply(0.0, fmv_protocol::ServerMsg::LiveCast { area, tick: 1, npcs: vec![] });
+        state.apply(0.0, fmv_protocol::ServerMsg::LiveCast { area, tick: 1, npcs: vec![], lead: None, poses: Vec::new() });
         let live_key = key(&mut talk, &state);
         assert_eq!((live_key.consumed, live_key.interact), (false, Some(None)));
     }

@@ -259,6 +259,11 @@ impl FieldRuntime {
         })
     }
 
+    /// The animation runtime model `model` stands in (`DFANM`'s; 0 until a script names one).
+    pub fn model_default_animation(&self, model: usize) -> u8 {
+        self.anim.models.get(model).map_or(0, |st| st.default_id)
+    }
+
     /// `CCANM`'s animations for the player's model: idle, walk, run.
     pub fn player_animations(&self) -> [u8; 3] {
         self.anim.player_anims

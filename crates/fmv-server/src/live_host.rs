@@ -12,7 +12,7 @@ use fmv_ff7::story::StoryState;
 use fmv_ff7::{facing_to_field_direction, field_direction_to_facing, Ff7Adapter};
 use fmv_protocol::NpcSnapshot;
 
-use crate::{LiveBattleOutcome, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
+use crate::{LiveBattleOutcome, LiveCastView, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
 
 /// The pad bit of the OK button (circle) in the original's key words (`KEY`, `KEYON`, `KEYOF`).
 const PAD_OK: u16 = 0x0020;
@@ -134,19 +134,24 @@ impl LiveField for Ff7Live {
         out
     }
 
-    fn cast(&self) -> Vec<NpcSnapshot> {
-        self.rt
-            .cast(self.loader.as_ref())
-            .into_iter()
-            .map(|m| NpcSnapshot {
-                id: u32::try_from(m.model).unwrap_or(u32::MAX),
-                name: m.name,
-                model: m.skeleton,
-                idle_animation: m.animation,
-                pos: pos_of(m.x, m.y, m.z),
-                facing: field_direction_to_facing(m.dir),
-            })
-            .collect()
+    fn cast(&self) -> LiveCastView {
+        let members = self.rt.cast(self.loader.as_ref());
+        let id = |model: usize| u32::try_from(model).unwrap_or(u32::MAX);
+        LiveCastView {
+            lead: members.iter().find(|m| m.lead).map(|m| id(m.model)),
+            poses: members.iter().filter_map(|m| m.pose.as_ref().map(|(animation, frame)| fmv_protocol::LivePose { id: id(m.model), animation: animation.clone(), frame: *frame })).collect(),
+            npcs: members
+                .into_iter()
+                .map(|m| NpcSnapshot {
+                    id: id(m.model),
+                    name: m.name,
+                    model: m.skeleton,
+                    idle_animation: m.animation,
+                    pos: pos_of(m.x, m.y, m.z),
+                    facing: field_direction_to_facing(m.dir),
+                })
+                .collect(),
+        }
     }
 
     fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>) {

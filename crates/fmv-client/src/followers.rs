@@ -27,7 +27,7 @@ use crate::avatar::{AvatarPlayer, Who};
 use crate::state::{ClientState, NpcView};
 
 /// Field units between the leader and the first follower, and between one follower and the next.
-pub const SPACING: f32 = 56.0;
+pub const SPACING: f32 = 88.0;
 /// How far the leader walks before the trail gets a new point (field units).
 const STEP: f32 = 4.0;
 /// A jump this long between two frames is a relocation (a link, a ladder), not a walk: the trail starts again.
@@ -76,6 +76,9 @@ pub struct Followers {
     last: Vec<FollowerPose>,
     /// Switched off for this state (a picture about something else); `FMV_FOLLOWERS=off` switches off the whole run.
     off: bool,
+    /// The first follower stays here until its leader has walked [`SPACING`] away: where a scene left it (a live
+    /// field's lead is drawn from the scene's cast while the scene runs, and must not jump when it ends).
+    hold: Option<FollowerPose>,
 }
 
 fn dist(a: Pos, b: Pos) -> f32 {
@@ -96,6 +99,7 @@ impl Followers {
         if self.key.as_ref() != Some(&key) || jumped || !leader.is_finite() {
             self.trail.clear();
             self.last.clear();
+            self.hold = None;
             self.key = Some(key);
         }
         if !leader.is_finite() {
@@ -131,8 +135,26 @@ impl Followers {
             let anim = if !moving { AnimState::Idle } else if anim == AnimState::Run { AnimState::Run } else { AnimState::Walk };
             poses.push(FollowerPose { pos: target, facing, anim });
         }
+        if let Some(hold) = self.hold {
+            if count == 0 || dist(leader, hold.pos) >= SPACING || dist(leader, hold.pos) > JUMP {
+                // The leader has walked off: fall in behind it, from where it stood.
+                self.hold = None;
+                self.trail.clear();
+                self.trail.push_front(hold.pos);
+                self.trail.push_front(leader);
+            } else if let Some(first) = poses.first_mut() {
+                *first = hold;
+            }
+        }
         self.last = poses.clone();
         poses
+    }
+
+    /// The first follower stands at `pos` facing `facing` until its leader has walked away from there.
+    pub fn hold_first(&mut self, pos: Pos, facing: f32) {
+        if pos.is_finite() {
+            self.hold = Some(FollowerPose { pos, facing, anim: AnimState::Idle });
+        }
     }
 
     /// The point `behind` field units back along the trail from `leader` (the trail's oldest point when it is shorter).
@@ -161,6 +183,7 @@ impl Followers {
     pub fn clear(&mut self) {
         self.trail.clear();
         self.last.clear();
+        self.hold = None;
         self.key = None;
     }
 }
@@ -249,6 +272,20 @@ mod tests {
         let again = f.frame(0, 1, Pos::new(400.0, 30.0, 0.0), 0.0, AnimState::Idle, 2);
         assert_eq!(still.iter().map(|p| p.pos).collect::<Vec<_>>(), again.iter().map(|p| p.pos).collect::<Vec<_>>());
         assert!(again.iter().all(|p| p.anim == AnimState::Idle));
+    }
+
+    #[test]
+    fn a_held_first_follower_stays_until_the_leader_has_walked_away_and_then_falls_in_without_a_jump() {
+        let mut f = Followers::default();
+        let stood = Pos::new(100.0, 0.0, 0.0);
+        f.frame(0, 1, stood, 0.0, AnimState::Idle, 1);
+        f.hold_first(stood, 1.5);
+        let near = walk(&mut f, (100.0, 0.0), (100.0 + SPACING - 2.0, 0.0), 40, 1);
+        assert_eq!((near[0].pos, near[0].facing, near[0].anim), (stood, 1.5, AnimState::Idle));
+        let off = f.frame(0, 1, Pos::new(100.0 + SPACING + 1.0, 0.0, 0.0), 0.0, AnimState::Walk, 1);
+        assert!(dist(off[0].pos, stood) < 2.0, "it starts from where it stood: {off:?}");
+        let on = walk(&mut f, (100.0 + SPACING + 1.0, 0.0), (400.0, 0.0), 80, 1);
+        assert!((on[0].pos.x - (400.0 - SPACING)).abs() < 1.0, "{on:?}");
     }
 
     #[test]

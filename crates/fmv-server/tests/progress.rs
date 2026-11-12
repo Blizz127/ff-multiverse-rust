@@ -617,7 +617,7 @@ async fn a_member_who_left_mid_battle_is_still_paid_in_the_store() {
 /// v23: earlier peers cannot decode a live field's cast, windows and holds).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_of_the_previous_protocol_version_is_refused_at_the_handshake() {
-    assert_eq!(PROTOCOL_VERSION, 23);
+    assert_eq!(PROTOCOL_VERSION, 24);
     let server = TestServer::start(fast(None)).await;
     for old_version in [22u16, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4] {
         let mut old = Client::connect(server.addr).await;

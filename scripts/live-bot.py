@@ -24,7 +24,7 @@ import struct
 import sys
 import time
 
-PROTOCOL = int(__import__("os").environ.get("FMV_PROTOCOL", "23"))
+PROTOCOL = int(__import__("os").environ.get("FMV_PROTOCOL", "24"))
 
 
 class Conn:

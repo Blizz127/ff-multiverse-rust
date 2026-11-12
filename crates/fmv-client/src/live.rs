@@ -61,12 +61,33 @@ pub struct LiveClient {
     background: Vec<crate::scene::SceneBackground>,
     /// The fade overlay the field shows now.
     pub fade: Option<LiveFade>,
+    /// The cast member that is the player's own script character (FF7: Cloud): drawn from the cast while the scripts
+    /// hold the scene, and as a follower otherwise (see `crate::companion`).
+    pub lead: Option<u32>,
+    /// The animation and frame of each cast member a script plays once or holds, by cast id.
+    poses: BTreeMap<u32, (String, u16)>,
 }
 
+/// More poses than this in one cast are not kept (a cast has at most a few dozen members).
+const MAX_POSES: usize = 256;
+
 impl LiveClient {
-    /// A `LiveCast` arrived: this area is a live field.
-    pub fn on_cast(&mut self) {
+    /// A `LiveCast` arrived: this area is a live field. `poses` are (cast id, clip, frame); a clip name that is not a
+    /// plain archive stem is dropped.
+    pub fn on_cast(&mut self, lead: Option<u32>, poses: impl IntoIterator<Item = (u32, String, u16)>) {
         self.live_area = true;
+        self.lead = lead;
+        self.poses = poses
+            .into_iter()
+            .filter(|(_, clip, _)| !clip.is_empty() && clip.len() <= 16 && clip.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+            .take(MAX_POSES)
+            .map(|(id, clip, frame)| (id, (clip, frame)))
+            .collect();
+    }
+
+    /// The clip and frame cast member `id` shows now, when a script plays it once or holds it.
+    pub fn pose(&self, id: u32) -> Option<(&str, u16)> {
+        self.poses.get(&id).map(|(clip, frame)| (clip.as_str(), *frame))
     }
 
     pub fn on_window(&mut self, mut view: LiveWindowView) {
@@ -185,6 +206,8 @@ impl LiveClient {
         self.locked = false;
         self.movie = None;
         self.live_area = false;
+        self.lead = None;
+        self.poses.clear();
     }
 }
 
@@ -228,9 +251,11 @@ mod tests {
     fn a_cast_makes_a_live_area_until_the_area_changes() {
         let mut live = LiveClient::default();
         assert!(!live.live_area);
-        live.on_cast();
+        live.on_cast(Some(3), vec![(3, "abcd".to_string(), 7), (4, "../x".to_string(), 1)]);
         assert!(live.live_area);
+        assert_eq!((live.lead, live.pose(3), live.pose(4)), (Some(3), Some(("abcd", 7)), None), "a clip name that is no stem is dropped");
         live.reset();
         assert!(!live.live_area);
+        assert_eq!((live.lead, live.pose(3)), (None, None));
     }
 }

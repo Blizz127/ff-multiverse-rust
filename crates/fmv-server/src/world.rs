@@ -126,7 +126,7 @@ pub use areas::{TravelReply, AREA_UNLOAD_GRACE, TRAVEL_TIMEOUT};
 pub use battle::BattleReply;
 pub use party::PartyOutcome;
 pub use press::PressOutcome;
-pub use live::{LiveBattleOutcome, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
+pub use live::{LiveBattleOutcome, LiveCastView, LiveEvent, LiveField, LiveFieldHost, LiveInput, LiveSeed};
 pub use scene::{SceneBoundary, SceneBoundaryKind, SceneHost, SceneInfo, SceneReply, SceneResult, SceneSettings, SceneTransaction, TriggerInfo};
 pub(crate) use scene::saved_landing_evidence;
 
@@ -682,7 +682,7 @@ impl World {
         let live_blocked = !live_held && self.players.get(&entity).is_some_and(|p| to.is_finite() && self.live_blocks(entity, p.snapshot.pos, to));
         let live_locked = live_held || live_blocked;
         if live_locked {
-            tracing::debug!(?entity, held = live_held, blocked = live_blocked, ?to, "live field refused a move");
+            self.logs.debug(format!("live field refused a move entity={} held={live_held} blocked={live_blocked} to=({:.0},{:.0},{:.0})", entity.0, to.x, to.y, to.z));
         }
         if live_blocked {
             // (whoever stands in the way hears of it: walking into someone is how the original makes them react)
@@ -805,7 +805,7 @@ impl World {
                 if clipped { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied }
             }
             Chord::Blocked { place } => {
-                tracing::debug!(?entity, ?from, ?to, ?place, "the walkmesh refused a move");
+                self.logs.debug(format!("the walkmesh refused a move entity={} from=({:.0},{:.0},{:.0}) to=({:.0},{:.0},{:.0})", entity.0, from.x, from.y, from.z, to.x, to.y, to.z));
                 let Some(p) = self.players.get_mut(&entity) else {
                     return MoveOutcome::Gone;
                 };

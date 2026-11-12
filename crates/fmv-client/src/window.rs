@@ -1368,7 +1368,9 @@ impl App {
         // (a scene's trigger is not drawn while its scene runs, and is not named either)
         let story = state.scene.player();
         let anchor = |subject: Subject, at: Pos| {
-            if scene::label_hidden(story, subject, state.npc_views())
+            // (a live field's characters are named by their script entities, `av_m`, `gu1`: no names for a player)
+            if (state.live.live_area && matches!(subject, Subject::Npc(_)))
+                || scene::label_hidden(story, subject, state.npc_views())
                 || scene::participant_label_hidden(story, state.self_entity(), subject) {
                 None
             } else {
@@ -1484,8 +1486,21 @@ pub(crate) fn field_draw(
     let story = state.scene.player();
     // (the characters of a live field glide between casts: they are drawn where they are NOW)
     let drawn_npcs = state.npc_views_at(render_t);
-    let npcs = scene::visible_npcs(&drawn_npcs, story);
+    let cast = scene::visible_npcs(&drawn_npcs, story);
+    // A live field's lead (the scripts' own player character; FF7: Cloud) is drawn from the cast only while the scripts
+    // hold the scene. While the player walks free it is a follower, and the cast's copy of it (which stands where the
+    // player does) is left out. See `crate::companion`.
+    let live_scene = state.live.live_area && state.live.locked;
+    let lead_id = state.live.lead.filter(|_| state.live.live_area);
+    let lead = lead_id.filter(|_| live_scene).and_then(|id| cast.iter().find(|n| n.id == id).map(|n| (n.pos, n.facing)));
+    let npcs: Vec<crate::state::NpcView> = cast.iter().filter(|n| live_scene || Some(n.id) != lead_id).cloned().collect();
     let mut players: Vec<AvatarPlayer<'_>> = npc_players(&npcs);
+    // Whoever a script plays a clip once on, or holds in a pose, shows that very frame (not the clip going round).
+    for (player, npc) in players.iter_mut().zip(&npcs) {
+        if let Some((clip, frame)) = state.live.pose(npc.id) {
+            player.scene_clip = Some((clip, crate::avatar::anim::ClipFrame::Hold(u8::try_from(frame).unwrap_or(u8::MAX))));
+        }
+    }
     if let Some(story) = story {
         players.extend(scene::cast_players(story));
     }
@@ -1504,12 +1519,35 @@ pub(crate) fn field_draw(
     // The story's party walking behind its leader (see `followers`; none while a scene's cast plays them), drawn under the
     // local player, which stays last.
     players.extend(crate::followers::players(state, &npcs, story.is_some(), render_t));
+    // The player's own character: in a live field's scene it stands beside the lead, not in it.
+    let own_pose = {
+        let mut companion = state.companion.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (own, area) = (state.own.pos(), state.area_changes());
+        match lead {
+            Some((lead_pos, lead_facing)) => {
+                let others: Vec<Pos> =
+                    npcs.iter().filter(|n| Some(n.id) != lead_id).map(|n| n.pos).chain(remotes.iter().map(|v| v.pose.pos)).collect();
+                // (ground: inside one of the walkmesh triangles the view shows; a view without any knows of none)
+                let walkable = |p: Pos| view.triangles.is_empty() || view.to_view(p).is_some_and(|q| view.triangles.iter().any(|t| in_triangle(t, q)));
+                companion.scene(area, own, lead_pos, lead_facing, &others, &walkable, dt)
+            }
+            None => {
+                let (pose, ended) = companion.free(area, own, state.own.facing(), state.own.anim());
+                if ended {
+                    // The lead stays where the scene left it (the player's real place) until the player walks away.
+                    let facing = lead_id.and_then(|id| cast.iter().find(|n| n.id == id)).map_or(state.own.facing(), |n| n.facing);
+                    state.followers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hold_first(own, facing);
+                }
+                pose
+            }
+        }
+    };
     let own_who = Who(state.self_entity().0);
     players.push(AvatarPlayer {
         who: own_who,
-        pos: state.own.pos(),
-        facing: state.own.facing(),
-        anim: state.own.anim(),
+        pos: own_pose.pos,
+        facing: own_pose.facing,
+        anim: own_pose.anim,
         scene_frame: None, scene_clip: None, scene_return: None,
         appearance: state.own_appearance(),
         npc: None,
@@ -1535,6 +1573,13 @@ pub(crate) fn field_draw(
         .filter_map(|(_, p)| marker(view, p))
         .collect();
     FieldDraw { built, markers, own_who, own_at }
+}
+
+/// Whether view-space point `p` lies in triangle `t` (its edges count).
+fn in_triangle(t: &[Pos; 3], p: Pos) -> bool {
+    let side = |a: Pos, b: Pos| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let (d0, d1, d2) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+    !((d0 < 0.0 || d1 < 0.0 || d2 < 0.0) && (d0 > 0.0 || d1 > 0.0 || d2 > 0.0))
 }
 
 /// The marker of a player or of a non-player character: where its feet are in view space, in its

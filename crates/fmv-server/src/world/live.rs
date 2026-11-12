@@ -69,6 +69,15 @@ pub enum LiveBattleOutcome {
     Defeat,
 }
 
+/// A live field's cast: everyone visible, which of them is the player's own script character, and the animation frame
+/// of those a script plays once or holds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LiveCastView {
+    pub npcs: Vec<NpcSnapshot>,
+    pub lead: Option<u32>,
+    pub poses: Vec<fmv_protocol::LivePose>,
+}
+
 /// What the governor does this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LiveInput {
@@ -104,7 +113,7 @@ pub trait LiveField: Send {
     /// Run one frame.
     fn advance(&mut self, input: Option<LiveInput>) -> Vec<LiveEvent>;
     /// The visible models other than the player's.
-    fn cast(&self) -> Vec<NpcSnapshot>;
+    fn cast(&self) -> LiveCastView;
     /// The stage: the background's group masks and the fade overlay (blend, colour).
     fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>);
     /// Whether a script holds the player still.
@@ -148,7 +157,7 @@ struct LiveRun {
     field: Box<dyn LiveField>,
     started: Instant,
     frames: u64,
-    cast: Vec<NpcSnapshot>,
+    cast: LiveCastView,
     stage: (Vec<u8>, Option<(u8, [u8; 3])>),
     locked: bool,
     place: Option<(Pos, f32)>,
@@ -221,7 +230,9 @@ impl World {
     pub(super) fn live_cast(&self, id: InstanceId) -> Option<Vec<NpcSnapshot>> {
         let key = self.instances.get(id)?.key().clone();
         governor_of(&key.phase)?;
-        Some(self.live.runs.get(&id).map(|r| r.cast.clone()).unwrap_or_default())
+        // (a snapshot's characters are plain: the player's own script character comes with the next cast, which says
+        // which one it is)
+        Some(self.live.runs.get(&id).map(|r| r.cast.npcs.iter().filter(|n| Some(n.id) != r.cast.lead).cloned().collect()).unwrap_or_default())
     }
 
     /// The run of the instance `entity` stands in, if it is live.
@@ -349,7 +360,7 @@ impl World {
                             field,
                             started: now,
                             frames: 0,
-                            cast: Vec::new(),
+                            cast: LiveCastView::default(),
                             stage: (Vec::new(), None),
                             locked: false,
                             place: None,
@@ -516,7 +527,7 @@ impl World {
         let cast = run.field.cast();
         if cast != run.cast {
             if let Some(area) = &area_id {
-                self.tell_instance(id, Arc::new(ServerMsg::LiveCast { area: area.clone(), tick: self.tick, npcs: cast.clone() }), &mut failed);
+                self.tell_instance(id, Arc::new(ServerMsg::LiveCast { area: area.clone(), tick: self.tick, npcs: cast.npcs.clone(), lead: cast.lead, poses: cast.poses.clone() }), &mut failed);
             }
             run.cast = cast;
         }
@@ -717,8 +728,9 @@ mod tests {
             }
             out
         }
-        fn cast(&self) -> Vec<NpcSnapshot> {
-            vec![NpcSnapshot { id: 0, name: "walker".into(), model: "m".into(), idle_animation: None, pos: Pos::new(self.frame as f32, 0.0, 0.0), facing: 0.0 }]
+        fn cast(&self) -> LiveCastView {
+            let npcs = vec![NpcSnapshot { id: 0, name: "walker".into(), model: "m".into(), idle_animation: None, pos: Pos::new(self.frame as f32, 0.0, 0.0), facing: 0.0 }];
+            LiveCastView { npcs, lead: None, poses: Vec::new() }
         }
         fn stage(&self) -> (Vec<u8>, Option<(u8, [u8; 3])>) {
             (vec![0; 64], None)

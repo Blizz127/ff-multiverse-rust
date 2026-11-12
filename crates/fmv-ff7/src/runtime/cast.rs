@@ -23,20 +23,33 @@ pub struct CastMember {
     pub z: i32,
     /// Field direction (0-255).
     pub dir: u8,
+    /// This is the player's own character (the model the scripts move in scenes and the player moves otherwise).
+    pub lead: bool,
+    /// The animation and frame it shows now when a script plays it once or holds it (`animation` is then what it
+    /// stands in afterwards); `None` while its animation simply loops.
+    pub pose: Option<(String, u16)>,
 }
 
 impl FieldRuntime {
-    /// The visible models other than the player's own character, with what the client needs to draw them.
+    /// The visible models, with what the client needs to draw them. The player's own character is among them
+    /// ([`CastMember::lead`]): a host shows it where the scripts put it while they hold the player.
     pub fn cast(&self, loader: Option<&ModelLoader>) -> Vec<CastMember> {
+        use super::AnimStatus;
         let pc = self.state.player_model.or(self.state.pc_model);
         self.models
             .iter()
             .enumerate()
-            .filter(|(i, m)| m.visible && Some(*i) != pc)
+            .filter(|(_, m)| m.visible)
             .filter_map(|(i, m)| {
                 let record = loader.and_then(|l| l.models.get(usize::from(m.char_id)));
                 let skeleton = record.map(|r| crate::util::entry_stem(&r.hrc)).filter(|s| !s.is_empty())?;
-                let animation = record.and_then(|r| r.animations.get(usize::from(m.anim)).or_else(|| r.animations.first())).map(|a| a.stem()).filter(|s| !s.is_empty());
+                let stem = |anim: u8| record.and_then(|r| r.animations.get(usize::from(anim))).map(|a| a.stem()).filter(|s| !s.is_empty());
+                let view = self.model_animation(i);
+                let looping = view.is_none_or(|v| matches!(v.status, AnimStatus::DefaultLoop | AnimStatus::ScriptedLoop));
+                // A clip played once or held is shown frame by frame; what the model stands in is its default clip.
+                let pose = if looping { None } else { view.and_then(|v| Some((stem(v.animation)?, v.frame.max(0.0) as u16))) };
+                let standing = if pose.is_some() { self.model_default_animation(i) } else { m.anim };
+                let animation = stem(standing).or_else(|| record.and_then(|r| r.animations.first()).map(|a| a.stem()).filter(|s| !s.is_empty()));
                 Some(CastMember {
                     model: i,
                     entity: m.entity,
@@ -47,6 +60,8 @@ impl FieldRuntime {
                     y: m.y,
                     z: m.z,
                     dir: m.dir,
+                    lead: Some(i) == pc,
+                    pose,
                 })
             })
             .collect()
