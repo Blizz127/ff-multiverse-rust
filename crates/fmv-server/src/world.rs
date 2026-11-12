@@ -679,13 +679,16 @@ impl World {
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
         // A field script may hold the player (the original's UC, an open window, a battle or movie under way).
         let live_held = self.live_locked(entity);
-        // Walking into someone solid ends beside them (the player slides round a character, as in the original).
-        let slid = if live_held || !to.is_finite() { None } else { self.players.get(&entity).and_then(|p| self.live_slide(entity, p.snapshot.pos, to)) };
-        let to = slid.unwrap_or(to);
         let live_blocked = !live_held && self.players.get(&entity).is_some_and(|p| to.is_finite() && self.live_blocks(entity, p.snapshot.pos, to));
         let live_locked = live_held || live_blocked;
         if live_locked {
             tracing::debug!(?entity, held = live_held, blocked = live_blocked, ?to, "live field refused a move");
+        }
+        if live_blocked {
+            // (whoever stands in the way hears of it: walking into someone is how the original makes them react)
+            if let Some(from) = self.players.get(&entity).map(|p| p.snapshot.pos) {
+                self.live_bumped(entity, from, to);
+            }
         }
         // The rules are the rules of the area the player stands in (areas differ in speed).
         let (from, chord) = {
@@ -767,7 +770,7 @@ impl World {
                     if !self.live_battles_disabled(entity) {
                         self.roll_encounter(entity, dist, now);
                     }
-                    return if clipped || slid.is_some() { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied };
+                    return if clipped { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied };
                 }
                 // An original scripted line owns its accepted crossing before exits, story
                 // points, local links or random encounters can act on the same move.

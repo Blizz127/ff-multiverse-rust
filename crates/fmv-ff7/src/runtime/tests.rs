@@ -303,3 +303,26 @@ fn control_handed_to_someone_else_while_the_player_is_held_does_not_make_the_pla
     assert_eq!(rt.player_model().map(|m| m.x), Some(10));
     assert_eq!(rt.state.player_model, rt.state.pc_model);
 }
+
+#[test]
+fn a_long_stride_over_a_line_still_crosses_it() {
+    // The same line; a network player arrives in strides longer than the reach of the line's touch (34 units at this
+    // scale), so no sample ever stands near it: from 45 units before to 45 units beyond in one frame.
+    let mut line = vec![0xD0];
+    for v in [0i16, -50, 0, 0, 50, 0] {
+        line.extend_from_slice(&v.to_le_bytes());
+    }
+    let ent = vec![script0(&line, IDLE), (3, [&set_byte(1, 0x90, 1)[..], &[0x00]].concat())];
+    let mut rt = runtime(SynthScript::default().entity("line", ent));
+    for x in [-135, -45, 45, 45, 45] {
+        rt.tick(Some(PlayerInput { x, y: 0, ..Default::default() }));
+    }
+    assert_eq!(rt.mem.banks.get(0x90), 1);
+    // A placement (too far to be a walk) is not swept: nothing between here and there was walked through.
+    let ent = vec![script0(&line, IDLE), (3, [&set_byte(1, 0x90, 1)[..], &[0x00]].concat())];
+    let mut rt = runtime(SynthScript::default().entity("line", ent));
+    for x in [-300, 300, 300, 300] {
+        rt.tick(Some(PlayerInput { x, y: 0, ..Default::default() }));
+    }
+    assert_eq!(rt.mem.banks.get(0x90), 0);
+}

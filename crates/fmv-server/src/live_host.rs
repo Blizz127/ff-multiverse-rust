@@ -211,31 +211,13 @@ impl LiveField for Ff7Live {
     fn blocks(&self, from: Pos, to: Pos) -> bool {
         let at = |p: Pos| (p.x.round() as i32, p.y.round() as i32, p.z.round() as i32);
         let locked = |p: Pos| self.rt.triangle_at(at(p).0, at(p).1, at(p).2).is_some_and(|t| self.rt.triangle_locked(t));
-        // (someone standing in the way blocks like a locked triangle: a player already inside the circle can step out)
-        let solid = |p: Pos| self.rt.solid_model_at(at(p).0, at(p).1, at(p).2);
-        (locked(to) && !locked(from)) || (solid(to) && !solid(from))
+        // (a player already on a locked triangle can still walk off it; someone solid stops a step towards them)
+        (locked(to) && !locked(from)) || self.rt.player_step_blocked(at(from), at(to))
     }
 
-    fn slide(&self, from: Pos, to: Pos) -> Option<Pos> {
+    fn bumped(&mut self, from: Pos, to: Pos) {
         let at = |p: Pos| (p.x.round() as i32, p.y.round() as i32, p.z.round() as i32);
-        // (a player someone walked into is free to step out)
-        if self.rt.solid_model_at(at(from).0, at(from).1, at(from).2) {
-            return None;
-        }
-        let (cx, cy, keep) = self.rt.solid_model_circle(at(to).0, at(to).1, at(to).2)?;
-        let (cx, cy, keep) = (cx as f32, cy as f32, keep as f32 + 1.5);
-        let (dx, dy) = (to.x - cx, to.y - cy);
-        let d = dx.hypot(dy);
-        // Out along the line from their centre through where the player wanted to stand (from where the player is, if
-        // that was their very centre).
-        let (ux, uy) = if d > 0.5 {
-            (dx / d, dy / d)
-        } else {
-            let (fx, fy) = (from.x - cx, from.y - cy);
-            let f = fx.hypot(fy).max(1.0);
-            (fx / f, fy / f)
-        };
-        Some(Pos::new(cx + ux * keep, cy + uy * keep, to.z))
+        self.rt.player_bumped(at(from), at(to));
     }
 
     fn map_jumps_disabled(&self) -> bool {

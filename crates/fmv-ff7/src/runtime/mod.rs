@@ -495,7 +495,7 @@ impl FieldRuntime {
         self.player = player;
         self.frame += 1;
         self.follow_player_model();
-        self.detect_player_events();
+        self.detect_player_steps();
         self.dispatch_event_requests();
         let count = self.ents.len();
         for _ in 0..count {
@@ -514,6 +514,30 @@ impl FieldRuntime {
         }
         self.update_families();
         self.follow_player_model();
+    }
+
+    /// What the player's move since the last frame touches. The original moves the player a few units a frame, and
+    /// its line and contact rules look only at where the player was a frame ago; a host that samples the player less
+    /// finely (a network player arrives in strides of a dozen units or more) would step over a line unnoticed. So a
+    /// longer stride is swept in short steps. A jump too long to be a walk (a placement) is taken as it is.
+    fn detect_player_steps(&mut self) {
+        const STRIDE: i64 = 4;
+        const WALK: i64 = 96;
+        if let (Some(prev), Some(now)) = (self.previous_player, self.player) {
+            let (dx, dy, dz) = (i64::from(now.x - prev.x), i64::from(now.y - prev.y), i64::from(now.z - prev.z));
+            let d = ((dx * dx + dy * dy) as f64).sqrt() as i64;
+            if d > STRIDE && d <= WALK && !self.player_scripted() {
+                let n = (d + STRIDE - 1) / STRIDE;
+                for i in 1..n {
+                    let at = |from: i32, by: i64| from + (by * i / n) as i32;
+                    self.player = Some(PlayerInput { x: at(prev.x, dx), y: at(prev.y, dy), z: at(prev.z, dz), ok: false, keys_pressed: 0, ..now });
+                    self.detect_player_events();
+                    self.previous_player = self.player;
+                }
+                self.player = Some(now);
+            }
+        }
+        self.detect_player_events();
     }
 
     /// Execute the instruction at entity `e`'s PC.
@@ -888,37 +912,72 @@ impl FieldRuntime {
         }
     }
 
-    /// Whether a solid model stands in the way at `(x, y, z)`: the original stops the player where its centre comes
-    /// closer to a solid model's than half their two solid ranges (within 128 units of height). People standing in a
-    /// doorway are how the game closes it.
-    pub fn solid_model_at(&self, x: i32, y: i32, z: i32) -> bool {
-        self.solid_model_circle(x, y, z).is_some()
+    /// The solid models a player stepping from `from` to `to` runs into. The original does not test the player's
+    /// centre: it tests three points a solid range ahead of where the step ends (straight on and an eighth of a turn
+    /// to each side) against every solid model, within 128 units of height, at half the two solid ranges. So a
+    /// character stops a player well before their centres meet, two guards close a gate between them, and stepping
+    /// away from someone is always free. A side point off the walkmesh is the wall pushing the player over: the test
+    /// is then repeated from where that point would be on it again (the original turns the player along the wall,
+    /// into whoever stands beside it).
+    pub fn step_contacts(&self, from: (i32, i32, i32), to: (i32, i32, i32)) -> Vec<usize> {
+        let (dx, dy) = (f64::from(to.0 - from.0), f64::from(to.1 - from.1));
+        let d = dx.hypot(dy);
+        if d < 0.5 {
+            return Vec::new();
+        }
+        let (ux, uy) = (dx / d, dy / d);
+        let (px, py) = (-uy, ux);
+        let r = f64::from(self.player_solid_range());
+        let h = r * std::f64::consts::FRAC_1_SQRT_2;
+        let me = self.state.player_model.or(self.state.pc_model);
+        let touching = |cx: f64, cy: f64, found: &mut Vec<usize>| {
+            for (fx, fy) in [(ux * r, uy * r), ((ux + px) * h, (uy + py) * h), ((ux - px) * h, (uy - py) * h)] {
+                let (x, y) = (cx + fx, cy + fy);
+                for (i, m) in self.models.iter().enumerate() {
+                    if Some(i) == me || m.solid_off || found.contains(&i) {
+                        continue;
+                    }
+                    let dz = m.z - to.2;
+                    let reach = (r + f64::from(m.solid_range)) / 2.0;
+                    let (mx, my) = (f64::from(m.x) - x, f64::from(m.y) - y);
+                    if dz > -127 && dz < 128 && mx * mx + my * my < reach * reach {
+                        found.push(i);
+                    }
+                }
+            }
+        };
+        let (cx, cy) = (f64::from(to.0), f64::from(to.1));
+        let mut found = Vec::new();
+        touching(cx, cy, &mut found);
+        if self.surface.is_some() {
+            for side in [1.0, -1.0] {
+                let (x, y) = (cx + (ux + px * side) * h, cy + (uy + py * side) * h);
+                if self.triangle_at(x.round() as i32, y.round() as i32, to.2).is_none() {
+                    touching(cx - px * side * h, cy - py * side * h, &mut found);
+                }
+            }
+        }
+        found
     }
 
-    /// The solid model in the way at `(x, y, z)`, if any: its centre and the distance the player's centre keeps from
-    /// it (the nearest one when several overlap).
-    pub fn solid_model_circle(&self, x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
-        let solid = i64::from(self.player_solid_range());
-        let pc = self.state.pc_model;
-        self.models
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| {
-                if Some(i) == pc || m.solid_off {
-                    return None;
-                }
-                let dz = i64::from(m.z) - i64::from(z);
-                let (dx, dy) = (i64::from(m.x) - i64::from(x), i64::from(m.y) - i64::from(y));
-                let threshold = (solid + i64::from(m.solid_range)) / 2;
-                let d2 = dx * dx + dy * dy;
-                (dz > -127 && dz < 128 && d2 < threshold * threshold).then_some((d2, (m.x, m.y, threshold as i32)))
-            })
-            .min_by_key(|(d2, _)| *d2)
-            .map(|(_, c)| c)
+    /// Whether someone solid stops a player stepping from `from` to `to` (see [`FieldRuntime::player_bumped`]).
+    pub fn player_step_blocked(&self, from: (i32, i32, i32), to: (i32, i32, i32)) -> bool {
+        !self.step_contacts(from, to).is_empty()
+    }
+
+    /// The player tried to step from `from` to `to` and the host stopped it there: whoever was in the way gets their
+    /// contact script, as in the original (walking into someone is how the game makes them react).
+    pub fn player_bumped(&mut self, from: (i32, i32, i32), to: (i32, i32, i32)) {
+        if self.player_scripted() {
+            return;
+        }
+        for i in self.step_contacts(from, to) {
+            self.models[i].request_push = true;
+        }
     }
 
     /// The player model's solid range: the original gives the player 34 units at scale 512.
-    fn player_solid_range(&self) -> u16 {
+    pub fn player_solid_range(&self) -> u16 {
         (34 * u32::from(self.scale) / 512) as u16
     }
 

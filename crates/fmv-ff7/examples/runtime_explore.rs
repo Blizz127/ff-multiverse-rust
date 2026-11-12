@@ -128,30 +128,28 @@ fn busy(rt: &FieldRuntime) -> bool {
 /// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived (`false`: a
 /// script took over on the way and changed something: the story, the field's scratch or where the player stands) and
 /// where it is. A script that only says something on the way (bumping into someone) is heard out and the walk goes on.
-/// Where a player wanting to stand at `p` stands: `p`, or beside whoever solid is there (the host slides the player
-/// out along the line from their centre). `None` when that is their very centre.
-fn beside(rt: &FieldRuntime, p: Pos) -> Option<Pos> {
-    let Some((cx, cy, keep)) = rt.solid_model_circle(p.0, p.1, p.2) else { return Some(p) };
-    let (dx, dy) = (f64::from(p.0 - cx), f64::from(p.1 - cy));
-    let d = dx.hypot(dy);
-    if d < 0.5 {
-        return None;
-    }
-    let k = (f64::from(keep) + 2.5) / d;
-    Some((cx + (dx * k).round() as i32, cy + (dy * k).round() as i32, p.2))
-}
-
 fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
     let mut at = from;
     let mut chats = 0;
     for p in approach {
-        // Someone solid on the way is walked round as the host makes a player do it; with no room beside them the
-        // walk ends here. (A player someone walked into may step out freely.)
-        let mut p = *p;
-        if !rt.solid_model_at(at.0, at.1, at.2) && rt.solid_model_at(p.0, p.1, p.2) {
-            match beside(rt, p).filter(|q| !rt.solid_model_at(q.0, q.1, q.2) && rt.triangle_at(q.0, q.1, q.2).is_some_and(|t| !rt.triangle_locked(t))) {
-                Some(q) => p = q,
-                None => return (false, at),
+        // Someone solid in the way stops the player (the host refuses the step). Whoever walked into the way gets a
+        // moment to walk on; someone who stays is bumped into (their contact script runs) and the walk ends there.
+        let p = *p;
+        if rt.player_step_blocked(at, p) {
+            for _ in 0..45 {
+                rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
+                if pump(rt, out) {
+                    return (false, at);
+                }
+                if busy(rt) || !rt.player_step_blocked(at, p) {
+                    break;
+                }
+            }
+            if busy(rt) || rt.player_step_blocked(at, p) {
+                rt.player_bumped(at, p);
+                let (more, end) = run_idle(rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
+                out.absorb(more);
+                return (false, end);
             }
         }
         at = p;
@@ -230,17 +228,12 @@ fn centre(walk: &Walkmesh, t: usize) -> Pos {
     (s(|p| p.x), s(|p| p.y), s(|p| p.z))
 }
 
-/// Whether the step from triangle `t` over its edge `e` into its neighbour can be walked: the neighbour is not locked
-/// and nobody solid stands at the edge's middle or the neighbour's centre (the points a walk goes through).
+/// The triangle across edge `e` of triangle `t`, if a player may step into it: it exists and no script locked it.
+/// Someone solid standing there does not close it: triangles are big, a player slides round a character, and whether
+/// there is room to is found by walking ([`walk_to`]), not by looking at the triangle's centre.
 fn link_open(walk: &Walkmesh, rt: &FieldRuntime, t: usize, e: usize) -> Option<usize> {
     let n = usize::from(walk.access[t][e]);
-    if n >= walk.triangles.len() || rt.triangle_locked(n as u16) {
-        return None;
-    }
-    let (a, b) = (walk.triangles[t][e], walk.triangles[t][(e + 1) % 3]);
-    let mid = ((i32::from(a.x) + i32::from(b.x)) / 2, (i32::from(a.y) + i32::from(b.y)) / 2, (i32::from(a.z) + i32::from(b.z)) / 2);
-    let c = centre(walk, n);
-    (!rt.solid_model_at(mid.0, mid.1, mid.2) && !rt.solid_model_at(c.0, c.1, c.2)).then_some(n)
+    (n < walk.triangles.len() && !rt.triangle_locked(n as u16)).then_some(n)
 }
 
 /// The triangles the player can walk to from `from` without entering a locked one.
@@ -260,6 +253,48 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
         }
     }
     seen
+}
+
+/// The model that stops the straight walk from `a` to `b`, if one does; `Err` when the walk leaves the walkmesh or
+/// enters a locked triangle instead.
+fn stopped_by(rt: &FieldRuntime, a: Pos, b: Pos) -> Result<Option<usize>, ()> {
+    let (dx, dy, dz) = (f64::from(b.0 - a.0), f64::from(b.1 - a.1), f64::from(b.2 - a.2));
+    let n = (dx.hypot(dy) / 8.0).ceil().max(1.0) as i32;
+    let mut prev = a;
+    for k in 1..=n {
+        let f = f64::from(k) / f64::from(n);
+        let q = (a.0 + (dx * f) as i32, a.1 + (dy * f) as i32, a.2 + (dz * f) as i32);
+        match rt.triangle_at(q.0, q.1, q.2) {
+            Some(t) if !rt.triangle_locked(t) => {}
+            _ => return Err(()),
+        }
+        if let Some(m) = rt.step_contacts(prev, q).first() {
+            return Ok(Some(*m));
+        }
+        prev = q;
+    }
+    Ok(None)
+}
+
+/// A corner to walk by on the way from `a` to `b` when someone solid stands on the straight line: beside them, on
+/// whichever side leaves room to pass. `None` when nobody is in the way, or there is no room on either side.
+fn detour(rt: &FieldRuntime, a: Pos, b: Pos) -> Option<Pos> {
+    let m = stopped_by(rt, a, b).ok()??;
+    let who = rt.models().get(m)?;
+    let (dx, dy) = (f64::from(b.0 - a.0), f64::from(b.1 - a.1));
+    let d = dx.hypot(dy).max(1.0);
+    let (px, py) = (-dy / d, dx / d);
+    let r = f64::from(rt.player_solid_range());
+    let keep = (r + f64::from(who.solid_range)) / 2.0 + r * std::f64::consts::FRAC_1_SQRT_2;
+    for margin in [8.0, 24.0, 48.0] {
+        for side in [1.0, -1.0] {
+            let by = ((f64::from(who.x) + px * side * (keep + margin)) as i32, (f64::from(who.y) + py * side * (keep + margin)) as i32, a.2);
+            if stopped_by(rt, a, by) == Ok(None) && stopped_by(rt, by, b) == Ok(None) {
+                return Some(by);
+            }
+        }
+    }
+    None
 }
 
 /// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
@@ -300,6 +335,17 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
         t = p;
     }
     corners.reverse();
+    // Round whoever stands on the way, where there is room to pass them (else the walk will stop at them).
+    let mut clear_corners = Vec::new();
+    let mut cur = from;
+    for c in corners {
+        if let Some(round) = detour(rt, cur, c) {
+            clear_corners.push(round);
+        }
+        clear_corners.push(c);
+        cur = c;
+    }
+    let corners = clear_corners;
     let mut out = Vec::new();
     let mut legs = Vec::new();
     let mut cur = from;
@@ -612,10 +658,20 @@ fn main() {
         let on_reach = |rt: &FieldRuntime, p: Pos| rt.triangle_at(p.0, p.1, p.2).is_some_and(|t| reach.get(usize::from(t)).copied().unwrap_or(false));
         let pc = rt.state.pc_model;
         for (mi, m) in rt.models().iter().enumerate().filter(|(i, m)| Some(*i) != pc && !m.talk_off) {
-            for (ox, oy) in [(-40, 0), (40, 0), (0, -40), (0, 40), (-28, -28), (28, 28), (-28, 28), (28, -28)] {
-                // (as near as someone solid lets a player stand)
-                let Some(stand) = beside(&rt, (m.x + ox, m.y + oy, m.z)) else { continue };
-                if on_reach(&rt, stand) && !rt.solid_model_at(stand.0, stand.1, stand.2) {
+            // As near as a player gets walking straight at them (their solid range stops it a stride short), and
+            // within their talk range.
+            let solid = f64::from(rt.player_solid_range());
+            let near = (solid + f64::from(m.solid_range)) / 2.0 + solid + 6.0;
+            let far = f64::from(m.talk_range) + solid - 4.0;
+            if far < 12.0 {
+                continue;
+            }
+            let off = near.min(far);
+            let diag = off * std::f64::consts::FRAC_1_SQRT_2;
+            for (ox, oy) in [(-off, 0.0), (off, 0.0), (0.0, -off), (0.0, off), (-diag, -diag), (diag, diag), (-diag, diag), (diag, -diag)] {
+                let (ox, oy) = (ox as i32, oy as i32);
+                let stand = (m.x + ox, m.y + oy, m.z);
+                if on_reach(&rt, stand) {
                     let face = direction_of(i64::from(-ox), i64::from(-oy));
                     actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
                     break;
@@ -623,32 +679,46 @@ fn main() {
             }
         }
         for (li, l) in rt.lines().iter().enumerate().filter(|(_, l)| l.active) {
-            let mid = ((i32::from(l.a.0) + i32::from(l.b.0)) / 2, (i32::from(l.a.1) + i32::from(l.b.1)) / 2, (i32::from(l.a.2) + i32::from(l.b.2)) / 2);
             let (dx, dy) = (f64::from(l.b.0 - l.a.0), f64::from(l.b.1 - l.a.1));
             let n = (dx * dx + dy * dy).sqrt().max(1.0);
             let (nx, ny) = (-dy / n, dx / n);
-            let side = |k: i32| (mid.0 + (nx * 5.0 * f64::from(k)) as i32, mid.1 + (ny * 5.0 * f64::from(k)) as i32, mid.2);
-            let (a_side, b_side) = (side(-6), side(6));
+            // A point of the line (its middle first: a long line is often closed off there by someone standing on it,
+            // and open further along), and the point `k` steps of five units off it there.
+            let along = |t: f64| ((f64::from(l.a.0) + dx * t) as i32, (f64::from(l.a.1) + dy * t) as i32, (f64::from(l.a.2) + f64::from(l.b.2 - l.a.2) * t) as i32);
+            let side = |t: f64, k: i32| {
+                let m = along(t);
+                (m.0 + (nx * 5.0 * f64::from(k)) as i32, m.1 + (ny * 5.0 * f64::from(k)) as i32, m.2)
+            };
+            const ALONG: [f64; 5] = [0.5, 0.25, 0.75, 0.1, 0.9];
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
-            if on_reach(&rt, a_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", a_side.0, a_side.1), (-6..=6).map(side).collect(), b_side, 0, false, format!("to {} {}", b_side.0, b_side.1)));
+            if let Some(t) = ALONG.into_iter().find(|t| on_reach(&rt, side(*t, -6))) {
+                let (from, to) = (side(t, -6), side(t, 6));
+                actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
             }
-            if on_reach(&rt, b_side) {
-                actions.push((format!("line {name} ({li}) across from {},{}", b_side.0, b_side.1), (-6..=6).rev().map(side).collect(), a_side, 0, false, format!("to {} {}", a_side.0, a_side.1)));
+            if let Some(t) = ALONG.into_iter().find(|t| on_reach(&rt, side(*t, 6))) {
+                let (from, to) = (side(t, 6), side(t, -6));
+                actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).rev().map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
             }
             // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
-            // in front of the player), or on its middle when neither side can be stood on.
+            // in front of the player), or on the line itself when neither side can be stood on.
             let mut stood = false;
-            for k in [-2, 2, -4, 4] {
-                let stand = side(k);
-                if on_reach(&rt, stand) {
-                    let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
-                    actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
-                    stood = true;
+            for t in ALONG {
+                for k in [-2, 2, -4, 4] {
+                    let stand = side(t, k);
+                    if on_reach(&rt, stand) {
+                        let face = direction_of((-nx * f64::from(k) * 100.0) as i64, (-ny * f64::from(k) * 100.0) as i64);
+                        actions.push((format!("line {name} ({li}); ok from {},{} facing {face}", stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
+                        stood = true;
+                    }
+                }
+                if stood {
+                    break;
                 }
             }
-            if !stood && on_reach(&rt, mid) {
-                actions.push((format!("line {name} ({li}); ok at {},{}", mid.0, mid.1), Vec::new(), mid, 0, true, "ok".to_string()));
+            if !stood {
+                if let Some(on) = ALONG.into_iter().map(along).find(|p| on_reach(&rt, *p)) {
+                    actions.push((format!("line {name} ({li}); ok at {},{}", on.0, on.1), Vec::new(), on, 0, true, "ok".to_string()));
+                }
             }
         }
 
