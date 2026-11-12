@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! FMV_FF7_DATA=<.../data> cargo run --release -p fmv-ff7 --example runtime_explore -- \
-//!     [--from FIELD] [--tri N] [--moment M] [--set SEL:ADDR=VALUE]... [--steps N] [--route-out FILE]
+//!     [--from FIELD] [--until FIELD] [--tri N] [--moment M] [--set SEL:ADDR=VALUE]... [--steps N] [--route-out FILE]
 //! ```
 //!
 //! A **state** is a running field and where the player stands in it. The search keeps a queue of states, always
@@ -492,6 +492,7 @@ fn main() {
     };
     let mut args = std::env::args().skip(1);
     let (mut start_field, mut steps, mut start_moment, mut route_out) = ("md1stin".to_string(), 200u32, None::<u16>, None::<String>);
+    let (mut until, mut reached_target) = (None::<String>, false);
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     let mut start_tri: Option<usize> = None;
     let (mut save_best, mut banks_file) = (None::<String>, None::<String>);
@@ -501,6 +502,7 @@ fn main() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
             "--from" => start_field = v,
+            "--until" => until = Some(v),
             "--steps" => steps = v.parse().unwrap_or(steps),
             "--moment" => start_moment = v.parse().ok(),
             "--route-out" => route_out = Some(v),
@@ -672,6 +674,14 @@ fn main() {
             println!("{step:>4} {field_name:<10} the player stands on no triangle at {at:?} (moment {now})");
             continue;
         };
+        if until.as_deref() == Some(field_name.as_str()) {
+            // Several real field transitions share one story moment. A focused replay needs the route to its
+            // requested destination even when no higher moment displaced the earlier best state.
+            best = (now, via.clone(), field_name.clone());
+            reached_target = true;
+            println!("target reached: {field_name} at moment {now}, triangle {here}");
+            break;
+        }
         let reach = reachable(&walk, &rt, here);
         let reach_count = reach.iter().filter(|r| **r).count();
 
@@ -975,7 +985,16 @@ fn main() {
     for l in &route {
         println!("  {l}");
     }
+    if let Some(target) = until.as_ref().filter(|_| !reached_target) {
+        eprintln!("target not reached: {target}; no target route written");
+        std::process::exit(1);
+    }
     if let Some(path) = route_out {
-        let _ = std::fs::write(path, commands(&best.1).join("\n") + "\n");
+        let mut cmds = commands(&best.1);
+        if let Some(target) = until {
+            // Even a route made entirely of automatic scenes must wait for its destination over TCP.
+            cmds.push(format!("{target}: wait 0"));
+        }
+        let _ = std::fs::write(path, cmds.join("\n") + "\n");
     }
 }

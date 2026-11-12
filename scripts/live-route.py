@@ -13,7 +13,8 @@ the player, no window is open, no battle runs), then plays the steps:
     ok           press OK (the field's own scripts decide what it does)
     wait S       stand S seconds
 
-An entry is over when its steps are done and the field is idle again, or when the player lands in another field.
+An entry is over when its steps are done and the field is idle again, or when the server starts a new field visit.
+Leaving an entry's field before its actions could start reports an obsolete route; those actions are not counted.
 Windows are answered (first choice), movies acknowledged, battles left to the server's companions.
 It prints what the server reports and ends with `ROUTE done=<entries played>/<entries> reached=<field> ...`
 (exit status 0 only when every entry was played).
@@ -149,7 +150,7 @@ def main():
     waited_for = None
     windows = set()
     pending = []
-    idx, steps, entry_area = 0, None, None
+    idx, steps = 0, None
     entry_expects_exit = False
     last_ping = last_move = busy_at = progress_at = time.monotonic()
     waiting_until = 0.0
@@ -176,8 +177,21 @@ def main():
                     with os.fdopen(os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
                         f.write(b["issued_token"])
             elif k in ("AreaManifest", "AreaChange"):
+                previous_area = area
                 area = b["area"]["key"]
                 if k == "AreaChange":
+                    # A scene can visit another field and return while control stays locked. Record the visit
+                    # boundary now, before busy filtering can hide it (including a jump to the same field).
+                    if steps is not None:
+                        idx, steps = idx + 1, None
+                    elif idx < len(route) and previous_area == route[idx][0]:
+                        status = "obsolete-route"
+                        print(f"  obsolete route: entry {idx + 1}/{len(route)} in {previous_area} was visited and left before its actions could start; actions unplayed", flush=True)
+                    entry_expects_exit = False
+                    pending = []  # answers queued in the previous visit must not dismiss a new field's windows
+                    leg_goal, leg_best, leg_best_at, tries, tries_goal, detour = None, 0.0, now, 0, None, None
+                    waited_for = None
+                    last_move, waiting_until = now, 0.0
                     pos, facing = b["arrival"], b["arrival_facing"]
                 c.send({"JoinArea": {"area": b["area"], "fingerprint": b["fingerprint"], "provenance": b["provenance"]}})
                 mesh = mesh_for(area, args.cache, args.tool)
@@ -185,6 +199,8 @@ def main():
                 reached.append(area)
                 busy_at = progress_at = now
                 print(f"AREA {area}", flush=True)
+                if status == "obsolete-route":
+                    break
             elif k == "AreaSnapshot":
                 for e in b["entities"]:
                     if e["id"] == entity:
@@ -236,6 +252,8 @@ def main():
             elif k == "Reject":
                 print(f"REJECT {b}", flush=True)
                 return 2
+        if status == "obsolete-route":
+            break
         for due, msg in [p for p in pending if p[0] <= now]:
             c.send(msg)
         pending = [p for p in pending if p[0] > now]
@@ -308,15 +326,11 @@ def main():
             if area != field or now - busy_at < 0.6:
                 time.sleep(0.02)
                 continue
-            steps, entry_area = list(entry_steps), area
+            steps = list(entry_steps)
             # A route with an explicit gateway still needs to leave this field after any conversation on the way.
             # Other entries may intentionally end when a script takes over (ladders, jumps, story scenes).
             entry_expects_exit = any(s[0] == "gate" for s in entry_steps)
             print(f"[{idx + 1}/{len(route)}] {field}: {'; '.join(' '.join(s) for s in entry_steps)}", flush=True)
-        if area != entry_area:
-            idx, steps = idx + 1, None  # the entry took us to another field
-            progress_at = now
-            continue
         if not steps:
             if now - busy_at >= 0.8 and now >= waiting_until:
                 idx, steps = idx + 1, None

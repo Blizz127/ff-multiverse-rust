@@ -113,6 +113,14 @@ server state; no route run should use the owner's saves.
 An entry with an explicit `gate` resumes its remaining walk after a scene in the same field (the station's farewell
 conversation is one example). Other entries still stop when a script takes over, since a ladder or jump may be their
 intended result. A failed run prints the field it expected and the control, window and pending-step state.
+Field transitions complete an already-started entry immediately, even while control stays locked: an automatic
+flashback can leave the bar and return without ever accepting player input. An unstarted entry whose field is
+visited and left is reported as an obsolete route, with its actions still unplayed; the bot never skips it as passed.
+
+For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
+route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`
+so the TCP replay checks arrival even when the entire trip is automatic. Failure to reach the target exits nonzero
+and writes no target route. This matters when several fields share one story moment, as on the next train journey.
 
 **Earlier numbers were wrong.** The first two versions of the solver (2026-11-11) stood on any triangle and took any
 gateway. They "reached" moments 78 and 197 by leaving Sector 7 through a gate a man stands in, and moment 33 by letting
