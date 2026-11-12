@@ -741,16 +741,24 @@ fn main() {
             };
             const ALONG: [f64; 5] = [0.5, 0.25, 0.75, 0.1, 0.9];
             let name = rt.entity_name(l.entity).unwrap_or("").to_string();
-            // (a crossing is a walk: over linked ground from one side to the other. A line at a ledge's edge has no far
-            // side to walk to, and a probe put there would stand on whatever lies under it)
-            let crossable = |from: Pos, to: Pos| on_reach(&rt, from) && stopped_by(&walk, &rt, from, to).is_ok();
-            if let Some(t) = ALONG.into_iter().find(|t| crossable(side(*t, -6), side(*t, 6))) {
-                let (from, to) = (side(t, -6), side(t, 6));
-                actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
-            }
-            if let Some(t) = ALONG.into_iter().find(|t| crossable(side(*t, 6), side(*t, -6))) {
-                let (from, to) = (side(t, 6), side(t, -6));
-                actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), (-6..=6).rev().map(|k| side(t, k)).collect(), to, 0, false, format!("to {} {}", to.0, to.1)));
+            // A crossing is a walk over linked ground from thirty units before the line to as far beyond it as there is
+            // ground (thirty units, or less at a ledge: a jump's line lies a stride from the edge). A probe put beyond
+            // the ground would stand on whatever lies under it.
+            let crossing = |sign: i32| {
+                ALONG.into_iter().find_map(|t| {
+                    let from = side(t, -6 * sign);
+                    if !on_reach(&rt, from) {
+                        return None;
+                    }
+                    [6, 3, 2, 1].into_iter().find(|far| stopped_by(&walk, &rt, from, side(t, far * sign)).is_ok()).map(|far| (t, far))
+                })
+            };
+            for sign in [1, -1] {
+                if let Some((t, far)) = crossing(sign) {
+                    let (from, to) = (side(t, -6 * sign), side(t, far * sign));
+                    let path: Vec<Pos> = (-6..=far).map(|k| side(t, k * sign)).collect();
+                    actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), path, to, 0, false, format!("to {} {}", to.0, to.1)));
+                }
             }
             // OK at the line: stand a few units off it on a reachable side, facing it (the original wants the line
             // in front of the player), or on the line itself when neither side can be stood on.

@@ -138,6 +138,7 @@ def main():
     leg_goal, leg_best, leg_best_at, tries, tries_goal, detour, rejected = None, 0.0, 0.0, 0, None, None, 0
     locked = in_battle = False
     cast = []
+    battle_at = 0.0
     waited_for = None
     windows = set()
     pending = []
@@ -208,6 +209,7 @@ def main():
                 pending.append((now + 0.3, {"LiveMovieDone": {"movie": b["movie"]}}))
             elif k == "EncounterStart":
                 in_battle = True
+                battle_at = now
                 print(f"  BATTLE start {b.get('formation_id')}", flush=True)
             elif k == "BattleEnd":
                 in_battle = False
@@ -221,6 +223,8 @@ def main():
         busy = locked or bool(windows) or in_battle or bool(pending)
         if busy:
             busy_at = now
+        if in_battle and now - battle_at < 600:
+            progress_at = now  # a boss takes minutes: a battle under way is progress
         if idx >= len(route):
             status = "done"
             break
