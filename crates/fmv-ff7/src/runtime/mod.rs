@@ -317,6 +317,10 @@ pub struct FieldState {
     pub encounter_table: u8,
     /// The model the player controls (`PC` of party slot 0, or `CC`).
     pub pc_model: Option<usize>,
+    /// The model that is the player's own character for a host: the one that was the controlled model when the
+    /// player last had control. A scene that hands "control" to someone else while the player is locked (`CC` under
+    /// `UC`: a child lifted onto a shoulder, so the camera follows her) does not make the player that character.
+    pub player_model: Option<usize>,
     /// `PMVIE`'s chosen movie.
     pub movie: Option<u16>,
     /// `MPNAM`'s map name dialog.
@@ -473,6 +477,15 @@ impl FieldRuntime {
             }
         }
         self.current = 0;
+        self.state.player_model = self.state.pc_model;
+    }
+
+    /// The player's own character is whoever the scripts let the player control, as of the last time the player had
+    /// control (or the field began).
+    fn follow_player_model(&mut self) {
+        if !self.state.character_lock || self.state.player_model.is_none() {
+            self.state.player_model = self.state.pc_model;
+        }
     }
 
     /// Advance one field frame (1/30 s). `player` is where the player's character is and what they pressed;
@@ -481,6 +494,7 @@ impl FieldRuntime {
         self.previous_player = self.player;
         self.player = player;
         self.frame += 1;
+        self.follow_player_model();
         self.detect_player_events();
         self.dispatch_event_requests();
         let count = self.ents.len();
@@ -499,6 +513,7 @@ impl FieldRuntime {
             self.current += 1;
         }
         self.update_families();
+        self.follow_player_model();
     }
 
     /// Execute the instruction at entity `e`'s PC.
@@ -675,16 +690,22 @@ impl FieldRuntime {
         true
     }
 
-    /// The player's position is only the host's to set while the player has control; a script moving the player's
-    /// model moves it here, and the host should follow ([`FieldRuntime::pc_model`]).
+    /// The model the scripts call the controlled one (`PC`, `CC`): what lines, talks and the camera go by. A host
+    /// placing the player's character wants [`FieldRuntime::player_model`].
     pub fn pc_model(&self) -> Option<&Model> {
         self.state.pc_model.and_then(|m| self.models.get(m))
     }
 
+    /// The player's own character. Its position is only the host's to set while the player has control; a script
+    /// moving it moves it here, and the host should follow.
+    pub fn player_model(&self) -> Option<&Model> {
+        self.state.player_model.or(self.state.pc_model).and_then(|m| self.models.get(m))
+    }
+
     /// Whether the scripts, not the player, place the player's character now: control is locked (`UC`) or its model is
-    /// in a scripted move (a walk, jump or ladder). The host then follows [`FieldRuntime::pc_model`].
+    /// in a scripted move (a walk, jump or ladder). The host then follows [`FieldRuntime::player_model`].
     pub fn player_scripted(&self) -> bool {
-        self.state.character_lock || self.question_open() || self.pc_model().is_some_and(|m| m.move_mode != MoveMode::None)
+        self.state.character_lock || self.question_open() || self.player_model().is_some_and(|m| m.move_mode != MoveMode::None)
     }
 
     /// The entity a model belongs to and its talk script, for a host that resolves talking itself.
@@ -871,17 +892,29 @@ impl FieldRuntime {
     /// closer to a solid model's than half their two solid ranges (within 128 units of height). People standing in a
     /// doorway are how the game closes it.
     pub fn solid_model_at(&self, x: i32, y: i32, z: i32) -> bool {
+        self.solid_model_circle(x, y, z).is_some()
+    }
+
+    /// The solid model in the way at `(x, y, z)`, if any: its centre and the distance the player's centre keeps from
+    /// it (the nearest one when several overlap).
+    pub fn solid_model_circle(&self, x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
         let solid = i64::from(self.player_solid_range());
         let pc = self.state.pc_model;
-        self.models.iter().enumerate().any(|(i, m)| {
-            if Some(i) == pc || m.solid_off {
-                return false;
-            }
-            let dz = i64::from(m.z) - i64::from(z);
-            let (dx, dy) = (i64::from(m.x) - i64::from(x), i64::from(m.y) - i64::from(y));
-            let threshold = (solid + i64::from(m.solid_range)) / 2;
-            dz > -127 && dz < 128 && dx * dx + dy * dy < threshold * threshold
-        })
+        self.models
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                if Some(i) == pc || m.solid_off {
+                    return None;
+                }
+                let dz = i64::from(m.z) - i64::from(z);
+                let (dx, dy) = (i64::from(m.x) - i64::from(x), i64::from(m.y) - i64::from(y));
+                let threshold = (solid + i64::from(m.solid_range)) / 2;
+                let d2 = dx * dx + dy * dy;
+                (dz > -127 && dz < 128 && d2 < threshold * threshold).then_some((d2, (m.x, m.y, threshold as i32)))
+            })
+            .min_by_key(|(d2, _)| *d2)
+            .map(|(_, c)| c)
     }
 
     /// The player model's solid range: the original gives the player 34 units at scale 512.

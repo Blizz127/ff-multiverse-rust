@@ -26,9 +26,9 @@ pub struct CastMember {
 }
 
 impl FieldRuntime {
-    /// The visible models other than the one the player controls, with what the client needs to draw them.
+    /// The visible models other than the player's own character, with what the client needs to draw them.
     pub fn cast(&self, loader: Option<&ModelLoader>) -> Vec<CastMember> {
-        let pc = self.state.pc_model;
+        let pc = self.state.player_model.or(self.state.pc_model);
         self.models
             .iter()
             .enumerate()

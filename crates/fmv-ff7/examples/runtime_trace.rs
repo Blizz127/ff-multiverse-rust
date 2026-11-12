@@ -100,20 +100,20 @@ fn main() {
         }
         // while the scripts hold or move the player, the player is where they put it
         if rt.player_scripted() {
-            if let Some(m) = rt.pc_model() {
+            if let Some(m) = rt.player_model() {
                 at = Some((m.x, m.y));
             }
         }
         if let (true, Some(target)) = (f > after.max(1), walk_tri.and_then(tri_centre)) {
             // follow the scripts while they hold the player, else walk 24 units a frame toward the triangle's centre
-            let cur = if rt.player_scripted() { rt.pc_model().map(|m| (m.x, m.y)) } else { at }.or_else(|| rt.pc_model().map(|m| (m.x, m.y)));
+            let cur = if rt.player_scripted() { rt.player_model().map(|m| (m.x, m.y)) } else { at }.or_else(|| rt.player_model().map(|m| (m.x, m.y)));
             if let Some((x, y)) = cur {
                 let (dx, dy) = (f64::from(target.0 - x), f64::from(target.1 - y));
                 let d = (dx * dx + dy * dy).sqrt();
                 at = Some(if rt.player_scripted() || d <= 24.0 { if rt.player_scripted() { (x, y) } else { target } } else { (x + (dx / d * 24.0) as i32, y + (dy / d * 24.0) as i32) });
             }
         }
-        let z = rt.pc_model().map_or(0, |m| m.z);
+        let z = rt.player_model().map_or(0, |m| m.z);
         let player = at.map(|(x, y)| PlayerInput { x, y, z, ok: ok_every > 0 && f % ok_every == 0, dir: 64, ..Default::default() });
         rt.tick(player);
         for ev in rt.drain_events() {

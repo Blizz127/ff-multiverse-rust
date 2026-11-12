@@ -276,3 +276,30 @@ fn a_background_trigger_opens_while_the_player_is_at_its_line_and_closes_when_it
     }
     assert!(!shown(&rt), "walking away closes it again");
 }
+
+#[test]
+fn control_handed_to_someone_else_while_the_player_is_held_does_not_make_the_player_them() {
+    // "cl" is the player's character at (10, 0); "kid" stands at (100, 0). A director holds the player (UC 1), hands
+    // control to the kid (CC 1), waits, hands it back (CC 0) and lets go (UC 0): the bar scene's child on a shoulder.
+    let cl = [&[0xA1, 0x00][..], &[0xA0, 0x00], &[0xA5, 0x00, 0x00, 10, 0, 0, 0, 0, 0, 0, 0]].concat();
+    let kid = [&[0xA1, 0x01][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
+    let director = [&[0x33, 1][..], &[0xBF, 1], &[0x24, 3, 0], &[0xBF, 0], &[0x33, 0], IDLE].concat();
+    let mut section = SynthScript::default().entity("cl", vec![script0(&cl, IDLE)]).entity("kid", vec![script0(&kid, IDLE)]).entity("dir", vec![script0(&[], &director)]);
+    section.scale = 512;
+    let mut banks = Banks::default();
+    banks.set(PARTY_SLOTS, 0);
+    let mut rt = FieldRuntime::new(&section.build(), banks).expect("runtime");
+    rt.init();
+    assert_eq!(rt.player_model().map(|m| m.x), Some(10));
+    rt.tick(None);
+    assert!(rt.player_scripted());
+    assert_eq!(rt.pc_model().map(|m| m.x), Some(100), "the scripts' controlled model is the kid");
+    assert_eq!(rt.player_model().map(|m| m.x), Some(10), "the player's character is still cl");
+    assert_eq!(rt.cast(None).len(), 0, "(no loader: nobody can be drawn)");
+    for _ in 0..6 {
+        rt.tick(None);
+    }
+    assert!(!rt.player_scripted());
+    assert_eq!(rt.player_model().map(|m| m.x), Some(10));
+    assert_eq!(rt.state.player_model, rt.state.pc_model);
+}

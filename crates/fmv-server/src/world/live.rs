@@ -128,6 +128,11 @@ pub trait LiveField: Send {
     /// Whether a script closed the way from `from` to `to` (FF7: `to` lies on a walkmesh triangle a script locked and
     /// `from` does not, so a player already inside can still walk out).
     fn blocks(&self, from: Pos, to: Pos) -> bool;
+    /// Where a move from `from` to `to` ends instead when someone solid stands at `to`: beside them, so a player
+    /// walking into a character slides round it (the original does the same). `None` when nobody is in the way.
+    fn slide(&self, _from: Pos, _to: Pos) -> Option<Pos> {
+        None
+    }
     fn battles_disabled(&self) -> bool;
     /// The progression to save over `saved` (which this field started from or last saved), if the field changed it.
     fn progression(&self, saved: &[u8]) -> Option<Vec<u8>>;
@@ -253,6 +258,11 @@ impl World {
     /// Whether the live field `entity` stands in closes the way from `from` to `to`.
     pub(super) fn live_blocks(&self, entity: EntityId, from: Pos, to: Pos) -> bool {
         self.live_run_of(entity).and_then(|id| self.live.runs.get(&id)).is_some_and(|r| r.field.blocks(from, to))
+    }
+
+    /// Where the live field `entity` stands in ends a move to `to` that runs into someone solid.
+    pub(super) fn live_slide(&self, entity: EntityId, from: Pos, to: Pos) -> Option<Pos> {
+        self.live_run_of(entity).and_then(|id| self.live.runs.get(&id)).and_then(|r| r.field.slide(from, to))
     }
 
     pub(super) fn live_map_jumps_disabled(&self, entity: EntityId) -> bool {

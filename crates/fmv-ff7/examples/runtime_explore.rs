@@ -128,11 +128,33 @@ fn busy(rt: &FieldRuntime) -> bool {
 /// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived (`false`: a
 /// script took over on the way and changed something: the story, the field's scratch or where the player stands) and
 /// where it is. A script that only says something on the way (bumping into someone) is heard out and the walk goes on.
+/// Where a player wanting to stand at `p` stands: `p`, or beside whoever solid is there (the host slides the player
+/// out along the line from their centre). `None` when that is their very centre.
+fn beside(rt: &FieldRuntime, p: Pos) -> Option<Pos> {
+    let Some((cx, cy, keep)) = rt.solid_model_circle(p.0, p.1, p.2) else { return Some(p) };
+    let (dx, dy) = (f64::from(p.0 - cx), f64::from(p.1 - cy));
+    let d = dx.hypot(dy);
+    if d < 0.5 {
+        return None;
+    }
+    let k = (f64::from(keep) + 2.5) / d;
+    Some((cx + (dx * k).round() as i32, cy + (dy * k).round() as i32, p.2))
+}
+
 fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
     let mut at = from;
     let mut chats = 0;
     for p in approach {
-        at = *p;
+        // Someone solid on the way is walked round as the host makes a player do it; with no room beside them the
+        // walk ends here. (A player someone walked into may step out freely.)
+        let mut p = *p;
+        if !rt.solid_model_at(at.0, at.1, at.2) && rt.solid_model_at(p.0, p.1, p.2) {
+            match beside(rt, p).filter(|q| !rt.solid_model_at(q.0, q.1, q.2) && rt.triangle_at(q.0, q.1, q.2).is_some_and(|t| !rt.triangle_locked(t))) {
+                Some(q) => p = q,
+                None => return (false, at),
+            }
+        }
+        at = p;
         rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
         let before = out.windows;
         if pump(rt, out) {
@@ -180,7 +202,10 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
             at = *p;
         }
         if rt.player_scripted() {
-            if let Some(m) = rt.pc_model() {
+            if let Some(m) = rt.player_model() {
+                if std::env::var_os("FMV_EXPLORE_JUMPS").is_some() && (m.x - at.0).abs() + (m.y - at.1).abs() + (m.z - at.2).abs() > 30 {
+                    println!("        frame {f}: the scripts put the player (model {:?}) at {},{},{} from {},{},{}", rt.state.pc_model, m.x, m.y, m.z, at.0, at.1, at.2);
+                }
                 at = (m.x, m.y, m.z);
             }
         }
@@ -192,7 +217,7 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
         }
     }
     if rt.player_scripted() {
-        if let Some(m) = rt.pc_model() {
+        if let Some(m) = rt.player_model() {
             at = (m.x, m.y, m.z);
         }
     }
@@ -375,6 +400,8 @@ fn main() {
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     let mut start_tri: Option<usize> = None;
     let (mut save_best, mut banks_file) = (None::<String>, None::<String>);
+    // A directory that gets the story on each first entry of a field at a moment (`FIELD-MOMENT.hex`), for the trace tool.
+    let mut save_entries: Option<String> = None;
     while let Some(a) = args.next() {
         let v = args.next().unwrap_or_default();
         match a.as_str() {
@@ -384,6 +411,7 @@ fn main() {
             "--route-out" => route_out = Some(v),
             "--tri" => start_tri = v.parse().ok(),
             "--save-best" => save_best = Some(v),
+            "--save-entries" => save_entries = Some(v),
             "--banks" => banks_file = Some(v),
             "--set" => {
                 if let Some((sa, val)) = v.split_once('=') {
@@ -467,6 +495,12 @@ fn main() {
                     continue;
                 }
                 let Ok(mut rt) = FieldRuntime::new(section, banks.clone()) else { continue };
+                if let Some(dir) = &save_entries {
+                    let file = format!("{dir}/{field_name}-{}.hex", moment_of(&banks));
+                    if !std::path::Path::new(&file).exists() {
+                        let _ = std::fs::write(&file, format!("{}\n", banks.to_hex()));
+                    }
+                }
                 rt.set_walkmesh(Arc::clone(&walk));
                 if let Some((save, gil)) = &carry {
                     rt.set_save_data(save.clone());
@@ -486,7 +520,7 @@ fn main() {
         visited.insert(field_name.clone());
 
         // Where the player stands: where the state says, else where the field's own scripts put its character.
-        let mut at = pos.or_else(|| rt.pc_model().map(|m| (m.x, m.y, m.z))).unwrap_or_else(|| centre(&walk, 0));
+        let mut at = pos.or_else(|| rt.player_model().map(|m| (m.x, m.y, m.z))).unwrap_or_else(|| centre(&walk, 0));
         // (an arrival's height is its triangle's)
         if fresh {
             if let Some(t) = tri.filter(|t| *t < walk.triangles.len()) {
@@ -579,8 +613,9 @@ fn main() {
         let pc = rt.state.pc_model;
         for (mi, m) in rt.models().iter().enumerate().filter(|(i, m)| Some(*i) != pc && !m.talk_off) {
             for (ox, oy) in [(-40, 0), (40, 0), (0, -40), (0, 40), (-28, -28), (28, 28), (-28, 28), (28, -28)] {
-                let stand = (m.x + ox, m.y + oy, m.z);
-                if on_reach(&rt, stand) {
+                // (as near as someone solid lets a player stand)
+                let Some(stand) = beside(&rt, (m.x + ox, m.y + oy, m.z)) else { continue };
+                if on_reach(&rt, stand) && !rt.solid_model_at(stand.0, stand.1, stand.2) {
                     let face = direction_of(i64::from(-ox), i64::from(-oy));
                     actions.push((format!("talk {} (model {mi}) from {},{}", rt.entity_name(m.entity).unwrap_or(""), stand.0, stand.1), Vec::new(), stand, face, true, format!("face {face}; ok")));
                     break;

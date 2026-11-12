@@ -133,6 +133,9 @@ def main():
     entity = area = mesh = None
     pos, facing, seq = None, 0.0, 0
     legs = []
+    # Getting round whoever stands in the way: the corner being walked to, the nearest we came to it and when, how
+    # many ways round were tried, and whether the first leg is such a way round.
+    leg_goal, leg_best, leg_best_at, tries, tries_goal, detour, rejected = None, 0.0, 0.0, 0, None, None, 0
     locked = in_battle = False
     windows = set()
     pending = []
@@ -189,9 +192,12 @@ def main():
                 if steps is not None:
                     steps = []
             elif k == "MoveRejected":
+                # Refused, or ended beside someone solid: carry on towards the same corner from where the server says
+                # we stand (the stuck check below walks round whoever is in the way).
                 pos = b["corrected"]
-                legs = []
-                print(f"  rejected, back at {round(pos['x'])},{round(pos['y'])}", flush=True)
+                rejected += 1
+                if args.verbose:
+                    print(f"  corrected to {round(pos['x'])},{round(pos['y'])}", flush=True)
             elif k == "LiveMovie":
                 print(f"  MOVIE {b['movie']}", flush=True)
                 pending.append((now + 0.3, {"LiveMovieDone": {"movie": b["movie"]}}))
@@ -224,6 +230,29 @@ def main():
                 tx, ty = legs[0]
                 dx, dy = tx - pos["x"], ty - pos["y"]
                 d = math.hypot(dx, dy)
+                on_detour = detour is not None and legs[0] == detour
+                if leg_goal != legs[0] or d < leg_best - 1.0:
+                    if not on_detour and legs[0] != tries_goal:
+                        tries, tries_goal = 0, legs[0]
+                    leg_goal, leg_best, leg_best_at = legs[0], d, now
+                elif now - leg_best_at > 1.0:
+                    # No nearer for a second: someone stands in the way (or on the corner itself).
+                    leg_best_at = now
+                    if on_detour:
+                        legs.pop(0)
+                        detour = None
+                    elif tries >= 4 and d < 90:
+                        print(f"  gave up on corner {round(tx)},{round(ty)} from {round(pos['x'])},{round(pos['y'])}", flush=True)
+                        legs.pop(0)
+                    else:
+                        side = (-1, 1)[tries % 2] * (45 + 35 * (tries // 2))
+                        tries += 1
+                        n = d or 1.0
+                        detour = (pos["x"] - dy / n * side + dx / n * 10, pos["y"] + dx / n * side + dy / n * 10)
+                        legs.insert(0, detour)
+                        print(f"  in the way at {round(pos['x'])},{round(pos['y'])}: going round ({side:+d})", flush=True)
+                    time.sleep(0.01)
+                    continue
                 step = args.speed * min(now - last_move, 0.2)
                 last_move = now
                 if d <= step:

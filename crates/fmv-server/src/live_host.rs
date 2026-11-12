@@ -168,7 +168,7 @@ impl LiveField for Ff7Live {
     }
 
     fn player_place(&self) -> Option<(Pos, f32)> {
-        self.rt.pc_model().map(|m| (pos_of(m.x, m.y, m.z), field_direction_to_facing(m.dir)))
+        self.rt.player_model().map(|m| (pos_of(m.x, m.y, m.z), field_direction_to_facing(m.dir)))
     }
 
     fn answer(&mut self, window: u8, choice: Option<u8>) -> bool {
@@ -214,6 +214,28 @@ impl LiveField for Ff7Live {
         // (someone standing in the way blocks like a locked triangle: a player already inside the circle can step out)
         let solid = |p: Pos| self.rt.solid_model_at(at(p).0, at(p).1, at(p).2);
         (locked(to) && !locked(from)) || (solid(to) && !solid(from))
+    }
+
+    fn slide(&self, from: Pos, to: Pos) -> Option<Pos> {
+        let at = |p: Pos| (p.x.round() as i32, p.y.round() as i32, p.z.round() as i32);
+        // (a player someone walked into is free to step out)
+        if self.rt.solid_model_at(at(from).0, at(from).1, at(from).2) {
+            return None;
+        }
+        let (cx, cy, keep) = self.rt.solid_model_circle(at(to).0, at(to).1, at(to).2)?;
+        let (cx, cy, keep) = (cx as f32, cy as f32, keep as f32 + 1.5);
+        let (dx, dy) = (to.x - cx, to.y - cy);
+        let d = dx.hypot(dy);
+        // Out along the line from their centre through where the player wanted to stand (from where the player is, if
+        // that was their very centre).
+        let (ux, uy) = if d > 0.5 {
+            (dx / d, dy / d)
+        } else {
+            let (fx, fy) = (from.x - cx, from.y - cy);
+            let f = fx.hypot(fy).max(1.0);
+            (fx / f, fy / f)
+        };
+        Some(Pos::new(cx + ux * keep, cy + uy * keep, to.z))
     }
 
     fn map_jumps_disabled(&self) -> bool {

@@ -678,8 +678,15 @@ impl World {
     /// budget, and facing and anim are tracked only from accepted moves.
     pub fn apply_move(&mut self, entity: EntityId, to: Pos, facing: f32, anim: AnimState, now: Instant) -> MoveOutcome {
         // A field script may hold the player (the original's UC, an open window, a battle or movie under way).
-        let live_locked = self.live_locked(entity)
-            || self.players.get(&entity).is_some_and(|p| to.is_finite() && self.live_blocks(entity, p.snapshot.pos, to));
+        let live_held = self.live_locked(entity);
+        // Walking into someone solid ends beside them (the player slides round a character, as in the original).
+        let slid = if live_held || !to.is_finite() { None } else { self.players.get(&entity).and_then(|p| self.live_slide(entity, p.snapshot.pos, to)) };
+        let to = slid.unwrap_or(to);
+        let live_blocked = !live_held && self.players.get(&entity).is_some_and(|p| to.is_finite() && self.live_blocks(entity, p.snapshot.pos, to));
+        let live_locked = live_held || live_blocked;
+        if live_locked {
+            tracing::debug!(?entity, held = live_held, blocked = live_blocked, ?to, "live field refused a move");
+        }
         // The rules are the rules of the area the player stands in (areas differ in speed).
         let (from, chord) = {
             let Some(p) = self.players.get_mut(&entity) else {
@@ -760,7 +767,7 @@ impl World {
                     if !self.live_battles_disabled(entity) {
                         self.roll_encounter(entity, dist, now);
                     }
-                    return MoveOutcome::Applied;
+                    return if clipped || slid.is_some() { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied };
                 }
                 // An original scripted line owns its accepted crossing before exits, story
                 // points, local links or random encounters can act on the same move.
@@ -795,6 +802,7 @@ impl World {
                 if clipped { MoveOutcome::Relocated { corrected: accepted } } else { MoveOutcome::Applied }
             }
             Chord::Blocked { place } => {
+                tracing::debug!(?entity, ?from, ?to, ?place, "the walkmesh refused a move");
                 let Some(p) = self.players.get_mut(&entity) else {
                     return MoveOutcome::Gone;
                 };
