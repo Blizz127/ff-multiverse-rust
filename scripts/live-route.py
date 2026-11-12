@@ -20,7 +20,9 @@ An explicit trailing `idle` survives a same-field script taking over; movement s
 Optional `@choice FIELD DIALOG INDEX` headers select an answer for that field/dialogue on every occurrence.
 INDEX counts from zero, relative to the question's first choice. Headers precede all route entries; unspecified
 questions use choice zero. Invalid or duplicate headers fail before connecting; an out-of-range answer fails
-before it is sent. Movies are acknowledged, battles left to the server's companions.
+before it is sent. `--answer-delay` controls the response delay for each window (default 0.2 seconds); this is a
+test policy, not an emulation of the original window animation or text timing. Movies are acknowledged, battles
+left to the server's companions.
 It prints what the server reports and ends with `ROUTE done=<entries played>/<entries> reached=<field> ...`
 (exit status 0 only when every entry was played).
 
@@ -79,6 +81,18 @@ def answer_choice(choices, field, dialog, ask):
     if not 0 <= index <= ask["last"] - ask["first"]:
         raise ValueError(f"{field} dialogue {dialog}: choice {index} outside 0..{ask['last'] - ask['first']}")
     return index
+
+
+def response_delay(value):
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("answer delay must be finite and nonnegative")
+    return seconds
+
+
+def without_window_answer(pending, window):
+    """An answer belongs to this opening of a window, never to a later reuse of its number."""
+    return [(due, msg) for due, msg in pending if msg.get("LiveAnswer", {}).get("window") != window]
 
 
 class IdleWait:
@@ -187,6 +201,7 @@ def main():
     ap.add_argument("--token-file", help="resume a throwaway test account; register and save its token when missing")
     ap.add_argument("--speed", type=float, default=200.0, help="walking speed, field units per second")
     ap.add_argument("--stall", type=float, default=60.0, help="give up after this long without progress")
+    ap.add_argument("--answer-delay", type=response_delay, default=0.2, help="seconds before answering each dialogue window (test policy)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     try:
@@ -280,6 +295,7 @@ def main():
                 # Count a new window as progress, never the repeated cast/lock snapshots of a stuck scene.
                 progress_at = now
                 windows.add(b["window"])
+                pending = without_window_answer(pending, b["window"])
                 ask = b.get("ask")
                 if args.verbose:
                     print(f"  WINDOW {b['window']} dialog={b['dialog']} ask={ask}", flush=True)
@@ -291,9 +307,10 @@ def main():
                         return 2
                     if args.verbose and ask is not None:
                         print(f"  ANSWER {area} dialog={b['dialog']} choice={choice}", flush=True)
-                    pending.append((now + 0.2, {"LiveAnswer": {"window": b["window"], "choice": choice}}))
+                    pending.append((now + args.answer_delay, {"LiveAnswer": {"window": b["window"], "choice": choice}}))
             elif k == "LiveWindowClosed":
                 windows.discard(b["window"])
+                pending = without_window_answer(pending, b["window"])
             elif k == "LiveControl":
                 locked = b["locked"]
                 idle_interrupted |= locked

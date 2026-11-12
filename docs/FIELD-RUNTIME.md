@@ -135,6 +135,23 @@ headers fail before connecting; a configured answer outside the encountered ques
 answering. This is an explicit replay policy, not automatic exploration of all dialogue branches. Busy solver states
 also report script PCs/waits and scratch counters, so a bounded settle failure need not be mistaken for a closed path.
 
+For timing diagnosis, the TCP bot accepts `--answer-delay SECONDS` (default0.2). A window closing or being reused
+cancels its old queued answer. The single-field trace accepts `--choice DIALOG=INDEX` and
+`--answer-delay-frames N` (default0), and continues ticking every entity while an answer waits. Its
+`--walk-tri` now defaults to200 units/sec (`--speed` changes it); fractional positions accumulate between ticks and
+are rounded for the runtime's integer input. `--then-tri` remains a diagnostic placement, not a gameplay route.
+These response delays are test policies, not native window emulation; `runtime_explore` still answers immediately.
+
+**Known window timing gap (2026-11-12):** the runtime accepts answers as soon as a window opens and resumes the
+owning script on its next poll. The GUI also displays page text immediately. The pinned PSX source instead grows
+the window, processes text/control bytes using message speed and held-OK input, accepts a fresh confirmation only
+in its ready phase, then shrinks the window before the opcode completes. Other entities continue meanwhile.
+`LiveWindow.answerable` currently expresses governor permission, not temporal readiness. A paired temporary TCP
+check at the tunnel_2 duct stalls with0.2s answers but reaches sbwy4_1 with1s answers. This establishes sensitivity
+to response timing, not a correct fixed delay or ordinary GUI behavior. The intended correction needs a shared
+runtime window lifecycle and legal input phases driven by window/text metadata. Keep native REQ drop semantics;
+do not replace them with a queue to hide this gap. Static source evidence is PSX, not a measured original-PC run.
+
 For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
 route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`
 so the TCP replay checks arrival even when the entire trip is automatic. Failure to reach the target exits nonzero

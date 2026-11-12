@@ -32,7 +32,7 @@ def area_message(kind, name):
 
 
 class RouteTimingTests(unittest.TestCase):
-    def play(self, commands, events=(), seconds=20, stall=2):
+    def play(self, commands, events=(), seconds=20, stall=2, answer_delay=.2):
         clock = Clock()
         queued = [(0, {"Welcome": {"entity": 1}}), (0, area_message("AreaManifest", "a")),
                   (0, {"AreaSnapshot": {"entities": [{"id": 1, "pos": {"x": 0., "y": 0., "z": 0.}, "facing": 0.}]}})]
@@ -57,12 +57,13 @@ class RouteTimingTests(unittest.TestCase):
             path = Path(temporary) / "route.txt"
             path.write_text(commands)
             argv = ["live-route.py", "unused:0", str(path), "--cache", temporary, "--tool", "unused",
-                    "--seconds", str(seconds), "--stall", str(stall)]
+                    "--seconds", str(seconds), "--stall", str(stall), "--answer-delay", str(answer_delay)]
             with patch.object(sys, "argv", argv), patch.object(route, "time", clock), \
                     patch.object(route.livebot, "Conn", return_value=Connection()), \
                     patch.object(route, "mesh_for", return_value=mesh), contextlib.redirect_stdout(output):
                 code = route.main()
         self.sent = [message for _, message in sent]
+        self.sent_at = sent
         return code, output.getvalue(), [(at, m["MoveIntent"]) for at, m in sent if isinstance(m, dict) and "MoveIntent" in m]
 
     def test_active_idle_pauses_during_a_scene_and_keeps_its_budget(self):
@@ -168,6 +169,42 @@ class RouteTimingTests(unittest.TestCase):
                     route.main()
                 self.assertEqual(error.exception.code, 2)
                 connection.assert_not_called()
+
+    def test_configured_response_delay_is_measured_from_window_open(self):
+        code, output, _ = self.play("a: wait 0\n", [
+            (.2, {"LiveWindow": {"window": 0, "dialog": 1, "answerable": True}}),
+            (1.5, {"LiveWindowClosed": {"window": 0}}),
+        ], answer_delay=1, stall=4)
+        self.assertEqual(code, 0, output)
+        answers = [(at, m) for at, m in self.sent_at if "LiveAnswer" in m]
+        self.assertEqual(len(answers), 1)
+        self.assertGreaterEqual(answers[0][0], 1.2)
+        self.assertLess(answers[0][0], 1.5)
+
+    def test_closed_window_cancels_a_delayed_answer(self):
+        code, output, _ = self.play("a: idle 2\n", [
+            (.2, {"LiveWindow": {"window": 0, "dialog": 1, "answerable": True}}),
+            (.5, {"LiveWindowClosed": {"window": 0}}),
+        ], answer_delay=1)
+        self.assertEqual(code, 0, output)
+        self.assertFalse(any("LiveAnswer" in m for m in self.sent))
+
+    def test_reused_window_discards_the_old_answer_and_starts_a_new_delay(self):
+        code, output, _ = self.play("@choice a 2 1\na: wait 0\n", [
+            (.2, {"LiveWindow": {"window": 0, "dialog": 1, "answerable": True}}),
+            (.8, {"LiveWindow": {"window": 0, "dialog": 2, "ask": {"first": 4, "last": 5}, "answerable": True}}),
+            (2.1, {"LiveWindowClosed": {"window": 0}}),
+        ], answer_delay=1, stall=4)
+        self.assertEqual(code, 0, output)
+        answers = [(at, m) for at, m in self.sent_at if "LiveAnswer" in m]
+        self.assertEqual(len(answers), 1)
+        self.assertGreaterEqual(answers[0][0], 1.8)
+        self.assertEqual(answers[0][1], {"LiveAnswer": {"window": 0, "choice": 1}})
+
+    def test_response_delay_rejects_invalid_values(self):
+        for value in ["-1", "nan", "inf", "-inf"]:
+            with self.assertRaises(route.argparse.ArgumentTypeError):
+                route.response_delay(value)
 
 
 if __name__ == "__main__":
