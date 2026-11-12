@@ -114,10 +114,16 @@ against a real `--field-runtime` server.
 - **Ladders** wait for direction keys in the original. A multiplayer host sends positions, so they climb by
   themselves here.
 - **Background triggers** (doors that open as the player nears) are engine data, not scripts.
-- **Solid models** block the way. A player walking into one ends beside it and so slides round it (the server moves
-  the step out along the line from the model's centre and answers with the corrected place). A fixed route must
-  therefore cope with being pushed off its line: the bot keeps heading for the same corner and steps aside when it
-  gets no nearer.
+- **Solid models** stop the player, and not at the centre. The original tests three points a solid range (34 units
+  at scale 512) ahead of where a step ends, straight on and an eighth of a turn to each side, against every solid
+  model at half the two solid ranges. On contact the player does not move, and whoever was touched gets its contact
+  script. So two guards 77 units apart close a gate, stepping away from someone is always free, and nobody slides
+  round a character: the player steers round. A side point off the walkmesh counts as the wall pushing the player
+  over (`FieldRuntime::player_step_blocked`, `player_bumped`). The server refuses such a step; the solver plans a
+  corner beside whoever stands on its line when there is room, and the bot steps aside when it gets no nearer.
+- **Lines are checked against where the player was a frame ago**, a few units back. A network player arrives in
+  strides of a dozen units or more, so the runtime sweeps a stride in four-unit steps; otherwise a line (the second
+  reactor ladder) is stepped over unnoticed.
 - **Control handed to someone else while the player is held** (`CC` under `UC`) does not make the player that
   character. In the bar a child is lifted onto a shoulder and made the "controlled" model until the scene ends. The
   player's own character is the model that was controlled when the player last had control
