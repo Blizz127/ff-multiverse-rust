@@ -490,9 +490,17 @@ impl FieldRuntime {
     }
 
     /// The host knows the real countdown (from the save): use it instead of the persisted bank bytes.
+    ///
+    /// The scripts see it at once, not from the end of the first frame on: a field entered during the reactor's
+    /// countdown checks the bytes in its very first frame and ends the game when they read zero.
     pub fn set_countdown_seconds(&mut self, seconds: u32) {
         self.windows_ext.countdown_seconds = seconds;
         self.windows_ext.countdown_seeded = true;
+        let banks = &mut self.mem.banks;
+        banks.set(COUNTDOWN_BYTES, (seconds / 3600).min(255) as u8);
+        banks.set(COUNTDOWN_BYTES + 1, (seconds % 3600 / 60) as u8);
+        banks.set(COUNTDOWN_BYTES + 2, (seconds % 60) as u8);
+        banks.set(COUNTDOWN_BYTES + 3, if seconds > 0 { 30 } else { 0 });
     }
 
     /// The play time in seconds.
@@ -503,6 +511,10 @@ impl FieldRuntime {
     pub fn set_play_time_seconds(&mut self, seconds: u32) {
         self.windows_ext.play_seconds = seconds;
         self.windows_ext.play_seeded = true;
+        let banks = &mut self.mem.banks;
+        banks.set(PLAY_TIME_BYTES, (seconds / 3600).min(255) as u8);
+        banks.set(PLAY_TIME_BYTES + 1, (seconds % 3600 / 60) as u8);
+        banks.set(PLAY_TIME_BYTES + 2, (seconds % 60) as u8);
     }
 
     /// The menu window colours: four corners of red, green, blue.
@@ -737,6 +749,19 @@ mod tests {
             rt.tick(None);
         }
         assert_eq!(rt.countdown_seconds(), 0);
+    }
+
+    #[test]
+    fn a_countdown_the_host_brings_is_in_the_scripts_bytes_before_the_first_frame() {
+        // The story's bytes hold no clock (the engine owns them); the host carries 9:41 from the field before.
+        let s = SynthScript::default().entity("a", vec![script0(&[], IDLE)]);
+        let mut rt = runtime(s);
+        assert_eq!((rt.mem.banks.get(21), rt.mem.banks.get(22), rt.mem.banks.get(23)), (0, 0, 0));
+        rt.set_countdown_seconds(9 * 60 + 41);
+        assert_eq!((rt.mem.banks.get(20), rt.mem.banks.get(21), rt.mem.banks.get(22)), (0, 9, 41));
+        assert_ne!(rt.mem.banks.get(23), 0, "minutes, seconds and frames all zero is how a script reads 'time is up'");
+        rt.tick(None);
+        assert_eq!((rt.mem.banks.get(21), rt.countdown_seconds()), (9, 9 * 60 + 41));
     }
 
     #[test]

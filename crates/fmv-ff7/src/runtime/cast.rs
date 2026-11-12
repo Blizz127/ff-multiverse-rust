@@ -80,7 +80,10 @@ impl FieldRuntime {
             }
             let selector = PERSISTENT_SELECTORS[index / 256];
             let address = (index % 256) as u8;
-            let mask = !crate::story::engine_owned_bits(selector, address);
+            // (and never the engine's "the countdown ran out" signal, bank 1 address 225 bit 7: a field sets it on the
+            // way to the game-over screen. Saved, it would end the game again on every return.)
+            let game_over = if (selector, address) == (1, 225) { 0x80 } else { 0 };
+            let mask = !(crate::story::engine_owned_bits(selector, address) | game_over);
             if (now ^ was) & mask == 0 {
                 continue;
             }

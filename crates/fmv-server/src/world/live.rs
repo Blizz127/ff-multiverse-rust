@@ -173,6 +173,9 @@ struct LiveRun {
     countdown: Option<(u32, u32, Instant)>,
     /// The run cannot go on (its save failed): it stops advancing and the instance keeps its last state.
     halted: bool,
+    /// The field ended the game (the story countdown ran out). The governor returns where it stands with the clocks
+    /// forgotten, so the countdown starts full again: a game over must never be a state a character cannot leave.
+    game_over: bool,
 }
 
 /// The world's live fields.
@@ -329,8 +332,12 @@ impl World {
         let gone: Vec<InstanceId> = self.live.runs.keys().filter(|id| !alive.contains(id)).copied().collect();
         for id in gone {
             if let Some(run) = self.live.runs.remove(&id) {
-                let (play, countdown) = run.field.clocks();
-                self.live.carried.insert(run.governor, (play, countdown, run.area.clone()));
+                if run.game_over {
+                    self.live.carried.remove(&run.governor);
+                } else {
+                    let (play, countdown) = run.field.clocks();
+                    self.live.carried.insert(run.governor, (play, countdown, run.area.clone()));
+                }
                 self.save_live_story(&run, true);
                 self.logs.info(format!("live field stopped area={} governor={} frames={}", run.area, run.governor.0, run.frames));
             }
@@ -372,6 +379,7 @@ impl World {
                             ok_hold: 0,
                             countdown: None,
                             halted: false,
+                            game_over: false,
                         },
                     );
                 }
@@ -514,6 +522,7 @@ impl World {
                 LiveEvent::GameOver => {
                     self.logs.warn(format!("live game over area={} governor={}", run.area, run.governor.0));
                     run.halted = true;
+                    run.game_over = true;
                 }
                 LiveEvent::MapJump { target, field_id, arrival, facing, hint } => {
                     jump = Some((target, field_id, arrival, facing, hint));

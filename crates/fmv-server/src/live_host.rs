@@ -74,9 +74,10 @@ impl LiveFieldHost for Ff7LiveHost {
         if let Some(t) = seed.play_time {
             rt.set_play_time_seconds(t);
         }
-        if let Some(t) = seed.countdown {
-            rt.set_countdown_seconds(t);
-        }
+        // The story countdown is the engine's, not the story's: it is carried from field to field in memory. Where
+        // nothing was carried (a new game, a return after the server restarted) it starts full: a field entered in
+        // the reactor's escape reads a clock at zero as "time is up" in its first frame.
+        rt.set_countdown_seconds(seed.countdown.unwrap_or(FULL_COUNTDOWN_S));
         if let Some(previous) = seed.previous_area.as_deref().and_then(|k| self.adapter.field_id_for_key(k)) {
             rt.set_previous_field(previous);
         }
@@ -239,6 +240,9 @@ impl LiveField for Ff7Live {
         self.rt.story_after(&story).ok().flatten().map(|s| s.encode())
     }
 }
+
+/// The countdown a governor without a carried one starts with (the first reactor's ten minutes).
+const FULL_COUNTDOWN_S: u32 = 600;
 
 impl Ff7Live {
     fn jump(&self, field: u16, x: i16, y: i16, triangle: i16, dir: u8) -> LiveEvent {
