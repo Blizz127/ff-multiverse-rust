@@ -12,9 +12,11 @@ the player, no window is open, no battle runs), then plays the steps:
     face DIR     face a field direction (0-255; 64 is +x)
     ok           press OK (the field's own scripts decide what it does)
     wait S       stand S seconds
+    idle S       stand S seconds of free control (pause for scenes, dialogue and battles)
 
 An entry is over when its steps are done and the field is idle again, or when the server starts a new field visit.
 Leaving an entry's field before its actions could start reports an obsolete route; those actions are not counted.
+An explicit trailing `idle` survives a same-field script taking over; movement still stops with that script.
 Windows are answered (first choice), movies acknowledged, battles left to the server's companions.
 It prints what the server reports and ends with `ROUTE done=<entries played>/<entries> reached=<field> ...`
 (exit status 0 only when every entry was played).
@@ -47,6 +49,34 @@ def load_route(path):
         field, steps = line.split(":", 1)
         route.append((field.strip(), [s.split() for s in steps.split(";") if s.strip()]))
     return route
+
+
+class IdleWait:
+    """A voluntary wait: forced scene time cannot consume its budget."""
+
+    def __init__(self):
+        self.remaining = 0.0
+        self.at = 0.0
+        self.free = False
+
+    def start(self, seconds, now):
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("idle duration must be finite and nonnegative")
+        self.remaining, self.at, self.free = seconds, now, True
+
+    def advance(self, now, free):
+        elapsed = min(self.remaining, max(0.0, now - self.at)) if free and self.free else 0.0
+        self.remaining -= elapsed
+        self.at, self.free = now, free
+        return elapsed
+
+
+def trailing_idle(steps):
+    """A scene cancels unfinished movement, but the solver's explicit post-action wait still applies."""
+    start = len(steps)
+    while start and steps[start - 1][0] == "idle":
+        start -= 1
+    return steps[start:]
 
 
 class Mesh:
@@ -154,6 +184,7 @@ def main():
     entry_expects_exit = False
     last_ping = last_move = busy_at = progress_at = time.monotonic()
     waiting_until = 0.0
+    idle_wait = IdleWait()
     reached = []
     status = "time"
     end = time.monotonic() + args.seconds
@@ -165,6 +196,7 @@ def main():
 
     while time.monotonic() < end:
         now = time.monotonic()
+        idle_interrupted = False
         if now - last_ping > 1:
             last_ping = now
             c.send({"Ping": {"nonce": int(now * 1000)}})
@@ -192,6 +224,7 @@ def main():
                     leg_goal, leg_best, leg_best_at, tries, tries_goal, detour = None, 0.0, now, 0, None, None
                     waited_for = None
                     last_move, waiting_until = now, 0.0
+                    idle_wait = IdleWait()
                     pos, facing = b["arrival"], b["arrival_facing"]
                 c.send({"JoinArea": {"area": b["area"], "fingerprint": b["fingerprint"], "provenance": b["provenance"]}})
                 mesh = mesh_for(area, args.cache, args.tool)
@@ -209,6 +242,7 @@ def main():
                 # (the bot is the lead: the cast's copy of it stands where the bot does)
                 cast = [(n["name"], n["pos"]["x"], n["pos"]["y"]) for n in b["npcs"] if n["id"] != b.get("lead")]
             elif k == "LiveWindow":
+                idle_interrupted = True
                 # A long scene can keep control for more than the stall budget while its dialogue advances.
                 # Count a new window as progress, never the repeated cast/lock snapshots of a stuck scene.
                 progress_at = now
@@ -222,16 +256,18 @@ def main():
                 windows.discard(b["window"])
             elif k == "LiveControl":
                 locked = b["locked"]
+                idle_interrupted |= locked
                 if args.verbose:
                     print(f"  CONTROL locked={locked}", flush=True)
                 if locked and steps is not None and not entry_expects_exit:
-                    legs, steps = [], []  # a script took over: what was left of this entry is void
+                    legs, steps = [], trailing_idle(steps)
             elif k == "LivePlace":
+                idle_interrupted = True
                 pos, facing = b["pos"], b["facing"]
                 if not entry_expects_exit:
                     legs = []
                     if steps is not None:
-                        steps = []
+                        steps = trailing_idle(steps)
             elif k == "MoveRejected":
                 # Refused, or ended beside someone solid: carry on towards the same corner from where the server says
                 # we stand (the stuck check below walks round whoever is in the way).
@@ -243,6 +279,7 @@ def main():
                 print(f"  MOVIE {b['movie']}", flush=True)
                 pending.append((now + 0.3, {"LiveMovieDone": {"movie": b["movie"]}}))
             elif k == "EncounterStart":
+                idle_interrupted = True
                 in_battle = True
                 battle_at = now
                 print(f"  BATTLE start {b.get('formation_id')}", flush=True)
@@ -258,6 +295,8 @@ def main():
             c.send(msg)
         pending = [p for p in pending if p[0] > now]
         busy = locked or bool(windows) or in_battle or bool(pending)
+        if idle_wait.advance(now, not busy and not idle_interrupted) > 0:
+            progress_at = now  # an intentional wait is progress; the overall time limit still applies
         if busy:
             busy_at = now
         if in_battle and now - battle_at < 600:
@@ -268,7 +307,7 @@ def main():
         if now - progress_at > args.stall:
             status = "stalled"
             break
-        if pos is None or mesh is None or busy or now < waiting_until:
+        if pos is None or mesh is None or busy or now < waiting_until or idle_wait.remaining > 0:
             time.sleep(0.02)
             continue
         if legs:
@@ -371,10 +410,12 @@ def main():
             waiting_until = now + 0.7
         elif step[0] == "wait":
             waiting_until = now + float(step[1])
+        elif step[0] == "idle":
+            idle_wait.start(float(step[1]), now)
     print(f"ROUTE {status} done={idx}/{len(route)} reached={reached[-1] if reached else '-'} areas={','.join(reached)}", flush=True)
     if status != "done":
         wanted = route[idx][0] if idx < len(route) else "-"
-        print(f"  waiting for {wanted}: area={area} locked={locked} windows={sorted(windows)} battle={in_battle} pos={pos} legs={len(legs)} steps={steps}", flush=True)
+        print(f"  waiting for {wanted}: area={area} locked={locked} windows={sorted(windows)} battle={in_battle} pos={pos} legs={len(legs)} steps={steps} idle_left={idle_wait.remaining:.3f}", flush=True)
     c.send("Leave")
     return 0 if status == "done" else 1
 

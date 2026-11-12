@@ -22,8 +22,10 @@
 //! first choice, battles count as won, movies, menus and tutorials complete at once.
 //!
 //! It prints one line per expansion and, at the end, the chain of actions that led to the furthest moment. Numbers
-//! and names only, never game text. Standing on a triangle's centre is a test shortcut: solid models and exact
-//! collision are not modelled, so a route it finds is a strong lead, not a proof.
+//! and names only, never game text. Candidate actions are replayed by walking at the route bot's default speed.
+//! Voluntary stationary time is exported as `idle` commands; locked scenes and dialogue are left to the bot.
+//! A player action after an internal idle is not exported: a trailing wait cannot preserve that
+//! order. Network sampling, dialogue response time and the bot's entry delays still make a route a lead, not proof.
 #[path = "../tests/script_common.rs"]
 mod common;
 
@@ -41,6 +43,9 @@ use std::sync::Arc;
 const SETTLE_FRAMES: u32 = 3600;
 const PROBE_FRAMES: u32 = 300;
 const FOLLOW_FRAMES: u32 = 3600;
+const FIELD_FPS: f64 = 30.0;
+/// Match scripts/live-route.py's default --speed, rather than walking 24 units per field frame (720 per second).
+const WALK_UNITS_PER_SECOND: f64 = 200.0;
 /// Expansions allowed per (field, moment): a field whose actions only shuffle its scratch must not eat the search.
 const PER_PLACE: u32 = 10;
 /// The pad's OK bit.
@@ -70,6 +75,44 @@ struct Outcome {
     movies: Vec<u16>,
     windows: u32,
     game_over: bool,
+    idle: IdleTime,
+    control_taken: bool,
+}
+
+/// A compact suffix of voluntary waiting. The bot can keep this suffix through a forced scene, but cannot replay
+/// it before a later player action without a richer trace. Do not silently move such a pause to the end instead.
+#[derive(Debug, Clone, Default)]
+struct IdleTime {
+    frames: u32,
+    acted: bool,
+    action_after_idle: bool,
+}
+
+impl IdleTime {
+    fn acted(&mut self) {
+        self.acted = true;
+        self.action_after_idle |= self.frames > 0;
+    }
+
+    fn absorb(&mut self, more: Self) {
+        self.action_after_idle |= more.action_after_idle || (self.frames > 0 && more.acted);
+        self.frames += more.frames;
+        self.acted |= more.acted;
+    }
+
+    /// Append one pause, not one route command per frame. None means this timing cannot be a suffix.
+    fn commands(&self, mut commands: String) -> Option<String> {
+        if self.action_after_idle {
+            return None;
+        }
+        if self.frames > 0 {
+            if !commands.is_empty() {
+                commands.push_str("; ");
+            }
+            commands.push_str(&format!("idle {:.3}", f64::from(self.frames) / FIELD_FPS));
+        }
+        Some(commands)
+    }
 }
 
 impl Outcome {
@@ -79,11 +122,15 @@ impl Outcome {
         self.movies.extend(more.movies);
         self.windows += more.windows;
         self.game_over |= more.game_over;
+        self.idle.absorb(more.idle);
+        self.control_taken |= more.control_taken;
     }
 }
 
 /// Answer what the field asked since the last frame. Returns true when the field is left (a map jump) or over.
 fn pump(rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
+    // The bot discards unfinished movement when the host takes control, but not for ordinary dialogue alone.
+    out.control_taken |= rt.player_scripted();
     if rt.pending_tutorial().is_some() {
         rt.complete_tutorial();
     }
@@ -138,7 +185,11 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
         let p = *p;
         if rt.player_step_blocked(at, p) {
             for _ in 0..45 {
+                let free = !busy(rt);
                 rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
+                if free && !busy(rt) {
+                    out.idle.frames += 1;
+                }
                 if pump(rt, out) {
                     return (false, at);
                 }
@@ -158,6 +209,10 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
                 out.absorb(more);
                 return (false, end);
             }
+        }
+        if p != at {
+            out.idle.acted();
+            out.control_taken = false;
         }
         at = p;
         rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
@@ -203,7 +258,13 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
         if f >= min.max(path.len() as u32 + 8) && idle >= 20 {
             break;
         }
+        let free = !busy(rt);
+        let walking = path.get(f as usize).is_some_and(|p| *p != at);
         if let Some(p) = path.get(f as usize) {
+            if free && walking {
+                out.idle.acted();
+                out.control_taken = false;
+            }
             at = *p;
         }
         if rt.player_scripted() {
@@ -215,8 +276,16 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
             }
         }
         let held = ok && (2..=6).contains(&f);
+        if free && ok && f == 2 {
+            out.idle.acted();
+        }
         let player = PlayerInput { x: at.0, y: at.1, z: at.2, dir, ok: ok && f == 2, keys_held: if held { OK } else { 0 }, keys_pressed: if ok && f == 2 { OK } else { 0 }, ..Default::default() };
         rt.tick(Some(player));
+        // Check both sides of the frame before pump dismisses a new window. The OK press/hold is an action, not
+        // voluntary idle, and a scripted walk is already represented by the bot waiting for control to return.
+        if free && !busy(rt) && path.get(f as usize).is_none() && !(ok && f <= 6) {
+            out.idle.frames += 1;
+        }
         if pump(rt, &mut out) {
             return (out, at);
         }
@@ -356,9 +425,8 @@ fn smooth(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, corners: &[Pos]) -> Vec
 }
 
 /// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
-/// walkmesh's links, never into a locked triangle, as points at most `STRIDE` units apart (one per frame).
+/// walkmesh's links, never into a locked triangle, at the bot's default walking speed (one point per field frame).
 fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize) -> Option<(Vec<Pos>, String)> {
-    const STRIDE: f64 = 24.0;
     let n = walk.triangles.len();
     if from_tri >= n || to_tri >= n {
         return None;
@@ -398,12 +466,7 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
     let mut legs = Vec::new();
     let mut cur = from;
     for c in corners {
-        let (dx, dy, dz) = (f64::from(c.0 - cur.0), f64::from(c.1 - cur.1), f64::from(c.2 - cur.2));
-        let steps = ((dx * dx + dy * dy).sqrt() / STRIDE).ceil().max(1.0) as i32;
-        for k in 1..=steps {
-            let f = f64::from(k) / f64::from(steps);
-            out.push((cur.0 + (dx * f) as i32, cur.1 + (dy * f) as i32, cur.2 + (dz * f) as i32));
-        }
+        out.extend(walk_segment(cur, c));
         if c != cur {
             legs.push(format!("to {} {}", c.0, c.1));
         }
@@ -411,6 +474,17 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
     }
     // (the same corners as bot steps: the bot walks exactly this way)
     Some((out, legs.join("; ")))
+}
+
+fn walk_segment(from: Pos, to: Pos) -> Vec<Pos> {
+    let (dx, dy, dz) = (f64::from(to.0 - from.0), f64::from(to.1 - from.1), f64::from(to.2 - from.2));
+    let steps = ((dx * dx + dy * dy).sqrt() * FIELD_FPS / WALK_UNITS_PER_SECOND).ceil() as i32;
+    (1..=steps)
+        .map(|k| {
+            let f = f64::from(k) / f64::from(steps);
+            (from.0 + (dx * f) as i32, from.1 + (dy * f) as i32, from.2 + (dz * f) as i32)
+        })
+        .collect()
 }
 
 /// One step of a route.
@@ -579,7 +653,7 @@ fn main() {
             println!("nothing left to try");
             break;
         };
-        let State { field: field_name, rt, banks, pos, tri, via, carry } = state;
+        let State { field: field_name, rt, banks, pos, tri, mut via, carry } = state;
         let Some(loaded) = load(&field_name, &mut lgp) else {
             if !unloadable.contains(&field_name) {
                 println!("{step:>4} {field_name:<10} cannot be loaded (another game mode): {}", chain(&via).last().cloned().unwrap_or_default());
@@ -635,6 +709,14 @@ fn main() {
         let moved = settle.1 != at;
         at = settle.1;
         let now = moment_of(&rt.mem.banks);
+        if settle.0.jump.is_none() && !settle.0.game_over {
+            // The field's forced entry scene is automatic. Only the free time we deliberately spent standing
+            // afterwards belongs in the route, before the next action that can depend on its timers.
+            let cmds = settle.0.idle.commands(String::new()).expect("settling has no player walk");
+            if !cmds.is_empty() {
+                via = Some(Rc::new(Step { text: format!("{field_name}: {cmds} after entry scene"), cmds: format!("{field_name}: {cmds}"), parent: via }));
+            }
+        }
         if now > best.0 && !settle.0.game_over {
             best = (now, via.clone(), field_name.clone());
             // The story on entering the furthest field (before it settled), for the trace tool.
@@ -780,7 +862,7 @@ fn main() {
             for sign in [1, -1] {
                 if let Some((t, far)) = crossing(sign) {
                     let (from, to) = (side(t, -6 * sign), side(t, far * sign));
-                    let path: Vec<Pos> = (-6..=far).map(|k| side(t, k * sign)).collect();
+                    let path: Vec<Pos> = std::iter::once(from).chain(walk_segment(from, to)).collect();
                     actions.push((format!("line {name} ({li}) across from {},{}", from.0, from.1), path, to, 0, false, format!("to {} {}", to.0, to.1)));
                 }
             }
@@ -854,6 +936,18 @@ fn main() {
             let mut probe = rt.clone();
             let mut out = Outcome::default();
             let (arrived, mut end) = walk_to(&mut probe, &approach, at, &mut out);
+            if !arrived && out.jump.is_none() && !out.control_taken {
+                // The exported corners still contain the unused movement tail. A dialogue/scratch change alone
+                // does not cancel that tail over TCP, so the bot would idle at a different position.
+                if debug { println!("      drop [{label}]: walk stopped without the bot cancelling its movement tail"); }
+                continue;
+            }
+            if arrived && out.control_taken && !cmds.is_empty() {
+                // A scene on the final approach step can return to the same place. The bot has already discarded
+                // this entry's pending action, even if the solver considers the approach complete.
+                if debug { println!("      drop [{label}]: scene cancelled the pending action at the end of the walk"); }
+                continue;
+            }
             let mut label = label;
             // The bot walks the same corners, then does what the action does there.
             let mut cmds = [legs.as_str(), cmds.as_str()].iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join("; ");
@@ -873,6 +967,10 @@ fn main() {
             if out.game_over {
                 continue;
             }
+            let Some(cmds) = out.idle.commands(cmds) else {
+                if debug { println!("      drop [{label}]: player action after voluntary idle; no faithful suffix export"); }
+                continue;
+            };
             let after = moment_of(&probe.mem.banks);
             let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
             let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
@@ -930,11 +1028,17 @@ fn main() {
                 let Some(spot) = spot else { continue };
                 let Some(spot_tri) = rt.triangle_at(spot.0, spot.1, spot.2).map(usize::from) else { continue };
                 let Some((mut approach, legs)) = way(&walk, &rt, at, here, spot, spot_tri) else { continue };
-                approach.push(mid);
+                approach.extend(walk_segment(approach.last().copied().unwrap_or(at), mid));
                 let mut probe = rt.clone();
                 let mut out = Outcome::default();
                 let (arrived, end) = walk_to(&mut probe, &approach, at, &mut out);
                 if !arrived {
+                    if out.jump.is_none() && !out.control_taken {
+                        if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                            println!("      drop [gate {gi}]: walk stopped without the bot cancelling its movement tail");
+                        }
+                        continue;
+                    }
                     let (more, end) = if out.jump.is_none() && !out.game_over { run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, 0, false) } else { (Outcome::default(), end) };
                     out.absorb(more);
                     if out.game_over {
@@ -943,7 +1047,13 @@ fn main() {
                     let after = moment_of(&probe.mem.banks);
                     let label = format!("walking towards gate {gi}, stopped at {},{}", end.0, end.1);
                     let summary = format!("{field_name}: {label} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
-                    let cmds = format!("{field_name}: {legs}; to {} {}", mid.0, mid.1);
+                    let Some(cmds) = out.idle.commands(format!("{legs}; to {} {}", mid.0, mid.1)) else {
+                        if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                            println!("      drop [gate {gi}]: player action after voluntary idle; no faithful suffix export");
+                        }
+                        continue;
+                    };
+                    let cmds = format!("{field_name}: {cmds}");
                     let score = if after > now { 4 } else { 2 };
                     match out.jump {
                         Some(jump) => {
@@ -962,6 +1072,14 @@ fn main() {
                                 push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via: Some(Rc::new(Step { text: summary, cmds, parent: via.clone() })), carry: None }, score);
                             }
                         }
+                    }
+                    continue;
+                }
+                if out.idle.frames > 0 || out.idle.action_after_idle {
+                    // The bot's gateway command walks across it. A pause before that movement needs an interleaved
+                    // trace, not an idle suffix after the gateway (which a field change would discard).
+                    if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                        println!("      drop [gate {gi}]: voluntary idle before gateway movement needs an interleaved export");
                     }
                     continue;
                 }
@@ -996,5 +1114,133 @@ fn main() {
             cmds.push(format!("{target}: wait 0"));
         }
         let _ = std::fs::write(path, cmds.join("\n") + "\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two synthetic entities: a director requests the worker at priority 6, so its voluntary waits remain
+    /// observable to run_idle's settling logic. One empty synthetic message; no owned game data.
+    fn runtime(worker: &[u8]) -> FieldRuntime {
+        let code_start = 0x20 + 2 * (8 + 64);
+        let mut code = Vec::new();
+        let mut entries = [[0u16; 32]; 2];
+        for (entity, row) in entries.iter_mut().enumerate() {
+            for (slot, entry) in row.iter_mut().enumerate() {
+                *entry = (code_start + code.len()) as u16;
+                match (entity, slot) {
+                    (0, 0) => code.extend_from_slice(&[0, 3, 1, 0xC1, 0]), // RET | REQEW worker.1; RET
+                    (1, 0) => code.extend_from_slice(&[0, 0]),
+                    (1, 1) => code.extend_from_slice(worker),
+                    _ => code.push(0),
+                }
+            }
+        }
+        let mut bytes = vec![0; 0x20];
+        bytes[0..3].copy_from_slice(&[2, 5, 2]);
+        bytes[4..6].copy_from_slice(&((code_start + code.len()) as u16).to_le_bytes());
+        bytes[8..10].copy_from_slice(&512u16.to_le_bytes());
+        bytes.extend_from_slice(b"directorworker\0\0");
+        for row in entries {
+            for entry in row {
+                bytes.extend_from_slice(&entry.to_le_bytes());
+            }
+        }
+        bytes.extend(code);
+        bytes.extend_from_slice(&[1, 0, 4, 0, 0xFF]); // one message, empty text
+        let mut rt = FieldRuntime::new(&bytes, Banks::default()).unwrap();
+        rt.init();
+        rt
+    }
+
+    fn scene(lock_frames: u16) -> FieldRuntime {
+        let [lo, hi] = lock_frames.to_le_bytes();
+        runtime(&[
+            0x33, 1, 0x24, lo, hi, // lock and wait
+            0x40, 0, 0, // message
+            0x33, 0, 0x24, 60, 0, // unlock and voluntarily stand for 60 frames
+            0x80, 0x10, 0x30, 1, 0, // set a flag, return
+        ])
+    }
+
+    #[test]
+    fn forced_scene_length_does_not_become_exported_idle() {
+        let (mut short, mut long) = (scene(30), scene(90));
+        let (a, _) = run_idle(&mut short, 500, 0, &[], (0, 0, 0), 0, false);
+        let (b, _) = run_idle(&mut long, 500, 0, &[], (0, 0, 0), 0, false);
+        assert_eq!((short.mem.banks.get(0x30), long.mem.banks.get(0x30)), (1, 1));
+        assert_eq!((a.windows, b.windows), (1, 1));
+        assert_eq!(long.frame() - short.frame(), 60);
+        assert_eq!(a.idle.frames, b.idle.frames);
+        assert!(a.idle.frames >= 60);
+        let exported = a.idle.commands("to 10 0".to_string()).unwrap();
+        assert_eq!(exported.matches("idle").count(), 1);
+        assert_eq!(exported, b.idle.commands("to 10 0".to_string()).unwrap());
+    }
+
+    #[test]
+    fn a_later_forced_scene_pauses_the_idle_suffix() {
+        let body = |locked: u8| vec![
+            0x24, 30, 0, // voluntary wait
+            0x33, 1, 0x24, locked, 0, 0x33, 0, // forced scene
+            0x24, 30, 0, 0, // voluntary wait, return
+        ];
+        let (mut short, mut long) = (runtime(&body(30)), runtime(&body(90)));
+        let (a, _) = run_idle(&mut short, 500, 0, &[], (0, 0, 0), 0, false);
+        let (b, _) = run_idle(&mut long, 500, 0, &[], (0, 0, 0), 0, false);
+        assert_eq!(long.frame() - short.frame(), 60);
+        assert_eq!(a.idle.frames, b.idle.frames);
+        assert_eq!(a.idle.commands(String::new()), b.idle.commands(String::new()));
+    }
+
+    #[test]
+    fn movement_after_an_internal_pause_is_not_exported_at_the_wrong_time() {
+        let mut rt = runtime(&[0]);
+        let (mut out, at) = run_idle(&mut rt, 10, 0, &[], (0, 0, 0), 0, false);
+        assert_eq!(out.idle.frames, 10);
+        let (arrived, _) = walk_to(&mut rt, &[(6, 0, 0)], at, &mut out);
+        assert!(arrived);
+        assert!(out.idle.commands("to 6 0".to_string()).is_none());
+    }
+
+    #[test]
+    fn ok_after_an_internal_pause_is_not_exported_before_the_pause() {
+        let mut rt = runtime(&[0]);
+        let (mut out, at) = run_idle(&mut rt, 10, 0, &[], (0, 0, 0), 0, false);
+        let (more, _) = run_idle(&mut rt, 7, 0, &[], at, 0, true);
+        assert_eq!(more.idle.frames, 0);
+        out.absorb(more);
+        assert!(out.idle.commands("ok".to_string()).is_none());
+    }
+
+    #[test]
+    fn ordinary_dialogue_does_not_mark_an_interrupted_walk_as_cancelled_by_the_bot() {
+        for locked in [false, true] {
+            let mut body = vec![0x24, 1, 0];
+            if locked { body.extend_from_slice(&[0x33, 1]); }
+            body.extend_from_slice(&[0x40, 0, 0, 0x80, 0x10, 0x30, 1, 0x33, 0, 0]);
+            let mut rt = runtime(&body);
+            let mut out = Outcome::default();
+            let (arrived, end) = walk_to(&mut rt, &walk_segment((0, 0, 0), (200, 0, 0)), (0, 0, 0), &mut out);
+            assert!(!arrived);
+            assert_ne!(end, (200, 0, 0));
+            assert_eq!(out.windows, 1);
+            assert_eq!(out.control_taken, locked);
+        }
+    }
+
+    #[test]
+    fn walking_matches_two_hundred_units_per_second_without_recording_path_frames_as_idle() {
+        let path = walk_segment((0, 0, 0), (200, 0, 30));
+        assert_eq!(path.len(), 30);
+        assert_eq!(path.last(), Some(&(200, 0, 30)));
+        assert!(walk_segment((0, 0, 0), (0, 0, 0)).is_empty());
+        let mut rt = runtime(&[0]);
+        let crossing = [(0, 0, 0), (6, 0, 0), (13, 0, 0)];
+        let (out, _) = run_idle(&mut rt, 3, 0, &crossing, (0, 0, 0), 0, false);
+        assert_eq!(out.idle.frames, 0);
+        assert!(out.idle.commands("to 13 0".to_string()).is_some());
     }
 }

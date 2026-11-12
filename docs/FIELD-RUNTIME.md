@@ -117,6 +117,16 @@ Field transitions complete an already-started entry immediately, even while cont
 flashback can leave the bar and return without ever accepting player input. An unstarted entry whose field is
 visited and left is reported as an obsolete route, with its actions still unplayed; the bot never skips it as passed.
 
+For timed routes, `idle S` means S seconds with free control: its budget pauses during scenes, open dialogue,
+movies awaiting acknowledgement and battles. A trailing idle survives a same-field script cancelling unfinished
+movement, and a field change discards the old budget. Intentional free waiting counts as watchdog progress, while
+a stuck lock still times out and the overall run budget always applies. `wait S` retains its wall-clock meaning.
+The asset-free checks run with `python3 -m unittest discover -s scripts -p test_live_route.py`.
+The solver uses 200 field units per second, matching the bot's default, and appends coalesced voluntary waits to
+its honest action playback. It rejects branches whose internal wait/movement order cannot be represented by an
+idle suffix, including interrupted walks that ordinary dialogue would not cancel in the bot. Entry delays,
+network sampling and dialogue response timing still differ; a generated route needs a TCP replay.
+
 For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
 route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`
 so the TCP replay checks arrival even when the entire trip is automatic. Failure to reach the target exits nonzero
