@@ -13,7 +13,7 @@
 //! * the menu window colours (`GWCOL`/`SWCOL`), which are save data the host owns.
 
 use super::super::memory::{base_of, is_word_selector};
-use super::super::{Event, FieldRuntime, Flow, Window, WINDOWS};
+use super::super::{Event, FieldRuntime, Flow, Window, WindowPhase, WINDOWS};
 
 /// Replacement parameters per window (`MPARA` / `MPRA2` slots).
 pub const PARAMS_PER_WINDOW: usize = 8;
@@ -167,7 +167,7 @@ impl FieldRuntime {
                     self.advance(2);
                     Flow::Continue
                 } else {
-                    self.close_by_script(w);
+                    self.close_window_and_poll_owner(w);
                     Flow::Yield
                 }
             }
@@ -182,7 +182,7 @@ impl FieldRuntime {
                     }
                     Some(owner) => {
                         if owner == self.current {
-                            self.close_by_script(w);
+                            self.close_window_and_poll_owner(w);
                         }
                         Flow::Yield
                     }
@@ -360,38 +360,56 @@ impl FieldRuntime {
         }
     }
 
-    /// Whether `owner` is sitting on the `MESSAGE`/`ASK` that opened window `w` with `dialog`, so that it will see
-    /// the window closed and finish the instruction.
-    fn owner_will_finish(&self, owner: usize, w: usize, dialog: u8) -> bool {
-        let Some(ent) = self.ents.get(owner) else { return false };
-        if ent.broken {
-            return false;
-        }
-        let at = |i: usize| self.code.get(ent.pc + i).copied().unwrap_or(0);
-        match at(0) {
-            0x40 => usize::from(at(1)) % WINDOWS == w && at(2) == dialog,
-            0x48 => usize::from(at(2)) % WINDOWS == w && at(3) == dialog,
-            _ => false,
-        }
+    /// Script close admission bypasses WMODE's player-input restriction. SHOW/Opening must finish first; no
+    /// geometry is advanced here. WCLSE can then continue, leaving the owner to perform the closing polls.
+    pub(in crate::runtime) fn request_window_close(&mut self, w: usize) -> bool {
+        let Some(open) = self.windows.get_mut(w).and_then(|win| win.open.as_mut()) else { return true };
+        if open.phase == WindowPhase::Opening { return false; }
+        if !open.closed { open.phase = WindowPhase::Closing; }
+        true
     }
 
-    /// A script closes window `w` (`WCLS`, or `WSIZW` on its own window). When another entity is waiting on the
-    /// window's `MESSAGE`/`ASK`, the window is marked closed and that entity finishes its instruction on its next
-    /// turn, as in the original; otherwise the window is simply taken down.
-    fn close_by_script(&mut self, w: usize) {
-        let Some(open) = self.windows.get(w).and_then(|win| win.open.as_ref()) else { return };
-        if open.closed {
-            return;
+    /// One owner's poll of the native structural phases. In particular this is not called by update_windows:
+    /// preempted owners pause their window, while other entities and field clocks continue normally.
+    pub(in crate::runtime) fn poll_window(&mut self, w: usize) -> bool {
+        let Some(win) = self.windows.get_mut(w) else { return false };
+        let Some(open) = win.open.as_mut() else { return false };
+        if open.entity != self.current { return false; }
+        if open.closed { return true; }
+        let (width, height) = (i32::from(win.width), i32::from(win.height));
+        match open.phase {
+            WindowPhase::Opening => {
+                open.current_width = (open.current_width + width / 4).max(8).min(width);
+                open.current_height = (open.current_height + height / 4).max(8).min(height);
+                if open.current_width == width && open.current_height == height { open.phase = WindowPhase::Text; }
+            }
+            WindowPhase::Text => {
+                // First increment: text is instantaneous, but still takes its own owner poll. No native glyph or
+                // paging timing is claimed. Existing consumers see a window only once it can legally be answered.
+                open.phase = WindowPhase::Ready;
+                self.events.push(Event::Window {
+                    window: w as u8, entity: open.entity, dialog: open.dialog,
+                    ask: open.ask.map(|ask| (ask.first, ask.last)), offset: open.offset,
+                });
+            }
+            WindowPhase::Ready => {}
+            WindowPhase::Closing => {
+                // Signed intermediate values preserve the original underflow-to-small-size completion rule.
+                // Do not force a minimum quantum: a target dimension below four has a zero quarter step.
+                open.current_width = if open.current_width >= 8 { open.current_width - width / 4 } else { 8 };
+                open.current_height = if open.current_height >= 8 { open.current_height - height / 4 } else { 8 };
+                open.closed = open.current_width < 9 && open.current_height < 9;
+            }
         }
-        let (owner, dialog) = (open.entity, open.dialog);
-        if owner != self.current && self.owner_will_finish(owner, w, dialog) {
-            if let Some(open) = self.windows.get_mut(w).and_then(|win| win.open.as_mut()) {
-                open.closed = true;
-            }
-        } else {
-            if let Some(win) = self.windows.get_mut(w) {
-                win.open = None;
-            }
+        open.closed
+    }
+
+    /// WCLS and the owning WSIZW always yield for an occupied slot, including the poll that clears it. A foreign
+    /// caller only requests closing: advancing its owner's geometry here as well would double-step the window.
+    fn close_window_and_poll_owner(&mut self, w: usize) {
+        self.request_window_close(w);
+        if self.open_owner(w) == Some(self.current) && self.poll_window(w) {
+            self.windows[w].open = None;
             self.events.push(Event::WindowClosedByScript { window: w as u8 });
         }
     }
@@ -602,7 +620,7 @@ mod tests {
         rt.tick(None);
         assert!(rt.window_open());
         let mut owner_done_first = false;
-        for _ in 0..8 {
+        for _ in 0..20 {
             rt.tick(None);
             let (talker, closer) = (rt.mem.banks.get(0x50), rt.mem.banks.get(0x51));
             assert!(closer == 0 || talker == 1, "WCLS goes on only after the owner's message finished");
@@ -613,7 +631,7 @@ mod tests {
         assert_eq!(rt.mem.banks.get(0x51), 1);
         assert!(!rt.window_open());
         let events = rt.drain_events();
-        assert_eq!(events.iter().filter(|e| matches!(e, Event::Window { .. })).count(), 1, "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, Event::Window { .. })), "script close before readiness does not solicit input: {events:?}");
         assert!(events.iter().any(|e| matches!(e, Event::WindowDone { window: 0 })), "{events:?}");
     }
 
@@ -622,9 +640,15 @@ mod tests {
         // The owner's script moved on (a priority switch left a stale window): the closer must not hang.
         let s = SynthScript::default().entity("closer", vec![flag_after(&[0x2E, 1], 0x52)]);
         let mut rt = runtime(s);
-        rt.windows[1].open = Some(crate::runtime::OpenWindow { entity: 0, dialog: 0, ask: None, closed: false });
+        rt.windows[1].open = Some(crate::runtime::OpenWindow::new(0, 0, None, 0, rt.windows[1].width, rt.windows[1].height));
         rt.tick(None);
         assert_eq!(rt.mem.banks.get(0x52), 0);
+        for _ in 0..20 {
+            if rt.windows[1].open.is_none() { break; }
+            rt.tick(None);
+        }
+        assert!(rt.windows[1].open.is_none());
+        assert_eq!(rt.mem.banks.get(0x52), 0, "the poll that clears the window still yields");
         rt.tick(None);
         assert_eq!(rt.mem.banks.get(0x52), 1);
         assert!(rt.windows()[1].open.is_none());
@@ -639,13 +663,16 @@ mod tests {
         let mut s = SynthScript::default().entity("talker", vec![talker]).entity("sizer", vec![sizer]);
         s.dialogs.push(dialog("Hi"));
         let mut rt = runtime(s);
-        for _ in 0..4 {
+        for _ in 0..16 {
             rt.tick(None);
+            if rt.window_ready(0) { break; }
         }
         assert_eq!(rt.mem.banks.get(0x53), 0, "waits while another entity's window is open");
-        rt.close_window(0);
-        rt.tick(None);
-        rt.tick(None);
+        assert!(rt.close_window(0));
+        for _ in 0..16 {
+            if rt.mem.banks.get(0x53) == 1 { break; }
+            rt.tick(None);
+        }
         assert_eq!(rt.mem.banks.get(0x53), 1);
         let w = &rt.windows()[0];
         assert_eq!((w.x, w.y, w.width, w.height), (8, 164, 100, 60));

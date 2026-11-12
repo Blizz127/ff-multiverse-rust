@@ -101,10 +101,9 @@ fn main() {
             rt.tick(None);
             for ev in rt.drain_events() {
                 match ev {
-                    Event::Window { window, .. } => {
+                    Event::Window { window, ask, .. } => {
                         windows += 1;
-                        rt.close_window(window);
-                        rt.answer(window, 0);
+                        if ask.is_some() { rt.answer(window, 0); } else { rt.close_window(window); }
                     }
                     Event::Command(c) => {
                         let key = format!("{c:?}").split([' ', '{']).next().unwrap_or("?").to_string();

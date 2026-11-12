@@ -142,15 +142,25 @@ cancels its old queued answer. The single-field trace accepts `--choice DIALOG=I
 are rounded for the runtime's integer input. `--then-tri` remains a diagnostic placement, not a gameplay route.
 These response delays are test policies, not native window emulation; `runtime_explore` still answers immediately.
 
-**Known window timing gap (2026-11-12):** the runtime accepts answers as soon as a window opens and resumes the
-owning script on its next poll. The GUI also displays page text immediately. The pinned PSX source instead grows
-the window, processes text/control bytes using message speed and held-OK input, accepts a fresh confirmation only
-in its ready phase, then shrinks the window before the opcode completes. Other entities continue meanwhile.
-`LiveWindow.answerable` currently expresses governor permission, not temporal readiness. A paired temporary TCP
-check at the tunnel_2 duct stalls with0.2s answers but reaches sbwy4_1 with1s answers. This establishes sensitivity
-to response timing, not a correct fixed delay or ordinary GUI behavior. The intended correction needs a shared
-runtime window lifecycle and legal input phases driven by window/text metadata. Keep native REQ drop semantics;
-do not replace them with a queue to hide this gap. Static source evidence is PSX, not a measured original-PC run.
+**Window lifecycle (first increment, 2026-11-12):** the owning `MESSAGE`/`ASK` polls now grow the window using its
+integer quarter dimensions, pass through a separate Text poll, then emit `Event::Window` when input is ready.
+Early, duplicate, prohibited and wrong-kind answers are rejected. Accepted input starts shrinking; the owning
+instruction resumes only when both dimensions have closed. Other entities keep running, and a preempted owner
+cannot advance its window until it resumes. ASK holds and non-passive window waiting remain through closing.
+This restores structural timing without changing protocol24: the client receives the existing window message at
+readiness and keeps it until final closure. `LiveWindow.answerable` still expresses governor permission.
+
+Scripted closing keeps distinct opcode behavior: `WCLSE` requests closing after opening and continues without
+waiting for shrink; `WCLS` waits for vacant ownership; `WSIZW` waits for a foreign owner or closes its own window
+before resizing. Foreign callers cannot double-step the owner's geometry. A tiny/zero window completes once
+without reopening; this is a bounded port behavior for a degenerate original-state-machine case.
+
+Text remains instantaneous in the distinct Text poll. Native message speed, held-OK acceleration, inline pauses,
+row/page controls and visible growth/shrink are **not implemented by this increment**. The GUI still shows full
+page text. The original timing reference is pinned PSX source, not a measured original-PC run. Before this change,
+the runtime accepted an answer immediately: paired temporary TCP checks at the tunnel_2 duct stalled with0.2s
+answers but reached sbwy4_1 with1s answers; traces showed the fast path dropping a request while Tifa's prior script
+was active. Preserve native REQ drop semantics. The diagnostic1s delay is not a game policy or a native text model.
 
 For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
 route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`

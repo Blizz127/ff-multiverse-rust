@@ -86,7 +86,7 @@ impl Answers {
         for window in self.pending.keys().copied().collect::<Vec<_>>() {
             let pending = &self.pending[&window];
             let current = rt.windows().get(usize::from(window)).and_then(|w| w.open.as_ref());
-            let matches = current.is_some_and(|open| !open.closed && open.entity == pending.entity && open.dialog == pending.dialog
+            let matches = rt.window_ready(window) && current.is_some_and(|open| !open.closed && open.entity == pending.entity && open.dialog == pending.dialog
                 && open.ask.map(|ask| (ask.first, ask.last)) == pending.ask);
             if !matches { self.pending.remove(&window); continue; }
             if frame < pending.due { continue; }
@@ -94,9 +94,8 @@ impl Answers {
             if let Some(choice) = choice {
                 if !rt.answer(window, choice) { return Err(format!("runtime refused choice {dialog}={choice} in window {window}")); }
             } else {
-                rt.close_window(window);
-                // A non-dismissible message is retried while this same window lifetime remains open.
-                if rt.windows()[usize::from(window)].open.as_ref().is_some_and(|open| !open.closed) { continue; }
+                // Acceptance starts closing; it does not mean the owning script has finished shrinking it.
+                if !rt.close_window(window) { return Err(format!("runtime refused dismissal of dialog {dialog} in window {window}")); }
             }
             self.pending.remove(&window);
             sent.push((window, dialog, choice));
@@ -348,14 +347,19 @@ mod tests {
     }
 
     #[test]
-    fn delivery_discards_closed_or_replaced_windows() {
+    fn delivery_discards_closing_or_replaced_windows() {
         for closed in [false, true] {
             let mut rt = runtime();
-            rt.tick(None);
             let mut answers = Answers::new(Choices::default(), 0);
-            for event in rt.drain_events() { answers.observe(&event, 1).unwrap(); }
-            if closed { rt.close_window(0); } else { answers.observe(&window(0, 2, 0), 1).unwrap(); }
-            assert!(answers.deliver(&mut rt, 1).unwrap().is_empty());
+            for frame in 1..=16 {
+                rt.tick(None);
+                for event in rt.drain_events() { answers.observe(&event, frame).unwrap(); }
+                if rt.window_ready(0) { break; }
+            }
+            assert!(rt.window_ready(0));
+            assert_eq!(answers.pending.len(), 1);
+            if closed { assert!(rt.answer(0, 0)); } else { answers.observe(&window(0, 2, 0), 16).unwrap(); }
+            assert!(answers.deliver(&mut rt, 16).unwrap().is_empty());
             assert!(answers.pending.is_empty());
         }
     }

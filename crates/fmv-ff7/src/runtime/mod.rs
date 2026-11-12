@@ -40,6 +40,8 @@ pub use ops::{CharacterVitals, PartySaveData};
 mod owned_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_lifecycle_tests;
 
 use std::collections::BTreeMap;
 
@@ -223,8 +225,35 @@ pub struct OpenWindow {
     pub entity: usize,
     pub dialog: u8,
     pub ask: Option<Ask>,
-    /// The host has closed it; the opening instruction completes on its next visit.
+    /// Closing geometry has finished; the owning instruction can complete.
     pub closed: bool,
+    pub phase: WindowPhase,
+    /// Geometry advanced by the owning script's polls, not by wall-clock frame updates.
+    pub current_width: i32,
+    pub current_height: i32,
+    /// Opening instruction, retained while a higher-priority script owns the entity's PC.
+    pub offset: usize,
+}
+
+/// Structural window timing. Text is still presented instantaneously in this first increment; its distinct poll
+/// is retained, but glyph printing, page waits and visible geometry animation are not yet modelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPhase {
+    Opening,
+    Text,
+    Ready,
+    Closing,
+}
+
+impl OpenWindow {
+    fn new(entity: usize, dialog: u8, ask: Option<Ask>, offset: usize, width: u16, height: u16) -> Self {
+        Self {
+            entity, dialog, ask, closed: false, phase: WindowPhase::Opening,
+            current_width: (i32::from(width) / 4).max(8),
+            current_height: (i32::from(height) / 4).max(8),
+            offset,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,12 +268,13 @@ pub struct Ask {
 /// What the host should know about, in the order it happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// A window opened. `ask` is `Some` for a question. `offset` is the section offset of the instruction that opened it
+    /// A window reached readiness after its opening and text polls. `ask` is `Some` for a question.
+    /// `offset` is the section offset of the instruction that opened it
     /// (a mod layer with its own dialog numbering finds its own line by the instruction).
     Window { window: u8, entity: usize, dialog: u8, ask: Option<(u8, u8)>, offset: usize },
     /// The window an instruction opened was dismissed and its instruction completed.
     WindowDone { window: u8 },
-    /// A window was closed by a script (`WCLSE`).
+    /// A script closed a slot without completing its opening MESSAGE/ASK (an owning WCLS/WSIZW poll).
     WindowClosedByScript { window: u8 },
     /// A command was issued (see [`FieldRuntime::command`]).
     Command(Command),
@@ -645,6 +675,12 @@ impl FieldRuntime {
         self.windows.get(usize::from(window)).is_some_and(|w| w.prevent_close)
     }
 
+    /// Whether the window currently accepts player input. Opening, closing and passive windows do not.
+    pub fn window_ready(&self, window: u8) -> bool {
+        self.windows.get(usize::from(window)).is_some_and(|w| !w.prevent_close
+            && w.open.as_ref().is_some_and(|open| !open.closed && open.phase == WindowPhase::Ready))
+    }
+
     /// Whether a question is open (the original holds the player still while one is, and only then: a plain message
     /// does not stop the player by itself, the scripts lock control around the ones that should).
     pub fn question_open(&self) -> bool {
@@ -685,32 +721,31 @@ impl FieldRuntime {
         }
     }
 
-    /// The player dismissed window `window` (a message).
-    pub fn close_window(&mut self, window: u8) {
-        let Some(w) = self.windows.get_mut(usize::from(window)) else { return };
-        // A window the script marked "cannot be closed" stays until the script closes it.
-        if w.prevent_close {
-            return;
-        }
-        if let Some(open) = w.open.as_mut() {
-            open.closed = true;
-        }
+    /// Accept a player's dismissal of a ready message. Early, duplicate, passive and question dismissals are
+    /// ignored, not queued. The owner continues only after its closing polls finish.
+    pub fn close_window(&mut self, window: u8) -> bool {
+        if !self.window_ready(window) { return false; }
+        let Some(open) = self.windows.get_mut(usize::from(window)).and_then(|w| w.open.as_mut()) else { return false };
+        if open.ask.is_some() { return false; }
+        open.phase = WindowPhase::Closing;
+        true
     }
 
     /// The player answered the question in window `window` with line `choice` (counted from the question's first
     /// choice line, as the script reads it). An answer outside the question's lines is refused (`false`).
     pub fn answer(&mut self, window: u8, choice: u8) -> bool {
+        if !self.window_ready(window) { return false; }
         let Some(open) = self.windows.get_mut(usize::from(window)).and_then(|w| w.open.as_mut()) else {
             return false;
         };
         let Some(ask) = open.ask.as_mut() else {
             return false;
         };
-        if choice > ask.last.saturating_sub(ask.first) {
+        if ask.first > ask.last || choice > ask.last - ask.first || ask.answer.is_some() {
             return false;
         }
         ask.answer = Some(choice);
-        open.closed = true;
+        open.phase = WindowPhase::Closing;
         true
     }
 

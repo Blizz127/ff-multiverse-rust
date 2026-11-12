@@ -181,10 +181,7 @@ impl LiveField for Ff7Live {
     fn answer(&mut self, window: u8, choice: Option<u8>) -> bool {
         match choice {
             Some(c) => self.rt.answer(window, c),
-            None => {
-                self.rt.close_window(window);
-                true
-            }
+            None => self.rt.close_window(window),
         }
     }
 

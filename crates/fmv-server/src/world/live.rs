@@ -405,11 +405,12 @@ impl World {
         let governor_entity = self.by_account.get(&run.governor).copied();
         // Answers and acknowledgements first.
         for (account, window, choice) in std::mem::take(&mut self.live.answers) {
-            if account == run.governor && run.field.answer(window, choice) {
-                run.windows.remove(&window);
-            } else {
+            if account != run.governor {
                 self.live.answers.push((account, window, choice));
+            } else if run.field.answer(window, choice) {
+                run.windows.remove(&window);
             }
+            // An invalid/early answer for this governor is consumed, never offered to another run.
         }
         match run.waiting.clone() {
             Some(Waiting::Battle(battle)) => {

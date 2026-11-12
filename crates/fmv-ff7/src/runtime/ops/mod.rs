@@ -195,12 +195,9 @@ impl FieldRuntime {
                 Flow::Continue
             }
             0x54 => {
-                let w = self.p8(1);
-                if let Some(win) = self.windows.get_mut(usize::from(w)) {
-                    if win.open.take().is_some() {
-                        self.events.push(Event::WindowClosedByScript { window: w });
-                    }
-                }
+                let w = usize::from(self.p8(1));
+                // WCLSE only requests closing. Opening must finish first; the owner performs the shrink polls.
+                if !self.request_window_close(w) { return Flow::Yield; }
                 self.advance(2);
                 Flow::Continue
             }
@@ -694,12 +691,12 @@ impl FieldRuntime {
         let e = self.current;
         match &self.windows[w].open {
             None => {
-                self.windows[w].open = Some(OpenWindow { entity: e, dialog, ask: None, closed: false });
                 let offset = self.pc();
-                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: None, offset });
+                self.windows[w].open = Some(OpenWindow::new(e, dialog, None, offset, self.windows[w].width, self.windows[w].height));
                 Flow::Yield
             }
-            Some(open) if open.entity == e && open.dialog == dialog && open.closed => {
+            Some(open) if open.entity == e && open.dialog == dialog => {
+                if !self.poll_window(w) { return Flow::Yield; }
                 self.windows[w].open = None;
                 self.events.push(Event::WindowDone { window: w as u8 });
                 self.advance(3);
@@ -717,13 +714,13 @@ impl FieldRuntime {
         match &self.windows[w].open {
             None => {
                 let ask = Ask { first, last, var, answer: None };
-                self.windows[w].open = Some(OpenWindow { entity: e, dialog, ask: Some(ask), closed: false });
                 let offset = self.pc();
-                self.events.push(Event::Window { window: w as u8, entity: e, dialog, ask: Some((first, last)), offset });
+                self.windows[w].open = Some(OpenWindow::new(e, dialog, Some(ask), offset, self.windows[w].width, self.windows[w].height));
                 Flow::Yield
             }
-            Some(open) if open.entity == e && open.dialog == dialog && open.closed => {
-                let answer = open.ask.and_then(|a| a.answer).unwrap_or(0);
+            Some(open) if open.entity == e && open.dialog == dialog => {
+                if !self.poll_window(w) { return Flow::Yield; }
+                let answer = self.windows[w].open.as_ref().and_then(|open| open.ask).and_then(|ask| ask.answer).unwrap_or(0);
                 self.windows[w].open = None;
                 self.wr8(2, 6, answer);
                 self.events.push(Event::WindowDone { window: w as u8 });

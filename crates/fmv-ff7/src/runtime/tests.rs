@@ -97,16 +97,29 @@ fn a_message_holds_its_script_until_the_window_is_closed_and_others_keep_running
     s.dialogs.push(dialog("Hello"));
     let mut rt = runtime(s);
     rt.tick(None);
+    assert!(rt.drain_events().is_empty(), "opening is not input readiness");
+    assert!(!rt.close_window(0), "early input is ignored");
+    for _ in 0..16 {
+        if rt.window_ready(0) { break; }
+        rt.tick(None);
+    }
+    assert!(rt.window_ready(0));
     let events = rt.drain_events();
     assert!(matches!(events.as_slice(), [Event::Window { window: 0, dialog: 0, ask: None, .. }]), "{events:?}");
     for _ in 0..5 {
         rt.tick(None);
     }
     assert_eq!(rt.mem.banks.get(0x50), 0);
-    assert_eq!(rt.mem.banks.get(0x51), 6, "the other entity ran every frame");
+    assert_eq!(u64::from(rt.mem.banks.get(0x51)), rt.frame(), "the other entity ran every frame");
     assert!(rt.window_open());
-    rt.close_window(0);
-    rt.tick(None);
+    assert!(rt.close_window(0));
+    assert!(!rt.close_window(0), "duplicate input is ignored");
+    assert!(rt.window_open());
+    assert_eq!(rt.mem.banks.get(0x50), 0, "acceptance does not skip closing");
+    for _ in 0..16 {
+        if !rt.window_open() { break; }
+        rt.tick(None);
+    }
     assert_eq!(rt.mem.banks.get(0x50), 1);
     assert!(!rt.window_open());
 }
@@ -119,9 +132,20 @@ fn ask_writes_the_answer_where_the_script_reads_it() {
     s.dialogs.push(dialog("Q"));
     let mut rt = runtime(s);
     rt.tick(None);
+    assert!(!rt.answer(1, 2), "opening is not ready for an answer");
+    for _ in 0..16 {
+        if rt.window_ready(1) { break; }
+        rt.tick(None);
+    }
+    assert!(rt.window_ready(1));
     assert!(!rt.answer(1, 3), "outside the question's lines");
     assert!(rt.answer(1, 2));
-    rt.tick(None);
+    assert!(!rt.answer(1, 0), "accepted answers cannot be overwritten");
+    assert_eq!(rt.mem.banks.get(0x60), 0, "answer write waits for closing");
+    for _ in 0..16 {
+        if !rt.window_open() { break; }
+        rt.tick(None);
+    }
     assert_eq!(rt.mem.banks.get(0x60), 2);
 }
 
