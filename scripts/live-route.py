@@ -150,6 +150,7 @@ def main():
     windows = set()
     pending = []
     idx, steps, entry_area = 0, None, None
+    entry_expects_exit = False
     last_ping = last_move = busy_at = progress_at = time.monotonic()
     waiting_until = 0.0
     reached = []
@@ -207,13 +208,14 @@ def main():
                 locked = b["locked"]
                 if args.verbose:
                     print(f"  CONTROL locked={locked}", flush=True)
-                if locked and steps is not None:
+                if locked and steps is not None and not entry_expects_exit:
                     legs, steps = [], []  # a script took over: what was left of this entry is void
             elif k == "LivePlace":
                 pos, facing = b["pos"], b["facing"]
-                legs = []
-                if steps is not None:
-                    steps = []
+                if not entry_expects_exit:
+                    legs = []
+                    if steps is not None:
+                        steps = []
             elif k == "MoveRejected":
                 # Refused, or ended beside someone solid: carry on towards the same corner from where the server says
                 # we stand (the stuck check below walks round whoever is in the way).
@@ -307,6 +309,9 @@ def main():
                 time.sleep(0.02)
                 continue
             steps, entry_area = list(entry_steps), area
+            # A route with an explicit gateway still needs to leave this field after any conversation on the way.
+            # Other entries may intentionally end when a script takes over (ladders, jumps, story scenes).
+            entry_expects_exit = any(s[0] == "gate" for s in entry_steps)
             print(f"[{idx + 1}/{len(route)}] {field}: {'; '.join(' '.join(s) for s in entry_steps)}", flush=True)
         if area != entry_area:
             idx, steps = idx + 1, None  # the entry took us to another field
@@ -353,6 +358,9 @@ def main():
         elif step[0] == "wait":
             waiting_until = now + float(step[1])
     print(f"ROUTE {status} done={idx}/{len(route)} reached={reached[-1] if reached else '-'} areas={','.join(reached)}", flush=True)
+    if status != "done":
+        wanted = route[idx][0] if idx < len(route) else "-"
+        print(f"  waiting for {wanted}: area={area} locked={locked} windows={sorted(windows)} battle={in_battle} pos={pos} legs={len(legs)} steps={steps}", flush=True)
     c.send("Leave")
     return 0 if status == "done" else 1
 

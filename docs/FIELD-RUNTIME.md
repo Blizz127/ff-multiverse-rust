@@ -110,6 +110,9 @@ its dialogue advances; repeated cast or lock snapshots alone do not reset the wa
 IDs and control changes without game text. `--token-file PATH` saves a newly registered **test** account's token with
 mode 0600, or resumes it when the file already exists. Use the remaining route with that account on its throwaway
 server state; no route run should use the owner's saves.
+An entry with an explicit `gate` resumes its remaining walk after a scene in the same field (the station's farewell
+conversation is one example). Other entries still stop when a script takes over, since a ladder or jump may be their
+intended result. A failed run prints the field it expected and the control, window and pending-step state.
 
 **Earlier numbers were wrong.** The first two versions of the solver (2026-11-11) stood on any triangle and took any
 gateway. They "reached" moments 78 and 197 by leaving Sector 7 through a gate a man stands in, and moment 33 by letting
