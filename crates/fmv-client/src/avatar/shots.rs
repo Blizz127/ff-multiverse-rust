@@ -704,7 +704,7 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
     use crate::session::SessionInfo;
     use crate::state::ClientState;
     use crate::ui::hud::{self, Subject};
-    use crate::window::{field_draw, label_anchor};
+    use crate::window::field_draw;
     use fmv_adapter_api::AreaRuntime;
     use fmv_core::{AccountId, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
     use fmv_protocol::{NpcSnapshot, ServerMsg, NPC_NAME_CHARS, NPC_REF_CHARS};
@@ -834,7 +834,7 @@ fn offscreen_real_ff7_npcs_in_two_fields() {
         // Pixels.
         let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
         let info = SessionInfo { name: "Cloud".into(), tint: own_tint, area_id: area_id.clone(), fixture: false, card: fmv_protocol::CharacterCard::plain("Cloud", own_tint) };
-        let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &view, draw.own_who, subject, at);
+        let anchor = |subject: Subject, at: Pos| draw.label_anchor(&view, subject, at);
         let hud_input = hud::gather_anchored(&state, &info, &view, render_t, &anchor);
         for npc in &npcs {
             assert!(hud_input.labels.iter().any(|l| l.text == npc.name && l.kind == hud::LabelKind::Npc), "{key}: {} is named", npc.name);
@@ -1030,7 +1030,7 @@ fn offscreen_field_two_originals() {
     use crate::session::SessionInfo;
     use crate::state::ClientState;
     use crate::ui::hud::{self, Subject};
-    use crate::window::{field_draw, label_anchor};
+    use crate::window::field_draw;
     use fmv_core::{AccountId, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
     use fmv_ff7::playable::PLACEHOLDER_BODIES;
     use fmv_protocol::{CharacterCard, ServerMsg};
@@ -1131,7 +1131,7 @@ fn offscreen_field_two_originals() {
         card: CharacterCard { name: "Blizz".into(), tint: blizz_tint, body: Some(blizz_body.archetype.into()), binding: Some(blizz_body.model.appearance_ref.into()), slot: Some(1), migrated: false },
     };
     let scene = Scene { bounds: view.bounds, triangles: &[], players: &draw.markers, fixture_banner: false, backdrop: view.backdrop.as_ref() };
-    let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &view, draw.own_who, subject, at);
+    let anchor = |subject: Subject, at: Pos| draw.label_anchor(&view, subject, at);
     let hud_input = hud::gather_anchored(&state, &info, &view, render_t, &anchor);
     let labels: Vec<&str> = hud_input.labels.iter().map(|l| l.text.as_str()).collect();
     assert!(labels.contains(&"Blizz") && labels.contains(&"Wedge"), "both are named: {labels:?}");

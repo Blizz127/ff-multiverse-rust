@@ -76,7 +76,7 @@ use crate::state::ClientState;
 use crate::ui::draw::DrawList;
 use crate::ui::hud::{self, Subject};
 use crate::ui::testkit::{save, Offscreen};
-use crate::window::{field_draw, label_anchor, FieldDraw};
+use crate::window::{field_draw, FieldDraw};
 use fmv_adapter_api::AreaRuntime;
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId, Pos};
 use fmv_ff7::playable::PLACEHOLDER_BODIES;
@@ -1328,7 +1328,7 @@ impl Rig {
         let story = self.state.scene.player();
         let anchor = |subject: Subject, at: Pos| if label_hidden(story, subject, self.state.npc_views())
             || super::draw::participant_label_hidden(story, self.state.self_entity(), subject) { None }
-            else { label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at) };
+            else { draw.label_anchor(&self.view, subject, at) };
         let mut hud_input = hud::gather_anchored(&self.state, &self.info(), &self.view, 1.0, &anchor);
         if let Some(story) = story {
             let mut labels = super::draw::cast_labels(story, draw.built.as_ref(), &self.view);

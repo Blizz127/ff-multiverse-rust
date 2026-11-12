@@ -432,7 +432,7 @@ pub struct ClientState {
     pub story: StoryMirror,
     /// The story's party walking behind its leader on the field (see `followers`): presentation only.
     pub(crate) followers: std::sync::Mutex<crate::followers::Followers>,
-    /// Where the player's own character stands in a live field's scenes (see `companion`): presentation only.
+    /// Where this instance's governor stands in live field scenes (local or remote): presentation only.
     pub(crate) companion: std::sync::Mutex<crate::companion::Companion>,
     story_hold: Option<StoryHold>,
     story_last_hold: u64,

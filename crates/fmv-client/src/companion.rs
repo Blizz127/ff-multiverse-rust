@@ -1,4 +1,6 @@
-//! Where the player's own character stands while a live field's scripts hold the scene.
+//! Where the governing player's character stands while a live field's scripts hold the scene.
+//! Every viewer applies this to the instance's recorded phase owner, whether local or remote; other players keep
+//! their ordinary positions. Binding to that entity prevents offsets from leaking when ownership changes.
 //!
 //! The owner's direction (2026-11-12): the player steers their own character and the story's lead (FF7: Cloud) is the
 //! computer's. On a live field the scripts know one "player character", and it is the lead's:
@@ -16,7 +18,7 @@
 //! Presentation only: the server, the scripts and every rule of the field see the player where the lead is. Nothing
 //! here reads game files or the network.
 
-use fmv_core::{AnimState, Pos};
+use fmv_core::{AnimState, EntityId, Pos};
 
 /// How far from the lead the player's character stands in a scene (field units).
 const RING: f32 = 64.0;
@@ -42,6 +44,8 @@ pub struct Drawn {
 
 #[derive(Debug, Default)]
 pub struct Companion {
+    /// The avatar this presentation belongs to; a new governor must not inherit the old one's offset.
+    entity: Option<EntityId>,
     /// The field the state belongs to (the client's count of area changes).
     area: u64,
     /// Where the character was drawn last.
@@ -60,13 +64,19 @@ fn dist(a: Pos, b: Pos) -> f32 {
 }
 
 impl Companion {
+    pub fn bind(&mut self, entity: Option<EntityId>) {
+        if self.entity != entity {
+            *self = Companion { entity, ..Companion::default() };
+        }
+    }
+
     /// One frame of a scene. The lead stands at `lead` facing `lead_facing`; `own` is where the character really is
     /// (the lead's place, by the server's reckoning); `others` are the places of everyone else drawn; `walkable` says
     /// whether a place is ground.
     #[allow(clippy::too_many_arguments)]
     pub fn scene(&mut self, area: u64, own: Pos, lead: Pos, lead_facing: f32, others: &[Pos], walkable: &dyn Fn(Pos) -> bool, dt: f32) -> Drawn {
         if self.area != area {
-            *self = Companion { area, ..Companion::default() };
+            *self = Companion { area, entity: self.entity, ..Companion::default() };
         }
         self.in_scene = true;
         self.settle = None;
@@ -136,7 +146,7 @@ impl Companion {
 
     /// One frame of a scene whose lead the scripts do not show: the player's character is off the stage with it.
     pub fn offstage(&mut self, area: u64) {
-        *self = Companion { area, in_scene: true, ..Companion::default() };
+        *self = Companion { area, entity: self.entity, in_scene: true, ..Companion::default() };
     }
 
     /// One frame of free walking: the character is drawn at `own`, except for what is left of a scene's place.
@@ -144,7 +154,7 @@ impl Companion {
     pub fn free(&mut self, area: u64, own: Pos, facing: f32, anim: AnimState) -> (Drawn, bool) {
         let ended = self.in_scene && self.area == area;
         if self.area != area {
-            *self = Companion { area, ..Companion::default() };
+            *self = Companion { area, entity: self.entity, ..Companion::default() };
         }
         self.in_scene = false;
         self.spot = None;

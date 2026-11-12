@@ -28,7 +28,7 @@ use crate::session::SessionInfo;
 use crate::state::ClientState;
 use crate::ui::hud::{self, Subject};
 use crate::ui::testkit::{save, Offscreen};
-use crate::window::{field_draw, label_anchor};
+use crate::window::field_draw;
 use fmv_adapter_api::AreaRuntime;
 use fmv_core::{AccountId, AnimState, AreaId, AvatarAppearance, EntityId, EntitySnapshot, GameId};
 use fmv_ff7::script::dialogue::{parse_message, Piece, StartOfGame, StoryVars, TalkSession};
@@ -204,7 +204,7 @@ impl Stage {
             fixture: false,
             card: fmv_protocol::CharacterCard::plain("Cloud", self.own_tint),
         };
-        let anchor = |subject: Subject, at: Pos| label_anchor(draw.built.as_ref(), &self.view, draw.own_who, subject, at);
+        let anchor = |subject: Subject, at: Pos| draw.label_anchor(&self.view, subject, at);
         let hud_input = hud::gather_anchored(&self.state, &info, &self.view, render_t, &anchor);
         let mut overlay = DrawList::new();
         hud::draw_hud(&hud_input, w, h, &mut overlay);

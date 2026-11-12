@@ -1350,7 +1350,7 @@ impl App {
         self.view.bounds = self.camera.update(&camera_input(&self.view, &self.session.state, &draw, (vw, vh), dt));
         let view = &self.view;
         let state = &self.session.state;
-        let (built, markers) = (draw.built, draw.markers);
+        let (built, markers) = (&draw.built, &draw.markers);
 
         // The walkmesh is the scenery of an area without a picture; over a picture it is a
         // debugging aid, shown on request (F1).
@@ -1358,7 +1358,7 @@ impl App {
         let scene = Scene {
             bounds: view.bounds,
             triangles: if walkmesh { &view.triangles } else { &[] },
-            players: &markers,
+            players: markers,
             fixture_banner: self.session.info.fixture,
             backdrop: view.backdrop.as_ref(),
         };
@@ -1374,7 +1374,7 @@ impl App {
                 || scene::participant_label_hidden(story, state.self_entity(), subject) {
                 None
             } else {
-                label_anchor(built.as_ref(), view, draw.own_who, subject, at)
+                draw.label_anchor(view, subject, at)
             }
         };
         let mut hud_input = hud::gather_anchored(state, &self.session.info, view, render_t, &anchor);
@@ -1453,6 +1453,23 @@ pub(crate) struct FieldDraw {
     /// Where the local player's character is drawn this frame (view space; on its witness spot while a scene runs), for
     /// the field camera to centre on. `None` when it cannot be drawn.
     pub own_at: Option<Pos>,
+    /// The scene governor's presented position, or `None` when offstage. Names must follow the same presentation.
+    governor: Option<(fmv_core::EntityId, Option<Pos>)>,
+}
+
+impl FieldDraw {
+    pub(crate) fn label_anchor(&self, view: &FieldView, subject: Subject, at: Pos) -> Option<Pos> {
+        let entity = match subject {
+            Subject::Own => Some(fmv_core::EntityId(self.own_who.0)),
+            Subject::Remote(id) => Some(id),
+            Subject::Npc(_) => None,
+        };
+        let at = match self.governor {
+            Some((governor, presented)) if entity == Some(governor) => presented?,
+            _ => at,
+        };
+        label_anchor(self.built.as_ref(), view, self.own_who, subject, at)
+    }
 }
 
 /// Everyone who is drawn in this frame of the field: the area's non-player characters first, then
@@ -1504,51 +1521,64 @@ pub(crate) fn field_draw(
     if let Some(story) = story {
         players.extend(scene::cast_players(story));
     }
-    players.extend(remotes.iter().map(|v| AvatarPlayer {
-        who: Who(v.id.0),
-        pos: v.pose.pos,
-        facing: v.pose.facing,
-        anim: v.pose.anim,
-        scene_frame: None, scene_clip: None, scene_return: None,
-        appearance: v.appearance.as_deref(),
-        npc: None,
-        tint: v.tint,
-        own: false,
-        party: state.party.is_party_entity(v.id),
-    }));
-    // The story's party walking behind its leader (see `followers`; none while a scene's cast plays them), drawn under the
-    // local player, which stays last.
-    players.extend(crate::followers::players(state, &npcs, story.is_some(), live_scene && lead_id.is_some(), render_t));
-    // The player's own character: in a live field's scene it stands beside the lead, not in it.
-    let own_pose = {
-        let mut companion = state.companion.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (own, area) = (state.own.pos(), state.area_changes());
-        match lead {
-            // The scripts hold the scene and do not show the lead: the player's character is off the stage with it.
-            None if live_scene && lead_id.is_some() => {
-                companion.offstage(area);
-                None
-            }
-            Some((lead_pos, lead_facing)) => {
-                let others: Vec<Pos> =
-                    npcs.iter().filter(|n| Some(n.id) != lead_id).map(|n| n.pos).chain(remotes.iter().map(|v| v.pose.pos)).collect();
-                // (ground: inside one of the walkmesh triangles the view shows; a view without any knows of none)
-                let walkable = |p: Pos| view.triangles.is_empty() || view.to_view(p).is_some_and(|q| view.triangles.iter().any(|t| in_triangle(t, q)));
-                Some(companion.scene(area, own, lead_pos, lead_facing, &others, &walkable, dt))
-            }
-            None => {
-                let (pose, ended) = companion.free(area, own, state.own.facing(), state.own.anim());
-                if ended {
-                    // The lead stays where the scene left it (the player's real place) until the player walks away.
-                    let facing = lead_id.and_then(|id| cast.iter().find(|n| n.id == id)).map_or(state.own.facing(), |n| n.facing);
-                    state.followers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hold_first(own, facing);
-                }
-                Some(pose)
-            }
+    // The scripts move the instance's governor, which can be another player. Every viewer presents THAT avatar
+    // beside the lead; the other party members keep their ordinary positions.
+    let own_real = crate::companion::Drawn { pos: state.own.pos(), facing: state.own.facing(), anim: state.own.anim() };
+    let governor_real = state.party.phase_owner_entity(state.self_entity()).and_then(|id| {
+        if id == state.self_entity() { Some((id, own_real)) } else {
+            remotes.iter().find(|v| v.id == id).map(|v| (id, crate::companion::Drawn {
+                pos: v.pose.pos, facing: v.pose.facing, anim: v.pose.anim,
+            }))
         }
+    });
+    let governor = {
+        let mut companion = state.companion.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        companion.bind(governor_real.map(|(id, _)| id));
+        governor_real.map(|(id, real)| {
+            let (own, area) = (real.pos, state.area_changes());
+            let pose = match lead {
+                // The scripts hold the scene and do not show the lead: the player's character is off the stage with it.
+                None if live_scene && lead_id.is_some() => {
+                    companion.offstage(area);
+                    None
+                }
+                Some((lead_pos, lead_facing)) => {
+                    let others: Vec<Pos> = npcs.iter().filter(|n| Some(n.id) != lead_id).map(|n| n.pos)
+                        .chain(remotes.iter().filter(|v| v.id != id).map(|v| v.pose.pos))
+                        .chain((id != state.self_entity()).then_some(state.own.pos())).collect();
+                    // (ground: inside one of the walkmesh triangles the view shows; a view without any knows of none)
+                    let walkable = |p: Pos| view.triangles.is_empty() || view.to_view(p).is_some_and(|q| view.triangles.iter().any(|t| in_triangle(t, q)));
+                    Some(companion.scene(area, own, lead_pos, lead_facing, &others, &walkable, dt))
+                }
+                None => {
+                    let (pose, ended) = companion.free(area, own, real.facing, real.anim);
+                    if ended {
+                        // The lead stays where the scene left it (the player's real place) until the player walks away.
+                        let facing = lead_id.and_then(|id| cast.iter().find(|n| n.id == id)).map_or(real.facing, |n| n.facing);
+                        state.followers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hold_first(own, facing);
+                    }
+                    Some(pose)
+                }
+            };
+            (id, pose)
+        })
     };
+    let presented = |id, real| match governor { Some((owner, pose)) if owner == id => pose, _ => Some(real) };
+    players.extend(remotes.iter().filter_map(|v| {
+        let pose = presented(v.id, crate::companion::Drawn { pos: v.pose.pos, facing: v.pose.facing, anim: v.pose.anim })?;
+        Some(AvatarPlayer {
+            who: Who(v.id.0),
+            pos: pose.pos, facing: pose.facing, anim: pose.anim,
+            scene_frame: None, scene_clip: None, scene_return: None,
+            appearance: v.appearance.as_deref(), npc: None, tint: v.tint, own: false,
+            party: state.party.is_party_entity(v.id),
+        })
+    }));
+    // The story's party walking behind its leader (see `followers`; none while a scene's cast plays them), drawn under
+    // the local player. Apply the end-of-scene hold above before the followers draw this frame.
+    players.extend(crate::followers::players(state, &npcs, story.is_some(), live_scene && lead_id.is_some(), render_t));
     let own_who = Who(state.self_entity().0);
-    if let Some(own_pose) = own_pose {
+    if let Some(own_pose) = presented(state.self_entity(), own_real) {
         players.push(AvatarPlayer {
             who: own_who,
             pos: own_pose.pos,
@@ -1582,7 +1612,7 @@ pub(crate) fn field_draw(
         .filter(|(i, _)| built.as_ref().is_none_or(|b| b.markers.contains(i)))
         .filter_map(|(_, p)| marker(view, p))
         .collect();
-    FieldDraw { built, markers, own_who, own_at }
+    FieldDraw { built, markers, own_who, own_at, governor: governor.map(|(id, pose)| (id, pose.map(|p| p.pos))) }
 }
 
 /// Whether view-space point `p` lies in triangle `t` (its edges count).
@@ -2614,3 +2644,7 @@ mod tests {
         assert_eq!(label_anchor(Some(built), &view, draw.own_who, Subject::Npc(1), npcs[1].pos), Some(marker_spot));
     }
 }
+
+#[cfg(test)]
+#[path = "party_scene_tests.rs"]
+mod party_scene_tests;

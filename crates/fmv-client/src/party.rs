@@ -206,6 +206,13 @@ impl PartyMirror {
         self.names.get(&party.leader)?.entity
     }
 
+    /// The player whose story governs this instance. A held placement can outlive a change of party leader.
+    /// Before the first placement (offline pictures included), the local player governs its own scene.
+    pub fn phase_owner_entity(&self, self_entity: EntityId) -> Option<EntityId> {
+        let owner = self.placement.as_ref().map_or(self.me, |p| p.phase_owner);
+        if owner == self.me { Some(self_entity) } else { self.names.get(&owner)?.entity }
+    }
+
     /// Is `account` in this account's party? (This account itself counts, when it is in one.)
     pub fn is_party_account(&self, account: AccountId) -> bool {
         self.party.as_ref().is_some_and(|p| p.contains(account))

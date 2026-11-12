@@ -82,7 +82,7 @@ fn offscreen_real_ff7_station_guards_keep_the_player_and_names_at_the_accepted_c
         let anchor = |subject: Subject, at: Pos| {
             if label_hidden(Some(scene), subject, rig.state.npc_views())
                 || super::super::draw::participant_label_hidden(Some(scene), rig.state.self_entity(), subject) { None }
-            else { label_anchor(Some(built), &rig.view, drawn.own_who, subject, at) }
+            else { drawn.label_anchor(&rig.view, subject, at) }
         };
         let own_hud = hud::gather_anchored(&rig.state, &rig.info(), &rig.view, 1.0, &anchor);
         let own: Vec<_> = own_hud.labels.iter().filter(|label| label.kind == LabelKind::Own).collect();
