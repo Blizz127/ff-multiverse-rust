@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! FMV_FF7_DATA=<.../data> cargo run --release -p fmv-ff7 --example runtime_explore -- \
-//!     [--from FIELD] [--until FIELD] [--tri N] [--moment M] [--set SEL:ADDR=VALUE]... [--steps N] [--route-out FILE]
+//!     [--from FIELD] [--until FIELD] [--tri N] [--moment M] [--set SEL:ADDR=VALUE]... [--steps N] [--route-out FILE] \
+//!     [--choice FIELD:DIALOG=INDEX]...
 //! ```
 //!
 //! A **state** is a running field and where the player stands in it. The search keeps a queue of states, always
@@ -19,7 +20,9 @@
 //! entering a triangle a script has locked (`IDLCK`), and gateways only while the scripts allow map jumps (`MPJPO`).
 //! An action is worth keeping when it moves the story moment, leaves the field, or changes the story or the field's
 //! own scratch (ignoring scratch bytes that merely follow where the player stands). Windows are answered with their
-//! first choice, battles count as won, movies, menus and tutorials complete at once.
+//! first choice unless a field/dialog override is supplied; battles count as won, movies, menus and tutorials
+//! complete at once. Choice indexes are zero-based relative to the question's first choice. Exported `@choice`
+//! headers carry the same immutable policy into replay, including choices made in automatic entry scenes.
 //!
 //! It prints one line per expansion and, at the end, the chain of actions that led to the furthest moment. Numbers
 //! and names only, never game text. Candidate actions are replayed by walking at the route bot's default speed.
@@ -33,7 +36,7 @@ use common::{data_dir, flevel_path, load_field};
 use fmv_ff7::field::{FieldFile, Gateway, Walkmesh};
 use fmv_ff7::lgp::LgpArchive;
 use fmv_ff7::runtime::{direction_of, Banks, Command, Event, FieldRuntime, PlayerInput, PERSISTENT_BYTES};
-use fmv_ff7::script::Maplist;
+use fmv_ff7::script::{decode_at, Maplist};
 use fmv_ff7::story::StoryState;
 use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -52,6 +55,55 @@ const PER_PLACE: u32 = 10;
 const OK: u16 = 0x20;
 
 type Pos = (i32, i32, i32);
+
+#[derive(Debug, Default)]
+struct ChoicePolicy(BTreeMap<(String, u16), u8>);
+
+impl ChoicePolicy {
+    fn insert(&mut self, directive: &str) -> Result<(), String> {
+        let invalid = || format!("invalid --choice {directive:?}; expected FIELD:DIALOG=INDEX (ASCII field, dialog 0..65535, index 0..255)");
+        let (field, answer) = directive.split_once(':').ok_or_else(invalid)?;
+        let (dialog, index) = answer.split_once('=').ok_or_else(invalid)?;
+        if field.is_empty() || !field.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || dialog.is_empty() || !dialog.bytes().all(|b| b.is_ascii_digit())
+            || index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let dialog = dialog.parse::<u16>().map_err(|_| invalid())?;
+        let index = index.parse::<u8>().map_err(|_| invalid())?;
+        let key = (field.to_string(), dialog);
+        if self.0.contains_key(&key) {
+            return Err(format!("duplicate --choice for {field}:{dialog}"));
+        }
+        self.0.insert(key, index);
+        Ok(())
+    }
+
+    fn headers(&self) -> Vec<String> {
+        self.0.iter().map(|((field, dialog), index)| format!("@choice {field} {dialog} {index}")).collect()
+    }
+}
+
+/// Shared run policy plus the field currently being played; probes borrow the same policy as honest playback.
+struct Playback<'a> {
+    field: &'a str,
+    choices: &'a ChoicePolicy,
+}
+
+impl Playback<'_> {
+    fn answer(&self, dialog: u8, (first, last): (u8, u8)) -> Result<u8, String> {
+        let choice = self.choices.0.get(&(self.field.to_string(), u16::from(dialog))).copied().unwrap_or(0);
+        if first > last || choice > last - first {
+            return Err(format!("choice {}:{dialog}={choice} is out of range for ASK lines {first}..{last}; indexes are zero-based", self.field));
+        }
+        Ok(choice)
+    }
+}
+
+fn fatal(message: String) -> ! {
+    eprintln!("runtime_explore: {message}");
+    std::process::exit(2)
+}
 
 fn moment_of(banks: &Banks) -> u16 {
     u16::from_le_bytes([banks.get(0), banks.get(1)])
@@ -128,7 +180,7 @@ impl Outcome {
 }
 
 /// Answer what the field asked since the last frame. Returns true when the field is left (a map jump) or over.
-fn pump(rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
+fn pump(ctx: &Playback<'_>, rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
     // The bot discards unfinished movement when the host takes control, but not for ordinary dialogue alone.
     out.control_taken |= rt.player_scripted();
     if rt.pending_tutorial().is_some() {
@@ -136,10 +188,13 @@ fn pump(rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
     }
     for ev in rt.drain_events() {
         match ev {
-            Event::Window { window, ask, .. } => {
+            Event::Window { window, dialog, ask, .. } => {
                 out.windows += 1;
-                if ask.is_some() {
-                    rt.answer(window, 0);
+                if let Some(lines) = ask {
+                    let choice = ctx.answer(dialog, lines).unwrap_or_else(|error| fatal(error));
+                    if !rt.answer(window, choice) {
+                        fatal(format!("runtime refused choice {}:{dialog}={choice} in window {window}", ctx.field));
+                    }
                 } else {
                     rt.close_window(window);
                 }
@@ -173,10 +228,28 @@ fn busy(rt: &FieldRuntime) -> bool {
     rt.player_scripted() || rt.window_waiting() || rt.command().is_some()
 }
 
+fn report_busy(rt: &FieldRuntime, section: &[u8]) {
+    println!("    busy frame={} lock={} window_waiting={} command={:?} scratch5:7={} scratch5:8={}", rt.frame(), rt.state.character_lock, rt.window_waiting(), rt.command(), rt.mem.scratch[7], rt.mem.scratch[8]);
+    for entity in 0..rt.entity_count() {
+        let Some((priority, pc)) = rt.entity_state(entity) else { continue };
+        if rt.entity_broken(entity) { continue; }
+        let instruction = decode_at(section, pc, 0);
+        let waiting = instruction.as_ref().is_ok_and(|op| op.mnemonic.starts_with("REQ") || op.mnemonic == "WAIT");
+        if priority < 7 || waiting {
+            let instruction = instruction.map(|op| op.to_string()).unwrap_or_else(|error| format!("PC {pc:#06x}: {error}"));
+            println!("    entity {entity} {} priority={priority} {instruction}", rt.entity_name(entity).unwrap_or("?"));
+        }
+    }
+    for (window, open) in rt.windows().iter().enumerate().filter_map(|(i, w)| w.open.as_ref().map(|open| (i, open))) {
+        println!("    window {window} entity={} dialog={} closed={} ask={:?}", open.entity, open.dialog, open.closed, open.ask);
+    }
+    println!("    PCs show current instructions; queued requests and remaining WAIT frames are not exposed");
+}
+
 /// Walk `approach`, a point a frame, the way a player walks there. Returns whether the player arrived (`false`: a
 /// script took over on the way and changed something: the story, the field's scratch or where the player stands) and
 /// where it is. A script that only says something on the way (bumping into someone) is heard out and the walk goes on.
-fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
+fn walk_to(ctx: &Playback<'_>, rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome) -> (bool, Pos) {
     let mut at = from;
     let mut chats = 0;
     for p in approach {
@@ -190,7 +263,7 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
                 if free && !busy(rt) {
                     out.idle.frames += 1;
                 }
-                if pump(rt, out) {
+                if pump(ctx, rt, out) {
                     return (false, at);
                 }
                 if busy(rt) || !rt.player_step_blocked(at, p) {
@@ -205,7 +278,7 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
                     }
                 }
                 rt.player_bumped(at, p);
-                let (more, end) = run_idle(rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
+                let (more, end) = run_idle(ctx, rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
                 out.absorb(more);
                 return (false, end);
             }
@@ -217,12 +290,12 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
         at = p;
         rt.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ..Default::default() }));
         let before = out.windows;
-        if pump(rt, out) {
+        if pump(ctx, rt, out) {
             return (false, at);
         }
         if busy(rt) || out.windows != before {
             let (story, scratch) = (story_key(&rt.mem.banks), rt.mem.scratch);
-            let (more, end) = run_idle(rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
+            let (more, end) = run_idle(ctx, rt, FOLLOW_FRAMES, 0, &[], at, 0, false);
             let over = more.jump.is_some() || more.game_over;
             out.absorb(more);
             let moved = (end.0 - at.0).abs() + (end.1 - at.1).abs() > 8;
@@ -240,7 +313,7 @@ fn walk_to(rt: &mut FieldRuntime, approach: &[Pos], from: Pos, out: &mut Outcome
 /// put it. Stops early once at least `min` frames ran and the field has been idle (no script holds the player, no
 /// window is open, no command is pending) for twenty frames: the story's clocks should not run while nothing happens.
 /// Returns what happened and where the player ends.
-fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
+fn run_idle(ctx: &Playback<'_>, rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: Pos, dir: u8, ok: bool) -> (Outcome, Pos) {
     let mut out = Outcome::default();
     let (mut idle, mut settling) = (0u32, 0u32);
     for f in 0..frames {
@@ -286,7 +359,7 @@ fn run_idle(rt: &mut FieldRuntime, frames: u32, min: u32, path: &[Pos], mut at: 
         if free && !busy(rt) && path.get(f as usize).is_none() && !(ok && f <= 6) {
             out.idle.frames += 1;
         }
-        if pump(rt, &mut out) {
+        if pump(ctx, rt, &mut out) {
             return (out, at);
         }
     }
@@ -560,16 +633,13 @@ struct Loaded {
 }
 
 fn main() {
-    let Some(dir) = data_dir() else {
-        eprintln!("FMV_FF7_DATA is not set; skipping");
-        return;
-    };
     let mut args = std::env::args().skip(1);
     let (mut start_field, mut steps, mut start_moment, mut route_out) = ("md1stin".to_string(), 200u32, None::<u16>, None::<String>);
     let (mut until, mut reached_target) = (None::<String>, false);
     let mut sets: Vec<(u8, u8, u8)> = Vec::new();
     let mut start_tri: Option<usize> = None;
     let (mut save_best, mut banks_file) = (None::<String>, None::<String>);
+    let mut choices = ChoicePolicy::default();
     // A directory that gets the story on each first entry of a field at a moment (`FIELD-MOMENT.hex`), for the trace tool.
     let mut save_entries: Option<String> = None;
     while let Some(a) = args.next() {
@@ -584,6 +654,7 @@ fn main() {
             "--save-best" => save_best = Some(v),
             "--save-entries" => save_entries = Some(v),
             "--banks" => banks_file = Some(v),
+            "--choice" => choices.insert(&v).unwrap_or_else(|error| fatal(error)),
             "--set" => {
                 if let Some((sa, val)) = v.split_once('=') {
                     if let (Some((sel, addr)), Ok(val)) = (sa.split_once(':'), val.parse::<u8>()) {
@@ -596,6 +667,10 @@ fn main() {
             _ => {}
         }
     }
+    let Some(dir) = data_dir() else {
+        eprintln!("FMV_FF7_DATA is not set; skipping");
+        return;
+    };
     let mut lgp = LgpArchive::open_path(&flevel_path(&dir)).expect("flevel");
     let mut chars = LgpArchive::open_path(dir.join("field/char.lgp")).ok();
     let maplist = Maplist::from_archive(&mut lgp).expect("maplist");
@@ -654,6 +729,7 @@ fn main() {
             break;
         };
         let State { field: field_name, rt, banks, pos, tri, mut via, carry } = state;
+        let ctx = &Playback { field: &field_name, choices: &choices };
         let Some(loaded) = load(&field_name, &mut lgp) else {
             if !unloadable.contains(&field_name) {
                 println!("{step:>4} {field_name:<10} cannot be loaded (another game mode): {}", chain(&via).last().cloned().unwrap_or_default());
@@ -705,7 +781,7 @@ fn main() {
             }
         }
         let before = moment_of(&rt.mem.banks);
-        let settle = if fresh || busy(&rt) { run_idle(&mut rt, SETTLE_FRAMES, 45, &[], at, 0, false) } else { (Outcome::default(), at) };
+        let settle = if fresh || busy(&rt) { run_idle(ctx, &mut rt, SETTLE_FRAMES, 45, &[], at, 0, false) } else { (Outcome::default(), at) };
         let moved = settle.1 != at;
         at = settle.1;
         let now = moment_of(&rt.mem.banks);
@@ -749,6 +825,7 @@ fn main() {
             // A still-running scene is not a walking action. Otherwise its eventual progress is attributed to an
             // arbitrary candidate walk, and the exported route tells the TCP bot to walk somewhere it never went.
             println!("{step:>4} {field_name:<10} still busy after settling (moment {before}->{now}); no player actions tried");
+            report_busy(&rt, section);
             continue;
         }
         let here = tri.filter(|_| fresh && !moved).or_else(|| rt.triangle_at(at.0, at.1, at.2).map(usize::from));
@@ -769,11 +846,11 @@ fn main() {
 
         // What the field does by itself over a probe's time, and which scratch bytes only follow the player's position.
         let mut baseline = rt.clone();
-        let _ = run_idle(&mut baseline, PROBE_FRAMES, 60, &[], at, 0, false);
+        let _ = run_idle(ctx, &mut baseline, PROBE_FRAMES, 60, &[], at, 0, false);
         let mut noise = [false; 256];
         for t in (0..walk.triangles.len()).filter(|t| reach[*t]).step_by((reach_count / 4).max(1)).take(5) {
             let mut other = rt.clone();
-            let _ = run_idle(&mut other, PROBE_FRAMES, 60, &[], centre(&walk, t), 0, false);
+            let _ = run_idle(ctx, &mut other, PROBE_FRAMES, 60, &[], centre(&walk, t), 0, false);
             for (i, n) in noise.iter_mut().enumerate() {
                 *n |= other.mem.scratch[i] != baseline.mem.scratch[i];
             }
@@ -893,11 +970,11 @@ fn main() {
         let mut line = Vec::new();
         for (label, path, stand, face, ok, cmds) in actions {
             let mut probe = rt.clone();
-            let (mut out, mut end) = run_idle(&mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
+            let (mut out, mut end) = run_idle(ctx, &mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
             let moved_story = story_key(&probe.mem.banks) != story_key(&rt.mem.banks);
             let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
             if (moved_story || moved_scratch || out.windows > 0 || probe.player_scripted()) && out.jump.is_none() && !out.game_over {
-                let (more, e) = run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
+                let (more, e) = run_idle(ctx, &mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
                 out.absorb(more);
                 end = e;
             }
@@ -935,7 +1012,7 @@ fn main() {
             };
             let mut probe = rt.clone();
             let mut out = Outcome::default();
-            let (arrived, mut end) = walk_to(&mut probe, &approach, at, &mut out);
+            let (arrived, mut end) = walk_to(ctx, &mut probe, &approach, at, &mut out);
             if !arrived && out.jump.is_none() && !out.control_taken {
                 // The exported corners still contain the unused movement tail. A dialogue/scratch change alone
                 // does not cancel that tail over TCP, so the bot would idle at a different position.
@@ -952,7 +1029,7 @@ fn main() {
             // The bot walks the same corners, then does what the action does there.
             let mut cmds = [legs.as_str(), cmds.as_str()].iter().filter(|c| !c.is_empty()).cloned().collect::<Vec<_>>().join("; ");
             if arrived {
-                let (more, e) = run_idle(&mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
+                let (more, e) = run_idle(ctx, &mut probe, PROBE_FRAMES, 60, &path, stand, face, ok);
                 out.absorb(more);
                 end = e;
             } else {
@@ -960,7 +1037,7 @@ fn main() {
                 cmds = legs.clone();
             }
             if out.jump.is_none() && !out.game_over && (busy(&probe) || !arrived || out.windows > 0 || story_key(&probe.mem.banks) != story_key(&rt.mem.banks) || scratch_key(&probe) != scratch_key(&baseline)) {
-                let (more, e) = run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
+                let (more, e) = run_idle(ctx, &mut probe, FOLLOW_FRAMES, 30, &[], end, face, false);
                 out.absorb(more);
                 end = e;
             }
@@ -1031,7 +1108,7 @@ fn main() {
                 approach.extend(walk_segment(approach.last().copied().unwrap_or(at), mid));
                 let mut probe = rt.clone();
                 let mut out = Outcome::default();
-                let (arrived, end) = walk_to(&mut probe, &approach, at, &mut out);
+                let (arrived, end) = walk_to(ctx, &mut probe, &approach, at, &mut out);
                 if !arrived {
                     if out.jump.is_none() && !out.control_taken {
                         if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
@@ -1039,7 +1116,7 @@ fn main() {
                         }
                         continue;
                     }
-                    let (more, end) = if out.jump.is_none() && !out.game_over { run_idle(&mut probe, FOLLOW_FRAMES, 30, &[], end, 0, false) } else { (Outcome::default(), end) };
+                    let (more, end) = if out.jump.is_none() && !out.game_over { run_idle(ctx, &mut probe, FOLLOW_FRAMES, 30, &[], end, 0, false) } else { (Outcome::default(), end) };
                     out.absorb(more);
                     if out.game_over {
                         continue;
@@ -1108,7 +1185,8 @@ fn main() {
         std::process::exit(1);
     }
     if let Some(path) = route_out {
-        let mut cmds = commands(&best.1);
+        let mut cmds = choices.headers();
+        cmds.extend(commands(&best.1));
         if let Some(target) = until {
             // Even a route made entirely of automatic scenes must wait for its destination over TCP.
             cmds.push(format!("{target}: wait 0"));
@@ -1167,9 +1245,11 @@ mod tests {
 
     #[test]
     fn forced_scene_length_does_not_become_exported_idle() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         let (mut short, mut long) = (scene(30), scene(90));
-        let (a, _) = run_idle(&mut short, 500, 0, &[], (0, 0, 0), 0, false);
-        let (b, _) = run_idle(&mut long, 500, 0, &[], (0, 0, 0), 0, false);
+        let (a, _) = run_idle(ctx, &mut short, 500, 0, &[], (0, 0, 0), 0, false);
+        let (b, _) = run_idle(ctx, &mut long, 500, 0, &[], (0, 0, 0), 0, false);
         assert_eq!((short.mem.banks.get(0x30), long.mem.banks.get(0x30)), (1, 1));
         assert_eq!((a.windows, b.windows), (1, 1));
         assert_eq!(long.frame() - short.frame(), 60);
@@ -1182,14 +1262,16 @@ mod tests {
 
     #[test]
     fn a_later_forced_scene_pauses_the_idle_suffix() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         let body = |locked: u8| vec![
             0x24, 30, 0, // voluntary wait
             0x33, 1, 0x24, locked, 0, 0x33, 0, // forced scene
             0x24, 30, 0, 0, // voluntary wait, return
         ];
         let (mut short, mut long) = (runtime(&body(30)), runtime(&body(90)));
-        let (a, _) = run_idle(&mut short, 500, 0, &[], (0, 0, 0), 0, false);
-        let (b, _) = run_idle(&mut long, 500, 0, &[], (0, 0, 0), 0, false);
+        let (a, _) = run_idle(ctx, &mut short, 500, 0, &[], (0, 0, 0), 0, false);
+        let (b, _) = run_idle(ctx, &mut long, 500, 0, &[], (0, 0, 0), 0, false);
         assert_eq!(long.frame() - short.frame(), 60);
         assert_eq!(a.idle.frames, b.idle.frames);
         assert_eq!(a.idle.commands(String::new()), b.idle.commands(String::new()));
@@ -1197,19 +1279,23 @@ mod tests {
 
     #[test]
     fn movement_after_an_internal_pause_is_not_exported_at_the_wrong_time() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         let mut rt = runtime(&[0]);
-        let (mut out, at) = run_idle(&mut rt, 10, 0, &[], (0, 0, 0), 0, false);
+        let (mut out, at) = run_idle(ctx, &mut rt, 10, 0, &[], (0, 0, 0), 0, false);
         assert_eq!(out.idle.frames, 10);
-        let (arrived, _) = walk_to(&mut rt, &[(6, 0, 0)], at, &mut out);
+        let (arrived, _) = walk_to(ctx, &mut rt, &[(6, 0, 0)], at, &mut out);
         assert!(arrived);
         assert!(out.idle.commands("to 6 0".to_string()).is_none());
     }
 
     #[test]
     fn ok_after_an_internal_pause_is_not_exported_before_the_pause() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         let mut rt = runtime(&[0]);
-        let (mut out, at) = run_idle(&mut rt, 10, 0, &[], (0, 0, 0), 0, false);
-        let (more, _) = run_idle(&mut rt, 7, 0, &[], at, 0, true);
+        let (mut out, at) = run_idle(ctx, &mut rt, 10, 0, &[], (0, 0, 0), 0, false);
+        let (more, _) = run_idle(ctx, &mut rt, 7, 0, &[], at, 0, true);
         assert_eq!(more.idle.frames, 0);
         out.absorb(more);
         assert!(out.idle.commands("ok".to_string()).is_none());
@@ -1217,13 +1303,15 @@ mod tests {
 
     #[test]
     fn ordinary_dialogue_does_not_mark_an_interrupted_walk_as_cancelled_by_the_bot() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         for locked in [false, true] {
             let mut body = vec![0x24, 1, 0];
             if locked { body.extend_from_slice(&[0x33, 1]); }
             body.extend_from_slice(&[0x40, 0, 0, 0x80, 0x10, 0x30, 1, 0x33, 0, 0]);
             let mut rt = runtime(&body);
             let mut out = Outcome::default();
-            let (arrived, end) = walk_to(&mut rt, &walk_segment((0, 0, 0), (200, 0, 0)), (0, 0, 0), &mut out);
+            let (arrived, end) = walk_to(ctx, &mut rt, &walk_segment((0, 0, 0), (200, 0, 0)), (0, 0, 0), &mut out);
             assert!(!arrived);
             assert_ne!(end, (200, 0, 0));
             assert_eq!(out.windows, 1);
@@ -1233,14 +1321,62 @@ mod tests {
 
     #[test]
     fn walking_matches_two_hundred_units_per_second_without_recording_path_frames_as_idle() {
+        let choices = ChoicePolicy::default();
+        let ctx = &Playback { field: "fixture", choices: &choices };
         let path = walk_segment((0, 0, 0), (200, 0, 30));
         assert_eq!(path.len(), 30);
         assert_eq!(path.last(), Some(&(200, 0, 30)));
         assert!(walk_segment((0, 0, 0), (0, 0, 0)).is_empty());
         let mut rt = runtime(&[0]);
         let crossing = [(0, 0, 0), (6, 0, 0), (13, 0, 0)];
-        let (out, _) = run_idle(&mut rt, 3, 0, &crossing, (0, 0, 0), 0, false);
+        let (out, _) = run_idle(ctx, &mut rt, 3, 0, &crossing, (0, 0, 0), 0, false);
         assert_eq!(out.idle.frames, 0);
         assert!(out.idle.commands("to 13 0".to_string()).is_some());
+    }
+
+    #[test]
+    fn choice_directives_reject_malformed_and_duplicate_values() {
+        for directive in ["", "fixture:0", ":0=1", "fixture:=1", "fixture:0=", "fixture:0=256", "fixture:65536=0",
+            "fixture:0=-1", "fixture:+1=0", "fixture:0=+1", "fixture:0=1=2", "fixture:1:2=0", "bad-field:0=0", "é:0=0", "field name:0=0", "fixture:0=1 "] {
+            assert!(ChoicePolicy::default().insert(directive).is_err(), "{directive:?}");
+        }
+        let mut policy = ChoicePolicy::default();
+        policy.insert("fixture:0=2").unwrap();
+        assert!(policy.insert("fixture:0=2").unwrap_err().contains("duplicate"));
+        assert!(policy.insert("fixture:00=1").unwrap_err().contains("duplicate"));
+        assert_eq!(policy.headers(), ["@choice fixture 0 2"]);
+        policy.insert("other_1:65535=255").unwrap();
+        assert_eq!(policy.headers(), ["@choice fixture 0 2", "@choice other_1 65535 255"]);
+    }
+
+    #[test]
+    fn entry_scene_choices_are_scoped_to_field_and_dialog_across_visits() {
+        let mut choices = ChoicePolicy::default();
+        choices.insert("fixture:0=2").unwrap();
+        choices.insert("fixture:1=1").unwrap();
+        for (field, expected) in [("fixture", 2), ("other", 0), ("fixture", 2)] {
+            let ctx = &Playback { field, choices: &choices };
+            // An automatic worker asks dialog 0 with authored choice lines 1..3, storing the relative index in 5:6.
+            let mut rt = runtime(&[0x48, 0x05, 0, 0, 1, 3, 6, 0]);
+            let (out, _) = run_idle(ctx, &mut rt, 100, 0, &[], (0, 0, 0), 0, false);
+            assert_eq!(out.windows, 1);
+            assert_eq!(rt.mem.scratch[6], expected);
+            assert!(!rt.window_waiting());
+        }
+        let ctx = Playback { field: "fixture", choices: &choices };
+        assert_eq!(ctx.answer(1, (4, 6)), Ok(1));
+        assert_eq!(ctx.answer(2, (4, 6)), Ok(0));
+    }
+
+    #[test]
+    fn configured_choice_outside_encountered_question_is_an_error() {
+        let mut choices = ChoicePolicy::default();
+        choices.insert("fixture:14=2").unwrap();
+        let ctx = Playback { field: "fixture", choices: &choices };
+        assert_eq!(ctx.answer(14, (1, 3)), Ok(2));
+        let error = ctx.answer(14, (1, 2)).unwrap_err();
+        assert!(error.contains("fixture:14=2") && error.contains("out of range"));
+        assert!(ctx.answer(14, (3, 1)).is_err());
+        assert_eq!(Playback { field: "other", choices: &choices }.answer(14, (1, 2)), Ok(0));
     }
 }

@@ -127,6 +127,14 @@ its honest action playback. It rejects branches whose internal wait/movement ord
 idle suffix, including interrupted walks that ordinary dialogue would not cancel in the bot. Entry delays,
 network sampling and dialogue response timing still differ; a generated route needs a TCP replay.
 
+For an authored dialogue branch, repeat `--choice FIELD:DIALOG=INDEX` on the solver. Answers count from zero relative
+to the question's first choice; an unspecified question still uses zero. The exported route starts with
+`@choice FIELD DIALOG INDEX` headers, and the TCP bot applies that same policy even in an automatic entry scene,
+before walking begins. Each override applies to every occurrence of that field/dialogue pair. Duplicate or malformed
+headers fail before connecting; a configured answer outside the encountered question's choices stops the run before
+answering. This is an explicit replay policy, not automatic exploration of all dialogue branches. Busy solver states
+also report script PCs/waits and scratch counters, so a bounded settle failure need not be mistaken for a closed path.
+
 For a focused destination rather than the highest story counter, the solver accepts `--until FIELD`. It exports a
 route only if it reaches that field with control returned and a valid standing triangle, and appends `FIELD: wait 0`
 so the TCP replay checks arrival even when the entire trip is automatic. Failure to reach the target exits nonzero

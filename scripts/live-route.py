@@ -17,7 +17,10 @@ the player, no window is open, no battle runs), then plays the steps:
 An entry is over when its steps are done and the field is idle again, or when the server starts a new field visit.
 Leaving an entry's field before its actions could start reports an obsolete route; those actions are not counted.
 An explicit trailing `idle` survives a same-field script taking over; movement still stops with that script.
-Windows are answered (first choice), movies acknowledged, battles left to the server's companions.
+Optional `@choice FIELD DIALOG INDEX` headers select an answer for that field/dialogue on every occurrence.
+INDEX counts from zero, relative to the question's first choice. Headers precede all route entries; unspecified
+questions use choice zero. Invalid or duplicate headers fail before connecting; an out-of-range answer fails
+before it is sent. Movies are acknowledged, battles left to the server's companions.
 It prints what the server reports and ends with `ROUTE done=<entries played>/<entries> reached=<field> ...`
 (exit status 0 only when every entry was played).
 
@@ -42,13 +45,40 @@ spec.loader.exec_module(livebot)
 
 def load_route(path):
     route = []
-    for line in Path(path).read_text().splitlines():
+    choices = {}
+    for number, line in enumerate(Path(path).read_text().splitlines(), 1):
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
+        if line.startswith("@"):
+            parts = line.split()
+            if route or len(parts) != 4 or parts[0] != "@choice":
+                raise ValueError(f"line {number}: expected @choice FIELD DIALOG INDEX before route entries")
+            _, field, dialog, choice = parts
+            if (not field.isascii() or not all(c.isalnum() or c == "_" for c in field)
+                    or not dialog.isascii() or not dialog.isdecimal()
+                    or not choice.isascii() or not choice.isdecimal()):
+                raise ValueError(f"line {number}: invalid choice field, dialogue or index")
+            key, index = (field, int(dialog)), int(choice)
+            if key[1] > 65535 or index > 255:
+                raise ValueError(f"line {number}: choice dialogue/index out of range")
+            if key in choices:
+                raise ValueError(f"line {number}: duplicate choice for {field} dialogue {key[1]}")
+            choices[key] = index
+            continue
         field, steps = line.split(":", 1)
         route.append((field.strip(), [s.split() for s in steps.split(";") if s.strip()]))
-    return route
+    return route, choices
+
+
+def answer_choice(choices, field, dialog, ask):
+    """Use the same zero-based answer convention as FieldRuntime and LiveAnswer."""
+    if ask is None:
+        return None
+    index = choices.get((field, dialog), 0)
+    if not 0 <= index <= ask["last"] - ask["first"]:
+        raise ValueError(f"{field} dialogue {dialog}: choice {index} outside 0..{ask['last'] - ask['first']}")
+    return index
 
 
 class IdleWait:
@@ -159,7 +189,10 @@ def main():
     ap.add_argument("--stall", type=float, default=60.0, help="give up after this long without progress")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
-    route = load_route(args.route)
+    try:
+        route, choices = load_route(args.route)
+    except ValueError as error:
+        ap.error(str(error))
     token_path = Path(args.token_file) if args.token_file else None
     token = token_path.read_text().strip() if token_path and token_path.exists() else None
     if token_path and token_path.exists() and not token:
@@ -251,7 +284,14 @@ def main():
                 if args.verbose:
                     print(f"  WINDOW {b['window']} dialog={b['dialog']} ask={ask}", flush=True)
                 if b["answerable"]:
-                    pending.append((now + 0.2, {"LiveAnswer": {"window": b["window"], "choice": 0 if ask else None}}))
+                    try:
+                        choice = answer_choice(choices, area, b["dialog"], ask)
+                    except ValueError as error:
+                        print(f"INVALID CHOICE {error}", flush=True)
+                        return 2
+                    if args.verbose and ask is not None:
+                        print(f"  ANSWER {area} dialog={b['dialog']} choice={choice}", flush=True)
+                    pending.append((now + 0.2, {"LiveAnswer": {"window": b["window"], "choice": choice}}))
             elif k == "LiveWindowClosed":
                 windows.discard(b["window"])
             elif k == "LiveControl":

@@ -51,6 +51,19 @@ story entry is. A spot that cannot be used never closes an exit, never moves any
 
 ## Limits
 
+* **Known live-field gap (2026-11-12):** an accepted location is restored, but a new `--field-runtime` instance
+  then initializes the field scripts from persistent banks. It does not restore the visit's scratch, script PCs,
+  model state or line activation, or distinguish resume from fresh entry. An entry script that takes control and
+  moves the lead can overwrite the restored position. This violates the same-spot rule above; it is not an intended
+  exception. The source path is `world/resume.rs::enter_at_saved_spot_or_story` -> `world/live.rs::advance_live` ->
+  `live_host.rs::Ff7LiveHost::start` -> `FieldRuntime::init`, followed by scripted `player_place` updates.
+  An already-retained runtime and a fresh runtime whose entry stays unlocked are different cases.
+  A temporary accepted `tin_1` checkpoint exhibited intro replay and repositioning; its fixture ancestry includes
+  an earlier resumability override, so it is not a clean full-new-game reconnect receipt. That earlier eligibility
+  override is a separate fixture issue, not evidence of a normal-play eligibility bug.
+  Next check: combine accepted location resume with a synthetic live host that locks and repositions on entry,
+  assert position after live advancement, and preserve ordinary travel's entry behavior. A position-only reset or
+  skipped initialization cannot restore the missing visit state and is not a justified fix.
 * The player first gets the entry area's snapshot, then the `AreaChange` to its spot (the same handshake as a story
   entry): a short loading step, not a direct join into the saved field.
 * Countdowns are not stored (see `world/countdown.rs`): a player that logs out while one runs comes back without it. A
@@ -63,6 +76,8 @@ story entry is. A spot that cannot be used never closes an exit, never moves any
 * Real data, real processes: `scripts/resume-smoke.sh` (walk into `md1_1`, server restart, back on the saved spot, nothing
   else of the store changed); `scripts/travel-smoke.sh --escape` (its re-login at 33 still lands in `md8_4`);
   `scripts/story-smoke.sh` (a re-login after the escape scenes lands in `md8_1`).
+  These resume checks do not cover the interaction with a fresh live runtime: the resume unit fixtures have no
+  live host, and `resume-smoke.sh` does not pass `--field-runtime`.
 * `~/ff-multiverse-preview/tools/ondevice-chain.sh` on the Alienware expects a re-login at moment 27 to land in `md1stin`;
   with MMO-style saving it comes back inside the reactor, where it left. That device check needs updating before it is
   used on a build with this.

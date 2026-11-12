@@ -1,4 +1,4 @@
-"""Asset-free route timing checks. Run: python3 -m unittest discover -s scripts -p test_live_route.py."""
+"""Asset-free route timing/answer checks. Run: python3 -m unittest discover -s scripts -p test_live_route.py."""
 import contextlib
 import importlib.util
 import io
@@ -62,6 +62,7 @@ class RouteTimingTests(unittest.TestCase):
                     patch.object(route.livebot, "Conn", return_value=Connection()), \
                     patch.object(route, "mesh_for", return_value=mesh), contextlib.redirect_stdout(output):
                 code = route.main()
+        self.sent = [message for _, message in sent]
         return code, output.getvalue(), [(at, m["MoveIntent"]) for at, m in sent if isinstance(m, dict) and "MoveIntent" in m]
 
     def test_active_idle_pauses_during_a_scene_and_keeps_its_budget(self):
@@ -116,6 +117,57 @@ class RouteTimingTests(unittest.TestCase):
         for value in [-1, float("inf"), float("nan")]:
             with self.assertRaises(ValueError):
                 route.IdleWait().start(value, 0)
+
+    def test_choice_header_answers_entry_scene_before_actions_start(self):
+        code, output, _ = self.play("@choice a 14 2\na: wait 0\n", [
+            (.2, {"LiveControl": {"locked": True}}),
+            (.3, {"LiveWindow": {"window": 0, "dialog": 14, "ask": {"first": 1, "last": 3}, "answerable": True}}),
+            (.8, {"LiveWindowClosed": {"window": 0}}),
+            (.8, {"LiveControl": {"locked": False}}),
+        ])
+        self.assertEqual(code, 0, output)
+        self.assertIn({"LiveAnswer": {"window": 0, "choice": 2}}, self.sent)
+
+    def test_choice_is_scoped_to_field_and_ordinary_message_still_closes(self):
+        code, output, _ = self.play("@choice a 14 2\na: wait 10\nb: wait 1\n", [
+            (.2, {"LiveWindow": {"window": 0, "dialog": 14, "ask": None, "answerable": True}}),
+            (.8, {"LiveWindowClosed": {"window": 0}}),
+            (2., area_message("AreaChange", "b")),
+            (2.1, {"LiveWindow": {"window": 1, "dialog": 14, "ask": {"first": 1, "last": 3}, "answerable": True}}),
+            (2.7, {"LiveWindowClosed": {"window": 1}}),
+        ], stall=4)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([m for m in self.sent if "LiveAnswer" in m], [
+            {"LiveAnswer": {"window": 0, "choice": None}}, {"LiveAnswer": {"window": 1, "choice": 0}},
+        ])
+
+    def test_out_of_range_choice_stops_before_sending_answer(self):
+        code, output, _ = self.play("@choice a 14 2\na: wait 0\n", [
+            (.2, {"LiveWindow": {"window": 0, "dialog": 14, "ask": {"first": 1, "last": 2}, "answerable": True}}),
+        ])
+        self.assertEqual(code, 2)
+        self.assertIn("INVALID CHOICE", output)
+        self.assertFalse(any("LiveAnswer" in m for m in self.sent))
+
+    def test_choice_policy_preserves_zero_based_indices_and_dialogue_scope(self):
+        choices = {("a", 14): 2}
+        self.assertEqual(route.answer_choice(choices, "a", 14, {"first": 5, "last": 7}), 2)
+        self.assertEqual(route.answer_choice(choices, "a", 15, {"first": 5, "last": 7}), 0)
+        self.assertIsNone(route.answer_choice(choices, "a", 14, None))
+
+    def test_malformed_choice_headers_fail_before_connecting(self):
+        for header in ["@choice a 14 256", "@choice a 65536 0", "@choice a 14 -1",
+                       "@choice a 14 +1", "@choice a 14", "@other a 14 1", "@choice a:b 14 1",
+                       "@choice a 14 2\n@choice a 14 2", "a: wait 0\n@choice a 14 2"]:
+            with self.subTest(header=header), tempfile.TemporaryDirectory(prefix="ffmv-route-parse.") as temporary:
+                path = Path(temporary) / "route.txt"
+                path.write_text(header + "\na: wait 0\n")
+                argv = ["live-route.py", "unused:0", str(path), "--cache", temporary, "--tool", "unused"]
+                with patch.object(sys, "argv", argv), patch.object(route.livebot, "Conn") as connection, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    route.main()
+                self.assertEqual(error.exception.code, 2)
+                connection.assert_not_called()
 
 
 if __name__ == "__main__":
