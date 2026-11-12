@@ -209,8 +209,11 @@ impl LiveField for Ff7Live {
     }
 
     fn blocks(&self, from: Pos, to: Pos) -> bool {
-        let locked = |p: Pos| self.rt.triangle_at(p.x.round() as i32, p.y.round() as i32, p.z.round() as i32).is_some_and(|t| self.rt.triangle_locked(t));
-        locked(to) && !locked(from)
+        let at = |p: Pos| (p.x.round() as i32, p.y.round() as i32, p.z.round() as i32);
+        let locked = |p: Pos| self.rt.triangle_at(at(p).0, at(p).1, at(p).2).is_some_and(|t| self.rt.triangle_locked(t));
+        // (someone standing in the way blocks like a locked triangle: a player already inside the circle can step out)
+        let solid = |p: Pos| self.rt.solid_model_at(at(p).0, at(p).1, at(p).2);
+        (locked(to) && !locked(from)) || (solid(to) && !solid(from))
     }
 
     fn map_jumps_disabled(&self) -> bool {

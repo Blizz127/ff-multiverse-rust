@@ -867,6 +867,23 @@ impl FieldRuntime {
         }
     }
 
+    /// Whether a solid model stands in the way at `(x, y, z)`: the original stops the player where its centre comes
+    /// closer to a solid model's than half their two solid ranges (within 128 units of height). People standing in a
+    /// doorway are how the game closes it.
+    pub fn solid_model_at(&self, x: i32, y: i32, z: i32) -> bool {
+        let solid = i64::from(self.player_solid_range());
+        let pc = self.state.pc_model;
+        self.models.iter().enumerate().any(|(i, m)| {
+            if Some(i) == pc || m.solid_off {
+                return false;
+            }
+            let dz = i64::from(m.z) - i64::from(z);
+            let (dx, dy) = (i64::from(m.x) - i64::from(x), i64::from(m.y) - i64::from(y));
+            let threshold = (solid + i64::from(m.solid_range)) / 2;
+            dz > -127 && dz < 128 && dx * dx + dy * dy < threshold * threshold
+        })
+    }
+
     /// The player model's solid range: the original gives the player 34 units at scale 512.
     fn player_solid_range(&self) -> u16 {
         (34 * u32::from(self.scale) / 512) as u16

@@ -205,6 +205,19 @@ fn centre(walk: &Walkmesh, t: usize) -> Pos {
     (s(|p| p.x), s(|p| p.y), s(|p| p.z))
 }
 
+/// Whether the step from triangle `t` over its edge `e` into its neighbour can be walked: the neighbour is not locked
+/// and nobody solid stands at the edge's middle or the neighbour's centre (the points a walk goes through).
+fn link_open(walk: &Walkmesh, rt: &FieldRuntime, t: usize, e: usize) -> Option<usize> {
+    let n = usize::from(walk.access[t][e]);
+    if n >= walk.triangles.len() || rt.triangle_locked(n as u16) {
+        return None;
+    }
+    let (a, b) = (walk.triangles[t][e], walk.triangles[t][(e + 1) % 3]);
+    let mid = ((i32::from(a.x) + i32::from(b.x)) / 2, (i32::from(a.y) + i32::from(b.y)) / 2, (i32::from(a.z) + i32::from(b.z)) / 2);
+    let c = centre(walk, n);
+    (!rt.solid_model_at(mid.0, mid.1, mid.2) && !rt.solid_model_at(c.0, c.1, c.2)).then_some(n)
+}
+
 /// The triangles the player can walk to from `from` without entering a locked one.
 fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
     let mut seen = vec![false; walk.triangles.len()];
@@ -214,9 +227,8 @@ fn reachable(walk: &Walkmesh, rt: &FieldRuntime, from: usize) -> Vec<bool> {
     seen[from] = true;
     let mut queue = VecDeque::from([from]);
     while let Some(t) = queue.pop_front() {
-        for &n in &walk.access[t] {
-            let n = usize::from(n);
-            if n < seen.len() && !seen[n] && !rt.triangle_locked(n as u16) {
+        for e in 0..3 {
+            if let Some(n) = link_open(walk, rt, t, e).filter(|n| !seen[*n]) {
                 seen[n] = true;
                 queue.push_back(n);
             }
@@ -241,9 +253,8 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
         if t == to_tri {
             break;
         }
-        for (e, &next) in walk.access[t].iter().enumerate() {
-            let next = usize::from(next);
-            if next < n && !seen[next] && !rt.triangle_locked(next as u16) {
+        for e in 0..3 {
+            if let Some(next) = link_open(walk, rt, t, e).filter(|next| !seen[*next]) {
                 seen[next] = true;
                 prev[next] = Some((t, e));
                 queue.push_back(next);
