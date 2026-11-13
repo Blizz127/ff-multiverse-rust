@@ -15,7 +15,9 @@ the player, no window is open, no battle runs), then plays the steps:
     idle S       stand S seconds of free control (pause for scenes, dialogue and battles)
 
 An entry is over when its steps are done and the field is idle again, or when the server starts a new field visit.
-Leaving an entry's field before its actions could start reports an obsolete route; those actions are not counted.
+Leaving an entry's field before its actions could start reports an obsolete route; those actions are not counted. A visit
+in which control was never free (a scene passing through the field, ealin_1 to ealin_12 and back) is not such a leaving: the
+entry's actions start on the later return.
 An explicit trailing `idle` survives a same-field script taking over; movement still stops with that script.
 Optional `@choice FIELD DIALOG INDEX` headers select an answer for that field/dialogue on every occurrence.
 INDEX counts from zero, relative to the question's first choice. Headers precede all route entries; unspecified
@@ -280,6 +282,7 @@ def main():
     window_dialogs = {}
     press = PressAfter()
     holding = None  # the pad key a `hold` step keeps down until control returns
+    visit_free = False  # control was free (for a moment) during this visit to the field
     pending = []
     idx, steps = 0, None
     entry_expects_exit = False
@@ -317,9 +320,13 @@ def main():
                     # boundary now, before busy filtering can hide it (including a jump to the same field).
                     if steps is not None:
                         idx, steps = idx + 1, None
-                    elif idx < len(route) and previous_area == route[idx][0]:
+                    elif idx < len(route) and previous_area == route[idx][0] and visit_free:
                         status = "obsolete-route"
                         print(f"  obsolete route: entry {idx + 1}/{len(route)} in {previous_area} was visited and left before its actions could start; actions unplayed", flush=True)
+                    elif idx < len(route) and previous_area == route[idx][0] and args.verbose:
+                        print(f"  entry {idx + 1}/{len(route)} waits for a return to {previous_area} (a scene passed through it)", flush=True)
+                    visit_free = False
+                    busy_at = now
                     entry_expects_exit = False
                     pending = []  # answers queued in the previous visit must not dismiss a new field's windows
                     leg_goal, leg_best, leg_best_at, tries, tries_goal, detour = None, 0.0, now, 0, None, None
@@ -444,6 +451,8 @@ def main():
             progress_at = now  # an intentional wait is progress; the overall time limit still applies
         if busy:
             busy_at = now
+        elif now - busy_at >= 0.6:
+            visit_free = True
         if in_battle and now - battle_at < 600:
             progress_at = now  # a boss takes minutes: a battle under way is progress
         if idx >= len(route):
