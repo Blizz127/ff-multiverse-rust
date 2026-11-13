@@ -216,6 +216,15 @@ class RouteTimingTests(unittest.TestCase):
         press.closed(18, 20.0)
         self.assertFalse(press.due(30.0))
 
+    def test_press_entry_arms_the_next_entry_once_the_walk_into_the_scene_is_done(self):
+        r = [("smkin_1", [["to", "1", "2"]]), ("smkin_1", [["okafter", "18", "1.233"]]), ("southmk1", [["idle", "1"]])]
+        self.assertEqual(route.press_entry(r, 1, None, "smkin_1"), 1, "the okafter entry itself, before it starts")
+        self.assertEqual(route.press_entry(r, 0, [], "smkin_1"), 1, "the walk is done: arm the next entry")
+        self.assertIsNone(route.press_entry(r, 0, [["to", "1", "2"]], "smkin_1"), "the walk is still going")
+        self.assertIsNone(route.press_entry(r, 0, [], "elevtr1"), "another field")
+        self.assertIsNone(route.press_entry(r, 2, None, "southmk1"), "no okafter")
+        self.assertIsNone(route.press_entry(r, 2, [], "southmk1"), "past the end")
+
     def test_press_after_must_open_its_entry(self):
         with tempfile.TemporaryDirectory() as d:
             ok = Path(d) / "ok.txt"

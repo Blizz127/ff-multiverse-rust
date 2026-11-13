@@ -149,6 +149,17 @@ class PressAfter:
         return False
 
 
+def press_entry(route, idx, steps, area):
+    """The entry whose leading `okafter` should be armed now: the current one before it starts, or the next one once the
+    current entry's steps are all done in the same field (the walk that started the locked scene is over, but control
+    only returns after the press). None when there is none."""
+    nxt = idx if steps is None else (idx + 1 if steps == [] else None)
+    if nxt is None or nxt >= len(route):
+        return None
+    field, entry_steps = route[nxt]
+    return nxt if field == area and entry_steps and entry_steps[0][0] == "okafter" else None
+
+
 def trailing_idle(steps):
     """A scene cancels unfinished movement, but the solver's explicit post-action wait still applies."""
     start = len(steps)
@@ -392,7 +403,11 @@ def main():
             c.send(msg)
         pending = [p for p in pending if p[0] > now]
         # A timed press belongs to a locked scene: it is armed even while the field holds the player.
-        if steps is None and press.dialog is None and idx < len(route) and route[idx][0] == area and route[idx][1] and route[idx][1][0][0] == "okafter":
+        nxt = press_entry(route, idx, steps, area) if press.dialog is None else None
+        if nxt is not None:
+            if nxt != idx:
+                idx, steps = nxt, None
+                progress_at = now
             field, entry_steps = route[idx]
             _, dialog, seconds = entry_steps[0]
             press.arm(int(dialog), float(seconds))
