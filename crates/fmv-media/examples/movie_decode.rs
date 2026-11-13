@@ -1,7 +1,7 @@
 //! Decode one explicitly selected local movie. This drains faster than presentation
 //! and reports timestamps/decoder EOF; it is deliberately not a movie player.
 
-use fmv_media::{Event, Limits, MovieWorker, Request, Tools};
+use fmv_media::{AudioRequirement, Event, Limits, MovieWorker, Request, Tools};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -9,21 +9,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let movie = PathBuf::from(
         args.next()
-            .ok_or("usage: movie_decode ABS_MOVIE ABS_FFMPEG ABS_FFPROBE")?,
+            .ok_or("usage: movie_decode ABS_MOVIE ABS_FFMPEG ABS_FFPROBE [--optional-audio]")?,
     );
     let ffmpeg = PathBuf::from(args.next().ok_or("missing explicit ffmpeg path")?);
     let ffprobe = PathBuf::from(args.next().ok_or("missing explicit ffprobe path")?);
+    // --optional-audio: a silent movie (one VP8 stream, no audio) is decoded instead of refused.
+    let requirement = match args.next() {
+        None => AudioRequirement::Required,
+        Some(flag) if flag == "--optional-audio" => AudioRequirement::Optional,
+        Some(_) => return Err("unexpected argument".into()),
+    };
     if args.next().is_some() {
         return Err("unexpected argument".into());
     }
     let limits = Limits::default();
     let started = Instant::now();
     let deadline = started + limits.lifetime;
-    let mut worker = MovieWorker::start(Request {
+    let mut worker = MovieWorker::start_with(Request {
         path: movie,
         tools: Tools { ffmpeg, ffprobe },
         limits,
-    })?;
+    }, requirement)?;
     let mut count = 0usize;
     let mut bytes = 0u64;
     loop {
