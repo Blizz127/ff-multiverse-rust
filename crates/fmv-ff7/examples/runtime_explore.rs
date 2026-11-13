@@ -1197,12 +1197,15 @@ fn main() {
             let moved_scratch = scratch_key(&probe) != scratch_key(&baseline);
             let end_place = place_of(&probe, end);
             let moved_place = out.jump.is_none() && end_place != here_place && end_place.1 > 0;
+            // A script that took the walk over and put the player somewhere else (chrin_2's jump down from triangles
+            // 118/119 to 110) is progress even on a walkmesh of one part: the place it leaves the player is new.
+            let relocated = out.jump.is_none() && !arrived && out.control_taken && f64::from(end.0 - at.0).hypot(f64::from(end.1 - at.1)) > 100.0;
             let score = match (out.jump.is_some(), after > now, moved_story) {
                 (true, true, _) => 5,
                 (false, true, _) => 4,
                 (true, false, _) => 3,
                 (false, false, true) => 2,
-                _ if moved_scratch || moved_place => 1,
+                _ if moved_scratch || moved_place || relocated => 1,
                 _ => 0,
             };
             if score == 0 {
@@ -1221,7 +1224,9 @@ fn main() {
                     push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);
                 }
                 None => {
-                    if !images.insert((field_name.clone(), story_key(&probe.mem.banks), image_key(&probe, end_place))) {
+                    // A relocation is told apart by the triangle it ended on (its walkmesh part may be the same).
+                    let spot = if relocated { probe.triangle_at(end.0, end.1, end.2).map_or(0, u64::from).wrapping_mul(0x2545_F491_4F6C_DD1D) } else { 0 };
+                    if !images.insert((field_name.clone(), story_key(&probe.mem.banks), image_key(&probe, end_place) ^ spot)) {
                         continue;
                     }
                     let via = Some(Rc::new(Step { text: summary, cmds: format!("{field_name}: {cmds}"), parent: via.clone() }));
