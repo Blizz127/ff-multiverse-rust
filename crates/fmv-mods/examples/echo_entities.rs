@@ -43,5 +43,27 @@ fn main() {
         for i in 0..o.entity_count().max(e.entity_count()) {
             println!("  {i:>2} {:<10} msgs {:>3} | {:<10} msgs {:>3}", o.entity_name(i).unwrap_or("-"), messages(&o, i), e.entity_name(i).unwrap_or("-"), messages(&e, i));
         }
+        // ENTITY=<index>: the (window, dialog) numbers each script slot opens, in decode order, on both sides.
+        if let Some(i) = std::env::var("ENTITY").ok().and_then(|v| v.parse::<usize>().ok()) {
+            for slot in 0..SCRIPTS_PER_ENTITY {
+                let list = |s: &FieldScript<'_>| -> Vec<(i32, i32)> {
+                    s.disassemble_partial(i, slot).map(|d| d.instructions.iter().filter(|x| matches!(x.opcode, 0x40 | 0x48)).map(|x| (x.literal("window").unwrap_or(-1), x.literal("dialog").unwrap_or(-1))).collect()).unwrap_or_default()
+                };
+                let (a, b) = (list(&o), list(&e));
+                if !a.is_empty() || !b.is_empty() {
+                    println!("  entity {i} slot {slot}: original {a:?}\n                 Echo-S   {b:?}");
+                    // TEXT=1: the lines themselves, to the terminal only (never into a file or the repository).
+                    if std::env::var_os("TEXT").is_some() {
+                        let show = |s: &FieldScript<'_>, d: i32| usize::try_from(d).ok().and_then(|d| s.dialog_text(d)).map(|t| t.text.chars().take(60).collect::<String>()).unwrap_or_default();
+                        for (k, &(_, d)) in a.iter().enumerate() {
+                            println!("    k={k} original #{d}: {:?}", show(&o, d));
+                        }
+                        for (k, &(_, d)) in b.iter().enumerate() {
+                            println!("    k={k} Echo-S   #{d}: {:?}", show(&e, d));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

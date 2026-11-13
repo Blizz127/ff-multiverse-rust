@@ -3,7 +3,10 @@
 //! The server runs the ORIGINAL field's scripts and names a window by the original's dialog number plus the instruction that
 //! opened it (the script entity and the section offset of its `MESSAGE` or `ASK`). Echo-S replaces whole script sections and
 //! numbers its dialogs differently, so its line is found by that instruction: the k-th `MESSAGE`/`ASK` (both kinds counted, in
-//! decode order) of script slot S of the same entity. The entity is matched by index when Echo-S's entity at that index has the
+//! decode order) of script slot S of the same entity **under the same branch conditions** (the `IF…` tests whose forward jump
+//! skips it). Echo-S adds and drops lines inside a script: nmkin_3's Jessie loses the ladder tutorial, so counting across the
+//! whole script gave the tutorial window her stuck-leg line. A message with no counterpart under the same conditions keeps
+//! the original's text. The entity is matched by index when Echo-S's entity at that index has the
 //! original's name, else by name when exactly one has it. [`build`] maps every message instruction of an area once; [`Skip`]
 //! says why one has no Echo-S line (the window then shows the original's text).
 
@@ -77,9 +80,38 @@ pub type LiveMap = HashMap<(u16, u32), Entry>;
 
 /// The message instructions of script `slot` of `entity`, in decode order (what decoded: a script that does not decode to its end
 /// still counts its first k).
+#[cfg(test)]
 fn messages(script: &FieldScript<'_>, entity: usize, slot: usize) -> Vec<Instruction> {
+    guarded_messages(script, entity, slot).into_iter().map(|(m, _)| m).collect()
+}
+
+/// An `IF…` test as a key: its mnemonic and every operand but the jump.
+fn condition(i: &Instruction) -> String {
+    let mut key = i.mnemonic.to_string();
+    for o in i.operands.iter().filter(|o| o.name != "jump") {
+        key.push_str(&format!(" {}={}:{}", o.name, o.bank, o.value));
+    }
+    key
+}
+
+/// The message instructions of a script with the branch conditions they sit under: the `IF…` instructions whose forward jump
+/// passes over them, outermost first.
+fn guarded_messages(script: &FieldScript<'_>, entity: usize, slot: usize) -> Vec<(Instruction, Vec<String>)> {
     let Ok(d) = script.disassemble_partial(entity, slot) else { return Vec::new() };
-    d.instructions.into_iter().filter(|i| matches!(i.opcode, MESSAGE | ASK)).collect()
+    let tests: Vec<(usize, usize, String)> = d
+        .instructions
+        .iter()
+        .filter(|i| i.mnemonic.starts_with("IF"))
+        .filter_map(|i| i.jump_target.filter(|t| *t > i.offset).map(|t| (i.offset, t, condition(i))))
+        .collect();
+    d.instructions
+        .into_iter()
+        .filter(|i| matches!(i.opcode, MESSAGE | ASK))
+        .map(|m| {
+            let under = tests.iter().filter(|(at, to, _)| *at < m.offset && m.offset < *to).map(|(_, _, c)| c.clone()).collect();
+            (m, under)
+        })
+        .collect()
 }
 
 /// The entity of `echo` that stands for entity `e` of `original`: the same index with the same name, else the one entity of
@@ -118,15 +150,18 @@ pub fn build(original: &[u8], echo: &[u8]) -> LiveMap {
     for entity in 0..o.entity_count() {
         let echo_at = echo_entity(&o, &e, entity);
         for slot in 0..SCRIPTS_PER_ENTITY {
-            let ours = messages(&o, entity, slot);
+            let ours = guarded_messages(&o, entity, slot);
             if ours.is_empty() {
                 continue;
             }
             let theirs = match echo_at {
-                Some(at) => messages(&e, at, slot),
+                Some(at) => guarded_messages(&e, at, slot),
                 None => Vec::new(),
             };
-            for (k, instruction) in ours.iter().enumerate() {
+            for (k, (instruction, under)) in ours.iter().enumerate() {
+                // The k-th message under these conditions, and Echo-S's k-th under the same ones.
+                let k = ours[..k].iter().filter(|(_, u)| u == under).count();
+                let theirs_here: Vec<&Instruction> = theirs.iter().filter(|(_, u)| u == under).map(|(m, _)| m).collect();
                 let (Ok(entity), Ok(offset), Some(dialog)) =
                     (u16::try_from(entity), u32::try_from(instruction.offset), instruction.literal("dialog").and_then(|d| u8::try_from(d).ok()))
                 else {
@@ -135,7 +170,7 @@ pub fn build(original: &[u8], echo: &[u8]) -> LiveMap {
                 // Slots can share code: the lowest slot that holds an instruction is the one that counts.
                 map.entry((entity, offset)).or_insert_with(|| Entry {
                     original_dialog: dialog,
-                    echo: if echo_at.is_none() { Err(Skip::NoEntity) } else { counterpart(instruction, theirs.get(k)) },
+                    echo: if echo_at.is_none() { Err(Skip::NoEntity) } else { counterpart(instruction, theirs_here.get(k).copied()) },
                 });
             }
         }
@@ -312,5 +347,88 @@ pub(crate) mod tests {
         assert!(build(&[1, 2, 3], &[4, 5]).is_empty());
         let original = section(&[("a", vec![(1, code(&[msg(0, 0)]))])], &["x"]);
         assert!(build(&original, &[]).is_empty());
+    }
+}
+
+/// Coverage of the map on the owner's own files (`FMV_FF7_DATA` = the folder with `field/flevel.lgp`, `FMV_ECHO_IRO` = Echo-S's
+/// archive): how many of the original's messages have an Echo-S line, and how many lines the old whole-script count gave that
+/// the conditions now refuse or change. Counts only, no text.
+#[cfg(test)]
+mod owned_coverage {
+    use super::*;
+    use fmv_ff7::field::FieldFile;
+    use fmv_ff7::lgp::LgpArchive;
+    use fmv_ff7::lzss;
+
+    fn section_of(bytes: &[u8]) -> Option<Vec<u8>> {
+        let file = FieldFile::parse(lzss::decompress(bytes).ok()?).ok()?;
+        Some(FieldScript::from_field(&file).ok()?.bytes().to_vec())
+    }
+
+    #[test]
+    #[ignore = "needs the owner's FF7 data (FMV_FF7_DATA) and Echo-S (FMV_ECHO_IRO)"]
+    fn conditions_keep_jessie_s_tutorial_off_her_stuck_leg_line_and_report_coverage() {
+        let (Some(data), Some(iro)) = (std::env::var_os("FMV_FF7_DATA"), std::env::var_os("FMV_ECHO_IRO")) else { return };
+        let mut orig = LgpArchive::open_path(std::path::Path::new(&data).join("field/flevel.lgp")).unwrap();
+        let echo = fmv_mods::IroArchive::open_path(&iro).unwrap();
+        let names: Vec<String> = orig.list().iter().map(|entry| entry.name.clone()).collect();
+        let (mut total, mut mapped, mut positional, mut switched, mut refused, mut gained) = (0, 0, 0, 0, 0, 0);
+        // Speaker agreement (the name on a line's first row): [old agrees, old total, new agrees, new total] per group.
+        let mut agree = std::collections::BTreeMap::<&str, [u32; 4]>::new();
+        fn speaker(s: &FieldScript<'_>, d: usize) -> Option<String> {
+            let t = s.dialog_text(d)?.text;
+            let first = t.split('\n').next()?.trim().to_string();
+            (!first.is_empty() && first.chars().count() <= 16 && !first.contains('“')).then_some(first)
+        }
+        for name in names {
+            let (Ok(ob), Ok(eb)) = (orig.read(&name), echo.read_named(&format!("Echo-S\\flevel.lgp\\{name}"))) else { continue };
+            let (Some(os), Some(es)) = (section_of(&ob), section_of(&eb)) else { continue };
+            let map = build(&os, &es);
+            let (Ok(o), Ok(e)) = (FieldScript::parse(&os), FieldScript::parse(&es)) else { continue };
+            for entity in 0..o.entity_count() {
+                let at = echo_entity(&o, &e, entity);
+                for slot in 0..SCRIPTS_PER_ENTITY {
+                    let ours = messages(&o, entity, slot);
+                    let theirs = at.map(|a| messages(&e, a, slot)).unwrap_or_default();
+                    for (k, m) in ours.iter().enumerate() {
+                        let Some(entry) = map.get(&(entity as u16, m.offset as u32)) else { continue };
+                        total += 1;
+                        let old = at.map(|_| counterpart(m, theirs.get(k)));
+                        if entry.echo.is_ok() { mapped += 1; }
+                        let od = usize::try_from(m.literal("dialog").unwrap_or(-1)).ok();
+                        let same = |l: &EchoLine| od.and_then(|d| speaker(&o, d)).zip(speaker(&e, l.dialog)).map(|(a, b)| a == b);
+                        let mut tally = |group: &'static str, l_old: Option<&EchoLine>, l_new: Option<&EchoLine>| {
+                            let slot = agree.entry(group).or_default();
+                            if let Some(v) = l_old.and_then(|l| same(l)) { slot[1] += 1; if v { slot[0] += 1; } }
+                            if let Some(v) = l_new.and_then(|l| same(l)) { slot[3] += 1; if v { slot[2] += 1; } }
+                        };
+                        match (&old, &entry.echo) {
+                            (Some(Ok(a)), Ok(b)) if a == b => tally("same", Some(a), Some(b)),
+                            (Some(Ok(a)), Ok(b)) => tally("switched", Some(a), Some(b)),
+                            (Some(Ok(a)), Err(_)) => tally("refused", Some(a), None),
+                            (_, Ok(b)) => tally("gained", None, Some(b)),
+                            _ => {}
+                        }
+                        match (old, entry.echo) {
+                            (Some(Ok(old)), Ok(now)) => { positional += 1; if now != old { switched += 1; } }
+                            (Some(Ok(_)), Err(_)) => { positional += 1; refused += 1; }
+                            (_, Ok(_)) => gained += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if name == "nmkin_3" {
+                let o = FieldScript::parse(&os).unwrap();
+                let tutorial = messages(&o, 4, 1)[0].offset as u32;
+                let line = lookup(&map, 4, tutorial, 72);
+                eprintln!("nmkin_3 Jessie tutorial (dialog 72) -> {line:?}");
+                assert!(line.map_or(true, |l| l.dialog != 5), "the tutorial must not take Echo-S's stuck-leg line (#5)");
+            }
+        }
+        eprintln!("messages {total}; with an Echo-S line now {mapped}; by the old whole-script count {positional}; switched {switched}, refused {refused}, gained {gained}");
+        for (group, [oa, ot, na, nt]) in &agree {
+            eprintln!("  {group}: speaker agrees old {oa}/{ot}, new {na}/{nt}");
+        }
     }
 }
