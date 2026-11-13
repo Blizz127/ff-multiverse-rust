@@ -146,7 +146,7 @@ fn ask_writes_the_answer_where_the_script_reads_it() {
         if !rt.window_open() { break; }
         rt.tick(None);
     }
-    assert_eq!(rt.mem.banks.get(0x60), 2);
+    assert_eq!(rt.mem.banks.get(0x60), 3, "the selected line: choice 2 of lines 1..3 is line 3, as the original stores it");
 }
 
 #[test]

@@ -160,7 +160,7 @@ fn ask_keeps_control_and_defers_the_selected_value_until_closing_finishes() {
     rt.tick(None);
     assert!(!rt.question_open());
     assert!(!rt.player_scripted());
-    assert_eq!(rt.mem.banks.get(0x60), 2);
+    assert_eq!(rt.mem.banks.get(0x60), 3, "choice 2 of lines 1..3 stores line 3");
     assert_eq!(rt.mem.banks.get(0x50), 1);
 }
 

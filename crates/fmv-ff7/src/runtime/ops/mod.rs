@@ -710,9 +710,12 @@ impl FieldRuntime {
             }
             Some(open) if open.entity == e && open.dialog == dialog => {
                 if !self.poll_window(w) { return Flow::Yield; }
+                // The original stores the selected LINE of the message (`OpcodeFuncAsk`'s selectedLine; Braver writes the
+                // same), so the first choice is line `first`, not 0: 369 of the Disc 1 questions whose choices start
+                // below line 0 compare against those line numbers (mrkt3's fatman1 tests 1 and 2 for lines 1 and 2).
                 let answer = self.windows[w].open.as_ref().and_then(|open| open.ask).and_then(|ask| ask.answer).unwrap_or(0);
                 self.windows[w].open = None;
-                self.wr8(2, 6, answer);
+                self.wr8(2, 6, first.saturating_add(answer));
                 self.events.push(Event::WindowDone { window: w as u8 });
                 self.advance(7);
                 Flow::Continue
