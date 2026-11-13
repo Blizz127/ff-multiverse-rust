@@ -290,6 +290,42 @@ fn press_after(ctx: &Playback<'_>, rt: &FieldRuntime, at: Pos, k: u32) -> Option
     None
 }
 
+/// A locked scene that waits for a direction held on the pad (`IFKEY`: mds5_4's stepping stones hop Cloud along while
+/// left is held, then give control back). Holds each direction until control returns (or 40 s) and keeps the first that
+/// moved the story or carried the player more than 100 units: (key name, the field after, what happened, where).
+fn held_key(ctx: &Playback<'_>, rt: &FieldRuntime, at: Pos) -> Option<(&'static str, FieldRuntime, Outcome, Pos)> {
+    let before = story_key(&rt.mem.banks);
+    for (name, bit) in [("left", 0x8000u16), ("right", 0x2000), ("up", 0x1000), ("down", 0x4000)] {
+        let mut probe = rt.clone();
+        let mut out = Outcome::default();
+        let mut here = at;
+        let mut left = false;
+        for f in 0..1200u32 {
+            if probe.player_scripted() {
+                if let Some(m) = probe.player_model() {
+                    here = (m.x, m.y, m.z);
+                }
+            }
+            probe.tick(Some(PlayerInput { x: here.0, y: here.1, z: here.2, keys_held: bit, keys_pressed: if f == 0 { bit } else { 0 }, ..Default::default() }));
+            if pump(ctx, &mut probe, &mut out) {
+                left = true;
+                break;
+            }
+            if f > 10 && !busy(&probe) {
+                break;
+            }
+        }
+        if let Some(m) = probe.player_model() {
+            here = (m.x, m.y, m.z);
+        }
+        let carried = (f64::from(here.0 - at.0)).hypot(f64::from(here.1 - at.1)) > 100.0;
+        if !out.game_over && (left && out.jump.is_some() || (!busy(&probe) && (carried || story_key(&probe.mem.banks) != before))) {
+            return Some((name, probe, out, here));
+        }
+    }
+    None
+}
+
 /// Whether the field holds the player or waits for it.
 fn busy(rt: &FieldRuntime) -> bool {
     rt.player_scripted() || rt.window_waiting() || rt.command().is_some()
@@ -908,6 +944,24 @@ fn main() {
                         let banks = probe.mem.banks.clone();
                         let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
                         push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via: step_via, carry: None }, 5);
+                    }
+                }
+                continue;
+            }
+            if let Some((key, probe, out, end)) = held_key(ctx, &rt, at) {
+                let after = moment_of(&probe.mem.banks);
+                println!("{step:>4} {field_name:<10} locked scene: holding {key} gives control back (moment {now}->{after})");
+                let text = format!("{field_name}: hold {key} (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
+                let step_via = Some(Rc::new(Step { text, cmds: format!("{field_name}: hold {key}"), parent: via.clone() }));
+                match out.jump {
+                    Some(jump) => {
+                        let to = maplist.name(jump.0).unwrap_or("?").to_string();
+                        push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), step_via), 5);
+                    }
+                    None => {
+                        let banks = probe.mem.banks.clone();
+                        let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
+                        push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via: step_via, carry: None }, 4);
                     }
                 }
                 continue;

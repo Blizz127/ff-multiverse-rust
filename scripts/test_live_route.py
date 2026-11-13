@@ -225,6 +225,19 @@ class RouteTimingTests(unittest.TestCase):
         self.assertIsNone(route.press_entry(r, 2, None, "southmk1"), "no okafter")
         self.assertIsNone(route.press_entry(r, 2, [], "southmk1"), "past the end")
 
+    def test_hold_opens_its_entry_and_names_a_direction(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = Path(d) / "ok.txt"
+            ok.write_text("mds5_4: hold left\n")
+            r = route.load_route(ok)[0]
+            self.assertEqual(r, [("mds5_4", [["hold", "left"]])])
+            self.assertEqual(route.press_entry(r, 0, None, "mds5_4"), 0)
+            for bad in ("mds5_4: to 1 2; hold left\n", "mds5_4: hold sideways\n"):
+                p = Path(d) / "bad.txt"
+                p.write_text(bad)
+                with self.assertRaises(ValueError):
+                    route.load_route(p)
+
     def test_press_after_must_open_its_entry(self):
         with tempfile.TemporaryDirectory() as d:
             ok = Path(d) / "ok.txt"

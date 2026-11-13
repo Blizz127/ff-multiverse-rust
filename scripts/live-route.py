@@ -73,6 +73,8 @@ def load_route(path):
         for i, step in enumerate(steps):
             if step[0] == "okafter" and (i != 0 or len(step) != 3 or not step[1].isdecimal()):
                 raise ValueError(f"line {number}: okafter DIALOG SECONDS must be the first step of its entry")
+            if step[0] == "hold" and (i != 0 or len(step) != 2 or step[1] not in PAD_BITS):
+                raise ValueError(f"line {number}: hold KEY (left, right, up or down) must be the first step of its entry")
         route.append((field.strip(), steps))
     return route, choices
 
@@ -149,6 +151,9 @@ class PressAfter:
         return False
 
 
+PAD_BITS = {"left": 0x8000, "right": 0x2000, "up": 0x1000, "down": 0x4000}
+
+
 def press_entry(route, idx, steps, area):
     """The entry whose leading `okafter` should be armed now: the current one before it starts, or the next one once the
     current entry's steps are all done in the same field (the walk that started the locked scene is over, but control
@@ -157,7 +162,7 @@ def press_entry(route, idx, steps, area):
     if nxt is None or nxt >= len(route):
         return None
     field, entry_steps = route[nxt]
-    return nxt if field == area and entry_steps and entry_steps[0][0] == "okafter" else None
+    return nxt if field == area and entry_steps and entry_steps[0][0] in ("okafter", "hold") else None
 
 
 def trailing_idle(steps):
@@ -274,6 +279,7 @@ def main():
     windows = set()
     window_dialogs = {}
     press = PressAfter()
+    holding = None  # the pad key a `hold` step keeps down until control returns
     pending = []
     idx, steps = 0, None
     entry_expects_exit = False
@@ -365,6 +371,11 @@ def main():
                 idle_interrupted |= locked
                 if not locked:
                     press.disarm()
+                    if holding is not None:
+                        c.send({"LiveKeys": {"held": 0}})
+                        if args.verbose:
+                            print(f"  RELEASE {holding}", flush=True)
+                        holding = None
                 if args.verbose:
                     print(f"  CONTROL locked={locked}", flush=True)
                 if locked and steps is not None and not entry_expects_exit:
@@ -403,7 +414,17 @@ def main():
             c.send(msg)
         pending = [p for p in pending if p[0] > now]
         # A timed press belongs to a locked scene: it is armed even while the field holds the player.
-        nxt = press_entry(route, idx, steps, area) if press.dialog is None else None
+        nxt = press_entry(route, idx, steps, area) if press.dialog is None and holding is None else None
+        if nxt is not None and route[nxt][1][0][0] == "hold":
+            if nxt != idx:
+                idx, steps = nxt, None
+            field, entry_steps = route[idx]
+            holding = entry_steps[0][1]
+            route[idx] = (field, entry_steps[1:])
+            c.send({"LiveKeys": {"held": PAD_BITS[holding]}})
+            progress_at = now
+            print(f"[{idx + 1}/{len(route)}] {field}: hold {holding} (until control returns)", flush=True)
+            nxt = None
         if nxt is not None:
             if nxt != idx:
                 idx, steps = nxt, None
