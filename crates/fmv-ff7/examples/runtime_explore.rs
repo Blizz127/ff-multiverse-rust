@@ -602,7 +602,94 @@ fn smooth(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, corners: &[Pos]) -> Vec
 
 /// The way a player walks from `from` (standing on triangle `from_tri`) to `to` on triangle `to_tri`: through the
 /// walkmesh's links, never into a locked triangle, at the bot's default walking speed (one point per field frame).
+/// The corners of a way through the triangles `prev` leads back along from `to_tri`, kept clear of `lines` (see
+/// [`way_with`]).
+fn clear_corners(walk: &Walkmesh, prev: &[Option<(usize, usize)>], from_tri: usize, to_tri: usize, from: Pos, to: Pos, lines: &[((f64, f64), (f64, f64))]) -> Vec<Pos> {
+    // The push reaches the player's solid range (34 at scale 512) from the line; keep a margin.
+    const CLEAR: f64 = 40.0;
+    let xy = |p: Pos| (f64::from(p.0), f64::from(p.1));
+    let vert = |v: &fmv_ff7::field::Vertex| (i32::from(v.x), i32::from(v.y), i32::from(v.z));
+    // The crossings, first to last: (the triangle entered, the shared edge's ends).
+    let mut crossings = Vec::new();
+    let mut t = to_tri;
+    while let Some((p, e)) = prev[t] {
+        crossings.push((p, t, vert(&walk.triangles[p][e]), vert(&walk.triangles[p][(e + 1) % 3])));
+        t = p;
+    }
+    let _ = from_tri;
+    crossings.reverse();
+    let mut corners: Vec<Pos> = Vec::new();
+    let mut cur = from;
+    for (left, entered, a, b) in crossings {
+        // The point of the edge (kept off its ends, which may be walls) farthest from every line.
+        let best = (2..=18).map(|k| {
+            let f = f64::from(k) / 20.0;
+            ((f64::from(a.0) + f64::from(b.0 - a.0) * f) as i32, (f64::from(a.1) + f64::from(b.1 - a.1) * f) as i32, (f64::from(a.2) + f64::from(b.2 - a.2) * f) as i32)
+        }).max_by(|p, q| {
+            let dp = lines.iter().map(|l| seg_point_dist(xy(*p), *l)).fold(f64::INFINITY, f64::min);
+            let dq = lines.iter().map(|l| seg_point_dist(xy(*q), *l)).fold(f64::INFINITY, f64::min);
+            dp.total_cmp(&dq)
+        }).unwrap_or(a);
+        if seg_clearance(xy(cur), xy(best), lines) < CLEAR {
+            // Round by a point inside the triangle just left or the one entered: of a grid of points across each, the
+            // one whose two legs stay farthest from every line (ealin_2: between the creaking floor and Elmyra's door).
+            let mut detour: Option<(f64, Pos)> = None;
+            for tt in [left, entered] {
+                let tri = &walk.triangles[tt];
+                for i in 1..8 {
+                    for j in 1..(8 - i) {
+                        let k = 8 - i - j;
+                        let at = |f: fn(&fmv_ff7::field::Vertex) -> i16| (i32::from(f(&tri[0])) * i + i32::from(f(&tri[1])) * j + i32::from(f(&tri[2])) * k) / 8;
+                        let q = (at(|v| v.x), at(|v| v.y), at(|v| v.z));
+                        let clear = seg_clearance(xy(cur), xy(q), lines).min(seg_clearance(xy(q), xy(best), lines));
+                        if clear >= CLEAR && detour.is_none_or(|(c, _)| clear > c) {
+                            detour = Some((clear, q));
+                        }
+                    }
+                }
+            }
+            let detour = detour.map(|(_, q)| q);
+            if let Some(q) = detour {
+                corners.push(q);
+            }
+        }
+        corners.push(best);
+        cur = best;
+    }
+    corners.push(to);
+    corners
+}
+
 fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize) -> Option<(Vec<Pos>, String)> {
+    way_with(walk, rt, from, from_tri, to, to_tri, None)
+}
+
+/// The active lines' segments (x, y ends): their push and across scripts fire within the player's reach of them. ealin_2's
+/// creaking floor by Aerith's door sends Cloud back to bed; the stairs are reached by keeping to the far side.
+fn active_lines(rt: &FieldRuntime) -> Vec<((f64, f64), (f64, f64))> {
+    rt.lines().iter().filter(|l| l.active).map(|l| ((f64::from(l.a.0), f64::from(l.a.1)), (f64::from(l.b.0), f64::from(l.b.1)))).collect()
+}
+
+fn seg_point_dist(p: (f64, f64), (a, b): ((f64, f64), (f64, f64))) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = (dx * dx + dy * dy).max(1.0);
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+/// The least distance from the walk p->q to any of `lines` (sampled every few units).
+fn seg_clearance(p: (f64, f64), q: (f64, f64), lines: &[((f64, f64), (f64, f64))]) -> f64 {
+    let n = ((q.0 - p.0).hypot(q.1 - p.1) / 4.0).ceil().max(1.0) as usize;
+    (0..=n).map(|k| {
+        let f = k as f64 / n as f64;
+        let x = (p.0 + (q.0 - p.0) * f, p.1 + (q.1 - p.1) * f);
+        lines.iter().map(|l| seg_point_dist(x, *l)).fold(f64::INFINITY, f64::min)
+    }).fold(f64::INFINITY, f64::min)
+}
+
+/// `way`, or with `lines` a way that keeps clear of them: each shared edge is crossed where it is farthest from the
+/// lines, and a leg that would still pass within reach of one goes round by a point inside the triangle it crosses.
+fn way_with(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, to_tri: usize, lines: Option<&[((f64, f64), (f64, f64))]>) -> Option<(Vec<Pos>, String)> {
     let n = walk.triangles.len();
     if from_tri >= n || to_tri >= n {
         return None;
@@ -637,7 +724,10 @@ fn way(walk: &Walkmesh, rt: &FieldRuntime, from: Pos, from_tri: usize, to: Pos, 
         t = p;
     }
     corners.reverse();
-    let corners = smooth(walk, rt, from, &corners);
+    let corners = match lines {
+        None => smooth(walk, rt, from, &corners),
+        Some(lines) => clear_corners(walk, &prev, from_tri, to_tri, from, to, lines),
+    };
     let mut out = Vec::new();
     let mut legs = Vec::new();
     let mut cur = from;
@@ -819,9 +909,11 @@ fn main() {
 
     // (field, story, scratch-without-noise) images already expanded or queued.
     let mut images: HashSet<(String, u64, u64)> = HashSet::new();
-    let mut entered: HashSet<(String, u64)> = HashSet::new();
+    // Field entries tried: (field, story, arrival triangle). The triangle tells apart a field re-entered by its own map jump
+    // at another place (ealin_2: sneaking downstairs at night jumps from ealin_2 to ealin_2).
+    let mut entered: HashSet<(String, u64, i32)> = HashSet::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut per_place: BTreeMap<(String, u16, Option<usize>), u32> = BTreeMap::new();
+    let mut per_place: BTreeMap<(String, u16, Option<usize>, bool), u32> = BTreeMap::new();
     let mut best: (u16, Option<Rc<Step>>, String) = (0, None, String::new());
     let mut unloadable: Vec<String> = Vec::new();
 
@@ -846,7 +938,7 @@ fn main() {
         let mut rt = match rt {
             Some(rt) => rt,
             None => {
-                if !entered.insert((field_name.clone(), story_key(&banks))) {
+                if !entered.insert((field_name.clone(), story_key(&banks), tri.map_or(-1, |t| t as i32))) {
                     continue;
                 }
                 let Ok(mut rt) = FieldRuntime::new(section, banks.clone()) else { continue };
@@ -869,7 +961,9 @@ fn main() {
         // The budget is per walkmesh part as well: reaching another part of a field (a ladder, a jump) is progress, and
         // loops in one part must not use up the expansions a later part needs (smkin_3's climb back from reactor 5's bomb).
         let part = tri.filter(|t| *t < walk.triangles.len()).and_then(|t| reachable(&walk, &rt, t).iter().position(|r| *r));
-        let place = (field_name.clone(), moment_of(&rt.mem.banks), part);
+        // A fresh entry (a map jump in, even into the same field) has its own budget: states still busy with a scene in
+        // the same place must not use up the expansions a new arrival needs (ealin_2 re-entered downstairs at night).
+        let place = (field_name.clone(), moment_of(&rt.mem.banks), part, fresh);
         let count = per_place.entry(place).or_insert(0);
         if *count >= PER_PLACE {
             continue;
@@ -1216,7 +1310,7 @@ fn main() {
             match out.jump {
                 Some(jump) => {
                     let to = maplist.name(jump.0).unwrap_or("?").to_string();
-                    if entered.contains(&(to.clone(), story_key(&probe.mem.banks))) {
+                    if entered.contains(&(to.clone(), story_key(&probe.mem.banks), i32::from(jump.3))) {
                         continue;
                     }
                     let via = Some(Rc::new(Step { text: format!("{summary} -> {to}"), cmds: format!("{field_name}: {cmds}"), parent: via.clone() }));
@@ -1249,7 +1343,7 @@ fn main() {
                 let mid = ((i32::from(g.exit_a[0]) + i32::from(g.exit_b[0])) / 2, (i32::from(g.exit_a[1]) + i32::from(g.exit_b[1])) / 2, (i32::from(g.exit_a[2]) + i32::from(g.exit_b[2])) / 2);
                 let near = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().any(|(ox, oy)| on_reach(&rt, (mid.0 + ox, mid.1 + oy, mid.2)));
                 let Some(to) = maplist.name(g.target_field_id).map(str::to_string) else { continue };
-                if !near || entered.contains(&(to.clone(), story_key(&rt.mem.banks))) {
+                if !near || entered.contains(&(to.clone(), story_key(&rt.mem.banks), i32::from(g.destination[2]))) {
                     if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
                         println!("      drop [gate {gi}] -> {to}: {}", if near { "already entered with this story" } else { "not near the reachable walkmesh" });
                     }
@@ -1259,12 +1353,23 @@ fn main() {
                 let spot = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().map(|(ox, oy)| (mid.0 + ox, mid.1 + oy, mid.2)).find(|p| on_reach(&rt, *p));
                 let Some(spot) = spot else { continue };
                 let Some(spot_tri) = rt.triangle_at(spot.0, spot.1, spot.2).map(usize::from) else { continue };
-                let Some((mut approach, legs)) = way(&walk, &rt, at, here, spot, spot_tri) else {
+                // The direct way, and one that keeps clear of active lines when that is a different way.
+                let mut plans: Vec<(Vec<Pos>, String)> = way(&walk, &rt, at, here, spot, spot_tri).into_iter().collect();
+                if let Some(clear) = way_with(&walk, &rt, at, here, spot, spot_tri, Some(&active_lines(&rt))) {
+                    if !plans.iter().any(|p| p.1 == clear.1) {
+                        plans.push(clear);
+                    }
+                }
+                if plans.is_empty() {
                     if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
                         println!("      drop [gate {gi}] -> {to}: no walk from tri {here} to tri {spot_tri}");
                     }
                     continue;
-                };
+                }
+                for (mut approach, legs) in plans {
+                    if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                        println!("      plan [gate {gi}] from {at:?}: {legs}");
+                    }
                 approach.extend(walk_segment(approach.last().copied().unwrap_or(at), mid));
                 let mut probe = rt.clone();
                 let mut out = Outcome::default();
@@ -1298,7 +1403,7 @@ fn main() {
                     match out.jump {
                         Some(jump) => {
                             let to = maplist.name(jump.0).unwrap_or("?").to_string();
-                            if !entered.contains(&(to.clone(), story_key(&probe.mem.banks))) {
+                            if !entered.contains(&(to.clone(), story_key(&probe.mem.banks), i32::from(jump.3))) {
                                 line.push(format!("[{score}] {label} -> {to}"));
                                 push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), Some(Rc::new(Step { text: format!("{summary} -> {to}"), cmds, parent: via.clone() }))), score + 1);
                             }
@@ -1329,6 +1434,7 @@ fn main() {
                 line.push(format!("[{score}] gate {gi} -> {to}"));
                 push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), via), score);
                 gates += 1;
+                }
             }
         }
         line.sort_by(|a, b| b.cmp(a));
