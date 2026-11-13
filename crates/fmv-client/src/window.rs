@@ -476,7 +476,9 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
 
 /// During a durable story save, only local presentation controls and an already active battle
 /// remain available. Field confirmation, previews, party changes and new encounters stay blocked.
-/// The original pad bit a key stands for in a live field (OK excluded: it is `Interact`): the directions and cancel.
+/// The original pad bit a key stands for in a live field (OK excluded: it is `Interact`): the directions, cancel (X),
+/// square and triangle. Wall Market's squat contest reads square, X and OK (mkt_mens: IFKEY 0x80, 0x40, 0x20). A
+/// controller's X and Y buttons arrive as P and Y (`PadKey`), so they are square and triangle as on the original's pad.
 fn live_pad_bit(code: KeyCode) -> Option<u16> {
     Some(match code {
         KeyCode::ArrowUp | KeyCode::KeyW => 0x1000,
@@ -484,6 +486,8 @@ fn live_pad_bit(code: KeyCode) -> Option<u16> {
         KeyCode::ArrowDown | KeyCode::KeyS => 0x4000,
         KeyCode::ArrowLeft | KeyCode::KeyA => 0x8000,
         KeyCode::Backspace => 0x0040,
+        KeyCode::KeyE | KeyCode::KeyP => 0x0080,
+        KeyCode::KeyQ | KeyCode::KeyY => 0x0010,
         _ => return None,
     })
 }
@@ -2664,6 +2668,16 @@ mod tests {
         assert!(over.y > feet.y + 10.0, "{over:?} over {feet:?}");
         let marker_spot = view.to_view(npcs[1].pos).unwrap();
         assert_eq!(label_anchor(Some(built), &view, draw.own_who, Subject::Npc(1), npcs[1].pos), Some(marker_spot));
+    }
+
+    #[test]
+    fn live_pad_bits_cover_the_squat_contest_keys() {
+        assert_eq!(live_pad_bit(KeyCode::KeyE), Some(0x0080), "square");
+        assert_eq!(live_pad_bit(crate::gamepad::PadKey::Invite.key_code()), Some(0x0080), "a controller's X is the original's square");
+        assert_eq!(live_pad_bit(crate::gamepad::PadKey::Accept.key_code()), Some(0x0010), "a controller's Y is triangle");
+        assert_eq!(live_pad_bit(KeyCode::Backspace), Some(0x0040), "cross");
+        assert_eq!(live_pad_bit(KeyCode::ArrowLeft), Some(0x8000));
+        assert_eq!(live_pad_bit(KeyCode::Enter), None, "OK is Interact");
     }
 }
 

@@ -923,7 +923,7 @@ fn main() {
     // at another place (ealin_2: sneaking downstairs at night jumps from ealin_2 to ealin_2).
     let mut entered: HashSet<(String, u64, i32)> = HashSet::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut per_place: BTreeMap<(String, u16, Option<usize>, bool), u32> = BTreeMap::new();
+    let mut per_place: BTreeMap<(String, u16, u64, Option<usize>, bool), u32> = BTreeMap::new();
     let mut discovered: Vec<(String, u16, u8)> = Vec::new();
     let mut best: (u16, Option<Rc<Step>>, String) = (0, None, String::new());
     let mut unloadable: Vec<String> = Vec::new();
@@ -978,7 +978,8 @@ fn main() {
         let part = tri.filter(|t| *t < walk.triangles.len()).and_then(|t| reachable(&walk, &rt, t).iter().position(|r| *r));
         // A fresh entry (a map jump in, even into the same field) has its own budget: states still busy with a scene in
         // the same place must not use up the expansions a new arrival needs (ealin_2 re-entered downstairs at night).
-        let place = (field_name.clone(), moment_of(&rt.mem.banks), part, fresh);
+        // The story fingerprint too: Wall Market's dress quest moves only flags (bank 1 addresses 160-161) at moment 191.
+        let place = (field_name.clone(), moment_of(&rt.mem.banks), story_key(&rt.mem.banks), part, fresh);
         let count = per_place.entry(place).or_insert(0);
         if *count >= PER_PLACE {
             continue;
