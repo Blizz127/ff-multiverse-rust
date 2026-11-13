@@ -1121,7 +1121,9 @@ fn main() {
         for t in (0..walk.triangles.len()).filter(|t| reach[*t]) {
             let c = centre(&walk, t);
             actions.push((format!("tri {t}"), Vec::new(), c, 0, false, String::new()));
-            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true, "ok".to_string()));
+            // The probe presses OK facing direction 0: the bot must face that way too (mds6_2's slide answered the
+            // solver's OK and not the bot's, which faced the way it had walked).
+            actions.push((format!("tri {t}; ok"), Vec::new(), c, 0, true, "face 0; ok".to_string()));
         }
         let on_reach = |rt: &FieldRuntime, p: Pos| rt.triangle_at(p.0, p.1, p.2).is_some_and(|t| reach.get(usize::from(t)).copied().unwrap_or(false));
         let pc = rt.state.pc_model;
