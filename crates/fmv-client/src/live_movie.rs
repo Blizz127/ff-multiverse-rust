@@ -219,6 +219,38 @@ pub fn configure(dir: Option<PathBuf>) {
     let _ = CONFIGURED_DIR.set(dir);
 }
 
+/// The movies folder of the owner's Steam install of FF7, when the game data was imported into the library (so no
+/// `flevel.lgp` is read in place to find it beside): every Steam library (the default roots, and the folders that
+/// `steamapps/libraryfolders.vdf` lists) is searched for the 2013 PC release's and the Steam Edition's `data/movies`.
+/// The files are only read, and only a movie the controller admits (checked by its bytes) plays.
+pub fn steam_movies_dir() -> Option<PathBuf> {
+    steam_movies_dir_in(Path::new(&std::env::var_os("HOME")?))
+}
+
+fn steam_movies_dir_in(home: &Path) -> Option<PathBuf> {
+    const GAMES: [&str; 2] = ["FINAL FANTASY VII Steam Edition/ff7/workingdir/data/movies", "FINAL FANTASY VII/data/movies"];
+    let roots = [".local/share/Steam", ".steam/steam", ".var/app/com.valvesoftware.Steam/.local/share/Steam"];
+    let mut libraries: Vec<PathBuf> = Vec::new();
+    for root in roots.iter().map(|r| home.join(r)) {
+        if !libraries.contains(&root) {
+            libraries.push(root.clone());
+        }
+        // `"path"  "/mnt/games/SteamLibrary"` lines name the other libraries.
+        let Ok(vdf) = std::fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) else { continue };
+        for line in vdf.lines() {
+            let mut quoted = line.split('"').skip(1).step_by(2);
+            if quoted.next().is_some_and(|key| key.eq_ignore_ascii_case("path")) {
+                if let Some(path) = quoted.next().map(|p| PathBuf::from(p.replace("\\\\", "/"))).filter(|p| p.is_absolute()) {
+                    if !libraries.contains(&path) {
+                        libraries.push(path);
+                    }
+                }
+            }
+        }
+    }
+    libraries.iter().flat_map(|lib| GAMES.iter().map(move |game| lib.join("steamapps/common").join(game))).find(|dir| dir.is_dir())
+}
+
 /// Where the decoder tools are: the environment, else `PATH`.
 fn tools() -> Result<Tools, String> {
     let find = |env: &str, name: &str| -> Result<PathBuf, String> {

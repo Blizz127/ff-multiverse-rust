@@ -324,7 +324,7 @@ fn run_delete(args: &Args, name: &str, state_dir: &Path, store: &TokenStore) -> 
 fn run(args: Args) -> u8 {
     // The movies of a live field come from the install's movies folder (or FMV_MOVIES_DIR), when there is one. Said once,
     // before the command-line and character-menu paths part, so a window made by either finds them.
-    live_movie::configure(ff7::resolve_movies_dir(&args.ff7_source()));
+    live_movie::configure(ff7::resolve_movies_dir(&args.ff7_source()).or_else(live_movie::steam_movies_dir));
     // Accounts first: it is cheap and local, so a missing `--name` or a broken token file is
     // reported before the (slow) content indexing and before anything reaches a server.
     let state_dir = match args.client_state_dir() {

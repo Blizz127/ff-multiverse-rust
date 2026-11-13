@@ -323,3 +323,19 @@ fn the_real_opening_prepares_and_starts_playing_through_the_window_source() {
     assert!(playback.controller.audio_handle().is_some());
     playback.cancel();
 }
+
+#[test]
+fn the_steam_editions_movies_are_found_in_the_default_library_or_one_the_library_list_names() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(steam_movies_dir_in(home.path()), None, "no Steam, no folder");
+    let steam = home.path().join(".local/share/Steam");
+    std::fs::create_dir_all(steam.join("steamapps")).unwrap();
+    let other = home.path().join("games/SteamLibrary");
+    let movies = other.join("steamapps/common/FINAL FANTASY VII Steam Edition/ff7/workingdir/data/movies");
+    std::fs::create_dir_all(&movies).unwrap();
+    std::fs::write(steam.join("steamapps/libraryfolders.vdf"), format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n", other.display())).unwrap();
+    assert_eq!(steam_movies_dir_in(home.path()), Some(movies), "a library the list names");
+    let default = steam.join("steamapps/common/FINAL FANTASY VII/data/movies");
+    std::fs::create_dir_all(&default).unwrap();
+    assert_eq!(steam_movies_dir_in(home.path()), Some(default), "the default library comes first");
+}
