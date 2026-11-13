@@ -598,6 +598,7 @@ impl Conn {
                 | ClientMsg::Interact { .. }
                 | ClientMsg::LiveAnswer { .. }
                 | ClientMsg::LiveMovieDone { .. }
+                | ClientMsg::LiveKeys { .. }
                 | ClientMsg::PartyInvite { .. }
                 | ClientMsg::PartyAccept { .. }
                 | ClientMsg::PartyDecline { .. }
@@ -679,6 +680,7 @@ impl Conn {
                 ClientMsg::Interact { npc } => self.on_interact(entity, npc)?,
                 ClientMsg::LiveAnswer { window, choice } => self.shared.with_world(|w| w.live_answer(entity, window, choice)),
                 ClientMsg::LiveMovieDone { .. } => self.shared.with_world(|w| w.live_movie_done(entity)),
+                ClientMsg::LiveKeys { held } => self.shared.with_world(|w| w.live_keys(entity, held)),
                 ClientMsg::Ping { nonce } => self.pong(nonce)?,
                 ClientMsg::Leave => return Err(Close::Left),
                 ClientMsg::PartyInvite { target } => self.party(|w, now| w.party_invite(entity, target, now))?,

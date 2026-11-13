@@ -66,7 +66,12 @@ pub struct LiveClient {
     pub lead: Option<u32>,
     /// The animation and frame of each cast member a script plays once or holds, by cast id.
     poses: BTreeMap<u32, (String, u16)>,
+    /// The pad buttons held now (the original's bits, OK excluded), as the server was last told (protocol 26).
+    pad: u16,
 }
+
+/// The pad's OK bit: never in `LiveKeys` (OK is `Interact`).
+const PAD_OK: u16 = 0x0020;
 
 /// More poses than this in one cast are not kept (a cast has at most a few dozen members).
 const MAX_POSES: usize = 256;
@@ -193,6 +198,27 @@ impl LiveClient {
         std::mem::take(&mut self.outbox)
     }
 
+    /// Pad button `bit` (the original's pad bits) went down or up: in a live field the server hears the new set, since
+    /// field scripts test the pad (`IFKEY`: Sector 5's rooftops wait for left or right). OK is never sent this way.
+    pub fn pad(&mut self, bit: u16, down: bool) {
+        let bit = bit & !PAD_OK;
+        let next = if down { self.pad | bit } else { self.pad & !bit };
+        if next != self.pad {
+            self.pad = next;
+            if self.live_area {
+                self.outbox.push(ClientMsg::LiveKeys { held: next });
+            }
+        }
+    }
+
+    /// OK while a script holds the player and no window takes it: the scripts may be waiting for that press (reactor 5's
+    /// three-person door). A free player's OK goes out as ever, with the character it addressed.
+    pub fn press_ok(&mut self) {
+        if self.live_area && self.locked && self.movie.is_none() {
+            self.outbox.push(ClientMsg::Interact { npc: None });
+        }
+    }
+
     pub fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
     }
@@ -208,6 +234,7 @@ impl LiveClient {
         self.live_area = false;
         self.lead = None;
         self.poses.clear();
+        self.pad = 0;
     }
 }
 
@@ -257,5 +284,27 @@ mod tests {
         live.reset();
         assert!(!live.live_area);
         assert_eq!((live.lead, live.pose(3)), (None, None));
+    }
+
+    #[test]
+    fn a_live_field_hears_the_pad_without_ok_and_a_locked_scene_hears_ok() {
+        let mut live = LiveClient::default();
+        live.pad(0x8000, true);
+        assert!(live.take_outbox().is_empty(), "not a live field yet");
+        live.live_area = true;
+        live.pad(0x2000, true);
+        live.pad(0x2000, true);
+        live.pad(0x0020, true);
+        live.pad(0x8000, false);
+        assert_eq!(live.take_outbox(), vec![ClientMsg::LiveKeys { held: 0xA000 }, ClientMsg::LiveKeys { held: 0x2000 }], "changes only, OK left out");
+        live.press_ok();
+        assert!(live.take_outbox().is_empty(), "a free player's OK is not this");
+        live.locked = true;
+        live.press_ok();
+        assert_eq!(live.take_outbox(), vec![ClientMsg::Interact { npc: None }]);
+        live.reset();
+        live.live_area = true;
+        live.pad(0x2000, true);
+        assert_eq!(live.take_outbox(), vec![ClientMsg::LiveKeys { held: 0x2000 }], "a new field starts with nothing held");
     }
 }

@@ -82,12 +82,14 @@ impl LiveFieldHost for Ff7LiveHost {
             rt.set_previous_field(previous);
         }
         rt.init();
-        Some(Box::new(Ff7Live { rt, loader, adapter: Arc::clone(&self.adapter) }))
+        Some(Box::new(Ff7Live { rt, held: 0, loader, adapter: Arc::clone(&self.adapter) }))
     }
 }
 
 struct Ff7Live {
     rt: FieldRuntime,
+    /// The pad buttons held on the last frame, for the presses (`IFKEYON` sees a button go down once).
+    held: u16,
     loader: Option<ModelLoader>,
     adapter: Arc<Ff7Adapter>,
 }
@@ -98,6 +100,9 @@ fn pos_of(x: i32, y: i32, z: i32) -> Pos {
 
 impl LiveField for Ff7Live {
     fn advance(&mut self, input: Option<LiveInput>) -> Vec<LiveEvent> {
+        let held = input.as_ref().map_or(0, |i| i.keys & !PAD_OK);
+        let pressed = held & !self.held;
+        self.held = held;
         let player = input.map(|i| PlayerInput {
             x: i.pos.x.round() as i32,
             y: i.pos.y.round() as i32,
@@ -105,8 +110,8 @@ impl LiveField for Ff7Live {
             triangle: 0,
             dir: facing_to_field_direction(i.facing),
             ok: i.ok,
-            keys_held: if i.ok || i.ok_held { PAD_OK } else { 0 },
-            keys_pressed: if i.ok { PAD_OK } else { 0 },
+            keys_held: held | if i.ok || i.ok_held { PAD_OK } else { 0 },
+            keys_pressed: pressed | if i.ok { PAD_OK } else { 0 },
         });
         self.rt.tick(player);
         // Tutorials are not shown yet: the field goes on as if the player read it.

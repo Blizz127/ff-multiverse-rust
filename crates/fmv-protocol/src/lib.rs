@@ -1,4 +1,8 @@
-//! FF Multiverse wire protocol v25.
+//! FF Multiverse wire protocol v26.
+//!
+//! v26 adds [`ClientMsg::LiveKeys`]: the pad buttons a player holds in a live field (the original's pad bits, OK left
+//! out: OK stays [`ClientMsg::Interact`]). Field scripts test them (`IFKEY`, `IFKEYON`, `IFKEYOFF`): Sector 5's
+//! rooftops, Wall Market and Shinra HQ wait for directions.
 //!
 //! v25 adds [`ServerMsg::LiveSound`]: a live field's script sound effects (`SOUND` and the playing `AKAO` operations
 //! on channels 1 and 2). An older client cannot read the message, so it is refused at the handshake.
@@ -507,7 +511,7 @@ pub use fmv_party::{
 };
 
 // Older peers cannot bind an ordinary point cutscene to its accepted activation pose.
-pub const PROTOCOL_VERSION: u16 = 25;
+pub const PROTOCOL_VERSION: u16 = 26;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -735,6 +739,10 @@ pub enum ClientMsg {
     LiveAnswer { window: u8, choice: Option<u8> },
     /// New in v23. The client finished (or could not play) live movie `movie`.
     LiveMovieDone { movie: u16 },
+    /// New in v26. The pad buttons held now in a live field, as the original's pad bits (up 0x1000, right 0x2000, down
+    /// 0x4000, left 0x8000, cancel 0x0040, menu 0x0010, ...), sent when they change. OK (0x0020) is never in it: a press of
+    /// OK is [`ClientMsg::Interact`].
+    LiveKeys { held: u16 },
 }
 
 /// A live field's fade overlay: how it blends (0 add, 1 subtract, 2 black) and its colour.
@@ -1171,7 +1179,7 @@ mod tests {
 
     #[test]
     fn the_version_is_twenty_two() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+        assert_eq!(PROTOCOL_VERSION, 26);
     }
 
     // -----------------------------------------------------------------------------------------

@@ -476,6 +476,18 @@ fn route_key(code: KeyCode, pressed: bool, repeat: bool, in_battle: bool) -> Key
 
 /// During a durable story save, only local presentation controls and an already active battle
 /// remain available. Field confirmation, previews, party changes and new encounters stay blocked.
+/// The original pad bit a key stands for in a live field (OK excluded: it is `Interact`): the directions and cancel.
+fn live_pad_bit(code: KeyCode) -> Option<u16> {
+    Some(match code {
+        KeyCode::ArrowUp | KeyCode::KeyW => 0x1000,
+        KeyCode::ArrowRight | KeyCode::KeyD => 0x2000,
+        KeyCode::ArrowDown | KeyCode::KeyS => 0x4000,
+        KeyCode::ArrowLeft | KeyCode::KeyA => 0x8000,
+        KeyCode::Backspace => 0x0040,
+        _ => return None,
+    })
+}
+
 fn story_pending_route(code: KeyCode, pressed: bool, repeat: bool, battle_menu: bool) -> KeyRoute {
     let route = route_key(code, pressed, repeat, battle_menu);
     match route {
@@ -844,6 +856,12 @@ impl App {
             }
             GameOverRoute::Inactive => {}
         }
+        // A live field's scripts read the pad (`IFKEY`): every press and release of a pad key goes to the server too.
+        if self.session.state.live.live_area {
+            if let Some(bit) = live_pad_bit(code) {
+                self.session.state.live.pad(bit, pressed);
+            }
+        }
         let route = if self.session.state.field_controls_held() {
             self.talk.close();
             // Key releases must survive every hold, even when the associated press was ignored.
@@ -851,6 +869,10 @@ impl App {
             // A window the server's script opened takes the OK and arrow keys: that is how the leader answers it.
             if self.talk.live_key(&mut self.session.state.live, code, pressed, repeat) {
                 return;
+            }
+            // No window wants it: a script holding the scene may be waiting for OK (reactor 5's three-person door).
+            if pressed && !repeat && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space) {
+                self.session.state.live.press_ok();
             }
             let battle_menu = self.session.state.battle.in_battle() || self.session.state.battle.lingering(now);
             story_pending_route(code, pressed, repeat, battle_menu)

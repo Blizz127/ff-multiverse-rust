@@ -87,6 +87,8 @@ pub struct LiveInput {
     pub ok: bool,
     /// OK is held (a press holds for a few frames, so a script that polls the pad sees it).
     pub ok_held: bool,
+    /// The other pad buttons held (protocol 26 `LiveKeys`; never OK).
+    pub keys: u16,
 }
 
 /// What a frame did that the world must carry out or tell.
@@ -180,6 +182,9 @@ struct LiveRun {
     game_over: bool,
 }
 
+/// The pad's OK bit, which `LiveKeys` never carries (OK is `Interact`).
+const LIVE_PAD_OK: u16 = 0x0020;
+
 /// The world's live fields.
 #[derive(Default)]
 pub(super) struct LiveWorld {
@@ -187,6 +192,8 @@ pub(super) struct LiveWorld {
     runs: BTreeMap<InstanceId, LiveRun>,
     /// OK presses since the last frame, by account.
     ok: BTreeSet<AccountId>,
+    /// The pad buttons each account holds (OK excluded), as its client last said.
+    keys: BTreeMap<AccountId, u16>,
     answers: Vec<(AccountId, u8, Option<u8>)>,
     movies_done: BTreeSet<AccountId>,
     /// Battles a run is waiting on, and how they ended.
@@ -288,6 +295,16 @@ impl World {
 
     pub(super) fn live_battles_disabled(&self, entity: EntityId) -> bool {
         self.live_run_of(entity).and_then(|id| self.live.runs.get(&id)).is_some_and(|r| r.field.battles_disabled())
+    }
+
+    /// The pad buttons `entity` holds now (OK excluded): the frames from now on see them, while it is in a live field.
+    pub fn live_keys(&mut self, entity: EntityId, held: u16) {
+        let Some(account) = self.players.get(&entity).map(|p| p.account) else { return };
+        if self.in_live_field(entity) {
+            self.live.keys.insert(account, held & !LIVE_PAD_OK);
+        } else {
+            self.live.keys.remove(&account);
+        }
     }
 
     /// An OK press of `entity` in a live field: the next frame sees it. Returns whether it was taken.
@@ -460,6 +477,7 @@ impl World {
                 facing: p.snapshot.facing,
                 ok,
                 ok_held,
+                keys: self.live.keys.get(&run.governor).copied().unwrap_or(0),
             });
             ok = false;
             events.extend(run.field.advance(input));
