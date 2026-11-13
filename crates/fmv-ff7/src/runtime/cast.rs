@@ -83,7 +83,12 @@ impl FieldRuntime {
             // (and never the engine's "the countdown ran out" signal, bank 1 address 225 bit 7: a field sets it on the
             // way to the game-over screen. Saved, it would end the game again on every return.)
             let game_over = if (selector, address) == (1, 225) { 0x80 } else { 0 };
-            let mask = !(crate::story::engine_owned_bits(selector, address) | game_over);
+            // The field party (bank 3, addresses 9-11) is engine-owned in the reset profile because its first value is
+            // the engine's, but afterwards only the field scripts (PRTYP / PRTYM / PRTYE / SPTYE) and the party menu
+            // change it, and the original keeps it in the savemap from field to field. Left out, every field reloaded
+            // Cloud alone: JOIN/SPLIT found no followers and battles lost Barret and Tifa.
+            let owned = if selector == 3 && (9..=11).contains(&address) { 0 } else { crate::story::engine_owned_bits(selector, address) };
+            let mask = !(owned | game_over);
             if (now ^ was) & mask == 0 {
                 continue;
             }

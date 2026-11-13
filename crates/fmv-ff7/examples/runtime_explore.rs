@@ -1091,6 +1091,9 @@ fn main() {
         }
         // Gateways the player can reach, while the scripts allow map jumps.
         let mut gates = 0;
+        if rt.state.map_jumps_disabled && std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+            println!("      no gates: the scripts disabled map jumps");
+        }
         if !rt.state.map_jumps_disabled {
             let gateways: Vec<Gateway> = loaded.field.triggers().map(|t| t.gateways).unwrap_or_default();
             for (gi, g) in gateways.iter().enumerate().filter(|(_, g)| g.target_field_id != Gateway::UNUSED_FIELD_ID) {
@@ -1098,13 +1101,21 @@ fn main() {
                 let near = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().any(|(ox, oy)| on_reach(&rt, (mid.0 + ox, mid.1 + oy, mid.2)));
                 let Some(to) = maplist.name(g.target_field_id).map(str::to_string) else { continue };
                 if !near || entered.contains(&(to.clone(), story_key(&rt.mem.banks))) {
+                    if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                        println!("      drop [gate {gi}] -> {to}: {}", if near { "already entered with this story" } else { "not near the reachable walkmesh" });
+                    }
                     continue;
                 }
                 // Walk to the gate; if a script steps in on the way, that is what happens instead of the gate.
                 let spot = [(0, 0), (-30, 0), (30, 0), (0, -30), (0, 30), (-60, 0), (60, 0), (0, -60), (0, 60)].iter().map(|(ox, oy)| (mid.0 + ox, mid.1 + oy, mid.2)).find(|p| on_reach(&rt, *p));
                 let Some(spot) = spot else { continue };
                 let Some(spot_tri) = rt.triangle_at(spot.0, spot.1, spot.2).map(usize::from) else { continue };
-                let Some((mut approach, legs)) = way(&walk, &rt, at, here, spot, spot_tri) else { continue };
+                let Some((mut approach, legs)) = way(&walk, &rt, at, here, spot, spot_tri) else {
+                    if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
+                        println!("      drop [gate {gi}] -> {to}: no walk from tri {here} to tri {spot_tri}");
+                    }
+                    continue;
+                };
                 approach.extend(walk_segment(approach.last().copied().unwrap_or(at), mid));
                 let mut probe = rt.clone();
                 let mut out = Outcome::default();
@@ -1112,7 +1123,10 @@ fn main() {
                 if !arrived {
                     if out.jump.is_none() && !out.control_taken {
                         if std::env::var_os("FMV_EXPLORE_DEBUG").is_some() {
-                            println!("      drop [gate {gi}]: walk stopped without the bot cancelling its movement tail");
+                            println!("      drop [gate {gi}]: walk stopped without the bot cancelling its movement tail (from {at:?} tri {here} to {mid:?}, stopped at {end:?}, path {approach:?}, lock {}, map jumps off {})", probe.state.character_lock, probe.state.map_jumps_disabled);
+                            for (i, m) in probe.models().iter().enumerate() {
+                                println!("        model {i} entity {} at ({},{},{}) solid_off {} visible {} range {}", m.entity, m.x, m.y, m.z, m.solid_off, m.visible, m.solid_range);
+                            }
                         }
                         continue;
                     }

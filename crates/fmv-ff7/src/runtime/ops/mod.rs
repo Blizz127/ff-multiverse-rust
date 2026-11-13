@@ -470,31 +470,21 @@ impl FieldRuntime {
                 self.command_op(Command::DiscChange { disc }, 2)
             }
             // ---- party ----
-            0xC8 => {
-                let ch = self.p8(1);
-                let mut party = self.party();
-                if !party.contains(&ch) {
-                    let slot = party.iter().position(|c| *c == NO_CHARACTER).unwrap_or(2);
-                    party[slot] = ch;
+            // PRTYP / PRTYM / PRTYE: the original's PartyAdd / PartyRemove / PartyReplace (`script::party`), so PRTYE's
+            // 254 stores an empty 255 and 255 keeps the member already there. An operand the original would reject
+            // leaves the party as it is.
+            0xC8 | 0xC9 | 0xCA => {
+                let len = if op == 0xCA { 4 } else { 2 };
+                let change = match op {
+                    0xC8 => crate::story::PartyOp::Add(self.p8(1)),
+                    0xC9 => crate::story::PartyOp::Remove(self.p8(1)),
+                    _ => crate::story::PartyOp::Set([self.p8(1), self.p8(2), self.p8(3)]),
+                };
+                let party = self.party();
+                if let Ok(next) = crate::script::party::native_transition(party, party, change) {
+                    self.set_party(next.bank);
                 }
-                self.set_party(party);
-                self.advance(2);
-                Flow::Continue
-            }
-            0xC9 => {
-                let ch = self.p8(1);
-                let mut party = self.party();
-                if let Some(slot) = party.iter().position(|c| *c == ch) {
-                    party[slot] = NO_CHARACTER;
-                }
-                self.set_party(party);
-                self.advance(2);
-                Flow::Continue
-            }
-            0xCA => {
-                let party = [self.p8(1), self.p8(2), self.p8(3)];
-                self.set_party(party);
-                self.advance(4);
+                self.advance(len);
                 Flow::Continue
             }
             0x0A => {

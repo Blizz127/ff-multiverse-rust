@@ -82,3 +82,37 @@ fn a_changed_story_byte_is_saved_and_an_engine_owned_one_is_not() {
     assert!(Banks::from_story(&after).is_some(), "still a complete image");
     assert_eq!(rt.story_after(&after).expect("writes"), None, "nothing more to save");
 }
+
+#[test]
+fn a_scripted_party_change_is_saved_for_the_next_field() {
+    let story = StoryState::fresh_reset();
+    let banks = Banks::from_story(&story).expect("complete");
+    // PRTYE Cloud, Barret, empty (254): the original stores the empty slot as 255.
+    let init = [0xCA, 0, 1, 254, 0x00];
+    let section = crate::script::synth::SynthScript { scale: 512, ..Default::default() }.entity("dir", vec![(0, init.to_vec())]).build();
+    let mut rt = FieldRuntime::new(&section, banks).expect("runtime");
+    rt.init();
+    assert_eq!(rt.party(), [0, 1, 255]);
+    let after = rt.story_after(&story).expect("writes").expect("changed");
+    assert_eq!([9, 10, 11].map(|a| after.known_byte(3, a)), [Some(0), Some(1), Some(255)]);
+    // The next field starts from the saved story with the same party.
+    let next = FieldRuntime::new(&section, Banks::from_story(&after).expect("complete")).expect("runtime");
+    assert_eq!(next.party(), [0, 1, 255]);
+}
+
+#[test]
+fn party_operations_follow_the_original_slot_rules() {
+    let story = StoryState::fresh_reset();
+    let banks = Banks::from_story(&story).expect("complete");
+    // PRTYE(0,254,254); PRTYP 1 fills the first empty slot; PRTYP 2; PRTYM 1 empties its slot; PRTYE(255,3,254) keeps Cloud.
+    let init = [0xCA, 0, 254, 254, 0xC8, 1, 0xC8, 2, 0xC9, 1, 0x00];
+    let section = crate::script::synth::SynthScript { scale: 512, ..Default::default() }.entity("dir", vec![(0, init.to_vec())]).build();
+    let mut rt = FieldRuntime::new(&section, banks.clone()).expect("runtime");
+    rt.init();
+    assert_eq!(rt.party(), [0, 255, 2]);
+    let init = [0xCA, 0, 1, 2, 0xCA, 255, 3, 254, 0x00];
+    let section = crate::script::synth::SynthScript { scale: 512, ..Default::default() }.entity("dir", vec![(0, init.to_vec())]).build();
+    let mut rt = FieldRuntime::new(&section, banks).expect("runtime");
+    rt.init();
+    assert_eq!(rt.party(), [0, 3, 255], "255 keeps a member (Cloud refills the first open slot), 254 empties");
+}
