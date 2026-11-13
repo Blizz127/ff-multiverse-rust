@@ -82,15 +82,23 @@ fn messages(script: &FieldScript<'_>, entity: usize, slot: usize) -> Vec<Instruc
     d.instructions.into_iter().filter(|i| matches!(i.opcode, MESSAGE | ASK)).collect()
 }
 
-/// The entity of `echo` that stands for entity `e` of `original`.
+/// The entity of `echo` that stands for entity `e` of `original`: the same index with the same name, else the one entity of
+/// that name, else the same index when Echo-S renamed it there (its name there is no original entity's: elevtr1's `cl`, `ba`
+/// and `av_j` are `Cloud`, `Barrett` and `Jessie` in Echo-S, in the same places).
 fn echo_entity(original: &FieldScript<'_>, echo: &FieldScript<'_>, e: usize) -> Option<usize> {
     let name = original.entity_name(e)?;
     if echo.entity_name(e) == Some(name) {
         return Some(e);
     }
     let mut named = (0..echo.entity_count()).filter(|&i| echo.entity_name(i) == Some(name));
-    let first = named.next()?;
-    named.next().is_none().then_some(first)
+    match (named.next(), named.next()) {
+        (Some(first), None) => return Some(first),
+        (Some(_), Some(_)) => return None,
+        (None, _) => {}
+    }
+    let theirs = echo.entity_name(e)?;
+    let renamed = !(0..original.entity_count()).any(|i| original.entity_name(i) == Some(theirs));
+    renamed.then_some(e)
 }
 
 fn counterpart(original: &Instruction, theirs: Option<&Instruction>) -> Result<EchoLine, Skip> {
@@ -286,9 +294,17 @@ pub(crate) mod tests {
         let same = section(&[("a", one(4))], &["0"; 5]);
         let only = section(&[("a", one(0))], &["0"]);
         assert_eq!(lookup(&build(&only, &same), 0, offset_of(&only, 0, 1, 0), 0), Ok(line(0, 4, None)));
-        // No entity of the name at all.
+        // No entity of the name, but Echo-S renamed the one in its place (elevtr1's cl is Cloud there): the same index.
         let other = section(&[("q", one(4))], &["0"; 5]);
-        assert_eq!(lookup(&build(&only, &other), 0, offset_of(&only, 0, 1, 0), 0), Err(Skip::NoEntity));
+        assert_eq!(lookup(&build(&only, &other), 0, offset_of(&only, 0, 1, 0), 0), Ok(line(0, 4, None)));
+        // Nothing in its place.
+        let none = section(&[], &["0"]);
+        assert_eq!(lookup(&build(&only, &none), 0, offset_of(&only, 0, 1, 0), 0), Err(Skip::NoEntity));
+        // In its place an entity named like another of the original's: not a rename.
+        let two = section(&[("a", one(0)), ("b", one(1))], &["0", "1"]);
+        let swapped = section(&[("b", one(4)), ("x", one(5))], &["0"; 6]);
+        let map = build(&two, &swapped);
+        assert_eq!(lookup(&map, 0, offset_of(&two, 0, 1, 0), 0), Err(Skip::NoEntity), "'a' has no namesake and 'b' is not a rename of it");
     }
 
     #[test]
