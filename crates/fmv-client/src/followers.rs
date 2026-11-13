@@ -27,7 +27,7 @@ use crate::avatar::{AvatarPlayer, Who};
 use crate::state::{ClientState, NpcView};
 
 /// Field units between the leader and the first follower, and between one follower and the next.
-pub const SPACING: f32 = 88.0;
+pub const SPACING: f32 = 120.0;
 /// How far the leader walks before the trail gets a new point (field units).
 const STEP: f32 = 4.0;
 /// A jump this long between two frames is a relocation (a link, a ladder), not a walk: the trail starts again.

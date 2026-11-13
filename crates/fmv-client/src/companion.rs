@@ -21,7 +21,7 @@
 use fmv_core::{AnimState, EntityId, Pos};
 
 /// How far from the lead the player's character stands in a scene (field units).
-const RING: f32 = 64.0;
+const RING: f32 = 80.0;
 /// A place stays good while it is this near the lead, and no nearer than this.
 const KEEP_FAR: f32 = 140.0;
 const KEEP_NEAR: f32 = 38.0;
