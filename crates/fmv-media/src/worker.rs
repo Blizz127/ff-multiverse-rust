@@ -1,6 +1,6 @@
 use crate::{
-    metadata, process, AudioContinuity, AudioFrameTiming, AudioMetadata, FrameTiming, Limits,
-    MediaError, MediaMetadata,
+    metadata, process, AudioContinuity, AudioFrameTiming, AudioMetadata, AudioRequirement,
+    FrameTiming, Limits, MediaError, MediaMetadata,
 };
 use std::ffi::OsString;
 use std::io::Read;
@@ -76,9 +76,12 @@ pub struct DecodedFrame {
 
 #[derive(Debug)]
 pub enum Event {
+    /// `audio` is `Some` exactly when `metadata.audio` is: always for a strict start, and for
+    /// [`MovieWorker::start_with`]`(.., AudioRequirement::Optional)` unless the file has no
+    /// audio stream (a silent movie: no audio is decoded, none is invented).
     Prepared {
         metadata: Arc<MediaMetadata>,
-        audio: DecodedAudio,
+        audio: Option<DecodedAudio>,
     },
     Frame(DecodedFrame),
     /// Successful process exit AND exact decoded frame-count agreement. The consumer
@@ -99,7 +102,15 @@ pub struct MovieWorker {
 }
 
 impl MovieWorker {
+    /// The strict profile: one video and one stereo audio stream.
     pub fn start(request: Request) -> Result<Self, MediaError> {
+        Self::start_with(request, AudioRequirement::Required)
+    }
+
+    /// Like [`Self::start`], but with [`AudioRequirement::Optional`] a file that is one VP8
+    /// video stream and no audio stream prepares as a silent movie (`Prepared.audio` is
+    /// `None`); a file with audio is handled exactly as by `start`.
+    pub fn start_with(request: Request, audio: AudioRequirement) -> Result<Self, MediaError> {
         request.limits.validate()?;
         for path in [&request.path, &request.tools.ffmpeg, &request.tools.ffprobe] {
             if !path.is_absolute() {
@@ -116,7 +127,7 @@ impl MovieWorker {
             .name("fmv-movie-decode".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    decode(request, &send, signal)
+                    decode(request, audio, &send, signal)
                 }))
                 .unwrap_or(Err(MediaError::WorkerPanic));
                 // The result channel has one small message and cannot be held behind a full
@@ -201,6 +212,7 @@ fn words(values: &[&str]) -> Vec<OsString> {
 
 fn decode(
     request: Request,
+    requirement: AudioRequirement,
     send: &SyncSender<Event>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), MediaError> {
@@ -243,7 +255,7 @@ fn decode(
         Arc::clone(&cancel),
         deadline,
     )?;
-    metadata::validate_streams(&streams, limits)?;
+    metadata::validate_streams_with(&streams, limits, requirement)?;
     let mut frames = words(&[
         "-v",
         "error",
@@ -268,6 +280,7 @@ fn decode(
         Arc::clone(&cancel),
         deadline,
     )?;
+    let has_audio = metadata::has_audio_stream(&streams);
     let mut audio_frames = words(&[
         "-v",
         "error",
@@ -284,67 +297,84 @@ fn decode(
         "json",
     ]);
     audio_frames.push(path.as_os_str().into());
-    let audio_frames = process::capture(
-        &request.tools.ffprobe,
+    // A silent movie has no audio stream to probe or decode; it is never given an empty one.
+    let audio_frames = if has_audio {
+        process::capture(
+            &request.tools.ffprobe,
+            &audio_frames,
+            limits
+                .max_metadata_bytes
+                .saturating_sub(streams.len())
+                .saturating_sub(frames.len()),
+            limits.max_stderr_bytes,
+            Arc::clone(&cancel),
+            deadline,
+        )?
+    } else {
+        Vec::new()
+    };
+    let metadata = Arc::new(metadata::parse_with(
+        &streams,
+        &frames,
         &audio_frames,
-        limits
-            .max_metadata_bytes
-            .saturating_sub(streams.len())
-            .saturating_sub(frames.len()),
-        limits.max_stderr_bytes,
-        Arc::clone(&cancel),
-        deadline,
-    )?;
-    let metadata = Arc::new(metadata::parse(&streams, &frames, &audio_frames, limits)?);
+        limits,
+        requirement,
+    )?);
     drop(streams);
     drop(frames);
     drop(audio_frames);
-    let mut audio = words(&[
-        "-nostdin",
-        "-v",
-        "error",
-        "-xerror",
-        "-err_detect",
-        "explode",
-        "-threads",
-        "2",
-        "-protocol_whitelist",
-        "file,pipe",
-        "-i",
-    ]);
-    audio.push(path.as_os_str().into());
-    audio.extend(words(&[
-        "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar",
-    ]));
-    audio.push(metadata.audio.sample_rate().to_string().into());
-    audio.extend(words(&["-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]));
-    let pcm_le = process::capture(
-        &request.tools.ffmpeg,
-        &audio,
-        limits.max_audio_bytes,
-        limits.max_stderr_bytes,
-        Arc::clone(&cancel),
-        deadline,
-    )?;
-    if pcm_le.is_empty() || !pcm_le.len().is_multiple_of(4) {
-        return Err(MediaError::Invalid(
-            "decoded stereo PCM is empty or has a partial sample frame".into(),
-        ));
-    }
-    if pcm_le.len() != metadata.audio.pcm_bytes()? {
-        return Err(MediaError::Invalid(
-            "decoded PCM sample count disagrees with the decoded-frame inventory".into(),
-        ));
-    }
+    let decoded_audio = match metadata.audio.as_ref() {
+        Some(audio_metadata) => {
+            let mut audio = words(&[
+                "-nostdin",
+                "-v",
+                "error",
+                "-xerror",
+                "-err_detect",
+                "explode",
+                "-threads",
+                "2",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-i",
+            ]);
+            audio.push(path.as_os_str().into());
+            audio.extend(words(&[
+                "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "2", "-ar",
+            ]));
+            audio.push(audio_metadata.sample_rate().to_string().into());
+            audio.extend(words(&["-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]));
+            let pcm_le = process::capture(
+                &request.tools.ffmpeg,
+                &audio,
+                limits.max_audio_bytes,
+                limits.max_stderr_bytes,
+                Arc::clone(&cancel),
+                deadline,
+            )?;
+            if pcm_le.is_empty() || !pcm_le.len().is_multiple_of(4) {
+                return Err(MediaError::Invalid(
+                    "decoded stereo PCM is empty or has a partial sample frame".into(),
+                ));
+            }
+            if pcm_le.len() != audio_metadata.pcm_bytes()? {
+                return Err(MediaError::Invalid(
+                    "decoded PCM sample count disagrees with the decoded-frame inventory".into(),
+                ));
+            }
+            Some(DecodedAudio {
+                sample_rate: audio_metadata.sample_rate(),
+                metadata: Arc::clone(audio_metadata),
+                pcm_le,
+            })
+        }
+        None => None,
+    };
     emit(
         send,
         Event::Prepared {
             metadata: Arc::clone(&metadata),
-            audio: DecodedAudio {
-                sample_rate: metadata.audio.sample_rate(),
-                metadata: Arc::clone(&metadata.audio),
-                pcm_le,
-            },
+            audio: decoded_audio,
         },
         &cancel,
         deadline,
@@ -487,7 +517,7 @@ mod tests {
         let metadata = metadata();
         let mut audio = DecodedAudio {
             sample_rate: 22_050,
-            metadata: metadata.audio,
+            metadata: metadata.audio.expect("the fixture has audio"),
             pcm_le: vec![0; 4],
         };
         assert!(audio.require_contiguous().is_ok());

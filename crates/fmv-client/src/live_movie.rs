@@ -19,10 +19,16 @@
 //! client does not know the disc), the file is found in the owner's movies folder (`FMV_MOVIES_DIR`, else the one beside a
 //! `flevel.lgp` read in place; the opening may also be named by `FMV_OPENING_MOVIE`), and the existing
 //! [`MovieController`] decodes it with the external decoder (`FMV_FFMPEG` and `FMV_FFPROBE`, else the ones on `PATH`).
-//! Only a movie the controller's [`Admission`] accepts plays; today that is the opening (`PMVIE 53`). The preflight hashes
-//! the file (about 30 MB) when a movie opens, a stall of a few frames at the start of a movie that holds the field anyway.
-//! The movie's sound goes through the run's audio engine, so `--mute` or `FMV_AUDIO=off` (no engine, no clock) skip movies;
-//! `FMV_AUDIO=null` plays them silently on the null sink's clock.
+//! Only a movie the controller's [`Admission`] accepts plays. The opening (`PMVIE 53`) has the pinned profile: its exact
+//! size, BLAKE3 hash (the preflight hashes about 30 MB when it opens, a stall of a few frames at the start of a movie that
+//! holds the field anyway) and decoder timestamps. Every other movie `fmv_ff7::movies` names has the general profile:
+//! no pinned bytes, but a regular file within the size limit that must stay unchanged (size and modification time) while
+//! it is decoded, PCM that matches its own timestamp inventory, the 600 second limit and the video tail rule. What the
+//! decoder finds in the file picks the clock: a movie with sound plays that sound through the run's audio engine and keeps
+//! time by it (so `--mute` or `FMV_AUDIO=off`, which leave no engine and no clock, skip it, and `FMV_AUDIO=null` plays it
+//! silently on the null sink's clock); a movie with no audio stream at all (the owner's `mkup`, `funeral`, `junon`, and
+//! so on) is played as a silent movie on real time against its own frame timestamps, with no sound and no engine, so
+//! `--mute` does not skip it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -267,9 +273,14 @@ fn tools() -> Result<Tools, String> {
     Ok(Tools { ffmpeg: find(FFMPEG_ENV, "ffmpeg")?, ffprobe: find(FFPROBE_ENV, "ffprobe")? })
 }
 
-/// The admission the controller has for the movie `basename`, if any. Only the inspected opening has a profile.
+/// The admission the controller has for the movie `basename`: the opening has its pinned profile (it never falls back to
+/// the general one), every other movie `fmv_ff7::movies` names for the disc has the general profile, and a name that table
+/// does not know has none.
 fn admission(basename: &str) -> Option<Admission> {
-    (basename == "opening").then_some(Admission::OpeningFfnxPcmZeroOrigin)
+    if basename == "opening" {
+        return Some(Admission::OpeningFfnxPcmZeroOrigin);
+    }
+    fmv_ff7::movies::disc_table(DISC).iter().any(|(_, name)| *name == basename).then_some(Admission::General)
 }
 
 /// Where the file of `basename` is.
@@ -310,20 +321,25 @@ impl LocalMovies {
         let opening = std::env::var_os(OPENING_ENV).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
         let path = file_of(basename, Self::dir().as_deref(), opening.as_deref())
             .ok_or_else(|| format!("{basename}.avi is not in the movies folder ({MOVIES_DIR_ENV})"))?;
-        let engine = audio.ok_or_else(|| "sound is off, so there is no movie clock".to_string())?;
+        // The opening has sound for certain; refuse at once rather than decode it for nothing. For every other movie the
+        // decoder decides: a silent one needs no engine, one with sound is refused as soon as its metadata says so.
+        if audio.is_none() && matches!(admission, Admission::OpeningFfnxPcmZeroOrigin) {
+            return Err("sound is off, so there is no movie clock".to_string());
+        }
         // Absolute, as the decoder worker requires; the preflight canonicalises it.
         let path = std::path::absolute(&path).map_err(|e| format!("{basename}.avi: {e}"))?;
         let request = Request { path, tools: tools()?, limits: Limits::default() };
         self.next_stream += 1;
         let controller = MovieController::prepare(self.next_stream, request, admission).map_err(|e| format!("{basename}.avi: {e}"))?;
-        Ok(ControllerPlayback { controller, engine, played: false, length: None })
+        Ok(ControllerPlayback { controller, engine: audio, played: false, length: None })
     }
 }
 
 /// A [`MovieController`] playing on the run's audio engine, drawn by [`Renderer::render_movie`].
 struct ControllerPlayback {
     controller: MovieController,
-    engine: Arc<AudioEngine>,
+    /// The run's audio engine; `None` when sound is off, which only a silent movie can do without.
+    engine: Option<Arc<AudioEngine>>,
     played: bool,
     length: Option<Duration>,
 }
@@ -335,7 +351,7 @@ impl Playback for ControllerPlayback {
         }
         if self.length.is_none() {
             self.length = self.controller.metadata().map(|m| {
-                let audio = Duration::from_secs_f64(m.audio.samples() as f64 / f64::from(m.audio.sample_rate().max(1)));
+                let audio = m.audio.as_ref().map_or(Duration::ZERO, |a| Duration::from_secs_f64(a.samples() as f64 / f64::from(a.sample_rate().max(1))));
                 let video = m.video.frames.last().map_or(Duration::ZERO, |f| {
                     let ticks = (f.pts + f.duration as i64).max(0) as f64;
                     Duration::from_secs_f64(ticks * f64::from(m.video.time_base.numerator) / f64::from(m.video.time_base.denominator.max(1)))
@@ -343,16 +359,30 @@ impl Playback for ControllerPlayback {
                 audio.max(video)
             });
         }
+        // A movie with sound and no engine has no clock: refused as soon as the decoder's metadata says it has sound.
+        if self.engine.is_none() && self.controller.metadata().is_some_and(|m| m.audio.is_some()) {
+            return Status::Failed("sound is off, so there is no movie clock".to_string());
+        }
         match self.controller.phase() {
             Phase::Completed => Status::Finished,
             Phase::Cancelled | Phase::Faulted => Status::Failed("the controller stopped".to_string()),
-            Phase::Prepared if !self.played => match self.controller.play(&self.engine, elapsed, 1.0) {
-                Ok(()) => {
-                    self.played = true;
-                    Status::Running
+            Phase::Prepared if !self.played => {
+                let started = if self.controller.is_silent() {
+                    self.controller.play_silent(elapsed)
+                } else {
+                    match &self.engine {
+                        Some(engine) => self.controller.play(engine, elapsed, 1.0),
+                        None => return Status::Failed("sound is off, so there is no movie clock".to_string()),
+                    }
+                };
+                match started {
+                    Ok(()) => {
+                        self.played = true;
+                        Status::Running
+                    }
+                    Err(e) => Status::Failed(e.to_string()),
                 }
-                Err(e) => Status::Failed(e.to_string()),
-            },
+            }
             _ => Status::Running,
         }
     }

@@ -89,3 +89,28 @@ impl VideoTailClock {
         self.observed_at = now;
     }
 }
+
+/// A silent movie's clock: the real time it has played, not counting the time it was paused.
+/// Unlike [`VideoTailClock`] it is unbounded here; the controller stops it at the video endpoint.
+pub(super) struct SilentClock {
+    elapsed: Duration,
+    observed_at: Duration,
+}
+
+impl SilentClock {
+    pub(super) fn start(now: Duration) -> Self {
+        Self { elapsed: Duration::ZERO, observed_at: now }
+    }
+    pub(super) fn advance(&mut self, now: Duration, paused: bool) {
+        if !paused {
+            self.elapsed = self.elapsed.saturating_add(now.saturating_sub(self.observed_at));
+        }
+        self.observed_at = self.observed_at.max(now);
+    }
+    pub(super) fn position(&self) -> PresentationTime {
+        PresentationTime {
+            numerator: self.elapsed.as_nanos(),
+            denominator: 1_000_000_000,
+        }
+    }
+}

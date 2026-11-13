@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Event::Prepared { metadata, audio }) => println!(
                 "prepared {}x{}, {} decoded timestamps, timebase {}/{}, PCM {} stereo frames at {} Hz; no playback clock started",
                 metadata.video.width, metadata.video.height, metadata.video.frames.len(), metadata.video.time_base.numerator,
-                metadata.video.time_base.denominator, audio.frames(), audio.sample_rate),
+                metadata.video.time_base.denominator, audio.as_ref().map_or(0, |a| a.frames()), audio.as_ref().map_or(0, |a| a.sample_rate)),
             Some(Event::Frame(frame)) => {
                 if frame.ordinal != count { return Err("noncontiguous decoded frames".into()); }
                 if [0, 21, 665, 1592].contains(&frame.ordinal) {

@@ -11,8 +11,11 @@
 //! No authoritative audio-device clock, native FF7 movie scheduler, GPU rendering, movie
 //! registration or save/admission behavior is implemented here.
 //!
-//! The initial bounded profile requires one video and one stereo audio stream, both
-//! starting at timestamp zero. Other layouts fail explicitly; they are not normalized.
+//! The bounded profile requires one video and one stereo audio stream, both starting at
+//! timestamp zero. Other layouts fail explicitly; they are not normalized. The one
+//! exception is explicit: [`MovieWorker::start_with`] with [`AudioRequirement::Optional`]
+//! also accepts a file that is a single VP8 video stream and no audio at all (a silent
+//! movie), reported with `audio: None`; no audio is decoded, probed or invented for it.
 //! Timestamps come from the selected decoder, not an inferred constant frame duration.
 //! Every decoded audio frame retains its source PTS and exact PCM range. A separate
 //! one-source-tick observation test classifies compatibility with a continuous clock;
@@ -30,7 +33,7 @@ mod timeline;
 mod worker;
 
 pub use metadata::{
-    AudioContinuity, AudioFrameTiming, AudioMetadata, FrameTiming, MediaMetadata, TimeBase,
+    AudioContinuity, AudioFrameTiming, AudioMetadata, AudioRequirement, FrameTiming, MediaMetadata, TimeBase,
     VideoMetadata,
 };
 pub use timeline::PlaybackTimeline;

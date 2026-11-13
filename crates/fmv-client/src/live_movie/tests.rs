@@ -239,18 +239,29 @@ fn only_the_ok_and_back_keys_skip() {
 }
 
 #[test]
-fn the_window_source_names_files_by_the_disc_one_table_and_admits_only_the_opening() {
-    assert!(admission("opening").is_some());
-    for other in ["ontrain", "mainplr", "mkup", "funeral"] {
-        assert!(admission(other).is_none(), "{other} has no admission profile");
+fn the_window_source_pins_the_opening_and_gives_every_other_named_movie_the_general_profile() {
+    assert!(matches!(admission("opening"), Some(Admission::OpeningFfnxPcmZeroOrigin)));
+    // With sound and without (mkup and funeral have no audio stream on the owner's disc).
+    for other in ["ontrain", "mainplr", "mkup", "funeral", "junon"] {
+        assert!(matches!(admission(other), Some(Admission::General)), "{other} has the general profile");
+    }
+    // Every id of the disc-1 table is covered, and each name other than the opening is general.
+    for (id, name) in fmv_ff7::movies::disc_table(DISC) {
+        assert!(admission(name).is_some(), "movie {id} ({name})");
+        assert_eq!(matches!(admission(name), Some(Admission::General)), name != "opening", "{name}");
+    }
+    // A name the table does not know, however it is spelled, is not admitted (and the opening is not matched loosely).
+    for unknown in ["nosuchmovie", "", "Opening", "opening.avi", "../opening"] {
+        assert!(admission(unknown).is_none(), "{unknown:?}");
     }
     let mut source = LocalMovies::default();
     let why = |movie: u16, source: &mut LocalMovies| source.open(movie, None).err().expect("cannot be opened here");
     assert!(why(999, &mut source).contains("no file is known"));
     assert!(why(0xFFFF, &mut source).contains("no file is known"));
-    assert!(why(24, &mut source).contains("mainplr has no admission profile"), "mainplr is the owned file but not admitted");
-    assert!(why(23, &mut source).contains("ontrain has no admission profile"));
-    assert!(why(20, &mut source).contains("mkup has no admission profile"));
+    // Admitted, so the answer comes from the missing file, not from a missing profile.
+    assert!(!why(24, &mut source).contains("admission profile"));
+    assert!(!why(20, &mut source).contains("admission profile"));
+    assert!(why(20, &mut source).contains("mkup.avi"), "movie 20 is mkup");
     // The opening is admitted, so the answer comes from the file or the sound: still never a playback without both.
     assert!(source.open(53, None).is_err());
 }
@@ -277,7 +288,7 @@ fn the_controller_playback_prepares_plays_and_stops_on_the_fake_decoder() {
     let Some(fixture) = Fixture::normal() else { return };
     // A manual mixer: no device, and nothing audible whatever FMV_AUDIO says.
     let engine = Arc::new(AudioEngine::start_manual(AudioConfig { sample_rate: 22_050, ..AudioConfig::default() }));
-    let mut playback = ControllerPlayback { controller: fixture.controller(1), engine: Arc::clone(&engine), played: false, length: None };
+    let mut playback = ControllerPlayback { controller: fixture.controller(1), engine: Some(Arc::clone(&engine)), played: false, length: None };
     let started = Instant::now();
     while !playback.played {
         assert!(started.elapsed() < Duration::from_secs(6), "the fake decoder never delivered a first frame");
@@ -293,6 +304,49 @@ fn the_controller_playback_prepares_plays_and_stops_on_the_fake_decoder() {
     assert_eq!(playback.poll(started.elapsed()), Status::Running);
     playback.cancel();
     assert!(matches!(playback.poll(started.elapsed()), Status::Failed(_)), "a cancelled movie ends the stage's wait");
+}
+
+#[test]
+fn a_silent_movie_prepares_and_plays_with_no_audio_engine_at_all() {
+    use crate::movie::tests::Fixture;
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150), (250, 100)], None) else { return };
+    // Sound is off (no engine, as with --mute): a movie with no audio does not need one.
+    let mut playback = ControllerPlayback { controller: fixture.general(1), engine: None, played: false, length: None };
+    let started = Instant::now();
+    while !playback.played {
+        assert!(started.elapsed() < Duration::from_secs(6), "the fake decoder never delivered a first frame");
+        assert_eq!(playback.poll(started.elapsed()), Status::Running);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(playback.controller.is_silent() && playback.controller.audio_handle().is_none());
+    // The length is the video's own: the last frame ends at 0.35 s.
+    let length = playback.length().expect("known once prepared");
+    assert!((length.as_secs_f64() - 0.35).abs() < 0.001, "{length:?}");
+    // It never finishes by wall time alone (the last frame must be presented, which only a drawn frame does).
+    assert_eq!(playback.poll(started.elapsed() + Duration::from_secs(60)), Status::Running);
+    playback.cancel();
+    assert!(matches!(playback.poll(started.elapsed() + Duration::from_secs(61)), Status::Failed(_)));
+}
+
+#[test]
+fn a_movie_with_sound_and_no_audio_engine_is_refused_as_soon_as_its_metadata_says_so() {
+    use crate::movie::tests::Fixture;
+    let Some(fixture) = Fixture::normal() else { return };
+    let mut playback = ControllerPlayback { controller: fixture.general(1), engine: None, played: false, length: None };
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(6), "never refused");
+        match playback.poll(started.elapsed()) {
+            Status::Running => std::thread::sleep(Duration::from_millis(2)),
+            Status::Failed(why) => {
+                assert!(why.contains("sound is off"), "{why}");
+                break;
+            }
+            Status::Finished => panic!("a movie with sound cannot finish without a clock"),
+        }
+    }
+    assert!(!playback.played);
+    playback.cancel();
 }
 
 /// The one movie this client admits, end to end up to its first played frame: the real preflight (size and blake3), the

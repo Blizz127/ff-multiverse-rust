@@ -10,6 +10,7 @@ use fmv_audio::{AudioConfig, AudioEngine, MovieAudioState, MoviePcm};
 use fmv_media::{Limits, Request, Tools};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,28 +25,46 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new(audio_frames: u32, timings: &[(u32, u32)], video_body: Option<&str>) -> Option<Self> {
+        Self::build(Some(audio_frames), timings, video_body)
+    }
+
+    /// A movie that is one video stream and no audio (the audio branches of the fake decoder fail loudly).
+    pub(crate) fn silent(timings: &[(u32, u32)], video_body: Option<&str>) -> Option<Self> {
+        Self::build(None, timings, video_body)
+    }
+
+    fn build(audio: Option<u32>, timings: &[(u32, u32)], video_body: Option<&str>) -> Option<Self> {
+        let audio_frames = audio.unwrap_or(0);
         let python = ["/usr/bin/python3", "/bin/python3"].into_iter().find(|p| Path::new(p).is_file())?;
         let dir = tempfile::tempdir().expect("synthetic movie directory");
         let tool = dir.path().join("fixture-decoder");
         let path = dir.path().join("synthetic.owned");
         let bytes = b"synthetic movie controller fixture";
         std::fs::write(&path, bytes).unwrap();
-        let streams = json!({"streams": [
+        let mut streams = json!({"streams": [
             {"index":0,"codec_type":"video","codec_name":"vp8","width":1,"height":1,"time_base":"1/1000","start_pts":0},
             {"index":1,"codec_type":"audio","codec_name":"vorbis","sample_rate":"22050","channels":2,"time_base":"1/22050","start_pts":0}
         ]});
+        if audio.is_none() {
+            streams["streams"].as_array_mut().unwrap().pop();
+        }
         let video = json!({"frames": timings.iter().map(|&(pts, duration)| {
             json!({"pts":pts,"duration":duration,"width":1,"height":1})
         }).collect::<Vec<_>>()});
-        let audio = json!({"frames": [{"pts":0,"nb_samples":audio_frames,"stream_index":1,"channels":2}]});
+        let audio_json = json!({"frames": [{"pts":0,"nb_samples":audio_frames,"stream_index":1,"channels":2}]});
         let default_body = format!("sys.stdout.buffer.write(bytes([20,40,60,255])*{})", timings.len());
         let body = video_body.unwrap_or(&default_body).lines().map(|line| format!(" {line}\n")).collect::<String>();
+        let (audio_branch, pcm_branch) = if audio.is_some() {
+            (format!("print(r'''{audio_json}''')"), format!("sys.stdout.buffer.write(bytes([0,32,0,32])*{audio_frames})"))
+        } else {
+            ("sys.exit(1)".to_string(), "sys.exit(1)".to_string())
+        };
         let script = format!(
             "#!{python}\nimport sys,json,time,pathlib\nargs=sys.argv[1:]\n\
              if '-show_streams' in args:\n print(r'''{streams}''')\n\
-             elif '-show_frames' in args and 'a:0' in args:\n print(r'''{audio}''')\n\
+             elif '-show_frames' in args and 'a:0' in args:\n {audio_branch}\n\
              elif '-show_frames' in args:\n print(r'''{video}''')\n\
-             elif 's16le' in args:\n sys.stdout.buffer.write(bytes([0,32,0,32])*{audio_frames})\n\
+             elif 's16le' in args:\n {pcm_branch}\n\
              else:\n{body}"
         );
         std::fs::write(&tool, script).unwrap();
@@ -61,6 +80,15 @@ impl Fixture {
 
     pub(crate) fn controller(&self, stream: u64) -> MovieController {
         MovieController::prepare(stream, self.request.clone(), Admission::Synthetic { digest: self.digest }).unwrap()
+    }
+
+    /// The same movie under the general admission: no pinned hash, whatever its bytes.
+    pub(crate) fn general(&self, stream: u64) -> MovieController {
+        MovieController::prepare(stream, self.request.clone(), Admission::General).unwrap()
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.request.path
     }
 }
 
@@ -460,7 +488,7 @@ fn offscreen_owned_opening_decodes_mixes_and_acknowledges_the_final_frame_before
     }
     let metadata = controller.metadata().unwrap();
     assert_eq!((metadata.video.width, metadata.video.height, metadata.video.frames.len()), (1280, 896, 1792));
-    assert!(metadata.audio.require_contiguous().is_err(), "the explicit pinned policy has not rewritten the source audio evidence");
+    assert!(metadata.audio.as_ref().expect("the opening has audio").require_contiguous().is_err(), "the explicit pinned policy has not rewritten the source audio evidence");
     let last = metadata.video.frames.len() - 1;
     let fit = DisplayPolicy { aspect: DisplayAspect::new(1280, 896).unwrap(), fit: MovieFit::Contain };
     let viewport = MovieViewport { x: 0, y: 0, width: 80, height: 56 };
@@ -503,4 +531,292 @@ fn offscreen_owned_opening_decodes_mixes_and_acknowledges_the_final_frame_before
     assert!(heard && final_seen);
     assert_eq!(controller.audio_handle().unwrap().status().state, MovieAudioState::Ended);
     assert!(maximum_pending <= 2, "controller retention stays bounded: {maximum_pending}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The general admission and silent movies
+// ---------------------------------------------------------------------------------------------
+
+/// Stand in for the renderer's upload, base draw and acknowledged present of the due frame, so the controller's completion
+/// rule can be driven without a GPU (the offscreen tests below do the real draw). Returns the presented ordinal.
+fn present_due(c: &mut MovieController) -> Option<usize> {
+    let frame = c.due.take()?;
+    let id = MovieFrameId { stream: c.id.generation, ordinal: frame.ordinal, timing: frame.timing, time_base: c.video.as_ref().unwrap().time_base };
+    let ticket = PresentationTicket { id: c.id, submission: MovieSubmission { frame: id }, serial: 0 };
+    c.pending_ticket = Some(ticket);
+    assert!(c.acknowledge_presented(ticket).unwrap());
+    Some(frame.ordinal)
+}
+
+fn run_until_completed(c: &mut MovieController, mut now: Duration, step: Duration, audio: Option<&AudioEngine>) {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while c.phase() != Phase::Completed {
+        assert!(Instant::now() < deadline, "did not complete: {:?} at {:?}", c.phase(), c.position());
+        if let Some(audio) = audio {
+            audio.pump(441);
+        }
+        c.poll(now).unwrap();
+        present_due(c);
+        now += step;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn touch(path: &Path) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3_600)).unwrap();
+}
+
+#[test]
+fn the_general_admission_plays_a_movie_with_audio_on_the_mixer_clock_without_a_pinned_hash() {
+    let Some(fixture) = Fixture::normal() else { return };
+    // No digest, no pinned size or timestamps: any owned movie is admitted by what is generic about it.
+    let audio = engine();
+    let mut controller = fixture.general(1);
+    prepared(&mut controller);
+    assert!(!controller.is_silent());
+    assert!(controller.metadata().unwrap().audio.is_some());
+    assert!(controller.play_silent(Duration::ZERO).is_err(), "a movie with audio cannot start on the silent clock");
+    assert_eq!(controller.phase(), Phase::Prepared);
+    controller.play(&audio, Duration::ZERO, 1.0).unwrap();
+    controller.poll(Duration::from_secs(100)).unwrap();
+    time_is(&controller, 0, 1);
+    audio.pump(2_205);
+    controller.poll(Duration::from_secs(100)).unwrap();
+    time_is(&controller, 1, 10);
+    run_until_completed(&mut controller, Duration::from_secs(100), Duration::ZERO, Some(&audio));
+    assert_eq!(controller.audio_handle().unwrap().status().state, MovieAudioState::Ended);
+}
+
+#[test]
+fn the_general_admission_keeps_the_generic_checks_that_are_not_asset_specific() {
+    // The finite video tail rule: 100 ms of audio plus 1001 ms of video is outside policy.
+    let Some(fixture) = Fixture::new(2_205, &[(0, 1_101)], None) else { return };
+    let mut controller = fixture.general(1);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        assert!(Instant::now() < deadline);
+        if controller.poll(Duration::ZERO).is_err() { break; }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted);
+    assert!(controller.audio_handle().is_none());
+    // A regular file within the size limit, named by an absolute path.
+    let Some(fixture) = Fixture::normal() else { return };
+    let general = |request: Request| MovieController::prepare(1, request, Admission::General).is_err();
+    let mut small = fixture.request.clone();
+    small.limits.max_media_bytes = 8;
+    assert!(general(small), "the size limit still applies");
+    let mut directory = fixture.request.clone();
+    directory.path = fixture.path().parent().unwrap().to_path_buf();
+    assert!(general(directory), "only a regular file");
+    let mut relative = fixture.request.clone();
+    relative.path = PathBuf::from("synthetic.owned");
+    assert!(general(relative), "an absolute path is required");
+    let mut empty = fixture.request.clone();
+    empty.path = fixture.path().with_file_name("empty.owned");
+    std::fs::write(&empty.path, b"").unwrap();
+    assert!(general(empty), "an empty file is refused");
+    // And the 600 second limit: 601 s of video.
+    let Some(fixture) = Fixture::new(2_205, &[(0, 601_000)], None) else { return };
+    let mut controller = fixture.general(2);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.poll(Duration::ZERO).is_ok() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted);
+}
+
+#[test]
+fn a_general_movie_whose_file_changes_is_refused_before_and_while_it_is_decoded() {
+    let Some(fixture) = Fixture::normal() else { return };
+    // Changed between admission and the decoder's first word: the controller never accepts its metadata.
+    let mut controller = fixture.general(1);
+    touch(fixture.path());
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        assert!(Instant::now() < deadline);
+        if controller.poll(Duration::ZERO).is_err() { break; }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted);
+    assert!(controller.metadata().is_none());
+    // Changed after preparation, before the decoder has finished reading: refused before it can complete.
+    let Some(fixture) = Fixture::normal() else { return };
+    let audio = engine();
+    let mut controller = fixture.general(2);
+    prepared(&mut controller);
+    controller.play(&audio, Duration::ZERO, 1.0).unwrap();
+    touch(fixture.path());
+    audio.pump(8_820);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut now = Duration::ZERO;
+    loop {
+        assert!(Instant::now() < deadline);
+        if controller.poll(now).is_err() { break; }
+        present_due(&mut controller);
+        assert_ne!(controller.phase(), Phase::Completed, "a movie that changed under the decoder never completes");
+        now += Duration::from_millis(10);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted);
+    // A file that grew (its modification time moves with it) is refused too.
+    let Some(fixture) = Fixture::normal() else { return };
+    let mut controller = fixture.general(3);
+    std::fs::OpenOptions::new().append(true).open(fixture.path()).unwrap().write_all(b"more").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.poll(Duration::ZERO).is_ok() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted);
+}
+
+#[test]
+fn the_pinned_admissions_still_refuse_a_file_without_audio() {
+    let Some(fixture) = Fixture::silent(&[(0, 100)], None) else { return };
+    let mut controller = fixture.controller(1);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.poll(Duration::ZERO).is_ok() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted, "only the general admission may meet a movie with no audio stream");
+    assert!(controller.metadata().is_none());
+    assert!(MovieController::prepare(2, fixture.request.clone(), Admission::OpeningFfnxPcmZeroOrigin).is_err());
+}
+
+#[test]
+fn a_silent_movie_plays_to_its_end_on_its_own_frame_clock_without_any_audio() {
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150), (250, 100)], None) else { return };
+    let audio = engine();
+    let mut controller = fixture.general(1);
+    prepared(&mut controller);
+    assert!(controller.is_silent());
+    assert!(controller.metadata().unwrap().audio.is_none(), "no audio is invented");
+    assert!(controller.play(&audio, Duration::ZERO, 1.0).is_err(), "there is nothing to play on the mixer");
+    assert_eq!(controller.phase(), Phase::Prepared);
+    assert!(controller.audio_handle().is_none());
+    // Wall time before play is not movie time, and a silent movie never needs an engine.
+    controller.poll(Duration::from_secs(50)).unwrap();
+    time_is(&controller, 0, 1);
+    controller.play_silent(Duration::from_secs(100)).unwrap();
+    assert_eq!(controller.phase(), Phase::Playing);
+    controller.poll(Duration::from_secs(100)).unwrap();
+    time_is(&controller, 0, 1);
+    controller.poll(Duration::from_millis(100_050)).unwrap();
+    time_is(&controller, 1, 20);
+    controller.poll(Duration::from_millis(100_200)).unwrap();
+    time_is(&controller, 1, 5);
+    // Pause stops the movie's time; resuming continues from where it stopped.
+    controller.set_paused(Duration::from_millis(100_200), true).unwrap();
+    controller.poll(Duration::from_secs(160)).unwrap();
+    assert_eq!(controller.phase(), Phase::Paused);
+    time_is(&controller, 1, 5);
+    controller.set_paused(Duration::from_secs(160), false).unwrap();
+    controller.poll(Duration::from_millis(160_100)).unwrap();
+    time_is(&controller, 3, 10);
+    assert!(controller.poll(Duration::from_secs(159)).is_err(), "the clock never runs backwards");
+}
+
+#[test]
+fn a_silent_movie_ends_at_the_video_endpoint_and_completes_only_after_the_final_presentation() {
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150), (250, 100)], None) else { return };
+    let mut controller = fixture.general(1);
+    prepared(&mut controller);
+    controller.play_silent(Duration::ZERO).unwrap();
+    // A long stall is one late tick: the position stops at the endpoint (350 ms), never past it, and the phase is still Playing.
+    controller.poll(Duration::from_secs(30)).unwrap();
+    time_is(&controller, 7, 20);
+    assert_eq!(controller.phase(), Phase::Playing, "a silent movie has no video tail phase");
+    controller.poll(Duration::from_secs(300)).unwrap();
+    time_is(&controller, 7, 20);
+    // Frames before the last are not the end: the movie completes only when the last frame is presented after decoder EOF.
+    let mut now = Duration::from_secs(300);
+    let mut presented = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.phase() != Phase::Completed {
+        assert!(Instant::now() < deadline, "silent movie did not complete: {:?}", controller.phase());
+        controller.poll(now).unwrap();
+        if let Some(ordinal) = present_due(&mut controller) {
+            presented.push(ordinal);
+        }
+        now += Duration::from_millis(5);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(presented.last(), Some(&2), "the last decoded frame is the last presented: {presented:?}");
+    time_is(&controller, 7, 20);
+    assert!(controller.audio_handle().is_none());
+}
+
+#[test]
+fn a_silent_movie_needs_its_first_frame_and_wall_time_alone_never_completes_it() {
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150), (250, 100)], Some("time.sleep(30)")) else { return };
+    let mut controller = fixture.general(1);
+    until(&mut controller, Duration::ZERO, |c| c.metadata().is_some());
+    assert!(!controller.first_frame_available());
+    assert!(controller.play_silent(Duration::ZERO).is_err());
+    controller.poll(Duration::from_secs(1_000)).unwrap();
+    time_is(&controller, 0, 1);
+    assert_eq!(controller.phase(), Phase::Preparing);
+    controller.cancel();
+    assert_eq!(controller.phase(), Phase::Cancelled);
+}
+
+#[test]
+fn a_silent_movie_that_outlasts_the_policy_is_refused_and_a_decoder_failure_faults_it() {
+    let Some(fixture) = Fixture::silent(&[(0, 601_000)], None) else { return };
+    let mut controller = fixture.general(1);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while controller.poll(Duration::ZERO).is_ok() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(controller.phase(), Phase::Faulted, "the 600 second limit applies to silent movies too");
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150)], Some("sys.stdout.buffer.write(bytes([1,2,3,255])); sys.exit(3)")) else { return };
+    let mut controller = fixture.general(2);
+    prepared_or_fault(&mut controller);
+    assert_eq!(controller.phase(), Phase::Faulted, "a decoder that stops short never completes a movie");
+}
+
+fn prepared_or_fault(controller: &mut MovieController) {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut now = Duration::ZERO;
+    while controller.poll(now).is_ok() {
+        assert!(Instant::now() < deadline);
+        if controller.first_frame_available() && controller.phase() == Phase::Prepared {
+            controller.play_silent(now).unwrap();
+        }
+        now += Duration::from_secs(1);
+        present_due(controller);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU or software Vulkan/GL driver"]
+fn offscreen_silent_movie_draws_its_frames_and_completes_on_real_time_after_the_acknowledged_last_frame() {
+    let Some(fixture) = Fixture::silent(&[(0, 100), (100, 150), (250, 100)], None) else { return };
+    let Some(mut offscreen) = Offscreen::new() else { return };
+    let mut controller = fixture.general(9);
+    prepared(&mut controller);
+    let first = draw(&mut controller, &mut offscreen, true);
+    assert_eq!(first.submission.frame.ordinal, 0);
+    assert!(controller.acknowledge_presented(first).unwrap());
+    let started = Instant::now();
+    controller.play_silent(Duration::ZERO).unwrap();
+    let deadline = started + Duration::from_secs(6);
+    let mut last_seen = false;
+    while controller.phase() != Phase::Completed {
+        assert!(Instant::now() < deadline, "silent movie deadline: {:?}", controller.phase());
+        controller.poll(started.elapsed()).unwrap();
+        let ticket = draw(&mut controller, &mut offscreen, false);
+        last_seen |= ticket.submission.frame.ordinal == 2;
+        assert!(controller.acknowledge_presented(ticket).unwrap());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(last_seen);
+    assert!(started.elapsed() >= Duration::from_millis(350), "a silent movie lasts its video's own length: {:?}", started.elapsed());
+    assert!(controller.audio_handle().is_none());
 }

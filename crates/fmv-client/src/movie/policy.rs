@@ -1,10 +1,13 @@
-//! Explicit admission for one inspected owned asset. This is a port policy, not
+//! Explicit admission of an owned movie: the one inspected opening, pinned to its exact bytes and
+//! timestamps, or any other owned movie under the general profile. This is a port policy, not
 //! a general repair for discontinuous media or a claim of original-PC parity.
 
 use super::ControllerError;
-use fmv_media::{DecodedAudio, MediaMetadata, Request, TimeBase};
+use fmv_media::{AudioRequirement, DecodedAudio, MediaMetadata, Request, TimeBase};
 use std::fs::{self, File};
 use std::io::Read;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 const OPENING_BYTES: u64 = 32_601_760;
 const OPENING_BLAKE3: &str = "622ac618acec7651bf9f4516866816004f9636fab5c3e419f9d5d55c40e0d467";
@@ -23,8 +26,53 @@ pub enum Admission {
     /// controller's exact mixer clock and finite tail are our explicit port
     /// policy; FFNx itself uses a wall clock constrained by its audio stream.
     OpeningFfnxPcmZeroOrigin,
+    /// Any other owned movie, which has no pinned bytes or timestamps. It is played like the
+    /// opening: decoded PCM from sample zero on the controller's exact mixer clock, then the
+    /// finite video tail. Nothing asset-specific is checked, but everything generic is: a
+    /// regular file within the size limit, unchanged (size and modification time) from
+    /// admission until the decoder has read all of it, PCM that matches its own timestamp
+    /// inventory, the 600 second limit and the one-second video tail rule.
+    ///
+    /// The probed metadata decides the clock. A file with audio takes the PCM path above. A
+    /// file that is one VP8 video stream and no audio is a silent movie: it has no audio, none
+    /// is invented, and its clock is real time against the video frames' own timestamps up to
+    /// the video endpoint.
+    General,
     #[cfg(test)]
     Synthetic { digest: blake3::Hash },
+}
+
+impl Admission {
+    /// Only the general profile may meet a file with no audio stream.
+    pub(super) fn audio_requirement(&self) -> AudioRequirement {
+        match self {
+            Admission::General => AudioRequirement::Optional,
+            Admission::OpeningFfnxPcmZeroOrigin => AudioRequirement::Required,
+            #[cfg(test)]
+            Admission::Synthetic { .. } => AudioRequirement::Required,
+        }
+    }
+}
+
+/// The identity of an admitted file that has no pinned hash: its canonical path, size and
+/// modification time as admitted. [`FileStamp::verify`] says whether it is still the same file.
+#[derive(Debug, Clone)]
+pub(super) struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    pub(super) fn verify(&self) -> Result<(), ControllerError> {
+        let now = fs::metadata(&self.path).map_err(ControllerError::Io)?;
+        if !now.is_file() || now.len() != self.len || now.modified().ok() != self.modified {
+            return Err(ControllerError::Admission(
+                "movie changed while it was being decoded",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Loading-stage work only. Hashing is bounded but synchronous; do this before
@@ -33,7 +81,7 @@ pub enum Admission {
 pub(super) fn preflight(
     request: &mut Request,
     admission: &Admission,
-) -> Result<(), ControllerError> {
+) -> Result<Option<FileStamp>, ControllerError> {
     if !request.path.is_absolute() {
         return Err(ControllerError::Admission("absolute movie path required"));
     }
@@ -60,6 +108,26 @@ pub(super) fn preflight(
                 return Err(ControllerError::Admission("uninspected opening size"));
             }
             blake3::Hash::from_hex(OPENING_BLAKE3).expect("literal hash")
+        }
+        Admission::General => {
+            // Nothing to hash against: the file's identity is its size and modification time,
+            // which must be the same on the opened descriptor and on the path now, and are
+            // checked again by the controller when the decoder has read the whole file.
+            let named_again = fs::metadata(&path).map_err(ControllerError::Io)?;
+            if named_again.len() != before.len()
+                || named_again.modified().ok() != before.modified().ok()
+            {
+                return Err(ControllerError::Admission(
+                    "movie changed while it was being opened",
+                ));
+            }
+            let stamp = FileStamp {
+                path: path.clone(),
+                len: before.len(),
+                modified: before.modified().ok(),
+            };
+            request.path = path;
+            return Ok(Some(stamp));
         }
         #[cfg(test)]
         Admission::Synthetic { digest } => *digest,
@@ -88,17 +156,34 @@ pub(super) fn preflight(
         ));
     }
     request.path = path;
-    Ok(())
+    Ok(None)
 }
 
+/// Check what the decoder prepared against the admission. A movie without audio (`audio` and
+/// `metadata.audio` both `None`) passes only the general profile; one with audio must have PCM
+/// that matches its timestamp inventory.
 pub(super) fn admit(
     admission: &Admission,
     metadata: &MediaMetadata,
-    audio: &DecodedAudio,
+    audio: Option<&DecodedAudio>,
 ) -> Result<(), ControllerError> {
-    if audio.metadata.as_ref() != metadata.audio.as_ref()
-        || audio.sample_rate != metadata.audio.sample_rate()
-        || audio.frames() as u64 != metadata.audio.samples()
+    let (Some(audio), Some(inventory)) = (audio, metadata.audio.as_ref()) else {
+        // Both absent: a silent movie. One without the other is a decoder contradicting
+        // itself, and the pinned profiles never accept silence.
+        return if audio.is_none()
+            && metadata.audio.is_none()
+            && matches!(admission, Admission::General)
+        {
+            Ok(())
+        } else {
+            Err(ControllerError::Admission(
+                "audio presence differs from the admitted profile",
+            ))
+        };
+    };
+    if audio.metadata.as_ref() != inventory.as_ref()
+        || audio.sample_rate != inventory.sample_rate()
+        || audio.frames() as u64 != inventory.samples()
         || !audio.pcm_le.len().is_multiple_of(4)
     {
         return Err(ControllerError::Admission(
@@ -107,7 +192,7 @@ pub(super) fn admit(
     }
     if matches!(admission, Admission::OpeningFfnxPcmZeroOrigin) {
         let video = &metadata.video;
-        let observed = metadata.audio.as_ref();
+        let observed = inventory.as_ref();
         let time_base = TimeBase {
             numerator: 1,
             denominator: 1000,

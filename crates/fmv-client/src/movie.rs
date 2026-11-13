@@ -6,10 +6,15 @@
 //! is bounded, as are retained frames and outstanding GPU presentation tickets.
 //! `play` is separate and requires the first decoded frame to be available.
 //!
-//! During playback the clock is the exact finite voice's consumed source frames,
-//! not wall time, decode speed or hardware-audible time. Only legitimate AudioEnded
-//! can start the named, pause-aware video tail. EOF additionally needs decoder EOF,
-//! an acknowledged final presentation and its complete authored duration.
+//! During playback of a movie with audio the clock is the exact finite voice's
+//! consumed source frames, not wall time, decode speed or hardware-audible time. Only
+//! legitimate AudioEnded can start the named, pause-aware video tail. EOF additionally
+//! needs decoder EOF, an acknowledged final presentation and its complete authored duration.
+//!
+//! A silent movie (the general admission met a file with no audio stream) has no audio
+//! and none is invented: `play_silent` starts a pause-aware real-time clock that is
+//! compared with the video frames' own timestamps and stops at the video endpoint. The
+//! same EOF rule applies: decoder EOF, an acknowledged final presentation and the endpoint.
 //!
 //! Drawing submits GPU work. A caller must separately acknowledge its actual
 //! presentation boundary (offscreen tests use completed readback). Display policy,
@@ -26,12 +31,13 @@ use crate::render::{
     Gpu,
 };
 pub use clock::PresentationTime;
-use clock::VideoTailClock;
+use clock::{SilentClock, VideoTailClock};
 use fmv_audio::{AudioEngine, MovieAudioState, MovieAudioStatus, MovieHandle, MoviePcm};
 use fmv_media::{
     DecodedFrame, Event, MediaMetadata, MovieWorker, PlaybackTimeline, Request, VideoMetadata,
 };
 pub use policy::Admission;
+use policy::FileStamp;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -132,6 +138,11 @@ pub struct MovieController {
     endpoint: PresentationTime,
     position: PresentationTime,
     tail: Option<VideoTailClock>,
+    /// The movie has no audio stream (general admission only): `clock` is its time source.
+    silent: bool,
+    clock: Option<SilentClock>,
+    /// The identity of an unpinned (general) file, checked again when preparation and decoding end.
+    stamp: Option<FileStamp>,
     last_now: Option<Duration>,
     next_decoded: usize,
     decoder_eof: bool,
@@ -154,11 +165,11 @@ impl MovieController {
         mut request: Request,
         admission: Admission,
     ) -> Result<Self, ControllerError> {
-        policy::preflight(&mut request, &admission)?;
+        let stamp = policy::preflight(&mut request, &admission)?;
         let generation = NEXT_GENERATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| ControllerError::State("movie generations exhausted"))?;
-        let worker = MovieWorker::start(request)?;
+        let worker = MovieWorker::start_with(request, admission.audio_requirement())?;
         Ok(Self {
             id: PlaybackId { stream, generation },
             admission,
@@ -178,6 +189,9 @@ impl MovieController {
             endpoint: PresentationTime::ZERO,
             position: PresentationTime::ZERO,
             tail: None,
+            silent: false,
+            clock: None,
+            stamp,
             last_now: None,
             next_decoded: 0,
             decoder_eof: false,
@@ -206,6 +220,10 @@ impl MovieController {
     }
     pub fn metadata(&self) -> Option<&MediaMetadata> {
         self.metadata.as_deref()
+    }
+    /// The movie has no audio stream: it plays with [`Self::play_silent`], not [`Self::play`].
+    pub fn is_silent(&self) -> bool {
+        self.silent
     }
     pub fn audio_handle(&self) -> Option<&MovieHandle> {
         self.handle.as_ref()
@@ -251,6 +269,9 @@ impl MovieController {
         if let Some(handle) = self.handle.clone() {
             self.accept_audio_status(self.id, &handle, handle.status(), now)?;
         }
+        if self.silent && self.phase == Phase::Playing {
+            self.advance_silent_clock(now);
+        }
         self.last_now = Some(now);
         let target = self.target()?;
         if self
@@ -273,6 +294,15 @@ impl MovieController {
         Ok(())
     }
 
+    /// A silent movie's position is the real time it has played (not paused), against the video
+    /// frames' own timestamps, never past the video endpoint.
+    fn advance_silent_clock(&mut self, now: Duration) {
+        let Some(clock) = self.clock.as_mut() else { return };
+        clock.advance(now, self.paused);
+        let time = clock.position();
+        self.position = if time.at_least(self.endpoint) { self.endpoint } else { time };
+    }
+
     fn target(&self) -> Result<usize, ControllerError> {
         self.timeline.as_ref().map_or(Ok(0), |timeline| {
             timeline
@@ -287,10 +317,23 @@ impl MovieController {
                 if self.metadata.is_some() {
                     return Err(ControllerError::State("duplicate prepared event"));
                 }
-                policy::admit(&self.admission, &metadata, &audio)?;
+                if let Some(stamp) = &self.stamp {
+                    stamp.verify()?;
+                }
+                policy::admit(&self.admission, &metadata, audio.as_ref())?;
                 let video = Arc::new(metadata.video.clone());
                 let timeline = PlaybackTimeline::new(video.clone())?;
                 let endpoint = PresentationTime::endpoint(&video)?;
+                let Some(audio) = audio else {
+                    // A silent movie: no audio_end, no tail rule. The endpoint is already
+                    // bounded by the 600 second policy, and the clock starts at play_silent.
+                    self.silent = true;
+                    self.endpoint = endpoint;
+                    self.video = Some(video);
+                    self.timeline = Some(timeline);
+                    self.metadata = Some(metadata);
+                    return Ok(());
+                };
                 let pcm = MoviePcm::from_s16le(audio.sample_rate, audio.pcm_le)?;
                 let audio_end = PresentationTime::samples(pcm.frames(), pcm.sample_rate());
                 if audio_end.numerator > 600 * audio_end.denominator {
@@ -347,6 +390,9 @@ impl MovieController {
                 }
             }
             Event::DecodedEof { frames } => {
+                if let Some(stamp) = &self.stamp {
+                    stamp.verify()?;
+                }
                 if self.decoder_eof || frames != self.next_decoded {
                     return Err(ControllerError::State(
                         "decoder EOF before its exact frame inventory",
@@ -375,6 +421,9 @@ impl MovieController {
         if self.phase != Phase::Prepared || !self.first_frame {
             return Err(ControllerError::State("first frame is not prepared"));
         }
+        if self.silent {
+            return Err(ControllerError::State("a silent movie has no audio to play"));
+        }
         if let Err(error) = self.worker.poll_status() {
             self.fail();
             return Err(error.into());
@@ -387,6 +436,28 @@ impl MovieController {
         self.pcm = None;
         self.handle = Some(handle);
         self.engine = Some(Arc::clone(engine));
+        self.last_now = Some(now);
+        self.phase = Phase::Playing;
+        Ok(())
+    }
+
+    /// Start a silent movie (one the general admission found to have no audio stream) on its
+    /// own clock: real time from `now`, pause-aware, compared with the video frames' own
+    /// timestamps. Refuses a movie with audio, so it can never be used to skip the audio.
+    /// Needs the first decoded frame, like [`Self::play`].
+    pub fn play_silent(&mut self, now: Duration) -> Result<(), ControllerError> {
+        self.check_now(now)?;
+        if self.phase != Phase::Prepared || !self.first_frame {
+            return Err(ControllerError::State("first frame is not prepared"));
+        }
+        if !self.silent {
+            return Err(ControllerError::State("this movie has audio: it plays with play"));
+        }
+        if let Err(error) = self.worker.poll_status() {
+            self.fail();
+            return Err(error.into());
+        }
+        self.clock = Some(SilentClock::start(now));
         self.last_now = Some(now);
         self.phase = Phase::Playing;
         Ok(())
@@ -584,7 +655,9 @@ impl MovieController {
         true
     }
     fn update_completion(&mut self) -> Result<(), ControllerError> {
-        if self.audio_ended && self.decoder_eof {
+        // The source of "the movie has ended" is the audio's natural end, or for a silent
+        // movie there is none: its position reaching the endpoint is checked just below.
+        if (self.silent || self.audio_ended) && self.decoder_eof {
             if let Some(timeline) = &self.timeline {
                 if timeline
                     .presented_eof_ratio(self.position.numerator, self.position.denominator)?

@@ -1,6 +1,9 @@
 //! Explicit ffprobe metadata for the bounded VP8-video, stereo-Vorbis-audio profile.
 //! Frame timestamps and durations come from the source; frame rate, final duration,
 //! sample aspect ratio and display aspect ratio are never inferred here.
+//!
+//! A file with no audio stream at all (one VP8 video stream) is accepted only when the
+//! caller asks for [`AudioRequirement::Optional`]; every other entry point is strict.
 
 use crate::{Limits, MediaError};
 use serde_json::{Map, Value};
@@ -71,11 +74,23 @@ impl VideoMetadata {
     }
 }
 
+/// Whether a file must carry its stereo Vorbis audio stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioRequirement {
+    /// One video and one audio stream (the original strict profile).
+    #[default]
+    Required,
+    /// The strict profile, or a file that is exactly one VP8 video stream and nothing else
+    /// (a silent movie). Audio is never invented for the latter: its metadata has no audio.
+    Optional,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaMetadata {
     pub video: VideoMetadata,
     /// Shared with the decoded PCM; decoded sample ranges retain their source PTS.
-    pub audio: Arc<AudioMetadata>,
+    /// `None` only for a silent movie admitted with [`AudioRequirement::Optional`].
+    pub audio: Option<Arc<AudioMetadata>>,
 }
 
 fn invalid(message: impl Into<String>) -> MediaError {
@@ -149,16 +164,40 @@ fn time_base(value: Option<&Value>) -> Result<TimeBase, MediaError> {
     }
 }
 
+/// Whether the ffprobe stream document lists an audio stream. Only a pre-check of which
+/// decoder passes to run: [`validate_streams_with`] and [`parse_with`] still decide validity.
+pub(crate) fn has_audio_stream(stream_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(stream_json)
+        .ok()
+        .and_then(|value| value.get("streams")?.as_array().cloned())
+        .is_some_and(|streams| {
+            streams
+                .iter()
+                .any(|stream| stream.get("codec_type").and_then(Value::as_str) == Some("audio"))
+        })
+}
+
 /// Check the stream profile and frame allocation size before requesting decoded-frame
 /// metadata. This bounds our buffers; it does not bound the decoder process's working memory.
+#[cfg(test)]
 pub fn validate_streams(stream_json: &[u8], limits: &Limits) -> Result<(), MediaError> {
-    parse_streams(stream_json, limits).map(|_| ())
+    validate_streams_with(stream_json, limits, AudioRequirement::Required)
+}
+
+/// [`validate_streams`] with an explicit audio requirement.
+pub fn validate_streams_with(
+    stream_json: &[u8],
+    limits: &Limits,
+    requirement: AudioRequirement,
+) -> Result<(), MediaError> {
+    parse_streams(stream_json, limits, requirement).map(|_| ())
 }
 
 fn parse_streams(
     stream_json: &[u8],
     limits: &Limits,
-) -> Result<(VideoMetadata, audio::AudioStream, u32), MediaError> {
+    requirement: AudioRequirement,
+) -> Result<(VideoMetadata, Option<audio::AudioStream>, u32), MediaError> {
     if stream_json.len() > limits.max_metadata_bytes {
         return Err(invalid("metadata exceeds its byte limit"));
     }
@@ -168,7 +207,8 @@ fn parse_streams(
         .get("streams")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("stream metadata needs a streams array"))?;
-    if streams.len() != 2 {
+    let silent_allowed = requirement == AudioRequirement::Optional && streams.len() == 1;
+    if streams.len() != 2 && !silent_allowed {
         return Err(invalid(
             "exactly one video and one audio stream are required",
         ));
@@ -237,7 +277,9 @@ fn parse_streams(
         }
     }
     let video = video.ok_or_else(|| invalid("missing video stream"))?;
-    let audio = audio.ok_or_else(|| invalid("missing audio stream"))?;
+    if audio.is_none() && !silent_allowed {
+        return Err(invalid("missing audio stream"));
+    }
     let video_index = video_index.ok_or_else(|| invalid("missing video stream index"))?;
     Ok((video, audio, video_index))
 }
@@ -246,11 +288,25 @@ fn parse_streams(
 /// covers all three documents. Audio sample ranges are checked against the PCM byte budget;
 /// video timing is not evidence of the audio stream's length. Each video frame must report
 /// the declared dimensions; this initial profile does not support changing frame geometry.
+#[cfg(test)]
 pub fn parse(
     stream_json: &[u8],
     frames_json: &[u8],
     audio_json: &[u8],
     limits: &Limits,
+) -> Result<MediaMetadata, MediaError> {
+    parse_with(stream_json, frames_json, audio_json, limits, AudioRequirement::Required)
+}
+
+/// [`parse`] with an explicit audio requirement. A file without an audio stream (accepted
+/// only for [`AudioRequirement::Optional`]) ignores `audio_json`; a file with one is parsed
+/// exactly as the strict profile.
+pub fn parse_with(
+    stream_json: &[u8],
+    frames_json: &[u8],
+    audio_json: &[u8],
+    limits: &Limits,
+    requirement: AudioRequirement,
 ) -> Result<MediaMetadata, MediaError> {
     if stream_json
         .len()
@@ -260,7 +316,7 @@ pub fn parse(
     {
         return Err(invalid("metadata exceeds its byte limit"));
     }
-    let (mut video, audio, video_index) = parse_streams(stream_json, limits)?;
+    let (mut video, audio, video_index) = parse_streams(stream_json, limits, requirement)?;
     let frames: Value =
         serde_json::from_slice(frames_json).map_err(|_| invalid("invalid frame metadata JSON"))?;
     let frames = object(&frames, "frame metadata")?
@@ -297,7 +353,9 @@ pub fn parse(
         });
     }
     video.validate_timing()?;
-    let audio = Arc::new(audio::parse(audio, audio_json, limits)?);
+    let audio = audio
+        .map(|stream| audio::parse(stream, audio_json, limits).map(Arc::new))
+        .transpose()?;
     Ok(MediaMetadata { video, audio })
 }
 
@@ -374,12 +432,10 @@ mod tests {
             ]
         );
         assert_eq!(media.video.frame_bytes().unwrap(), 4_587_520);
-        assert_eq!(
-            (media.audio.sample_rate(), media.audio.channels()),
-            (44_100, 2)
-        );
-        assert_eq!(media.audio.samples(), 2);
-        assert_eq!(media.audio.initial_pts(), 0);
+        let audio = media.audio.as_ref().expect("the strict profile has audio");
+        assert_eq!((audio.sample_rate(), audio.channels()), (44_100, 2));
+        assert_eq!(audio.samples(), 2);
+        assert_eq!(audio.initial_pts(), 0);
     }
 
     #[test]
@@ -545,5 +601,98 @@ mod tests {
             huge.frame_bytes().is_err(),
             "even dimensions representable individually can overflow RGBA storage"
         );
+    }
+
+    fn read_with(
+        streams: &Value,
+        frames: &Value,
+        requirement: AudioRequirement,
+    ) -> Result<MediaMetadata, MediaError> {
+        parse_with(
+            &serde_json::to_vec(streams).unwrap(),
+            &serde_json::to_vec(frames).unwrap(),
+            &serde_json::to_vec(
+                &json!({"frames":[{"pts":0,"nb_samples":2,"stream_index":1,"channels":2}]}),
+            )
+            .unwrap(),
+            &limits(),
+            requirement,
+        )
+    }
+
+    #[test]
+    fn a_file_without_audio_needs_the_explicit_optional_requirement() {
+        let (streams, frames) = fixture();
+        let mut silent = streams.clone();
+        silent["streams"].as_array_mut().unwrap().pop();
+        // The strict entry points keep refusing it.
+        assert!(read(&silent, &frames, &limits()).is_err());
+        assert!(read_with(&silent, &frames, AudioRequirement::Required).is_err());
+        assert!(validate_streams(&serde_json::to_vec(&silent).unwrap(), &limits()).is_err());
+        // Optional: accepted, with no audio metadata and the source's own video timing.
+        validate_streams_with(
+            &serde_json::to_vec(&silent).unwrap(),
+            &limits(),
+            AudioRequirement::Optional,
+        )
+        .unwrap();
+        let media = read_with(&silent, &frames, AudioRequirement::Optional).unwrap();
+        assert!(media.audio.is_none());
+        assert_eq!(media.video.frames.len(), 3);
+        assert_eq!(media.video.frames[2].pts, 7500);
+        // Nothing reads an audio document for it.
+        parse_with(
+            &serde_json::to_vec(&silent).unwrap(),
+            &serde_json::to_vec(&frames).unwrap(),
+            b"",
+            &limits(),
+            AudioRequirement::Optional,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn optional_audio_is_the_strict_profile_when_an_audio_stream_exists_and_nothing_looser() {
+        let (streams, frames) = fixture();
+        let strict = read(&streams, &frames, &limits()).unwrap();
+        let optional = read_with(&streams, &frames, AudioRequirement::Optional).unwrap();
+        assert_eq!(strict, optional);
+        assert!(optional.audio.is_some());
+        // Every strict refusal of the two-stream profile still refuses under Optional.
+        for (index, name, value) in [
+            (1, "start_pts", json!(1)),
+            (1, "channels", json!(1)),
+            (1, "codec_name", json!("opus")),
+            (0, "codec_name", json!("vp9")),
+            (0, "start_pts", json!(1)),
+            (1, "index", json!(0)),
+        ] {
+            let mut changed = streams.clone();
+            changed["streams"][index][name] = value;
+            assert!(
+                read_with(&changed, &frames, AudioRequirement::Optional).is_err(),
+                "stream {index} {name}"
+            );
+        }
+        // One stream is a silent movie only when it is the VP8 video; no other layout slips in.
+        let mut audio_alone = streams.clone();
+        audio_alone["streams"].as_array_mut().unwrap().remove(0);
+        assert!(read_with(&audio_alone, &frames, AudioRequirement::Optional).is_err(), "audio alone");
+        let mut vp9 = streams.clone();
+        vp9["streams"].as_array_mut().unwrap().pop();
+        vp9["streams"][0]["codec_name"] = json!("vp9");
+        assert!(read_with(&vp9, &frames, AudioRequirement::Optional).is_err(), "silent but not VP8");
+        let mut data = streams.clone();
+        data["streams"][1] = json!({"index": 1, "codec_type": "data", "start_pts": 0});
+        assert!(read_with(&data, &frames, AudioRequirement::Optional).is_err(), "video plus data");
+        let mut lone_data = streams.clone();
+        lone_data["streams"] = json!([{"index": 0, "codec_type": "data", "start_pts": 0}]);
+        assert!(read_with(&lone_data, &frames, AudioRequirement::Optional).is_err());
+        let mut three = streams.clone();
+        three["streams"].as_array_mut().unwrap().push(json!({"index": 2, "codec_type": "data"}));
+        assert!(read_with(&three, &frames, AudioRequirement::Optional).is_err());
+        let mut none = streams.clone();
+        none["streams"] = json!([]);
+        assert!(read_with(&none, &frames, AudioRequirement::Optional).is_err());
     }
 }

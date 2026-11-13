@@ -81,7 +81,11 @@ fn public_worker_preserves_pts_and_reports_only_verified_decoder_eof() {
     assert_eq!(result, Ok(()));
     assert!(matches!(events.first(), Some(Event::Prepared { .. })));
     if let Some(Event::Prepared { metadata, audio }) = events.first() {
-        assert!(std::sync::Arc::ptr_eq(&metadata.audio, &audio.metadata));
+        let audio = audio.as_ref().expect("strict start has audio");
+        assert!(std::sync::Arc::ptr_eq(
+            metadata.audio.as_ref().unwrap(),
+            &audio.metadata
+        ));
         assert_eq!((audio.frames(), audio.metadata.samples()), (1, 1));
         assert_eq!(audio.chunk(0).unwrap().1, [0, 0, 1, 0]);
         assert!(audio.chunk(1).is_none());
@@ -191,7 +195,10 @@ fn timestamped_discontinuous_audio_decodes_but_simple_clock_admission_refuses() 
         Ok(()),
         "noncontiguity does not discard a successful decode"
     );
-    let Some(Event::Prepared { audio, .. }) = events.first() else {
+    let Some(Event::Prepared {
+        audio: Some(audio), ..
+    }) = events.first()
+    else {
         panic!("prepared audio")
     };
     assert_eq!(audio.metadata.initial_pts(), 11);
@@ -264,4 +271,82 @@ fn audio_frame_limits_and_malformed_timestamps_refuse_before_pcm_decode() {
             Err(MediaError::Invalid(_))
         ));
     }
+}
+
+/// A decoder tool for a file that is one VP8 video stream and no audio. Its audio branches
+/// fail loudly, so a worker that probes or decodes audio for a silent file cannot succeed.
+fn silent_fixture() -> Option<(tempfile::TempDir, Request)> {
+    let (dir, request) = fixture("sys.stdout.buffer.write(b'abcdefgh')")?;
+    let tool = &request.tools.ffmpeg;
+    let python = std::fs::read_to_string(tool).ok()?.lines().next()?.to_string();
+    let script = format!(
+        r##"{python}
+import json,sys
+args=sys.argv[1:]
+if '-show_streams' in args:
+ print(json.dumps({{'streams':[
+ {{'index':0,'codec_type':'video','codec_name':'vp8','width':1,'height':1,'time_base':'1/1000','start_pts':0}}]}}))
+elif '-show_frames' in args and 'a:0' in args:
+ sys.exit(1)
+elif '-show_frames' in args:
+ print(json.dumps({{'frames':[
+ {{'pts':0,'duration':37,'width':1,'height':1}},{{'pts':37,'duration':51,'width':1,'height':1}}]}}))
+elif 's16le' in args or '0:a:0' in args:
+ sys.exit(1)
+else:
+ sys.stdout.buffer.write(b'abcdefgh')
+"##
+    );
+    std::fs::write(tool, script).ok()?;
+    Some((dir, request))
+}
+
+#[test]
+fn a_silent_file_is_refused_by_the_strict_worker_and_prepared_without_audio_when_optional() {
+    let Some((_dir, request)) = silent_fixture() else {
+        return;
+    };
+    let mut strict = MovieWorker::start(request.clone()).expect("worker");
+    let (events, result) = drain(&mut strict);
+    assert!(result.is_err(), "the strict start keeps refusing a file with no audio stream");
+    assert!(!events.iter().any(|event| matches!(event, Event::Prepared { .. })));
+
+    let mut worker =
+        MovieWorker::start_with(request, fmv_media::AudioRequirement::Optional).expect("worker");
+    let (events, result) = drain(&mut worker);
+    assert_eq!(result, Ok(()));
+    match events.first() {
+        Some(Event::Prepared { metadata, audio }) => {
+            assert!(audio.is_none() && metadata.audio.is_none(), "no audio is decoded or invented");
+            assert_eq!(metadata.video.frames.len(), 2);
+        }
+        other => panic!("expected Prepared first, got {other:?}"),
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Frame(frame) => Some((frame.ordinal, frame.timing.pts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [(0, 0), (1, 37)]
+    );
+    assert!(matches!(events.last(), Some(Event::DecodedEof { frames: 2 })));
+}
+
+#[test]
+fn optional_audio_still_decodes_a_file_that_has_audio_exactly_as_the_strict_start() {
+    let Some((_dir, request)) = fixture("sys.stdout.buffer.write(b'abcdefgh')") else {
+        return;
+    };
+    let mut worker =
+        MovieWorker::start_with(request, fmv_media::AudioRequirement::Optional).expect("worker");
+    let (events, result) = drain(&mut worker);
+    assert_eq!(result, Ok(()));
+    let Some(Event::Prepared { metadata, audio: Some(audio) }) = events.first() else {
+        panic!("a file with audio keeps its audio")
+    };
+    assert!(std::sync::Arc::ptr_eq(metadata.audio.as_ref().unwrap(), &audio.metadata));
+    assert_eq!(audio.chunk(0).unwrap().1, [0, 0, 1, 0]);
 }

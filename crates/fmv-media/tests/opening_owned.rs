@@ -32,6 +32,7 @@ fn opening_movie_decodes_its_actual_timestamps_audio_and_all_frames_before_eof()
         );
         match worker.poll().expect("actual owned decode succeeds") {
             Some(Event::Prepared { metadata, audio }) => {
+                let audio = audio.expect("the opening has audio");
                 assert!(prepared.is_none());
                 assert_eq!(
                     (
