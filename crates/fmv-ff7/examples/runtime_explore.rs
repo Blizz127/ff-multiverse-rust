@@ -718,7 +718,7 @@ fn main() {
     let mut images: HashSet<(String, u64, u64)> = HashSet::new();
     let mut entered: HashSet<(String, u64)> = HashSet::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut per_place: BTreeMap<(String, u16), u32> = BTreeMap::new();
+    let mut per_place: BTreeMap<(String, u16, Option<usize>), u32> = BTreeMap::new();
     let mut best: (u16, Option<Rc<Step>>, String) = (0, None, String::new());
     let mut unloadable: Vec<String> = Vec::new();
 
@@ -763,7 +763,10 @@ fn main() {
                 rt
             }
         };
-        let place = (field_name.clone(), moment_of(&rt.mem.banks));
+        // The budget is per walkmesh part as well: reaching another part of a field (a ladder, a jump) is progress, and
+        // loops in one part must not use up the expansions a later part needs (smkin_3's climb back from reactor 5's bomb).
+        let part = tri.filter(|t| *t < walk.triangles.len()).and_then(|t| reachable(&walk, &rt, t).iter().position(|r| *r));
+        let place = (field_name.clone(), moment_of(&rt.mem.banks), part);
         let count = per_place.entry(place).or_insert(0);
         if *count >= PER_PLACE {
             continue;
