@@ -632,7 +632,10 @@ mod tests {
     }
 
     fn runtime_with(init: &[u8], main: &[u8], frames: &[u16]) -> FieldRuntime {
-        let mut s = SynthScript::default().entity("m", vec![script0(init, main)]);
+        // These fixtures exercise script-driven animation. Model 0 is the native default player, so explicitly
+        // hold control instead of relying on a lone CHAR being unbound when no PC instruction names it.
+        let init = [&[0x33, 1][..], init].concat();
+        let mut s = SynthScript::default().entity("m", vec![script0(&init, main)]);
         s.scale = 512;
         let mut rt = FieldRuntime::new(&s.build(), Banks::default()).expect("runtime");
         rt.anim.set_animation_frames(0, frames.to_vec());

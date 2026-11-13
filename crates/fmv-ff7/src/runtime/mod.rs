@@ -345,7 +345,7 @@ pub struct FieldState {
     pub battle_mode: u16,
     /// `BTLTB`'s encounter table.
     pub encounter_table: u8,
-    /// The model the player controls (`PC` of party slot 0, or `CC`).
+    /// The model the player controls: slot 0 by default, overridden by `PC` of party slot 0 or `CC`.
     pub pc_model: Option<usize>,
     /// The model that is the player's own character for a host: the one that was the controlled model when the
     /// player last had control. A scene that hands "control" to someone else while the player is locked (`CC` under
@@ -480,6 +480,10 @@ impl FieldRuntime {
     /// the start of its main part. Yields are ignored here, as in the original: the instruction is simply executed
     /// again until the init part reaches its `RET`.
     pub fn init(&mut self) {
+        // Native FieldInitDefaultValues selects slot 0 before any CHAR/PC/CC runs. CHAR allocates in entity order;
+        // fields need not name a party member with PC to make their first model controllable. Init scripts may
+        // replace this selection, so establish it before them rather than choosing a fallback afterwards.
+        self.state.pc_model = Some(0);
         // The original locks the PHS and save menus on every field entry (bank 1, address 31, bits 0-1).
         let locks = self.mem.banks.get(31) | 3;
         self.mem.banks.set(31, locks);
@@ -507,6 +511,8 @@ impl FieldRuntime {
             }
         }
         self.current = 0;
+        // A field with no allocated models has no host character, despite the native numeric default of zero.
+        self.state.pc_model = self.state.pc_model.filter(|&model| model < self.models.len());
         self.state.player_model = self.state.pc_model;
     }
 

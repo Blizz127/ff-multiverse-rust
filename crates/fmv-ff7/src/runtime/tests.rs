@@ -167,10 +167,10 @@ fn a_battle_waits_for_the_host_and_then_continues() {
 
 #[test]
 fn talking_to_a_model_runs_its_talk_script_at_priority_one() {
-    // Entity "npc": CHAR 0, XYZI (100, 0, 0, triangle 0); talk script sets a flag.
-    let init = [&[0xA1, 0x00][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
+    // Model 0 is the default player; the separate NPC at (100, 0, 0, triangle 0) has a talk script setting a flag.
+    let init = [&[0xA1, 0x01][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
     let npc = vec![script0(&init, IDLE), (1, [&set_byte(1, 0x80, 1)[..], &[0x00]].concat())];
-    let s = SynthScript::default().entity("npc", npc);
+    let s = SynthScript::default().entity("player", vec![script0(&[0xA1, 0], IDLE)]).entity("npc", npc);
     let mut rt = runtime(s);
     rt.tick(None);
     // The player stands at (60, 0) facing +x (direction 64) with the model 40 units ahead.
@@ -198,18 +198,22 @@ fn crossing_a_line_runs_its_across_script() {
 
 #[test]
 fn talk_needs_the_model_in_front_and_within_reach() {
-    let init = [&[0xA1, 0x00][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
+    let init = [&[0xA1, 0x01][..], &[0xA5, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0]].concat();
     let npc = vec![script0(&init, IDLE), (1, [&set_byte(1, 0x80, 1)[..], &[0x00]].concat())];
-    let mut rt = runtime(SynthScript::default().entity("npc", npc));
+    let mut rt = runtime(SynthScript::default().entity("player", vec![script0(&[0xA1, 0], IDLE)]).entity("npc", npc));
     rt.tick(None);
     // Facing away (direction 192, -x): nothing.
     rt.tick(Some(PlayerInput { x: 60, y: 0, dir: 192, ok: true, ..Default::default() }));
     rt.tick(None);
     assert_eq!(rt.mem.banks.get(0x80), 0);
-    // Too far: 80 + 34 = 114 is the reach.
+    // Too far: outside the NPC's talk range plus the player's solid range.
     rt.tick(Some(PlayerInput { x: -20, y: 0, dir: 64, ok: true, ..Default::default() }));
     rt.tick(None);
     assert_eq!(rt.mem.banks.get(0x80), 0);
+    // A valid approach must still talk, so the negative cases cannot pass just because the NPC became the player.
+    rt.tick(Some(PlayerInput { x: 60, y: 0, dir: 64, ok: true, ..Default::default() }));
+    rt.tick(None);
+    assert_eq!(rt.mem.banks.get(0x80), 1);
 }
 
 #[test]
@@ -299,6 +303,78 @@ fn a_background_trigger_opens_while_the_player_is_at_its_line_and_closes_when_it
         rt.tick(Some(PlayerInput { x, y: 0, dir: 192, ..Default::default() }));
     }
     assert!(!shown(&rt), "walking away closes it again");
+}
+
+#[test]
+fn default_model_binding_follows_allocation_order_and_exposes_arrival_to_main_getai() {
+    // A director precedes two models. Neither uses PC, and the first CHAR operand is not Cloud's model id.
+    // GETAI in its first main frame must see the host's arrival triangle, as an entry ladder's branch does.
+    let getai = [&[0xB9, 0x05, 1, 0x40][..], IDLE].concat();
+    let mut rt = runtime(SynthScript::default()
+        .entity("director", vec![script0(&[], IDLE)])
+        .entity("first", vec![script0(&[0xA1, 6], &getai)])
+        .entity("second", vec![script0(&[0xA1, 0], IDLE)]));
+    assert_eq!(rt.state.pc_model, Some(0));
+    assert_eq!(rt.state.player_model, Some(0));
+    assert_eq!(rt.pc_model().map(|m| (m.entity, m.char_id)), Some((1, 6)));
+    rt.tick(Some(PlayerInput { x: 11, y: 433, z: 314, triangle: 3, ..Default::default() }));
+    let model = rt.player_model().unwrap();
+    assert_eq!((model.x, model.y, model.z, model.triangle), (11, 433, 314, 3));
+    assert_eq!(u16::from_le_bytes([rt.mem.scratch[0x40], rt.mem.scratch[0x41]]), 3);
+    assert_eq!((rt.models()[1].x, rt.models()[1].y, rt.models()[1].triangle), (0, 0, 0));
+}
+
+#[test]
+fn default_model_binding_is_absent_when_no_model_was_allocated() {
+    let mut rt = runtime(SynthScript::default().entity("director", vec![script0(&[], IDLE)]));
+    assert_eq!(rt.state.pc_model, None);
+    assert_eq!(rt.state.player_model, None);
+    rt.tick(Some(PlayerInput { x: 11, triangle: 3, ..Default::default() }));
+    assert!(rt.pc_model().is_none());
+    assert!(rt.player_model().is_none());
+}
+
+#[test]
+fn default_model_binding_preserves_explicit_party_leader_pc_in_init() {
+    let mut section = SynthScript::default()
+        .entity("first", vec![script0(&[0xA1, 6], IDLE)])
+        .entity("leader", vec![script0(&[0xA1, 7, 0xA0, 1], IDLE)]);
+    section.scale = 512;
+    let mut banks = Banks::default();
+    banks.set(PARTY_SLOTS, 1);
+    let mut rt = FieldRuntime::new(&section.build(), banks).unwrap();
+    rt.init();
+    assert_eq!(rt.state.pc_model, Some(1));
+    assert_eq!(rt.state.player_model, Some(1));
+}
+
+#[test]
+fn default_model_binding_preserves_explicit_cc_in_init() {
+    let rt = runtime(SynthScript::default()
+        .entity("first", vec![script0(&[0xA1, 6], IDLE)])
+        .entity("second", vec![script0(&[0xA1, 7], IDLE)])
+        .entity("director", vec![script0(&[0xBF, 1], IDLE)]));
+    assert_eq!(rt.state.pc_model, Some(1));
+    assert_eq!(rt.state.player_model, Some(1));
+}
+
+#[test]
+fn default_model_binding_survives_cc_to_an_entity_without_a_model() {
+    let rt = runtime(SynthScript::default()
+        .entity("director", vec![script0(&[0xBF, 0], IDLE)])
+        .entity("first", vec![script0(&[0xA1, 6], IDLE)]));
+    assert_eq!(rt.state.pc_model, Some(0));
+    assert_eq!(rt.pc_model().map(|m| m.entity), Some(1));
+}
+
+#[test]
+fn default_model_binding_does_not_replace_an_explicit_empty_pc_selection() {
+    // Preserve the existing invalid-PC result rather than treating it as an invitation to fall back to model 0.
+    let rt = runtime(SynthScript::default()
+        .entity("first", vec![script0(&[0xA1, 6], IDLE)])
+        .entity("empty", vec![script0(&[0xA0, 0], IDLE)]));
+    assert_eq!(rt.state.pc_model, None);
+    assert_eq!(rt.state.player_model, None);
 }
 
 #[test]

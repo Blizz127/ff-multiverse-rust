@@ -177,6 +177,9 @@ against a real `--field-runtime` server.
 
 **What the original engine does that the scripts rely on** (each was found by the solver or the bot getting stuck):
 
+- **The first allocated model is selected by default before initialization.** Explicit PC/CC instructions can
+  override it; a field with no model remains unbound. Fields such as sbwy4_4 omit PC/CC but read the selected
+  model's arrival triangle to start an entry ladder. The host's locked-scene player_model anchor remains separate.
 - **Lines, pushes, talks and gateways** fire only for a player walking under its own control. A character the scripts
   hold or move triggers nothing.
 - **A plain message** does not hold the player. Only a question does, or a script's own `UC`.
