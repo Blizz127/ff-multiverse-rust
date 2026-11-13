@@ -685,6 +685,7 @@ where
             | ServerMsg::LiveCast { .. }
             | ServerMsg::LiveWindow { .. }
             | ServerMsg::LiveWindowClosed { .. }
+            | ServerMsg::LiveSound { .. }
             | ServerMsg::LiveControl { .. }
             | ServerMsg::LivePlace { .. }
             | ServerMsg::LiveMovie { .. }

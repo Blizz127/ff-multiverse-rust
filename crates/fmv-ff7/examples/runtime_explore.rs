@@ -129,6 +129,9 @@ struct Outcome {
     game_over: bool,
     idle: IdleTime,
     control_taken: bool,
+    /// Dialogs of windows open now (by window), and of the windows that finished closing, in order.
+    open_dialogs: BTreeMap<u8, u8>,
+    closed: Vec<u8>,
 }
 
 /// A compact suffix of voluntary waiting. The bot can keep this suffix through a forced scene, but cannot replay
@@ -188,8 +191,14 @@ fn pump(ctx: &Playback<'_>, rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
     }
     for ev in rt.drain_events() {
         match ev {
+            Event::WindowDone { window } | Event::WindowClosedByScript { window } => {
+                if let Some(dialog) = out.open_dialogs.remove(&window) {
+                    out.closed.push(dialog);
+                }
+            }
             Event::Window { window, dialog, ask, .. } => {
                 out.windows += 1;
+                out.open_dialogs.insert(window, dialog);
                 if let Some(lines) = ask {
                     let choice = ctx.answer(dialog, lines).unwrap_or_else(|error| fatal(error));
                     if !rt.answer(window, choice) {
@@ -221,6 +230,64 @@ fn pump(ctx: &Playback<'_>, rt: &mut FieldRuntime, out: &mut Outcome) -> bool {
         }
     }
     false
+}
+
+/// A locked scene that loops until OK is pressed at the right moment (smkin_1's three-person door after reactor 5's
+/// bomb: Barret and Tifa press their buttons a fixed time into each round and Cloud's press must land with theirs).
+/// Tries OK `k` frames after the next window finishes closing, for every `k` up to three seconds, and returns the
+/// first press after which the story moved: (dialog of that window, k, the field after the press, what happened).
+/// The bot replays it as `okafter DIALOG SECONDS`: OK that long after it sees a window with that dialog close.
+fn timed_press(ctx: &Playback<'_>, rt: &FieldRuntime, at: Pos) -> Option<(u8, u32, FieldRuntime, Outcome, Pos)> {
+    // The middle of the first run of delays that work: a networked press lands a frame or two either way.
+    let mut works = Vec::new();
+    for k in 0..=90u32 {
+        match press_after(ctx, rt, at, k) {
+            Some(found) => works.push(found),
+            None if works.is_empty() => continue,
+            None => break,
+        }
+    }
+    let middle = works.len() / 2;
+    works.into_iter().nth(middle)
+}
+
+/// One `timed_press` probe: OK `k` frames after the next window finishes closing.
+fn press_after(ctx: &Playback<'_>, rt: &FieldRuntime, at: Pos, k: u32) -> Option<(u8, u32, FieldRuntime, Outcome, Pos)> {
+    let before = story_key(&rt.mem.banks);
+    {
+        let mut probe = rt.clone();
+        let mut out = Outcome::default();
+        let mut at = at;
+        let mut mark: Option<(u8, u32)> = None;
+        for f in 0..2400u32 {
+            let press_at = mark.map(|(_, c)| c + k);
+            let press = press_at == Some(f);
+            let held = press_at.is_some_and(|p| f >= p && f < p + 5);
+            if probe.player_scripted() {
+                if let Some(m) = probe.player_model() {
+                    at = (m.x, m.y, m.z);
+                }
+            }
+            probe.tick(Some(PlayerInput { x: at.0, y: at.1, z: at.2, ok: press, keys_held: if held { OK } else { 0 }, keys_pressed: if press { OK } else { 0 }, ..Default::default() }));
+            let closed = out.closed.len();
+            let left = pump(ctx, &mut probe, &mut out);
+            if mark.is_none() && out.closed.len() > closed {
+                mark = Some((out.closed[closed], f));
+            }
+            // After the press, the scene runs on until it gives control back (or twenty seconds pass).
+            if left || press_at.is_some_and(|p| f > p + 600 || (f > p + 30 && !busy(&probe))) {
+                break;
+            }
+        }
+        if std::env::var_os("FMV_EXPLORE_PRESS").is_some() {
+            println!("      press k={k}: mark {mark:?} frame {} scratch 11..14 {:?} windows {} closed {:?}", probe.frame(), &probe.mem.scratch[11..14], out.windows, out.closed);
+        }
+        let (dialog, _) = mark?;
+        if !out.game_over && (out.jump.is_some() || story_key(&probe.mem.banks) != before) {
+            return Some((dialog, k, probe, out, at));
+        }
+    }
+    None
 }
 
 /// Whether the field holds the player or waits for it.
@@ -825,6 +892,26 @@ fn main() {
             continue;
         }
         if busy(&rt) {
+            if let Some((dialog, k, probe, out, end)) = timed_press(ctx, &rt, at) {
+                let after = moment_of(&probe.mem.banks);
+                let secs = f64::from(k) / FIELD_FPS;
+                println!("{step:>4} {field_name:<10} locked scene: OK {k} frames after dialog {dialog} closes moves the story (moment {now}->{after})");
+                let text = format!("{field_name}: OK {k} frames after dialog {dialog} closes (moment {now}->{after}, battles {:?}, movies {:?}, windows {})", out.battles, out.movies, out.windows);
+                let cmds = format!("{field_name}: okafter {dialog} {secs:.3}");
+                let step_via = Some(Rc::new(Step { text, cmds, parent: via.clone() }));
+                match out.jump {
+                    Some(jump) => {
+                        let to = maplist.name(jump.0).unwrap_or("?").to_string();
+                        push(&mut heap, enter(&to, jump, probe.mem.banks.clone(), step_via), 5);
+                    }
+                    None => {
+                        let banks = probe.mem.banks.clone();
+                        let tri = probe.triangle_at(end.0, end.1, end.2).map(usize::from);
+                        push(&mut heap, State { field: field_name.clone(), rt: Some(probe), banks, pos: Some(end), tri, via: step_via, carry: None }, 5);
+                    }
+                }
+                continue;
+            }
             // A still-running scene is not a walking action. Otherwise its eventual progress is attributed to an
             // arbitrary candidate walk, and the exported route tells the TCP bot to walk somewhere it never went.
             println!("{step:>4} {field_name:<10} still busy after settling (moment {before}->{now}); no player actions tried");

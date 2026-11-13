@@ -1,4 +1,7 @@
-//! FF Multiverse wire protocol v24.
+//! FF Multiverse wire protocol v25.
+//!
+//! v25 adds [`ServerMsg::LiveSound`]: a live field's script sound effects (`SOUND` and the playing `AKAO` operations
+//! on channels 1 and 2). An older client cannot read the message, so it is refused at the handshake.
 //!
 //! v24 puts the player's own script character into [`ServerMsg::LiveCast`] (`lead`) and adds `poses`, the animation
 //! frame of every cast member a script plays once or holds. An older client would draw that character twice and loop
@@ -504,7 +507,7 @@ pub use fmv_party::{
 };
 
 // Older peers cannot bind an ordinary point cutscene to its accepted activation pose.
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 /// Hard cap on a single frame payload (bytes).
 pub const MAX_FRAME: u32 = 256 * 1024;
 
@@ -1002,6 +1005,9 @@ pub enum ServerMsg {
     },
     /// New in v23. Live window `window` is closed.
     LiveWindowClosed { area: AreaId, window: u8 },
+    /// New in v25. A live field's script played a sound effect: `id` is the game's 1-based sound id (0 stops the
+    /// channel), `channel` 1 or 2, `pan` the script's byte (0 left, 64 centre, 127 right).
+    LiveSound { area: AreaId, channel: u8, id: u16, pan: u8 },
     /// New in v23. Whether a field script holds the player still (the original's `UC`).
     LiveControl { locked: bool },
     /// New in v23. A field script moved this player's character: stand here.
@@ -1165,7 +1171,7 @@ mod tests {
 
     #[test]
     fn the_version_is_twenty_two() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
     }
 
     // -----------------------------------------------------------------------------------------

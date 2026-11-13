@@ -858,6 +858,11 @@ impl ClientState {
                     self.live.on_window_closed(window);
                 }
             }
+            ServerMsg::LiveSound { area, channel, id, pan } => {
+                if area == self.area {
+                    self.scene.live_sound(&area.key, channel, id, pan);
+                }
+            }
             ServerMsg::LiveControl { locked } => self.live.on_control(locked),
             ServerMsg::LivePlace { pos, facing } => {
                 if pos.is_finite() && facing.is_finite() {

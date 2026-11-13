@@ -95,6 +95,8 @@ pub enum LiveEvent {
     /// A window opened. `passive`: one the player cannot close (the countdown's clock, a standing notice).
     Window { window: u8, dialog: u16, ask: Option<(u8, u8)>, entity: u16, offset: u32, passive: bool },
     WindowClosed { window: u8 },
+    /// A script sound effect on channel 1 or 2 (`id` 0 stops the channel).
+    Sound { channel: u8, id: u16, pan: u8 },
     /// Go to another area (`target` is `None` when the field id names no area the adapter has).
     MapJump { target: Option<AreaKey>, field_id: u16, arrival: Pos, facing: f32, hint: Option<u32> },
     Battle { formation: u16, party: Vec<u8> },
@@ -497,6 +499,11 @@ impl World {
                     run.windows.remove(&window);
                     if let Some(area) = &area_id {
                         self.tell_instance(id, Arc::new(ServerMsg::LiveWindowClosed { area: area.clone(), window }), &mut failed);
+                    }
+                }
+                LiveEvent::Sound { channel, id: sound, pan } => {
+                    if let Some(area) = &area_id {
+                        self.tell_instance(id, Arc::new(ServerMsg::LiveSound { area: area.clone(), channel, id: sound, pan }), &mut failed);
                     }
                 }
                 LiveEvent::Movie { movie } => {

@@ -201,6 +201,33 @@ class RouteTimingTests(unittest.TestCase):
         self.assertGreaterEqual(answers[0][0], 1.8)
         self.assertEqual(answers[0][1], {"LiveAnswer": {"window": 0, "choice": 1}})
 
+    def test_press_after_fires_once_per_close_of_its_dialog(self):
+        press = route.PressAfter()
+        press.arm(18, 1.2)
+        press.closed(17, 10.0)
+        self.assertFalse(press.due(20.0), "another dialog does not start the clock")
+        press.closed(18, 10.0)
+        self.assertFalse(press.due(11.1))
+        self.assertTrue(press.due(11.2))
+        self.assertFalse(press.due(11.3), "one press per close")
+        press.closed(18, 15.0)
+        self.assertTrue(press.due(16.2), "a failed round's next close presses again")
+        press.disarm()
+        press.closed(18, 20.0)
+        self.assertFalse(press.due(30.0))
+
+    def test_press_after_must_open_its_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = Path(d) / "ok.txt"
+            ok.write_text("smkin_1: okafter 18 1.233\n")
+            self.assertEqual(route.load_route(ok)[0], [("smkin_1", [["okafter", "18", "1.233"]])])
+            bad = Path(d) / "bad.txt"
+            bad.write_text("smkin_1: to 1 2; okafter 18 1.2\n")
+            with self.assertRaises(ValueError):
+                route.load_route(bad)
+        with self.assertRaises(ValueError):
+            route.PressAfter().arm(18, float("nan"))
+
     def test_response_delay_rejects_invalid_values(self):
         for value in ["-1", "nan", "inf", "-inf"]:
             with self.assertRaises(route.argparse.ArgumentTypeError):

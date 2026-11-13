@@ -129,6 +129,13 @@ impl LiveField for Ff7Live {
                 Event::Control { locked } => out.push(LiveEvent::Note(format!("control locked={locked}"))),
                 Event::Gil { delta } => out.push(LiveEvent::Gil { delta }),
                 Event::Item { item, delta } => out.push(LiveEvent::Item { item, delta }),
+                // Script sound effects. Channels 3 and 4 stay with the client's field ambience (as in a scene).
+                Event::Presentation { bytes, .. } => {
+                    let call = fmv_ff7::script::decode_at(&bytes, 0, 0).ok().and_then(|ins| fmv_ff7::field_sound::Call::of(&ins).ok().flatten());
+                    if let Some(call) = call.filter(|c| (1..=2).contains(&c.channel)) {
+                        out.push(LiveEvent::Sound { channel: call.channel, id: call.id, pan: call.pan });
+                    }
+                }
                 _ => {}
             }
         }

@@ -69,7 +69,11 @@ def load_route(path):
             choices[key] = index
             continue
         field, steps = line.split(":", 1)
-        route.append((field.strip(), [s.split() for s in steps.split(";") if s.strip()]))
+        steps = [s.split() for s in steps.split(";") if s.strip()]
+        for i, step in enumerate(steps):
+            if step[0] == "okafter" and (i != 0 or len(step) != 3 or not step[1].isdecimal()):
+                raise ValueError(f"line {number}: okafter DIALOG SECONDS must be the first step of its entry")
+        route.append((field.strip(), steps))
     return route, choices
 
 
@@ -113,6 +117,36 @@ class IdleWait:
         self.remaining -= elapsed
         self.at, self.free = now, free
         return elapsed
+
+
+class PressAfter:
+    """`okafter DIALOG SECONDS`, the first step of its entry: a locked scene that waits for OK at the right moment
+    (reactor 5's three-person door). OK is sent SECONDS after a window showing DIALOG finishes closing, and again
+    after every later close of that dialog, until control returns or the field changes. The solver measures the
+    delay from the same event (the runtime's WindowDone, the server's LiveWindowClosed)."""
+
+    def __init__(self):
+        self.dialog = None
+        self.delay = 0.0
+        self.fire_at = None
+
+    def arm(self, dialog, delay):
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError("okafter delay must be finite and nonnegative")
+        self.dialog, self.delay, self.fire_at = dialog, delay, None
+
+    def disarm(self):
+        self.dialog, self.fire_at = None, None
+
+    def closed(self, dialog, now):
+        if self.dialog is not None and dialog == self.dialog:
+            self.fire_at = now + self.delay
+
+    def due(self, now):
+        if self.fire_at is not None and now >= self.fire_at:
+            self.fire_at = None
+            return True
+        return False
 
 
 def trailing_idle(steps):
@@ -227,6 +261,8 @@ def main():
     battle_at = 0.0
     waited_for = None
     windows = set()
+    window_dialogs = {}
+    press = PressAfter()
     pending = []
     idx, steps = 0, None
     entry_expects_exit = False
@@ -295,6 +331,7 @@ def main():
                 # Count a new window as progress, never the repeated cast/lock snapshots of a stuck scene.
                 progress_at = now
                 windows.add(b["window"])
+                window_dialogs[b["window"]] = b["dialog"]
                 pending = without_window_answer(pending, b["window"])
                 ask = b.get("ask")
                 if args.verbose:
@@ -310,10 +347,13 @@ def main():
                     pending.append((now + args.answer_delay, {"LiveAnswer": {"window": b["window"], "choice": choice}}))
             elif k == "LiveWindowClosed":
                 windows.discard(b["window"])
+                press.closed(window_dialogs.pop(b["window"], None), now)
                 pending = without_window_answer(pending, b["window"])
             elif k == "LiveControl":
                 locked = b["locked"]
                 idle_interrupted |= locked
+                if not locked:
+                    press.disarm()
                 if args.verbose:
                     print(f"  CONTROL locked={locked}", flush=True)
                 if locked and steps is not None and not entry_expects_exit:
@@ -351,6 +391,18 @@ def main():
         for due, msg in [p for p in pending if p[0] <= now]:
             c.send(msg)
         pending = [p for p in pending if p[0] > now]
+        # A timed press belongs to a locked scene: it is armed even while the field holds the player.
+        if steps is None and press.dialog is None and idx < len(route) and route[idx][0] == area and route[idx][1] and route[idx][1][0][0] == "okafter":
+            field, entry_steps = route[idx]
+            _, dialog, seconds = entry_steps[0]
+            press.arm(int(dialog), float(seconds))
+            route[idx] = (field, entry_steps[1:])
+            print(f"[{idx + 1}/{len(route)}] {field}: okafter {dialog} {seconds} (armed)", flush=True)
+        if press.due(now):
+            c.send({"Interact": {}})
+            progress_at = now
+            if args.verbose:
+                print(f"  PRESS OK {press.delay:.3f}s after dialog {press.dialog} closed", flush=True)
         busy = locked or bool(windows) or in_battle or bool(pending)
         if idle_wait.advance(now, not busy and not idle_interrupted) > 0:
             progress_at = now  # an intentional wait is progress; the overall time limit still applies

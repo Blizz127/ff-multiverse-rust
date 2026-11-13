@@ -54,6 +54,8 @@ pub struct SceneClient {
     events: VecDeque<SceneEvent>,
     notes: VecDeque<String>,
     sounds: VecDeque<SceneSound>,
+    /// The run the last queued `Begin` started (a scene's or a live field's), so a live field's sounds begin their own.
+    sound_run: Option<SceneRunId>,
     /// The run this client finished by itself (or could not play) and has not yet heard the server end, with the windows
     /// it moved past: its `SceneEnded` is still to be reported.
     finished: Option<(SceneRunId, u32)>,
@@ -108,6 +110,7 @@ impl SceneClient {
             events: VecDeque::new(),
             notes: VecDeque::new(),
             sounds: VecDeque::new(),
+            sound_run: None,
             finished: None,
             refusal: None,
             started: 0,
@@ -511,7 +514,18 @@ impl SceneClient {
         self.outbox.push(SceneCmd::Preview { scene: scene.to_string() });
     }
 
+    /// A live field's script sound effect (protocol 25), played on the same two channels as a scene's. Each live field
+    /// is a run of its own: a scene starting, or another live field's first sound, stops what it was playing.
+    pub fn live_sound(&mut self, area: &str, channel: u8, id: u16, pan: u8) {
+        let run = live_sound_run(area);
+        if self.sound_run != Some(run) {
+            self.sound(SceneSound { run, action: SoundAction::Begin });
+        }
+        self.sound(SceneSound { run, action: SoundAction::Play { channel, id, pan } });
+    }
+
     fn sound(&mut self, sound: SceneSound) {
+        if sound.action == SoundAction::Begin { self.sound_run = Some(sound.run); }
         if self.sounds.len() >= MAX_PENDING { self.sounds.pop_front(); }
         self.sounds.push_back(sound);
     }
@@ -588,4 +602,33 @@ struct Start {
     presentation_origin: Option<fmv_protocol::SceneOrigin>,
     participants: Vec<SceneParticipant>,
     you: SceneRole,
+}
+
+/// The sound run of a live field: high bit set (a scene's run ids count up from the server), the rest a hash of its
+/// area key, so each field's effects are their own run.
+fn live_sound_run(area: &str) -> SceneRunId {
+    let hash = area.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    SceneRunId((1 << 63) | (hash >> 1))
+}
+
+#[cfg(test)]
+mod live_sound_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_field_begins_its_own_sound_run_once_and_again_after_a_scene() {
+        let mut c = SceneClient::new();
+        c.live_sound("Ff7/md1stin", 1, 62, 64);
+        c.live_sound("Ff7/md1stin", 2, 0, 64);
+        let actions: Vec<_> = c.take_sounds().into_iter().map(|s| s.action).collect();
+        assert_eq!(actions, vec![SoundAction::Begin, SoundAction::Play { channel: 1, id: 62, pan: 64 }, SoundAction::Play { channel: 2, id: 0, pan: 64 }]);
+        // A scene took the channels: the live field begins again.
+        c.sound(SceneSound { run: SceneRunId(7), action: SoundAction::Begin });
+        c.take_sounds();
+        c.live_sound("Ff7/md1stin", 1, 59, 64);
+        let sounds = c.take_sounds();
+        assert_eq!(sounds[0].action, SoundAction::Begin);
+        assert_eq!(sounds[0].run, live_sound_run("Ff7/md1stin"));
+        assert_ne!(live_sound_run("Ff7/md1stin"), live_sound_run("Ff7/md1_1"));
+    }
 }
