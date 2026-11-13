@@ -1290,7 +1290,7 @@ fn main() {
                 _ if moved_scratch || moved_place => 1,
                 _ => 0,
             };
-            if std::env::var_os("FMV_EXPLORE_TALK").is_some() && label.starts_with("talk") {
+            if std::env::var_os("FMV_EXPLORE_TALK").is_some() && (label.starts_with("talk") || label.starts_with("line")) {
                 println!("      probe [{label}] face {face}: windows {} moment {now}->{after} score {score}", out.windows);
             }
             if score == 0 {
